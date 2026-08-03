@@ -29,7 +29,8 @@ jobs:
           -p:EnableCompressionInSingleFile=true
 
       - name: Build NSIS installer
-        run: makensis windows/installer.nsi
+        shell: pwsh
+        run: '& "C:\Program Files (x86)\NSIS\makensis.exe" windows/installer.nsi'
 
       - name: Portable ZIP
         shell: pwsh
