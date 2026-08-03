@@ -80,6 +80,116 @@ private struct Row<Content: View>: View {
     }
 }
 
+// MARK: - Window background style cards (visual picker)
+
+/// Visual previews: each card shows what the window screenshot will
+/// look like with that background. Click a card to choose.
+private struct BGStyleCard: View {
+    let style: WindowBGStyle
+    let isSelected: Bool
+    var solidColor: Color = .white
+
+    var body: some View {
+        VStack(spacing: 6) {
+            ZStack {
+                cardBackground
+                miniWindow
+            }
+            .frame(width: 110, height: 72)
+            .clipShape(RoundedRectangle(cornerRadius: 9))
+            .overlay(
+                RoundedRectangle(cornerRadius: 9)
+                    .stroke(
+                        isSelected ? Color.accentColor : Color.gray.opacity(0.35),
+                        lineWidth: isSelected ? 2.5 : 1
+                    )
+            )
+            Text(style.label)
+                .font(.callout)
+                .foregroundStyle(isSelected ? .primary : .secondary)
+        }
+        .contentShape(Rectangle())
+        .help(helpText)
+        .animation(.easeOut(duration: 0.12), value: isSelected)
+    }
+
+    @ViewBuilder private var cardBackground: some View {
+        switch style {
+        case .wallpaper:
+            LinearGradient(
+                colors: [
+                    Color(red: 0.25, green: 0.45, blue: 0.95),
+                    Color(red: 0.30, green: 0.75, blue: 0.85),
+                ],
+                startPoint: .topLeading, endPoint: .bottomTrailing
+            )
+        case .transparent:
+            Checkerboard()
+        case .solid:
+            solidColor
+        case .trimShadow:
+            Color.black.opacity(0.001) // no backdrop — the window is all there is
+        }
+    }
+
+    private var miniWindow: some View {
+        RoundedRectangle(cornerRadius: 5)
+            .fill(Color(white: 0.24))
+            .overlay(alignment: .topLeading) {
+                HStack(spacing: 3.5) {
+                    Circle().fill(Color(red: 1, green: 0.37, blue: 0.34)).frame(width: 5.5, height: 5.5)
+                    Circle().fill(Color(red: 1, green: 0.75, blue: 0.18)).frame(width: 5.5, height: 5.5)
+                    Circle().fill(Color(red: 0.22, green: 0.79, blue: 0.25)).frame(width: 5.5, height: 5.5)
+                }
+                .padding(6)
+            }
+            .frame(
+                width: style == .trimShadow ? 92 : 66,
+                height: style == .trimShadow ? 60 : 44
+            )
+            .shadow(
+                color: style == .trimShadow ? .clear : .black.opacity(0.55),
+                radius: 7, y: 4
+            )
+    }
+
+    private var helpText: String {
+        switch style {
+        case .wallpaper: return "Window on top of your desktop wallpaper"
+        case .transparent: return "Padding with transparency — great for pasting into docs (PNG)"
+        case .solid: return "Window on a solid color backdrop"
+        case .trimShadow: return "Just the window — no padding, no shadow"
+        }
+    }
+}
+
+private struct Checkerboard: View {
+    var body: some View {
+        Canvas { ctx, size in
+            let s: CGFloat = 8
+            var row = 0
+            var y: CGFloat = 0
+            while y < size.height {
+                var col = 0
+                var x: CGFloat = 0
+                while x < size.width {
+                    if (row + col) % 2 == 0 {
+                        ctx.fill(
+                            Path(CGRect(x: x, y: y, width: s, height: s)),
+                            with: .color(.gray.opacity(0.4))
+                        )
+                    }
+                    col += 1
+                    x += s
+                }
+                row += 1
+                y += s
+            }
+        }
+        .background(Color.gray.opacity(0.15))
+    }
+}
+
 // MARK: - General
 
 struct GeneralTab: View {
@@ -99,25 +209,32 @@ struct GeneralTab: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            Row(label: "Window Screenshot Background") {
-                Picker("", selection: $bgStyle) {
+            // visual picker — click a preview card to choose the backdrop
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(spacing: 6) {
+                    Text("Window Screenshot Background")
+                    Image(systemName: "questionmark.circle")
+                        .foregroundStyle(.secondary)
+                        .help("The backdrop drawn behind Capture Active/Any Window shots. Hover a preview for details.")
+                }
+                HStack(spacing: 14) {
                     ForEach(WindowBGStyle.allCases, id: \.rawValue) { style in
-                        Text(style.label).tag(style.rawValue)
+                        BGStyleCard(
+                            style: style,
+                            isSelected: bgStyle == style.rawValue,
+                            solidColor: bgColor
+                        )
+                        .onTapGesture { bgStyle = style.rawValue }
                     }
                 }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                .frame(maxWidth: 330)
-            }
-            if bgStyle == WindowBGStyle.solid.rawValue {
-                Row(label: "Background color") {
-                    ColorPicker("", selection: $bgColor, supportsOpacity: false)
-                        .labelsHidden()
+                if bgStyle == WindowBGStyle.solid.rawValue {
+                    ColorPicker("Backdrop color:", selection: $bgColor, supportsOpacity: false)
                         .onChange(of: bgColor) { _, new in
                             Settings.shared.windowBGColor = NSColor(new)
                         }
                 }
             }
+            .frame(maxWidth: .infinity, alignment: .center)
 
             Divider()
 
@@ -458,7 +575,7 @@ struct AboutTab: View {
                 .font(.system(size: 42, weight: .medium))
                 .foregroundStyle(.tint)
             Text("Snippr").font(.title).bold()
-            Text("Version 1.0.1 — native Apple Silicon (arm64)")
+            Text("Version 1.0.2 — native for Apple Silicon & Intel")
                 .foregroundStyle(.secondary)
             Divider().frame(width: 300)
             Text("Free for personal use. Screenshot, annotate, OCR,\nscrolling capture — everything stays on your Mac.")

@@ -1,0 +1,120 @@
+namespace Snippr;
+
+/// Fullscreen frozen-desktop overlay: drag to select an area, Esc to cancel.
+sealed class OverlayForm : Form
+{
+    readonly Bitmap _frozen;
+    readonly Rectangle _virtualBounds;
+    Point? _dragStart;
+    Point _current;
+    public Rectangle? SelectedVirtualRect { get; private set; }
+
+    public static (Bitmap? shot, Rectangle virtualRect) SelectArea()
+    {
+        var frozen = CaptureUtil.VirtualScreen(out var bounds);
+        using var overlay = new OverlayForm(frozen, bounds);
+        overlay.ShowDialog();
+        if (overlay.SelectedVirtualRect is Rectangle rect && rect.Width > 3 && rect.Height > 3)
+        {
+            var cropped = CaptureUtil.CropVirtual(frozen, bounds, rect);
+            frozen.Dispose();
+            return (cropped, rect);
+        }
+        frozen.Dispose();
+        return (null, Rectangle.Empty);
+    }
+
+    OverlayForm(Bitmap frozen, Rectangle virtualBounds)
+    {
+        _frozen = frozen;
+        _virtualBounds = virtualBounds;
+        FormBorderStyle = FormBorderStyle.None;
+        StartPosition = FormStartPosition.Manual;
+        Bounds = virtualBounds;
+        TopMost = true;
+        ShowInTaskbar = false;
+        Cursor = Cursors.Cross;
+        KeyPreview = true;
+        DoubleBuffered = true;
+        SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint
+            | ControlStyles.OptimizedDoubleBuffer, true);
+    }
+
+    Rectangle? SelectionLocal
+    {
+        get
+        {
+            if (_dragStart is not Point a) return null;
+            var b = _current;
+            return new Rectangle(
+                Math.Min(a.X, b.X), Math.Min(a.Y, b.Y),
+                Math.Abs(a.X - b.X), Math.Abs(a.Y - b.Y));
+        }
+    }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        var g = e.Graphics;
+        g.DrawImageUnscaled(_frozen, 0, 0);
+
+        using var dim = new SolidBrush(Color.FromArgb(105, Color.Black));
+        var sel = SelectionLocal;
+        if (sel is Rectangle r)
+        {
+            var region = new Region(ClientRectangle);
+            region.Exclude(r);
+            g.FillRegion(dim, region);
+            region.Dispose();
+
+            using var pen = new Pen(Color.DeepSkyBlue, 1.6f);
+            g.DrawRectangle(pen, r);
+
+            string label = $"{r.Width} × {r.Height}";
+            DrawBubble(g, label, new Point(r.Right + 8, r.Bottom + 6));
+        }
+        else
+        {
+            g.FillRectangle(dim, ClientRectangle);
+            using var cross = new Pen(Color.FromArgb(170, Color.White), 1f);
+            g.DrawLine(cross, _current.X, 0, _current.X, Height);
+            g.DrawLine(cross, 0, _current.Y, Width, _current.Y);
+        }
+    }
+
+    static void DrawBubble(Graphics g, string text, Point at)
+    {
+        using var font = new Font("Segoe UI", 9.5f, FontStyle.Bold);
+        var size = g.MeasureString(text, font);
+        var rect = new RectangleF(at.X, at.Y, size.Width + 12, size.Height + 6);
+        using var bg = new SolidBrush(Color.FromArgb(195, Color.Black));
+        g.FillRectangle(bg, rect);
+        g.DrawString(text, font, Brushes.White, at.X + 6, at.Y + 3);
+    }
+
+    protected override void OnMouseDown(MouseEventArgs e)
+    {
+        if (e.Button == MouseButtons.Left) { _dragStart = e.Location; _current = e.Location; }
+        else Close(); // right-click cancels
+    }
+
+    protected override void OnMouseMove(MouseEventArgs e)
+    {
+        _current = e.Location;
+        Invalidate();
+    }
+
+    protected override void OnMouseUp(MouseEventArgs e)
+    {
+        if (SelectionLocal is Rectangle r && r.Width > 3 && r.Height > 3)
+        {
+            SelectedVirtualRect = new Rectangle(
+                r.X + _virtualBounds.X, r.Y + _virtualBounds.Y, r.Width, r.Height);
+        }
+        Close();
+    }
+
+    protected override void OnKeyDown(KeyEventArgs e)
+    {
+        if (e.KeyCode == Keys.Escape) Close();
+    }
+}

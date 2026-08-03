@@ -1,0 +1,46 @@
+name: Windows installer
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to upload the installer to"
+        required: true
+        default: "v1.0.2"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Publish self-contained exe
+        run: >
+          dotnet publish windows/Snippr.Win.csproj -c Release -r win-x64
+          --self-contained -p:PublishSingleFile=true
+          -p:IncludeNativeLibrariesForSelfExtract=true
+          -p:EnableCompressionInSingleFile=true
+
+      - name: Build NSIS installer
+        run: makensis windows/installer.nsi
+
+      - name: Portable ZIP
+        shell: pwsh
+        run: >
+          Compress-Archive -Path windows/bin/Release/net8.0-windows/win-x64/publish/Snippr.exe
+          -DestinationPath windows/Snippr-portable-win-x64.zip -Force
+
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          gh release upload ${{ inputs.tag }} (Get-Item windows/SnipprSetup-*.exe).FullName --clobber
+          gh release upload ${{ inputs.tag }} windows/Snippr-portable-win-x64.zip --clobber

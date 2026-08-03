@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Snippr — chụp màn hình cho Mac Apple Silicon</title>
-<meta name="description" content="Snippr: app chụp màn hình miễn phí, native cho Mac chip Apple Silicon. Chụp vùng chọn, cửa sổ, cuộn trang, OCR tiếng Việt, chú thích ảnh — mọi thứ ở lại máy bạn.">
+<title>Snippr — chụp màn hình cho Mac & Windows</title>
+<meta name="description" content="Snippr: app chụp màn hình miễn phí cho Mac (Apple Silicon & Intel) và Windows. Chụp vùng chọn, cửa sổ, cuộn trang, OCR tiếng Việt, chú thích ảnh — mọi thứ ở lại máy bạn.">
 <link rel="icon" href="icon.png">
 <style>
   :root {
@@ -25,20 +25,22 @@
     background: linear-gradient(90deg, var(--accent), var(--accent2));
     -webkit-background-clip: text; background-clip: text; color: transparent;
   }
-  .tagline { font-size: 20px; color: var(--muted); max-width: 560px; margin: 0 auto; }
-  .cta { margin: 32px 0 10px; }
+  .tagline { font-size: 20px; color: var(--muted); max-width: 600px; margin: 0 auto; }
+  .cta { margin: 32px 0 10px; display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; }
   .btn {
-    display: inline-block; padding: 14px 34px; border-radius: 12px;
-    font-size: 17px; font-weight: 600; text-decoration: none;
+    display: inline-block; padding: 13px 26px; border-radius: 12px;
+    font-size: 16px; font-weight: 600; text-decoration: none;
     background: linear-gradient(90deg, var(--accent), var(--accent2)); color: #fff;
     box-shadow: 0 6px 24px rgba(76,154,255,.35); transition: transform .15s;
   }
   .btn:hover { transform: translateY(-2px); }
+  .btn small { display: block; font-weight: 400; font-size: 12px; opacity: .85; }
   .btn.ghost {
     background: transparent; border: 1px solid var(--border); color: var(--text);
-    box-shadow: none; margin-left: 10px;
+    box-shadow: none;
   }
   .sub { color: var(--muted); font-size: 13px; margin-top: 12px; }
+  .sub a { color: var(--accent); }
   section { padding: 36px 0; border-top: 1px solid var(--border); }
   h2 { font-size: 26px; margin-bottom: 18px; }
   .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 14px; }
@@ -46,7 +48,7 @@
   .card b { display: block; margin-bottom: 6px; font-size: 15px; }
   .card span { color: var(--muted); font-size: 14px; }
   ol { margin-left: 22px; }
-  ol li { margin-bottom: 14px; }
+  ol li { margin-bottom: 12px; }
   code, kbd {
     background: #10141c; border: 1px solid var(--border); border-radius: 6px;
     padding: 2px 7px; font-size: 13px; font-family: ui-monospace, "SF Mono", Menlo, monospace;
@@ -57,11 +59,10 @@
     border-radius: 12px; padding: 14px 18px; margin-top: 16px; font-size: 14.5px;
   }
   table { width: 100%; border-collapse: collapse; font-size: 15px; }
-  td { padding: 9px 12px; border-bottom: 1px solid var(--border); }
-  td:first-child { white-space: nowrap; width: 150px; }
+  td, th { padding: 9px 12px; border-bottom: 1px solid var(--border); text-align: left; }
+  th { color: var(--muted); font-weight: 600; font-size: 13px; }
   footer { text-align: center; padding: 40px 0 56px; color: var(--muted); font-size: 14px; }
   footer a { color: var(--accent); text-decoration: none; }
-  img.shot { width: 100%; border-radius: 14px; border: 1px solid var(--border); margin-top: 14px; }
 </style>
 </head>
 <body>
@@ -70,53 +71,67 @@
 <header>
   <img src="icon.png" alt="Snippr icon">
   <h1>Snippr</h1>
-  <p class="tagline">Chụp màn hình nhanh, gọn, native cho Mac chip Apple Silicon.<br>Chú thích · OCR tiếng Việt · Chụp cuộn trang — mọi thứ ở lại máy bạn.</p>
+  <p class="tagline">Chụp màn hình nhanh, gọn cho <b>Mac</b> và <b>Windows</b>.<br>Chú thích · OCR tiếng Việt · Chụp cuộn trang — mọi thứ ở lại máy bạn.</p>
   <div class="cta">
-    <a class="btn" href="Snippr-1.0.1.dmg" download>⬇ Tải Snippr 1.0.1</a>
-    <a class="btn ghost" href="https://github.com/fantasy9876/snippr">Source trên GitHub</a>
+    <a class="btn" href="Snippr-1.0.2.dmg" download> Mac Apple Silicon<small>v1.0.2 · M1–M5 · DMG 1.3 MB</small></a>
+    <a class="btn" href="Snippr-1.0.2-intel.dmg" download> Mac Intel<small>v1.0.2 · x86_64 · DMG 1.4 MB</small></a>
+    <a class="btn" href="https://github.com/fantasy9876/snippr/releases/download/v1.0.2/SnipprSetup-1.1.0-win-x64.exe">🪟 Windows Installer<small>v1.1.0 · x64 · Setup.exe</small></a>
   </div>
-  <p class="sub">macOS 14 trở lên · chỉ hỗ trợ chip Apple Silicon (M1–M5) · miễn phí, mã nguồn mở (MIT) · DMG 1.3 MB</p>
+  <p class="sub">
+    macOS 14+ · Windows 10/11 64-bit · miễn phí, mã nguồn mở (MIT) ·
+    <a href="https://github.com/fantasy9876/snippr">GitHub</a> ·
+    <a href="https://github.com/fantasy9876/snippr/releases/download/v1.0.2/Snippr-portable-win-x64.zip">bản Windows portable (ZIP)</a>
+  </p>
 </header>
 
 <section>
   <h2>Tính năng</h2>
   <div class="grid">
-    <div class="card"><b>📸 Chụp đủ kiểu</b><span>Toàn màn hình, kéo chọn vùng, cửa sổ bất kỳ (kèm nền đẹp), hẹn giờ 3s, lặp lại vùng cũ.</span></div>
-    <div class="card"><b>📜 Chụp cuộn trang</b><span>Tự cuộn và ghép ảnh trang web / tài liệu dài thành một ảnh liền mạch.</span></div>
-    <div class="card"><b>🔍 OCR & QR</b><span>Quét chữ trong ảnh (có tiếng Việt) và mã QR, copy thẳng vào clipboard. Chạy offline bằng Apple Vision.</span></div>
+    <div class="card"><b>📸 Chụp đủ kiểu</b><span>Toàn màn hình, kéo chọn vùng, cửa sổ đang mở, hẹn giờ 3s, lặp lại vùng cũ.</span></div>
     <div class="card"><b>✏️ Editor chú thích</b><span>Mũi tên, khung, bút vẽ, text, đánh số thứ tự, che mờ thông tin nhạy cảm, crop, undo/redo.</span></div>
+    <div class="card"><b>⌨️ Hotkey tùy chỉnh</b><span>Đổi phím tắt theo ý thích — trên cả Mac (tab Hotkeys) lẫn Windows (Settings).</span></div>
     <div class="card"><b>📌 Ghim ảnh</b><span>Ghim screenshot nổi luôn-trên-cùng để đối chiếu khi làm việc.</span></div>
+    <div class="card"><b>📜 Cuộn trang & 🔍 OCR</b><span>Chụp trang dài tự ghép ảnh; quét chữ (có tiếng Việt) và QR offline. <i>(hiện có trên bản Mac)</i></span></div>
     <div class="card"><b>🔒 Riêng tư tuyệt đối</b><span>Không tài khoản, không upload, không thu thập gì. Ảnh không bao giờ rời khỏi máy.</span></div>
   </div>
 </section>
 
 <section>
-  <h2>Cài đặt</h2>
+  <h2>Cài đặt trên macOS</h2>
   <ol>
-    <li>Tải file <code>Snippr-1.0.1.dmg</code>, mở ra và kéo <b>Snippr</b> vào thư mục <b>Applications</b>.</li>
-    <li>Mở Snippr lần đầu: vì app chưa qua notarization của Apple, macOS sẽ cảnh báo. Vào <b>System Settings → Privacy &amp; Security</b>, kéo xuống và bấm <b>Open Anyway</b>.<br>
-    <span style="color:var(--muted)">Cách khác cho người quen Terminal: <code>xattr -cr /Applications/Snippr.app</code> rồi mở bình thường.</span></li>
-    <li>Cấp quyền <b>Screen Recording</b> khi được hỏi (bắt buộc để chụp), và <b>Accessibility</b> nếu muốn dùng chụp cuộn trang. Sau khi cấp, mở lại app.</li>
+    <li>Tải đúng bản cho máy (Apple Silicon cho M1–M5, Intel cho Mac cũ), mở DMG và kéo <b>Snippr</b> vào <b>Applications</b>.</li>
+    <li>Lần đầu mở: app chưa qua notarization nên macOS sẽ cảnh báo. Vào <b>System Settings → Privacy &amp; Security</b>, bấm <b>Open Anyway</b>.<br>
+    <span style="color:var(--muted)">Cách khác: chạy <code>xattr -cr /Applications/Snippr.app</code> trong Terminal.</span></li>
+    <li>Cấp quyền <b>Screen Recording</b> (bắt buộc) và <b>Accessibility</b> (cho chụp cuộn trang), rồi mở lại app. Snippr nằm trên menu bar (icon 📷).</li>
   </ol>
-  <div class="note">💡 Sau khi cài xong, Snippr nằm trên <b>menu bar</b> (icon ✂️) chứ không có cửa sổ chính — giống các app chụp màn hình khác. Bật "Launch at Startup" trong menu để app tự chạy cùng máy.</div>
+
+  <h2 style="margin-top:32px">Cài đặt trên Windows</h2>
+  <ol>
+    <li>Tải <b>Windows Installer</b>, chạy file <code>SnipprSetup-1.1.0-win-x64.exe</code>.</li>
+    <li>Nếu SmartScreen cảnh báo (app chưa mua chứng chỉ ký số): bấm <b>More info → Run anyway</b>.</li>
+    <li>Installer cho <b>chọn thư mục cài đặt</b>, tạo shortcut Start Menu và mục gỡ trong "Add or remove programs". Xong bấm <b>Finish</b> là Snippr chạy luôn ở khay hệ thống.</li>
+  </ol>
+  <div class="note">💡 Không thích cài đặt? Dùng <a href="https://github.com/fantasy9876/snippr/releases/download/v1.0.2/Snippr-portable-win-x64.zip" style="color:var(--accent)">bản portable (ZIP)</a> — giải nén là chạy, xóa thư mục là gỡ xong.</div>
 </section>
 
 <section>
-  <h2>Phím tắt mặc định</h2>
+  <h2>Phím tắt mặc định <span style="font-size:14px;color:var(--muted)">(đổi được trong Settings)</span></h2>
   <table>
-    <tr><td><kbd>⇧⌘1</kbd></td><td>Chụp toàn màn hình</td></tr>
-    <tr><td><kbd>⇧⌘2</kbd></td><td>Chụp vùng chọn — kéo chuột để chọn, <kbd>Esc</kbd> để hủy</td></tr>
-    <tr><td><kbd>^⌥⌘O</kbd></td><td>Quét chữ / QR trong vùng chọn → copy vào clipboard</td></tr>
-    <tr><td><kbd>⌘,</kbd></td><td>Mở Settings (đổi phím tắt, thư mục lưu, định dạng ảnh...)</td></tr>
+    <tr><th>Chức năng</th><th>macOS</th><th>Windows</th></tr>
+    <tr><td>Chụp toàn màn hình</td><td><kbd>⇧⌘1</kbd></td><td><kbd>Ctrl+Shift+1</kbd></td></tr>
+    <tr><td>Chụp vùng chọn</td><td><kbd>⇧⌘2</kbd></td><td><kbd>Ctrl+Shift+2</kbd></td></tr>
+    <tr><td>Chụp cửa sổ đang mở</td><td>menu 📷 → more</td><td><kbd>Ctrl+Shift+4</kbd></td></tr>
+    <tr><td>Quét chữ / QR (OCR)</td><td><kbd>^⌥⌘O</kbd></td><td><i>sắp có</i></td></tr>
   </table>
-  <div class="note">Trong Editor: lăn chuột để zoom · <kbd>⌘C</kbd> copy · <kbd>⌘S</kbd> lưu · <kbd>Esc</kbd> copy nhanh rồi đóng · phím <kbd>A</kbd>/<kbd>R</kbd>/<kbd>T</kbd>/<kbd>B</kbd>... chuyển công cụ (arrow/rect/text/blur).</div>
+  <div class="note">Trong Editor: lăn chuột để zoom · <kbd>Ctrl/⌘+C</kbd> copy rồi tự đóng · <kbd>Ctrl/⌘+S</kbd> chọn nơi lưu · <kbd>Ctrl/⌘+Z</kbd> undo · phím <kbd>A</kbd>/<kbd>R</kbd>/<kbd>T</kbd>/<kbd>B</kbd>… chuyển công cụ (arrow/rect/text/blur).</div>
 </section>
 
 <section>
   <h2>Câu hỏi thường gặp</h2>
-  <p><b>Mac Intel dùng được không?</b> Không — Snippr build riêng cho chip Apple Silicon (M1 trở lên) để nhẹ và nhanh nhất.</p>
-  <p style="margin-top:10px"><b>Sao macOS báo app "không xác minh được"?</b> App ký ad-hoc chứ chưa mua chứng chỉ Apple Developer ($99/năm). Source code công khai trên GitHub, bạn có thể tự build nếu muốn chắc chắn.</p>
-  <p style="margin-top:10px"><b>Ảnh lưu ở đâu?</b> Mặc định ở Desktop, đổi được trong Settings → General. Định dạng Auto sẽ tự chọn PNG cho ảnh UI và JPEG cho ảnh nhiều màu.</p>
+  <p><b>Mac Intel dùng được không?</b> Được! Từ v1.0.2 có bản Intel (x86_64) riêng — tải nút "Mac Intel" ở trên.</p>
+  <p style="margin-top:10px"><b>Sao hệ điều hành cảnh báo app "không xác minh"?</b> App ký ad-hoc / chưa mua chứng chỉ ($99–$400/năm). Mã nguồn công khai trên GitHub, bạn có thể tự build nếu muốn chắc chắn.</p>
+  <p style="margin-top:10px"><b>Đổi phím tắt kiểu gì?</b> Mac: menu 📷 → Settings → tab Hotkeys, bấm vào ô rồi gõ tổ hợp mới. Windows: chuột phải icon khay → Settings, bấm vào ô hotkey rồi gõ tổ hợp mới (Esc để tắt phím tắt đó).</p>
+  <p style="margin-top:10px"><b>Ảnh lưu ở đâu?</b> Mặc định ở Desktop, đổi được trong Settings. Định dạng Auto tự chọn PNG cho ảnh UI, JPEG cho ảnh nhiều màu.</p>
 </section>
 
 <footer>

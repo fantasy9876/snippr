@@ -1,0 +1,557 @@
+using System.Drawing.Drawing2D;
+
+namespace Snippr;
+
+sealed class EditorForm : Form
+{
+    Bitmap _image;
+    Bitmap? _pixelated;
+    readonly List<Annotation> _annotations = new();
+    readonly Stack<(Bitmap img, List<Annotation> anns)> _undo = new();
+    readonly Stack<(Bitmap img, List<Annotation> anns)> _redo = new();
+
+    Tool _tool = Tool.Select;
+    Color _color = Color.Red;
+    float _zoom = 1f;
+
+    Annotation? _draft;
+    Annotation? _selected;
+    Point _dragStartPx;
+    bool _movingSelection;
+    Rectangle? _cropRectPx;
+
+    readonly Panel _scroller = new();
+    readonly CanvasControl _canvas;
+    readonly ToolStrip _bar = new();
+    ToolStripLabel _sizeLabel = new();
+    ToolStripLabel _zoomLabel = new();
+    ToolStripButton _colorButton = new();
+    readonly Dictionary<Tool, ToolStripButton> _toolButtons = new();
+    TextBox? _textBox;
+    TextAnnotation? _editingText;
+
+    public static void OpenWith(Bitmap image)
+    {
+        var f = new EditorForm(image);
+        f.Show();
+        f.Activate();
+    }
+
+    EditorForm(Bitmap image)
+    {
+        _image = image;
+        Text = "Snippr";
+        BackColor = Color.FromArgb(28, 30, 36);
+        KeyPreview = true;
+        StartPosition = FormStartPosition.CenterScreen;
+
+        var wa = Screen.FromPoint(Cursor.Position).WorkingArea;
+        ClientSize = new Size(
+            Math.Min(Math.Max(image.Width, 640), (int)(wa.Width * 0.9)),
+            Math.Min(image.Height, (int)(wa.Height * 0.85)) + 40);
+
+        _canvas = new CanvasControl(this);
+        BuildToolbar();
+
+        _scroller.Dock = DockStyle.Fill;
+        _scroller.AutoScroll = true;
+        _scroller.BackColor = Color.FromArgb(33, 36, 43);
+        _scroller.Controls.Add(_canvas);
+        Controls.Add(_scroller);
+        Controls.Add(_bar);
+
+        ApplyZoom(1f);
+        FormClosed += (_, _) => { _pixelated?.Dispose(); };
+    }
+
+    // ---------- toolbar ----------
+
+    void BuildToolbar()
+    {
+        _bar.Dock = DockStyle.Top;
+        _bar.GripStyle = ToolStripGripStyle.Hidden;
+        _bar.BackColor = Color.FromArgb(22, 24, 29);
+        _bar.ForeColor = Color.Gainsboro;
+        _bar.RenderMode = ToolStripRenderMode.System;
+        _bar.ImageScalingSize = new Size(20, 20);
+
+        ToolStripButton Btn(string text, string tip, EventHandler onClick)
+        {
+            var b = new ToolStripButton(text) { ToolTipText = tip, ForeColor = Color.Gainsboro };
+            b.Click += onClick;
+            _bar.Items.Add(b);
+            return b;
+        }
+
+        Btn("Copy", "Copy to clipboard and close (Ctrl+C)", (_, _) => CopyAndClose());
+        Btn("Save", "Save as… (Ctrl+S)", (_, _) => SaveWithDialog());
+        Btn("Pin", "Pin to screen (Ctrl+P)", (_, _) => PinAndClose());
+        _bar.Items.Add(new ToolStripSeparator());
+
+        (Tool, string, string)[] tools =
+        {
+            (Tool.Select, "▲", "Select / move (V)"),
+            (Tool.Arrow, "↗", "Arrow (A)"),
+            (Tool.Line, "╱", "Line (L)"),
+            (Tool.Rect, "▭", "Rectangle (R)"),
+            (Tool.Oval, "◯", "Oval (O)"),
+            (Tool.Highlight, "▉", "Highlighter (H)"),
+            (Tool.Pen, "✎", "Pen (P)"),
+            (Tool.Text, "T", "Text (T)"),
+            (Tool.Counter, "①", "Counter (N)"),
+            (Tool.Blur, "▩", "Pixelate (B)"),
+            (Tool.Crop, "✂", "Crop (C)"),
+        };
+        foreach (var (tool, glyph, tip) in tools)
+        {
+            var b = Btn(glyph, tip, (_, _) => SelectTool(tool));
+            _toolButtons[tool] = b;
+        }
+
+        _bar.Items.Add(new ToolStripSeparator());
+        _colorButton = new ToolStripButton("") { ToolTipText = "Annotation color" };
+        _colorButton.Click += (_, _) => PickColor();
+        _bar.Items.Add(_colorButton);
+        UpdateColorSwatch();
+
+        _zoomLabel = new ToolStripLabel("100%") { Alignment = ToolStripItemAlignment.Right, ForeColor = Color.Silver };
+        _sizeLabel = new ToolStripLabel("") { Alignment = ToolStripItemAlignment.Right, ForeColor = Color.Silver };
+        _bar.Items.Add(_zoomLabel);
+        _bar.Items.Add(_sizeLabel);
+
+        SelectTool(Tool.Select);
+        RefreshLabels();
+    }
+
+    void UpdateColorSwatch()
+    {
+        var bmp = new Bitmap(20, 20);
+        using (var g = Graphics.FromImage(bmp))
+        {
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            using var brush = new SolidBrush(_color);
+            g.FillEllipse(brush, 1, 1, 18, 18);
+            g.DrawEllipse(Pens.Gray, 1, 1, 18, 18);
+        }
+        _colorButton.Image = bmp;
+        _colorButton.DisplayStyle = ToolStripItemDisplayStyle.Image;
+    }
+
+    void PickColor()
+    {
+        using var dlg = new ColorDialog { Color = _color, FullOpen = true };
+        if (dlg.ShowDialog(this) == DialogResult.OK)
+        {
+            _color = dlg.Color;
+            UpdateColorSwatch();
+            if (_selected != null)
+            {
+                PushUndo();
+                _selected.Color = _color;
+                _canvas.Invalidate();
+            }
+        }
+    }
+
+    void SelectTool(Tool tool)
+    {
+        CommitText();
+        _tool = tool;
+        foreach (var (t, b) in _toolButtons) b.Checked = t == tool;
+        _canvas.Cursor = tool switch
+        {
+            Tool.Select => Cursors.Default,
+            Tool.Text => Cursors.IBeam,
+            _ => Cursors.Cross,
+        };
+    }
+
+    void RefreshLabels()
+    {
+        _sizeLabel.Text = $"{_image.Width}×{_image.Height}px";
+        _zoomLabel.Text = $"{(int)Math.Round(_zoom * 100)}%  ";
+    }
+
+    // ---------- zoom ----------
+
+    internal void ApplyZoom(float zoom)
+    {
+        _zoom = Math.Clamp(zoom, 0.1f, 8f);
+        _canvas.Size = new Size(
+            (int)(_image.Width * _zoom), (int)(_image.Height * _zoom));
+        _canvas.Invalidate();
+        RefreshLabels();
+    }
+
+    internal void ZoomBy(float factor) => ApplyZoom(_zoom * factor);
+
+    // ---------- undo ----------
+
+    void PushUndo()
+    {
+        _undo.Push((_image, _annotations.Select(a => a.Clone()).ToList()));
+        _redo.Clear();
+    }
+
+    void Undo()
+    {
+        if (_undo.Count == 0) return;
+        _redo.Push((_image, _annotations.Select(a => a.Clone()).ToList()));
+        Restore(_undo.Pop());
+    }
+
+    void Redo()
+    {
+        if (_redo.Count == 0) return;
+        _undo.Push((_image, _annotations.Select(a => a.Clone()).ToList()));
+        Restore(_redo.Pop());
+    }
+
+    void Restore((Bitmap img, List<Annotation> anns) state)
+    {
+        if (!ReferenceEquals(state.img, _image))
+        {
+            _image = state.img;
+            _pixelated?.Dispose();
+            _pixelated = null;
+        }
+        _annotations.Clear();
+        _annotations.AddRange(state.anns);
+        _selected = null;
+        ApplyZoom(_zoom);
+    }
+
+    // ---------- actions ----------
+
+    Bitmap Flatten()
+    {
+        CommitText();
+        bool needsPix = _annotations.Any(a => a is BlurAnnotation);
+        return AnnotationRenderer.Flatten(_image, _annotations, needsPix ? Pixelated : null);
+    }
+
+    Bitmap Pixelated => _pixelated ??= AnnotationRenderer.Pixelate(_image);
+
+    void CopyAndClose()
+    {
+        using var flat = Flatten();
+        Clipboard.SetImage(flat);
+        ToastForm.Show("Copied to clipboard");
+        Close();
+    }
+
+    void SaveWithDialog()
+    {
+        using var flat = Flatten();
+        using var dlg = new SaveFileDialog
+        {
+            Filter = "PNG image|*.png|JPEG image|*.jpg",
+            FileName = $"Snippr {DateTime.Now:yyyy-MM-dd 'at' HH.mm.ss}.png",
+            InitialDirectory = AppSettings.Current.SaveFolder,
+        };
+        if (dlg.ShowDialog(this) == DialogResult.OK)
+        {
+            bool jpeg = Path.GetExtension(dlg.FileName).ToLowerInvariant() is ".jpg" or ".jpeg";
+            CaptureUtil.SaveAs(flat, dlg.FileName, jpeg);
+            ToastForm.Show($"Saved {Path.GetFileName(dlg.FileName)}");
+        }
+    }
+
+    void PinAndClose()
+    {
+        new PinForm(Flatten()).Show();
+        Close();
+    }
+
+    // ---------- keyboard ----------
+
+    protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
+    {
+        if (_textBox != null && _textBox.Focused)
+        {
+            if (keyData == Keys.Escape) { CancelText(); return true; }
+            return base.ProcessCmdKey(ref msg, keyData);
+        }
+
+        switch (keyData)
+        {
+            case Keys.Control | Keys.C: CopyAndClose(); return true;
+            case Keys.Control | Keys.S: SaveWithDialog(); return true;
+            case Keys.Control | Keys.P: PinAndClose(); return true;
+            case Keys.Control | Keys.Z: Undo(); return true;
+            case Keys.Control | Keys.Y:
+            case Keys.Control | Keys.Shift | Keys.Z: Redo(); return true;
+            case Keys.Control | Keys.D0: ApplyZoom(1f); return true;
+            case Keys.Control | Keys.Oemplus: ZoomBy(1.25f); return true;
+            case Keys.Control | Keys.OemMinus: ZoomBy(0.8f); return true;
+            case Keys.Escape: CopyAndClose(); return true;
+            case Keys.Delete:
+            case Keys.Back:
+                if (_selected != null)
+                {
+                    PushUndo();
+                    _annotations.Remove(_selected);
+                    _selected = null;
+                    _canvas.Invalidate();
+                }
+                return true;
+            case Keys.V: SelectTool(Tool.Select); return true;
+            case Keys.A: SelectTool(Tool.Arrow); return true;
+            case Keys.L: SelectTool(Tool.Line); return true;
+            case Keys.R: SelectTool(Tool.Rect); return true;
+            case Keys.O: SelectTool(Tool.Oval); return true;
+            case Keys.H: SelectTool(Tool.Highlight); return true;
+            case Keys.P: SelectTool(Tool.Pen); return true;
+            case Keys.T: SelectTool(Tool.Text); return true;
+            case Keys.N: SelectTool(Tool.Counter); return true;
+            case Keys.B: SelectTool(Tool.Blur); return true;
+            case Keys.C: SelectTool(Tool.Crop); return true;
+        }
+        return base.ProcessCmdKey(ref msg, keyData);
+    }
+
+    // ---------- canvas events (called by CanvasControl) ----------
+
+    Point ToPx(Point view) => new((int)(view.X / _zoom), (int)(view.Y / _zoom));
+
+    internal void CanvasMouseDown(MouseEventArgs e)
+    {
+        CommitText();
+        var px = ToPx(e.Location);
+        _dragStartPx = px;
+
+        switch (_tool)
+        {
+            case Tool.Select:
+                _selected = _annotations.AsEnumerable().Reverse().FirstOrDefault(a => a.HitTest(px));
+                _movingSelection = _selected != null;
+                if (_movingSelection) PushUndo();
+                _canvas.Invalidate();
+                break;
+            case Tool.Arrow or Tool.Line or Tool.Rect or Tool.Oval or Tool.Highlight:
+                _draft = new ShapeAnnotation
+                {
+                    Shape = _tool switch
+                    {
+                        Tool.Arrow => ShapeAnnotation.Kind.Arrow,
+                        Tool.Line => ShapeAnnotation.Kind.Line,
+                        Tool.Rect => ShapeAnnotation.Kind.Rect,
+                        Tool.Oval => ShapeAnnotation.Kind.Oval,
+                        _ => ShapeAnnotation.Kind.Highlight,
+                    },
+                    Start = px,
+                    End = px,
+                    Color = _tool == Tool.Highlight && _color.ToArgb() == Color.Red.ToArgb()
+                        ? Color.Gold : _color,
+                };
+                break;
+            case Tool.Pen:
+                _draft = new PenAnnotation { Color = _color, Points = { px } };
+                break;
+            case Tool.Blur:
+                _draft = new BlurAnnotation { Rect = new Rectangle(px, Size.Empty) };
+                break;
+            case Tool.Crop:
+                _cropRectPx = new Rectangle(px, Size.Empty);
+                break;
+            case Tool.Text:
+                BeginText(e.Location, px);
+                break;
+            case Tool.Counter:
+                PushUndo();
+                _annotations.Add(new CounterAnnotation
+                {
+                    Center = px,
+                    Color = _color,
+                    Number = _annotations.OfType<CounterAnnotation>()
+                        .Select(c => c.Number).DefaultIfEmpty(0).Max() + 1,
+                });
+                _canvas.Invalidate();
+                break;
+        }
+    }
+
+    internal void CanvasMouseMove(MouseEventArgs e)
+    {
+        if (e.Button != MouseButtons.Left) return;
+        var px = ToPx(e.Location);
+
+        switch (_tool)
+        {
+            case Tool.Select when _movingSelection && _selected != null:
+                _selected.Move(px.X - _dragStartPx.X, px.Y - _dragStartPx.Y);
+                _dragStartPx = px;
+                _canvas.Invalidate();
+                break;
+            case Tool.Arrow or Tool.Line or Tool.Rect or Tool.Oval or Tool.Highlight:
+                if (_draft is ShapeAnnotation s) { s.End = px; _canvas.Invalidate(); }
+                break;
+            case Tool.Pen:
+                if (_draft is PenAnnotation p) { p.Points.Add(px); _canvas.Invalidate(); }
+                break;
+            case Tool.Blur:
+                if (_draft is BlurAnnotation blur)
+                {
+                    blur.Rect = RectFrom(_dragStartPx, px);
+                    _canvas.Invalidate();
+                }
+                break;
+            case Tool.Crop:
+                _cropRectPx = RectFrom(_dragStartPx, px);
+                _canvas.Invalidate();
+                break;
+        }
+    }
+
+    internal void CanvasMouseUp(MouseEventArgs e)
+    {
+        if (_draft != null)
+        {
+            var b = _draft.Bounds;
+            if (b.Width > 2 || b.Height > 2 || _draft is PenAnnotation)
+            {
+                PushUndo();
+                _annotations.Add(_draft);
+            }
+            _draft = null;
+            _canvas.Invalidate();
+        }
+        if (_tool == Tool.Crop && _cropRectPx is Rectangle crop)
+        {
+            _cropRectPx = null;
+            if (crop.Width > 4 && crop.Height > 4) PerformCrop(crop);
+            _canvas.Invalidate();
+        }
+        _movingSelection = false;
+    }
+
+    static Rectangle RectFrom(Point a, Point b) => Rectangle.FromLTRB(
+        Math.Min(a.X, b.X), Math.Min(a.Y, b.Y), Math.Max(a.X, b.X), Math.Max(a.Y, b.Y));
+
+    void PerformCrop(Rectangle cropPx)
+    {
+        cropPx.Intersect(new Rectangle(Point.Empty, _image.Size));
+        if (cropPx.Width < 4 || cropPx.Height < 4) return;
+        PushUndo();
+        var cropped = _image.Clone(cropPx, _image.PixelFormat);
+        _image = cropped;
+        _pixelated?.Dispose();
+        _pixelated = null;
+        foreach (var a in _annotations) a.Move(-cropPx.X, -cropPx.Y);
+        _selected = null;
+        ApplyZoom(_zoom);
+    }
+
+    // ---------- text tool ----------
+
+    void BeginText(Point viewLoc, Point px)
+    {
+        CommitText();
+        _editingText = new TextAnnotation { Origin = px, Color = _color };
+        _textBox = new TextBox
+        {
+            Location = viewLoc,
+            Width = 240,
+            Font = new Font("Segoe UI", Math.Max(10, 20 * _zoom * 0.75f)),
+            ForeColor = _color,
+            BackColor = Color.FromArgb(40, 42, 50),
+        };
+        _textBox.KeyDown += (_, e) =>
+        {
+            if (e.KeyCode == Keys.Enter) { e.SuppressKeyPress = true; CommitText(); }
+        };
+        _textBox.LostFocus += (_, _) => CommitText();
+        _canvas.Controls.Add(_textBox);
+        _textBox.Focus();
+    }
+
+    void CommitText()
+    {
+        if (_textBox == null || _editingText == null) return;
+        var text = _textBox.Text.Trim();
+        var ann = _editingText;
+        var box = _textBox;
+        _textBox = null;
+        _editingText = null;
+        _canvas.Controls.Remove(box);
+        box.Dispose();
+        if (text.Length > 0)
+        {
+            PushUndo();
+            ann.Text = text;
+            _annotations.Add(ann);
+        }
+        _canvas.Invalidate();
+    }
+
+    void CancelText()
+    {
+        if (_textBox == null) return;
+        var box = _textBox;
+        _textBox = null;
+        _editingText = null;
+        _canvas.Controls.Remove(box);
+        box.Dispose();
+    }
+
+    // ---------- canvas control ----------
+
+    sealed class CanvasControl : Control
+    {
+        readonly EditorForm _owner;
+
+        public CanvasControl(EditorForm owner)
+        {
+            _owner = owner;
+            DoubleBuffered = true;
+            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint
+                | ControlStyles.OptimizedDoubleBuffer, true);
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            var g = e.Graphics;
+            var o = _owner;
+            g.InterpolationMode = o._zoom < 1 ? InterpolationMode.HighQualityBicubic : InterpolationMode.NearestNeighbor;
+            g.DrawImage(o._image, 0, 0, o._image.Width * o._zoom, o._image.Height * o._zoom);
+
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            var state = g.Save();
+            g.ScaleTransform(o._zoom, o._zoom);
+            bool needsPix = o._annotations.Any(a => a is BlurAnnotation) || o._draft is BlurAnnotation;
+            var pix = needsPix ? o.Pixelated : null;
+            foreach (var a in o._annotations) a.Draw(g, pix);
+            o._draft?.Draw(g, pix);
+
+            if (o._selected != null)
+            {
+                using var pen = new Pen(Color.DeepSkyBlue, 1.5f / o._zoom) { DashStyle = DashStyle.Dash };
+                var b = Rectangle.Inflate(o._selected.Bounds, 5, 5);
+                g.DrawRectangle(pen, b);
+            }
+            g.Restore(state);
+
+            if (o._cropRectPx is Rectangle crop)
+            {
+                var view = new Rectangle(
+                    (int)(crop.X * o._zoom), (int)(crop.Y * o._zoom),
+                    (int)(crop.Width * o._zoom), (int)(crop.Height * o._zoom));
+                using var dim = new SolidBrush(Color.FromArgb(110, Color.Black));
+                var region = new Region(ClientRectangle);
+                region.Exclude(view);
+                g.FillRegion(dim, region);
+                region.Dispose();
+                g.DrawRectangle(Pens.White, view);
+            }
+        }
+
+        protected override void OnMouseDown(MouseEventArgs e) { Focus(); _owner.CanvasMouseDown(e); }
+        protected override void OnMouseMove(MouseEventArgs e) => _owner.CanvasMouseMove(e);
+        protected override void OnMouseUp(MouseEventArgs e) => _owner.CanvasMouseUp(e);
+
+        protected override void OnMouseWheel(MouseEventArgs e)
+        {
+            _owner.ZoomBy(e.Delta > 0 ? 1.15f : 1 / 1.15f);
+        }
+    }
+}
