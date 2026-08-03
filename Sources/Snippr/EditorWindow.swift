@@ -217,30 +217,40 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
     @objc func copyImage() {
         SaveService.shared.copyToClipboard(canvas.flattened())
         ToastHUD.show("Copied to clipboard")
+        window?.close()
     }
 
+    /// ⌘S / Save button: choose where to save via the system panel.
     @objc func saveImage() {
-        if let url = SaveService.shared.save(canvas.flattened()) {
-            ToastHUD.show("Saved \(url.lastPathComponent)", symbol: "square.and.arrow.down.fill")
-        } else {
-            ToastHUD.show("Save failed", symbol: "exclamationmark.triangle.fill")
-        }
-    }
-
-    @objc func saveImageAs() {
         guard let window else { return }
-        let flat = canvas.flattened()
+        var flat = canvas.flattened()
+        if Settings.shared.downscaleRetina {
+            flat = flat.downscaledTo1x()
+        }
+        let df = DateFormatter()
+        df.dateFormat = "yyyy-MM-dd 'at' HH.mm.ss"
         let panel = NSSavePanel()
-        panel.nameFieldStringValue = "Snippr.png"
-        panel.allowedContentTypes = [.png]
+        panel.nameFieldStringValue = "Snippr \(df.string(from: Date())).png"
+        panel.directoryURL = Settings.shared.screenshotsFolder
+        panel.allowedContentTypes = [.png, .jpeg]
+        panel.canCreateDirectories = true
+        let image = flat
         panel.beginSheetModal(for: window) { response in
             guard response == .OK, let url = panel.url else { return }
-            if let data = SaveService.data(for: flat.cgImage, format: .png) {
-                try? data.write(to: url)
-                ToastHUD.show("Saved \(url.lastPathComponent)", symbol: "square.and.arrow.down.fill")
+            let ext = url.pathExtension.lowercased()
+            let format: ImageFileFormat = (ext == "jpg" || ext == "jpeg") ? .jpeg : .png
+            if let data = SaveService.data(for: image.cgImage, format: format) {
+                do {
+                    try data.write(to: url)
+                    ToastHUD.show("Saved \(url.lastPathComponent)", symbol: "square.and.arrow.down.fill")
+                } catch {
+                    ToastHUD.show("Save failed", symbol: "exclamationmark.triangle.fill")
+                }
             }
         }
     }
+
+    @objc func saveImageAs() { saveImage() }
 
     @objc func pinImage() {
         PinWindow.pin(canvas.flattened())

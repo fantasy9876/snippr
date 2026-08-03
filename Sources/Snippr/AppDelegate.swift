@@ -44,7 +44,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
 
         if !UserDefaults.standard.bool(forKey: Settings.Keys.noSplash) {
-            ToastHUD.show("Snippr is running — ⇧⌘1 screen · ⇧⌘2 area", symbol: "scissors", duration: 3)
+            ToastHUD.show("Snippr is running — ⇧⌘1 screen · ⇧⌘2 area", symbol: "camera.viewfinder", duration: 3)
         }
 
         UITest.runIfRequested()
@@ -116,7 +116,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func setupStatusItem() {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         item.button?.image = NSImage(
-            systemSymbolName: "scissors", accessibilityDescription: "Snippr"
+            systemSymbolName: "camera.viewfinder", accessibilityDescription: "Snippr"
         )
         item.menu = buildMenu()
         item.isVisible = !Settings.shared.hideMenubarIcon

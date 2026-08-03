@@ -454,11 +454,11 @@ struct AdvancedTab: View {
 struct AboutTab: View {
     var body: some View {
         VStack(spacing: 12) {
-            Image(systemName: "scissors")
+            Image(systemName: "camera.viewfinder")
                 .font(.system(size: 42, weight: .medium))
                 .foregroundStyle(.tint)
             Text("Snippr").font(.title).bold()
-            Text("Version 1.0.0 — native Apple Silicon (arm64)")
+            Text("Version 1.0.1 — native Apple Silicon (arm64)")
                 .foregroundStyle(.secondary)
             Divider().frame(width: 300)
             Text("Free for personal use. Screenshot, annotate, OCR,\nscrolling capture — everything stays on your Mac.")
