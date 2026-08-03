@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Snippr — chụp màn hình cho Mac Apple Silicon</title>
+<meta name="description" content="Snippr: app chụp màn hình miễn phí, native cho Mac chip Apple Silicon. Chụp vùng chọn, cửa sổ, cuộn trang, OCR tiếng Việt, chú thích ảnh — mọi thứ ở lại máy bạn.">
+<link rel="icon" href="icon.png">
+<style>
+  :root {
+    --bg: #0d0f14; --card: #161a22; --text: #e8eaf0; --muted: #9aa3b2;
+    --accent: #4c9aff; --accent2: #7c5cff; --border: #262c38;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    line-height: 1.6;
+  }
+  .wrap { max-width: 860px; margin: 0 auto; padding: 0 24px; }
+  header { text-align: center; padding: 72px 0 48px; }
+  header img { width: 128px; height: 128px; border-radius: 28px; box-shadow: 0 12px 40px rgba(76,154,255,.25); }
+  h1 {
+    font-size: 52px; margin: 20px 0 8px; letter-spacing: -1px;
+    background: linear-gradient(90deg, var(--accent), var(--accent2));
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+  }
+  .tagline { font-size: 20px; color: var(--muted); max-width: 560px; margin: 0 auto; }
+  .cta { margin: 32px 0 10px; }
+  .btn {
+    display: inline-block; padding: 14px 34px; border-radius: 12px;
+    font-size: 17px; font-weight: 600; text-decoration: none;
+    background: linear-gradient(90deg, var(--accent), var(--accent2)); color: #fff;
+    box-shadow: 0 6px 24px rgba(76,154,255,.35); transition: transform .15s;
+  }
+  .btn:hover { transform: translateY(-2px); }
+  .btn.ghost {
+    background: transparent; border: 1px solid var(--border); color: var(--text);
+    box-shadow: none; margin-left: 10px;
+  }
+  .sub { color: var(--muted); font-size: 13px; margin-top: 12px; }
+  section { padding: 36px 0; border-top: 1px solid var(--border); }
+  h2 { font-size: 26px; margin-bottom: 18px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 14px; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 14px; padding: 18px; }
+  .card b { display: block; margin-bottom: 6px; font-size: 15px; }
+  .card span { color: var(--muted); font-size: 14px; }
+  ol { margin-left: 22px; }
+  ol li { margin-bottom: 14px; }
+  code, kbd {
+    background: #10141c; border: 1px solid var(--border); border-radius: 6px;
+    padding: 2px 7px; font-size: 13px; font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  }
+  kbd { background: #1d2430; }
+  .note {
+    background: rgba(76,154,255,.08); border: 1px solid rgba(76,154,255,.3);
+    border-radius: 12px; padding: 14px 18px; margin-top: 16px; font-size: 14.5px;
+  }
+  table { width: 100%; border-collapse: collapse; font-size: 15px; }
+  td { padding: 9px 12px; border-bottom: 1px solid var(--border); }
+  td:first-child { white-space: nowrap; width: 150px; }
+  footer { text-align: center; padding: 40px 0 56px; color: var(--muted); font-size: 14px; }
+  footer a { color: var(--accent); text-decoration: none; }
+  img.shot { width: 100%; border-radius: 14px; border: 1px solid var(--border); margin-top: 14px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <img src="icon.png" alt="Snippr icon">
+  <h1>Snippr</h1>
+  <p class="tagline">Chụp màn hình nhanh, gọn, native cho Mac chip Apple Silicon.<br>Chú thích · OCR tiếng Việt · Chụp cuộn trang — mọi thứ ở lại máy bạn.</p>
+  <div class="cta">
+    <a class="btn" href="Snippr-1.0.0.dmg" download>⬇ Tải Snippr 1.0.0</a>
+    <a class="btn ghost" href="https://github.com/fantasy9876/snippr">Source trên GitHub</a>
+  </div>
+  <p class="sub">macOS 14 trở lên · chỉ hỗ trợ chip Apple Silicon (M1–M5) · miễn phí, mã nguồn mở (MIT) · DMG 1.3 MB</p>
+</header>
+
+<section>
+  <h2>Tính năng</h2>
+  <div class="grid">
+    <div class="card"><b>📸 Chụp đủ kiểu</b><span>Toàn màn hình, kéo chọn vùng, cửa sổ bất kỳ (kèm nền đẹp), hẹn giờ 3s, lặp lại vùng cũ.</span></div>
+    <div class="card"><b>📜 Chụp cuộn trang</b><span>Tự cuộn và ghép ảnh trang web / tài liệu dài thành một ảnh liền mạch.</span></div>
+    <div class="card"><b>🔍 OCR & QR</b><span>Quét chữ trong ảnh (có tiếng Việt) và mã QR, copy thẳng vào clipboard. Chạy offline bằng Apple Vision.</span></div>
+    <div class="card"><b>✏️ Editor chú thích</b><span>Mũi tên, khung, bút vẽ, text, đánh số thứ tự, che mờ thông tin nhạy cảm, crop, undo/redo.</span></div>
+    <div class="card"><b>📌 Ghim ảnh</b><span>Ghim screenshot nổi luôn-trên-cùng để đối chiếu khi làm việc.</span></div>
+    <div class="card"><b>🔒 Riêng tư tuyệt đối</b><span>Không tài khoản, không upload, không thu thập gì. Ảnh không bao giờ rời khỏi máy.</span></div>
+  </div>
+</section>
+
+<section>
+  <h2>Cài đặt</h2>
+  <ol>
+    <li>Tải file <code>Snippr-1.0.0.dmg</code>, mở ra và kéo <b>Snippr</b> vào thư mục <b>Applications</b>.</li>
+    <li>Mở Snippr lần đầu: vì app chưa qua notarization của Apple, macOS sẽ cảnh báo. Vào <b>System Settings → Privacy &amp; Security</b>, kéo xuống và bấm <b>Open Anyway</b>.<br>
+    <span style="color:var(--muted)">Cách khác cho người quen Terminal: <code>xattr -cr /Applications/Snippr.app</code> rồi mở bình thường.</span></li>
+    <li>Cấp quyền <b>Screen Recording</b> khi được hỏi (bắt buộc để chụp), và <b>Accessibility</b> nếu muốn dùng chụp cuộn trang. Sau khi cấp, mở lại app.</li>
+  </ol>
+  <div class="note">💡 Sau khi cài xong, Snippr nằm trên <b>menu bar</b> (icon ✂️) chứ không có cửa sổ chính — giống các app chụp màn hình khác. Bật "Launch at Startup" trong menu để app tự chạy cùng máy.</div>
+</section>
+
+<section>
+  <h2>Phím tắt mặc định</h2>
+  <table>
+    <tr><td><kbd>⇧⌘1</kbd></td><td>Chụp toàn màn hình</td></tr>
+    <tr><td><kbd>⇧⌘2</kbd></td><td>Chụp vùng chọn — kéo chuột để chọn, <kbd>Esc</kbd> để hủy</td></tr>
+    <tr><td><kbd>^⌥⌘O</kbd></td><td>Quét chữ / QR trong vùng chọn → copy vào clipboard</td></tr>
+    <tr><td><kbd>⌘,</kbd></td><td>Mở Settings (đổi phím tắt, thư mục lưu, định dạng ảnh...)</td></tr>
+  </table>
+  <div class="note">Trong Editor: lăn chuột để zoom · <kbd>⌘C</kbd> copy · <kbd>⌘S</kbd> lưu · <kbd>Esc</kbd> copy nhanh rồi đóng · phím <kbd>A</kbd>/<kbd>R</kbd>/<kbd>T</kbd>/<kbd>B</kbd>... chuyển công cụ (arrow/rect/text/blur).</div>
+</section>
+
+<section>
+  <h2>Câu hỏi thường gặp</h2>
+  <p><b>Mac Intel dùng được không?</b> Không — Snippr build riêng cho chip Apple Silicon (M1 trở lên) để nhẹ và nhanh nhất.</p>
+  <p style="margin-top:10px"><b>Sao macOS báo app "không xác minh được"?</b> App ký ad-hoc chứ chưa mua chứng chỉ Apple Developer ($99/năm). Source code công khai trên GitHub, bạn có thể tự build nếu muốn chắc chắn.</p>
+  <p style="margin-top:10px"><b>Ảnh lưu ở đâu?</b> Mặc định ở Desktop, đổi được trong Settings → General. Định dạng Auto sẽ tự chọn PNG cho ảnh UI và JPEG cho ảnh nhiều màu.</p>
+</section>
+
+<footer>
+  <p>Snippr — mã nguồn mở theo giấy phép MIT · <a href="https://github.com/fantasy9876/snippr">github.com/fantasy9876/snippr</a></p>
+  <p style="margin-top:6px">Lấy cảm hứng từ Shottr · Made with <a href="https://claude.com/claude-code">Claude Code</a> 🤖</p>
+</footer>
+
+</div>
+</body>
+</html>
