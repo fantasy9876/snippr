@@ -33,7 +33,8 @@ jobs:
 
       - name: Build NSIS installer
         shell: pwsh
-        run: '& "C:\Program Files (x86)\NSIS\makensis.exe" windows/installer.nsi'
+        working-directory: windows
+        run: '& "C:\Program Files (x86)\NSIS\makensis.exe" installer.nsi'
 
       - name: Portable ZIP
         shell: pwsh
