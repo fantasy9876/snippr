@@ -200,7 +200,7 @@ sealed class SettingsForm : Form
 
     public SettingsForm()
     {
-        Text = "Snippr Settings";
+        Text = $"Snippr Settings — v{Application.ProductVersion.Split('+')[0]}";
         FormBorderStyle = FormBorderStyle.FixedDialog;
         MaximizeBox = false;
         MinimizeBox = false;

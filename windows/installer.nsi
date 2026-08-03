@@ -2,7 +2,7 @@
 !include "MUI2.nsh"
 
 Name "Snippr"
-OutFile "SnipprSetup-1.1.0-win-x64.exe"
+OutFile "SnipprSetup-1.1.1-win-x64.exe"
 InstallDir "$PROGRAMFILES64\Snippr"
 InstallDirRegKey HKLM "Software\Snippr" "InstallDir"
 RequestExecutionLevel admin
@@ -22,6 +22,8 @@ SetCompressor /SOLID lzma
 !insertmacro MUI_LANGUAGE "English"
 
 Section "Snippr"
+  ; kill any running copy so the update actually replaces it
+  ExecWait 'taskkill /F /IM Snippr.exe' $0
   SetOutPath "$INSTDIR"
   File "Snippr.exe"
 
@@ -34,7 +36,7 @@ Section "Snippr"
 
   ; Add/Remove Programs entry
   WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Snippr" "DisplayName" "Snippr"
-  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Snippr" "DisplayVersion" "1.1.0"
+  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Snippr" "DisplayVersion" "1.1.1"
   WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Snippr" "Publisher" "Snippr (open source)"
   WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Snippr" "URLInfoAbout" "https://snippr.pages.dev"
   WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Snippr" "DisplayIcon" "$INSTDIR\Snippr.exe"

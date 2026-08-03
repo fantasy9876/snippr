@@ -13,7 +13,7 @@ sealed class TrayContext : ApplicationContext
         Instance = this;
         _tray.Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath)
             ?? SystemIcons.Application;
-        _tray.Text = "Snippr — screenshot from the tray";
+        _tray.Text = $"Snippr {Application.ProductVersion.Split('+')[0]}";
         _tray.Visible = true;
         _tray.ContextMenuStrip = BuildMenu();
         _tray.DoubleClick += (_, _) => CaptureArea();
