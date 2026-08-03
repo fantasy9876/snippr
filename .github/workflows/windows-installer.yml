@@ -28,6 +28,9 @@ jobs:
           -p:IncludeNativeLibrariesForSelfExtract=true
           -p:EnableCompressionInSingleFile=true
 
+      - name: Install NSIS
+        run: choco install nsis -y --no-progress
+
       - name: Build NSIS installer
         shell: pwsh
         run: '& "C:\Program Files (x86)\NSIS\makensis.exe" windows/installer.nsi'
