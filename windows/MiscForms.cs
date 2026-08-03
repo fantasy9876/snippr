@@ -178,11 +178,24 @@ sealed class HotkeyBox : TextBox
         if (code is Keys.ControlKey or Keys.ShiftKey or Keys.Menu or Keys.None)
             return true;
         bool hasModifier = (keyData & (Keys.Control | Keys.Shift | Keys.Alt)) != 0;
-        bool isFKey = code is >= Keys.F1 and <= Keys.F12;
-        if (!hasModifier && !isFKey) return true; // require a modifier (except F-keys)
+        bool standalone = code is (>= Keys.F1 and <= Keys.F12) or Keys.PrintScreen;
+        if (!hasModifier && !standalone) return true; // require a modifier (except F-keys/PrtScn)
         Combo = (int)keyData;
         RefreshText();
         return true;
+    }
+
+    // PrintScreen never generates a KeyDown message — catch it on KeyUp
+    protected override void OnKeyUp(KeyEventArgs e)
+    {
+        if (e.KeyCode == Keys.PrintScreen)
+        {
+            Combo = (int)e.KeyData;
+            RefreshText();
+            e.Handled = true;
+            return;
+        }
+        base.OnKeyUp(e);
     }
 }
 

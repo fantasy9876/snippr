@@ -63,6 +63,7 @@ static class HotkeyUtil
             >= Keys.NumPad0 and <= Keys.NumPad9 => "Num" + ((int)code - (int)Keys.NumPad0),
             Keys.Oemplus => "=",
             Keys.OemMinus => "-",
+            Keys.PrintScreen => "PrtScn",
             _ => code.ToString(),
         });
         return string.Join("+", parts);
