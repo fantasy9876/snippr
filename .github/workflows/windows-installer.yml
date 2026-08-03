@@ -28,6 +28,15 @@ jobs:
           -p:IncludeNativeLibrariesForSelfExtract=true
           -p:EnableCompressionInSingleFile=true
 
+      - name: Stage exe next to installer script
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem -Recurse -Path windows -Filter Snippr.exe |
+            Where-Object { $_.FullName -like '*publish*' } | Select-Object -First 1
+          if (-not $exe) { throw "publish output not found" }
+          Write-Host "Found $($exe.FullName)"
+          Copy-Item $exe.FullName windows/Snippr.exe
+
       - name: Install NSIS
         run: choco install nsis -y --no-progress
 
@@ -39,7 +48,7 @@ jobs:
       - name: Portable ZIP
         shell: pwsh
         run: >
-          Compress-Archive -Path windows/bin/Release/net8.0-windows/win-x64/publish/Snippr.exe
+          Compress-Archive -Path windows/Snippr.exe
           -DestinationPath windows/Snippr-portable-win-x64.zip -Force
 
       - name: Upload to release

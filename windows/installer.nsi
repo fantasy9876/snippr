@@ -23,7 +23,7 @@ SetCompressor /SOLID lzma
 
 Section "Snippr"
   SetOutPath "$INSTDIR"
-  File "bin/Release/net8.0-windows/win-x64/publish/Snippr.exe"
+  File "Snippr.exe"
 
   WriteUninstaller "$INSTDIR\Uninstall.exe"
   WriteRegStr HKLM "Software\Snippr" "InstallDir" "$INSTDIR"
