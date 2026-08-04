@@ -586,7 +586,7 @@ struct AboutTab: View {
                 .font(.system(size: 42, weight: .medium))
                 .foregroundStyle(.tint)
             Text("Snippr").font(.title).bold()
-            Text("Version 1.1.1 — native for Apple Silicon & Intel")
+            Text("Version 1.1.2 — native for Apple Silicon & Intel")
                 .foregroundStyle(.secondary)
             Divider().frame(width: 300)
             Text("Free for personal use. Screenshot, annotate, OCR,\nscrolling capture — everything stays on your Mac.")

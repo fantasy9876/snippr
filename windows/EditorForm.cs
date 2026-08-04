@@ -61,6 +61,7 @@ sealed class EditorForm : Form
         _scroller.Controls.Add(_canvas);
         Controls.Add(_scroller);
         Controls.Add(_bar);
+        _previewTimer.Tick += (_, _) => { _previewTimer.Stop(); _canvas.Invalidate(); };
 
         ApplyZoom(1f);
         FormClosed += (_, _) => { _pixelated?.Dispose(); };
@@ -176,24 +177,76 @@ sealed class EditorForm : Form
     void RunOcr() => TextResultForm.RunOcrFlow(Flatten());
     void RunTranslate() => TextResultForm.RunOcrFlow(Flatten(), autoTranslate: true);
 
+    static bool IsStrokeTool(Tool t) =>
+        t is Tool.Arrow or Tool.Line or Tool.Rect or Tool.Oval or Tool.Pen;
+
+    static bool IsStrokeAnnotation(Annotation a) =>
+        a is PenAnnotation ||
+        (a is ShapeAnnotation s && s.Shape != ShapeAnnotation.Kind.Highlight);
+
+    internal bool CanAdjustStroke =>
+        _selected != null ? IsStrokeAnnotation(_selected) : IsStrokeTool(_tool);
+
+    static string ToolKeyFor(Annotation a) => a is ShapeAnnotation s
+        ? s.Shape switch
+        {
+            ShapeAnnotation.Kind.Arrow => nameof(Tool.Arrow),
+            ShapeAnnotation.Kind.Line => nameof(Tool.Line),
+            ShapeAnnotation.Kind.Rect => nameof(Tool.Rect),
+            ShapeAnnotation.Kind.Oval => nameof(Tool.Oval),
+            _ => nameof(Tool.Highlight),
+        }
+        : nameof(Tool.Pen);
+
+    float _previewWidth;
+    Color _previewColor;
+    DateTime _previewUntil = DateTime.MinValue;
+    readonly System.Windows.Forms.Timer _previewTimer = new() { Interval = 1100 };
+
     internal void AdjustStrokeWidth(float step)
     {
-        if (_selected != null)
+        float width;
+        Color color;
+        if (_selected != null && IsStrokeAnnotation(_selected))
         {
             _selected.Width = Math.Clamp(_selected.Width + step, 1, 20);
-            if (_selected is TextAnnotation t)
-                t.FontSize = Math.Clamp(t.FontSize + step * 3, 8, 96);
-            if (_selected is CounterAnnotation c)
-                c.Radius = (int)Math.Clamp(c.Radius + step * 2, 6, 60);
-            AppSettings.Current.SetToolWidth(_tool.ToString(), _selected.Width);
+            AppSettings.Current.SetToolWidth(ToolKeyFor(_selected), _selected.Width);
+            width = _selected.Width;
+            color = _selected.Color;
         }
         else
         {
-            var w = Math.Clamp(AppSettings.Current.GetToolWidth(_tool.ToString()) + step, 1, 20);
-            AppSettings.Current.SetToolWidth(_tool.ToString(), w);
+            width = Math.Clamp(AppSettings.Current.GetToolWidth(_tool.ToString()) + step, 1, 20);
+            AppSettings.Current.SetToolWidth(_tool.ToString(), width);
+            color = _color;
         }
+        _previewWidth = width;
+        _previewColor = color;
+        _previewUntil = DateTime.Now.AddSeconds(1);
+        _previewTimer.Stop();
+        _previewTimer.Start();
         UpdateWidthLabel();
         _canvas.Invalidate();
+    }
+
+    /// HUD sample: a line drawn at the actual width & color plus the number.
+    internal void DrawStrokePreview(Graphics g)
+    {
+        if (DateTime.Now >= _previewUntil) return;
+        int w = 200, h = 46;
+        int x = -_canvas.Location.X + (_scroller.ClientSize.Width - w) / 2;
+        int y = -_canvas.Location.Y + 16;
+        using var bg = new SolidBrush(Color.FromArgb(210, 15, 17, 22));
+        g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+        g.FillRectangle(bg, x, y, w, h);
+        using var pen = new Pen(_previewColor, _previewWidth)
+        {
+            StartCap = System.Drawing.Drawing2D.LineCap.Round,
+            EndCap = System.Drawing.Drawing2D.LineCap.Round,
+        };
+        g.DrawLine(pen, x + 16, y + h / 2, x + w - 70, y + h / 2);
+        using var f = new Font("Segoe UI", 10f, FontStyle.Bold);
+        g.DrawString($"{_previewWidth:0.#}", f, Brushes.White, x + w - 56, y + h / 2 - 10);
     }
 
     void UpdateWidthLabel()
@@ -418,7 +471,6 @@ sealed class EditorForm : Form
                 {
                     Center = px,
                     Color = _color,
-                    Radius = (int)(10 + AppSettings.Current.GetToolWidth(_tool.ToString()) * 2),
                     Number = _annotations.OfType<CounterAnnotation>()
                         .Select(c => c.Number).DefaultIfEmpty(0).Max() + 1,
                 });
@@ -503,12 +555,7 @@ sealed class EditorForm : Form
     void BeginText(Point viewLoc, Point px)
     {
         CommitText();
-        _editingText = new TextAnnotation
-        {
-            Origin = px,
-            Color = _color,
-            FontSize = 14 + AppSettings.Current.GetToolWidth(Tool.Text.ToString()) * 3,
-        };
+        _editingText = new TextAnnotation { Origin = px, Color = _color };
         _textBox = new TextBox
         {
             Location = viewLoc,
@@ -592,6 +639,8 @@ sealed class EditorForm : Form
             }
             g.Restore(state);
 
+            o.DrawStrokePreview(g);
+
             if (o._cropRectPx is Rectangle crop)
             {
                 var view = new Rectangle(
@@ -612,14 +661,21 @@ sealed class EditorForm : Form
 
         protected override void OnMouseWheel(MouseEventArgs e)
         {
-            // Ctrl+scroll zooms; plain scroll adjusts stroke width
+            // Ctrl+scroll zooms; plain scroll adjusts stroke width for
+            // stroke-based shapes only — anything else scrolls the view
             if ((Control.ModifierKeys & Keys.Control) != 0)
             {
                 _owner.ZoomBy(e.Delta > 0 ? 1.15f : 1 / 1.15f);
+                if (e is HandledMouseEventArgs h1) h1.Handled = true;
+            }
+            else if (_owner.CanAdjustStroke)
+            {
+                _owner.AdjustStrokeWidth(e.Delta > 0 ? 0.5f : -0.5f);
+                if (e is HandledMouseEventArgs h2) h2.Handled = true;
             }
             else
             {
-                _owner.AdjustStrokeWidth(e.Delta > 0 ? 0.5f : -0.5f);
+                base.OnMouseWheel(e); // bubbles to the scroll panel
             }
         }
     }

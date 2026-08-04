@@ -492,7 +492,6 @@ final class EditorCanvasView: NSView {
             let counter = CounterAnnotation(uiScale: pxScale)
             counter.center = pp
             counter.color = currentColor
-            counter.radiusPt = 10 + toolWidth * 2
             counter.number = (annotations.compactMap { ($0 as? CounterAnnotation)?.number }.max() ?? 0) + 1
             annotations.append(counter)
             needsDisplay = true
@@ -593,7 +592,6 @@ final class EditorCanvasView: NSView {
         let ann = TextAnnotation(uiScale: pxScale)
         ann.color = currentColor
         ann.origin = pp
-        ann.fontSizePt = 12 + toolWidth * 3
         editingTextAnnotation = ann
     }
 
@@ -706,8 +704,14 @@ final class EditorCanvasView: NSView {
             super.scrollWheel(with: event)
             return
         }
-        // plain scroll — mouse wheel OR trackpad — adjusts stroke width;
-        // trackpad deltas are accumulated so it doesn't feel jumpy
+        // plain scroll adjusts stroke width — but ONLY for stroke-based shapes
+        // (arrow/line/rect/oval/pen). Anything else falls back to panning.
+        let adjustable = selected.map(Self.isStrokeAnnotation) ?? Self.isStrokeTool(currentTool)
+        guard adjustable else {
+            trackpadAccum = 0
+            super.scrollWheel(with: event)
+            return
+        }
         if event.hasPreciseScrollingDeltas {
             trackpadAccum += event.scrollingDeltaY
             guard abs(trackpadAccum) >= 18 else { return }
@@ -721,50 +725,73 @@ final class EditorCanvasView: NSView {
 
     private var trackpadAccum: CGFloat = 0
 
+    static func isStrokeTool(_ tool: EditorTool) -> Bool {
+        switch tool {
+        case .arrow, .line, .rect, .oval, .pen: return true
+        default: return false
+        }
+    }
+
+    static func isStrokeAnnotation(_ a: Annotation) -> Bool {
+        if let s = a as? ShapeAnnotation { return s.kind != .highlight }
+        return a is PenAnnotation
+    }
+
+    /// Settings key for the annotation's tool, so adjusting a selected shape
+    /// updates the right per-tool default.
+    private func toolKey(for a: Annotation) -> String {
+        if let s = a as? ShapeAnnotation {
+            switch s.kind {
+            case .arrow: return EditorTool.arrow.rawValue
+            case .line: return EditorTool.line.rawValue
+            case .rect: return EditorTool.rect.rawValue
+            case .oval: return EditorTool.oval.rawValue
+            case .highlight: return EditorTool.highlight.rawValue
+            }
+        }
+        return EditorTool.pen.rawValue
+    }
+
     private func adjustStrokeWidth(by step: CGFloat) {
+        let color: NSColor
+        let width: CGFloat
         if let sel = selected {
             sel.strokeWidthPt = min(20, max(1, sel.strokeWidthPt + step))
-            if let t = sel as? TextAnnotation {
-                t.fontSizePt = min(72, max(8, t.fontSizePt + step * 3))
-            }
-            if let c = sel as? CounterAnnotation {
-                c.radiusPt = min(50, max(6, c.radiusPt + step * 2))
-            }
-            Settings.shared.setToolWidth(sel.strokeWidthPt, for: currentTool.rawValue)
-            showStrokeHUD(sel.strokeWidthPt)
+            Settings.shared.setToolWidth(sel.strokeWidthPt, for: toolKey(for: sel))
+            width = sel.strokeWidthPt
+            color = sel.color
         } else {
-            let w = min(20, max(1, toolWidth + step))
-            Settings.shared.setToolWidth(w, for: currentTool.rawValue)
-            showStrokeHUD(w)
+            width = min(20, max(1, toolWidth + step))
+            Settings.shared.setToolWidth(width, for: currentTool.rawValue)
+            color = currentColor
         }
+        showStrokeHUD(width: width, color: color)
         needsDisplay = true
     }
 
-    private var strokeHUDLabel: NSTextField?
+    private var strokeHUD: StrokePreviewView?
     private var strokeHUDHide: DispatchWorkItem?
 
-    private func showStrokeHUD(_ width: CGFloat) {
-        let label: NSTextField
-        if let existing = strokeHUDLabel {
-            label = existing
+    /// HUD with a real line sample drawn at the exact thickness & color.
+    private func showStrokeHUD(width: CGFloat, color: NSColor) {
+        let hud: StrokePreviewView
+        if let existing = strokeHUD {
+            hud = existing
         } else {
-            label = NSTextField(labelWithString: "")
-            label.font = .monospacedDigitSystemFont(ofSize: 12, weight: .semibold)
-            label.textColor = .white
-            label.backgroundColor = NSColor.black.withAlphaComponent(0.78)
-            label.drawsBackground = true
-            addSubview(label)
-            strokeHUDLabel = label
+            hud = StrokePreviewView(frame: CGRect(x: 0, y: 0, width: 190, height: 44))
+            addSubview(hud)
+            strokeHUD = hud
         }
-        label.stringValue = String(format: "  ✏️ %.1f pt  ", width)
-        label.sizeToFit()
+        hud.strokeWidth = width
+        hud.color = color
         let vis = visibleRect
-        label.frame.origin = CGPoint(x: vis.minX + 10, y: vis.maxY - label.frame.height - 10)
-        label.isHidden = false
+        hud.frame.origin = CGPoint(x: vis.midX - 95, y: vis.minY + 16)
+        hud.isHidden = false
+        hud.needsDisplay = true
         strokeHUDHide?.cancel()
-        let work = DispatchWorkItem { [weak self] in self?.strokeHUDLabel?.isHidden = true }
+        let work = DispatchWorkItem { [weak self] in self?.strokeHUD?.isHidden = true }
         strokeHUDHide = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.9, execute: work)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0, execute: work)
     }
 
     override func resetCursorRects() {
@@ -773,6 +800,37 @@ final class EditorCanvasView: NSView {
         case .text: addCursorRect(bounds, cursor: .iBeam)
         default: addCursorRect(bounds, cursor: .crosshair)
         }
+    }
+}
+
+/// Floating sample: a line stroked at the actual width & color, plus the number.
+final class StrokePreviewView: NSView {
+    var strokeWidth: CGFloat = 3
+    var color: NSColor = .systemRed
+
+    override func draw(_ dirtyRect: NSRect) {
+        let bg = NSBezierPath(roundedRect: bounds, xRadius: 10, yRadius: 10)
+        NSColor.black.withAlphaComponent(0.82).setFill()
+        bg.fill()
+
+        let line = NSBezierPath()
+        line.move(to: NSPoint(x: 16, y: bounds.midY))
+        line.line(to: NSPoint(x: bounds.width - 66, y: bounds.midY))
+        line.lineWidth = strokeWidth
+        line.lineCapStyle = .round
+        color.setStroke()
+        line.stroke()
+
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .semibold),
+            .foregroundColor: NSColor.white,
+        ]
+        let text = String(format: "%.1f pt", strokeWidth) as NSString
+        let size = text.size(withAttributes: attrs)
+        text.draw(
+            at: NSPoint(x: bounds.width - 12 - size.width, y: bounds.midY - size.height / 2),
+            withAttributes: attrs
+        )
     }
 }
 

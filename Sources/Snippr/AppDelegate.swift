@@ -48,6 +48,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         UITest.runIfRequested()
+        if UITest.requestedOutputDir == nil {
+            UpdateChecker.checkOnLaunch()
+        }
     }
 
     /// Debug breadcrumb: lets tooling confirm the app booted and see its TCC state.
@@ -162,6 +165,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(moreItem)
 
         menu.addItem(.separator())
+        add("Check for Updates…", #selector(checkUpdates), symbol: "arrow.triangle.2.circlepath")
         add("About Snippr", #selector(openAbout))
         menu.addItem(.separator())
 
@@ -243,6 +247,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func openAbout() { PreferencesWindowController.show() }
+
+    @objc private func checkUpdates() {
+        Task { await UpdateChecker.check(manual: true) }
+    }
 
     @objc private func toggleLaunch() {
         LaunchAtLogin.toggle()

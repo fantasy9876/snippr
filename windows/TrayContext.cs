@@ -22,7 +22,10 @@ sealed class TrayContext : ApplicationContext
         RegisterHotkeys();
 
         ToastForm.Show($"Snippr is running — {HotkeyUtil.Display(AppSettings.Current.HotkeyArea)} to capture");
+        UpdateChecker.Check(manual: false);
     }
+
+    public void QuitApp() => Quit();
 
     void RegisterHotkeys()
     {
@@ -81,6 +84,7 @@ sealed class TrayContext : ApplicationContext
         Add("Load From Clipboard", LoadClipboard);
         menu.Items.Add(new ToolStripSeparator());
         Add("Settings…", () => new SettingsForm().ShowDialog());
+        Add("Check for Updates", () => UpdateChecker.Check(manual: true));
         Add("About Snippr", () => System.Diagnostics.Process.Start(
             new System.Diagnostics.ProcessStartInfo("https://snippr.pages.dev") { UseShellExecute = true }));
         menu.Items.Add(new ToolStripSeparator());
