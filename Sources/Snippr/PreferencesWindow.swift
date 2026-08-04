@@ -227,12 +227,15 @@ struct GeneralTab: View {
                         .onTapGesture { bgStyle = style.rawValue }
                     }
                 }
-                if bgStyle == WindowBGStyle.solid.rawValue {
-                    ColorPicker("Backdrop color:", selection: $bgColor, supportsOpacity: false)
-                        .onChange(of: bgColor) { _, new in
-                            Settings.shared.windowBGColor = NSColor(new)
-                        }
-                }
+                // always occupies its row — hidden (not removed) when unused,
+                // so switching cards never shifts the layout
+                ColorPicker("Backdrop color:", selection: $bgColor, supportsOpacity: false)
+                    .onChange(of: bgColor) { _, new in
+                        Settings.shared.windowBGColor = NSColor(new)
+                    }
+                    .opacity(bgStyle == WindowBGStyle.solid.rawValue ? 1 : 0)
+                    .disabled(bgStyle != WindowBGStyle.solid.rawValue)
+                    .accessibilityHidden(bgStyle != WindowBGStyle.solid.rawValue)
             }
             .frame(maxWidth: .infinity, alignment: .center)
 
@@ -307,6 +310,7 @@ struct GeneralTab: View {
             }
         }
         .padding(24)
+        .frame(maxHeight: .infinity, alignment: .top)
     }
 
     private func pickFolder() {
@@ -575,7 +579,7 @@ struct AboutTab: View {
                 .font(.system(size: 42, weight: .medium))
                 .foregroundStyle(.tint)
             Text("Snippr").font(.title).bold()
-            Text("Version 1.0.2 — native for Apple Silicon & Intel")
+            Text("Version 1.0.3 — native for Apple Silicon & Intel")
                 .foregroundStyle(.secondary)
             Divider().frame(width: 300)
             Text("Free for personal use. Screenshot, annotate, OCR,\nscrolling capture — everything stays on your Mac.")

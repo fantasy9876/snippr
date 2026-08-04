@@ -18,6 +18,12 @@ if [ -f Support/AppIcon.icns ]; then
   cp Support/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 fi
 
-# Ad-hoc sign so TCC permissions (Screen Recording, Accessibility) stick between builds
-codesign --force -s - "$APP"
+# Prefer the local "Snippr Dev" certificate (stable identity → TCC permissions
+# survive rebuilds); fall back to ad-hoc signing when it isn't available.
+if security find-identity -v -p codesigning 2>/dev/null | grep -q "Snippr Dev"; then
+  codesign --force -s "Snippr Dev" "$APP"
+  echo "signed with Snippr Dev certificate"
+else
+  codesign --force -s - "$APP"
+fi
 echo "✅ Built $APP ($(lipo -archs "$APP/Contents/MacOS/Snippr"))"
