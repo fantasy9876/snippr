@@ -155,7 +155,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         add("Capture Active Window", #selector(menuActiveWindow), action: .activeWindow, symbol: "macwindow.on.rectangle", to: moreMenu)
         add("Capture Any Window", #selector(menuAnyWindow), action: .anyWindow, symbol: "macwindow.badge.plus", to: moreMenu)
         add("Delayed Screenshot (3s)", #selector(menuDelayed), symbol: "timer", to: moreMenu)
-        add("Scrolling (Up)", #selector(menuScrollingUp), symbol: "arrow.up.doc", to: moreMenu)
         moreMenu.addItem(.separator())
         add("Open File", #selector(menuOpenFile), symbol: "doc", to: moreMenu)
         add("Load From Clipboard", #selector(menuLoadClipboard), symbol: "doc.on.clipboard", to: moreMenu)

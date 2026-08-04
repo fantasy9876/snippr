@@ -15,6 +15,10 @@ class AppSettings
     public int HotkeyFullscreen { get; set; } = (int)(Keys.Control | Keys.Shift | Keys.D1);
     public int HotkeyArea { get; set; } = (int)(Keys.Control | Keys.Shift | Keys.D2);
     public int HotkeyWindow { get; set; } = (int)(Keys.Control | Keys.Shift | Keys.D4);
+    // Editor preferences remembered across sessions
+    public Dictionary<string, float> ToolWidths { get; set; } = new();
+    public string LastColor { get; set; } = "#FF0000";
+    public string TranslateTarget { get; set; } = "vi";
     public int LastAreaX { get; set; } = -1;
     public int LastAreaY { get; set; }
     public int LastAreaW { get; set; }
@@ -49,6 +53,15 @@ class AppSettings
                 new JsonSerializerOptions { WriteIndented = true }));
         }
         catch { }
+    }
+
+    public float GetToolWidth(string tool) =>
+        ToolWidths.TryGetValue(tool, out var w) ? Math.Clamp(w, 1, 20) : 3f;
+
+    public void SetToolWidth(string tool, float w)
+    {
+        ToolWidths[tool] = Math.Clamp(w, 1, 20);
+        Save();
     }
 
     public Rectangle? LastArea

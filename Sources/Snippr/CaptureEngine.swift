@@ -87,14 +87,20 @@ final class CaptureEngine {
     }
 
     /// Screenshot of one full display, at native pixel resolution.
-    func captureDisplay(screen: NSScreen) async throws -> CapturedImage {
+    /// `excludingOwnWindows` hides Snippr's overlays (scrolling border, HUDs)
+    /// from the capture so they never leak into stitched output.
+    func captureDisplay(screen: NSScreen, excludingOwnWindows: Bool = false) async throws -> CapturedImage {
         let content = try await shareableContent()
         let id = Self.displayID(of: screen)
         guard let display = content.displays.first(where: { $0.displayID == id }) else {
             throw CaptureError.noDisplay
         }
         let scale = screen.backingScaleFactor
-        let filter = SCContentFilter(display: display, excludingWindows: [])
+        let myPID = NSRunningApplication.current.processIdentifier
+        let excluded = excludingOwnWindows
+            ? content.windows.filter { $0.owningApplication?.processID == myPID }
+            : []
+        let filter = SCContentFilter(display: display, excludingWindows: excluded)
         let config = SCStreamConfiguration()
         config.width = Int(screen.frame.width * scale)
         config.height = Int(screen.frame.height * scale)

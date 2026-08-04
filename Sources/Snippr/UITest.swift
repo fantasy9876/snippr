@@ -21,6 +21,7 @@ enum UITest {
         EditorWindowController.open(with: sample)
         PreferencesWindowController.show()
         ToastHUD.show("Snippr UI test — toast OK", symbol: "checkmark.seal.fill", duration: 6)
+        TextResultWindow.show(text: "Snippr — chụp màn hình, nhận diện chữ (OCR), dịch đa ngôn ngữ.\nScreenshot → OCR → Translate, everything on your machine.")
         ThumbnailHUD.show(sample) { _ in }
         PinWindow.pin(CapturedImage(cgImage: SelfTest.makeTestImage(width: 400, height: 260), scale: 2))
 

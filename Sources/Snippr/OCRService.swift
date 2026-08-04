@@ -81,15 +81,9 @@ final class OCRService {
                         ToastHUD.show("No text or QR found", symbol: "text.magnifyingglass")
                     } else {
                         SaveService.copyText(clip)
-                        if !ocr.qrPayloads.isEmpty {
-                            ToastHUD.show("QR/text copied (\(clip.count) chars)", symbol: "qrcode.viewfinder")
-                            if let first = ocr.qrPayloads.first, let url = URL(string: first),
-                               url.scheme == "http" || url.scheme == "https" {
-                                // QR with URL: keep in clipboard only; don't auto-open for safety
-                            }
-                        } else {
-                            ToastHUD.show("Text copied (\(clip.count) chars)", symbol: "text.viewfinder")
-                        }
+                        ToastHUD.show("Text copied (\(clip.count) chars)", symbol: "text.viewfinder")
+                        // Lark-style result panel: edit, pick a language, translate
+                        TextResultWindow.show(text: clip)
                     }
                 }
             }

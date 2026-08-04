@@ -25,6 +25,7 @@ sealed class EditorForm : Form
     readonly ToolStrip _bar = new();
     ToolStripLabel _sizeLabel = new();
     ToolStripLabel _zoomLabel = new();
+    ToolStripLabel _widthLabel = new();
     ToolStripButton _colorButton = new();
     readonly Dictionary<Tool, ToolStripButton> _toolButtons = new();
     TextBox? _textBox;
@@ -40,6 +41,7 @@ sealed class EditorForm : Form
     EditorForm(Bitmap image)
     {
         _image = image;
+        try { _color = ColorTranslator.FromHtml(AppSettings.Current.LastColor); } catch { }
         Text = "Snippr";
         BackColor = Color.FromArgb(28, 30, 36);
         KeyPreview = true;
@@ -72,12 +74,22 @@ sealed class EditorForm : Form
         _bar.GripStyle = ToolStripGripStyle.Hidden;
         _bar.BackColor = Color.FromArgb(22, 24, 29);
         _bar.ForeColor = Color.Gainsboro;
-        _bar.RenderMode = ToolStripRenderMode.System;
-        _bar.ImageScalingSize = new Size(20, 20);
+        _bar.Renderer = new DarkToolRenderer();
+        // 50% larger controls for readability
+        _bar.Font = new Font("Segoe UI", 13.5f);
+        _bar.ImageScalingSize = new Size(30, 30);
+        _bar.Padding = new Padding(8, 5, 8, 5);
+        _bar.AutoSize = true;
 
         ToolStripButton Btn(string text, string tip, EventHandler onClick)
         {
-            var b = new ToolStripButton(text) { ToolTipText = tip, ForeColor = Color.Gainsboro };
+            var b = new ToolStripButton(text)
+            {
+                ToolTipText = tip,
+                ForeColor = Color.Gainsboro,
+                Padding = new Padding(6, 3, 6, 3),
+                Margin = new Padding(2, 1, 2, 1),
+            };
             b.Click += onClick;
             _bar.Items.Add(b);
             return b;
@@ -86,6 +98,8 @@ sealed class EditorForm : Form
         Btn("Copy", "Copy to clipboard and close (Ctrl+C)", (_, _) => CopyAndClose());
         Btn("Save", "Save as… (Ctrl+S)", (_, _) => SaveWithDialog());
         Btn("Pin", "Pin to screen (Ctrl+P)", (_, _) => PinAndClose());
+        Btn("OCR", "Recognize text in the image", (_, _) => RunOcr());
+        Btn("🌐", "OCR + translate", (_, _) => RunTranslate());
         _bar.Items.Add(new ToolStripSeparator());
 
         (Tool, string, string)[] tools =
@@ -113,6 +127,10 @@ sealed class EditorForm : Form
         _colorButton.Click += (_, _) => PickColor();
         _bar.Items.Add(_colorButton);
         UpdateColorSwatch();
+
+        _widthLabel = new ToolStripLabel("") { ForeColor = Color.Silver, ToolTipText = "Độ dày nét — lăn chuột trên ảnh để chỉnh" };
+        _bar.Items.Add(_widthLabel);
+        UpdateWidthLabel();
 
         _zoomLabel = new ToolStripLabel("100%") { Alignment = ToolStripItemAlignment.Right, ForeColor = Color.Silver };
         _sizeLabel = new ToolStripLabel("") { Alignment = ToolStripItemAlignment.Right, ForeColor = Color.Silver };
@@ -143,6 +161,8 @@ sealed class EditorForm : Form
         if (dlg.ShowDialog(this) == DialogResult.OK)
         {
             _color = dlg.Color;
+            AppSettings.Current.LastColor = ColorTranslator.ToHtml(_color);
+            AppSettings.Current.Save();
             UpdateColorSwatch();
             if (_selected != null)
             {
@@ -153,11 +173,40 @@ sealed class EditorForm : Form
         }
     }
 
+    void RunOcr() => TextResultForm.RunOcrFlow(Flatten());
+    void RunTranslate() => TextResultForm.RunOcrFlow(Flatten(), autoTranslate: true);
+
+    internal void AdjustStrokeWidth(float step)
+    {
+        if (_selected != null)
+        {
+            _selected.Width = Math.Clamp(_selected.Width + step, 1, 20);
+            if (_selected is TextAnnotation t)
+                t.FontSize = Math.Clamp(t.FontSize + step * 3, 8, 96);
+            if (_selected is CounterAnnotation c)
+                c.Radius = (int)Math.Clamp(c.Radius + step * 2, 6, 60);
+            AppSettings.Current.SetToolWidth(_tool.ToString(), _selected.Width);
+        }
+        else
+        {
+            var w = Math.Clamp(AppSettings.Current.GetToolWidth(_tool.ToString()) + step, 1, 20);
+            AppSettings.Current.SetToolWidth(_tool.ToString(), w);
+        }
+        UpdateWidthLabel();
+        _canvas.Invalidate();
+    }
+
+    void UpdateWidthLabel()
+    {
+        _widthLabel.Text = $"✏ {AppSettings.Current.GetToolWidth(_tool.ToString()):0.#}";
+    }
+
     void SelectTool(Tool tool)
     {
         CommitText();
         _tool = tool;
         foreach (var (t, b) in _toolButtons) b.Checked = t == tool;
+        UpdateWidthLabel();
         _canvas.Cursor = tool switch
         {
             Tool.Select => Cursors.Default,
@@ -343,10 +392,16 @@ sealed class EditorForm : Form
                     End = px,
                     Color = _tool == Tool.Highlight && _color.ToArgb() == Color.Red.ToArgb()
                         ? Color.Gold : _color,
+                    Width = AppSettings.Current.GetToolWidth(_tool.ToString()),
                 };
                 break;
             case Tool.Pen:
-                _draft = new PenAnnotation { Color = _color, Points = { px } };
+                _draft = new PenAnnotation
+                {
+                    Color = _color,
+                    Width = AppSettings.Current.GetToolWidth(_tool.ToString()),
+                    Points = { px },
+                };
                 break;
             case Tool.Blur:
                 _draft = new BlurAnnotation { Rect = new Rectangle(px, Size.Empty) };
@@ -363,6 +418,7 @@ sealed class EditorForm : Form
                 {
                     Center = px,
                     Color = _color,
+                    Radius = (int)(10 + AppSettings.Current.GetToolWidth(_tool.ToString()) * 2),
                     Number = _annotations.OfType<CounterAnnotation>()
                         .Select(c => c.Number).DefaultIfEmpty(0).Max() + 1,
                 });
@@ -447,7 +503,12 @@ sealed class EditorForm : Form
     void BeginText(Point viewLoc, Point px)
     {
         CommitText();
-        _editingText = new TextAnnotation { Origin = px, Color = _color };
+        _editingText = new TextAnnotation
+        {
+            Origin = px,
+            Color = _color,
+            FontSize = 14 + AppSettings.Current.GetToolWidth(Tool.Text.ToString()) * 3,
+        };
         _textBox = new TextBox
         {
             Location = viewLoc,
@@ -551,7 +612,43 @@ sealed class EditorForm : Form
 
         protected override void OnMouseWheel(MouseEventArgs e)
         {
-            _owner.ZoomBy(e.Delta > 0 ? 1.15f : 1 / 1.15f);
+            // Ctrl+scroll zooms; plain scroll adjusts stroke width
+            if ((Control.ModifierKeys & Keys.Control) != 0)
+            {
+                _owner.ZoomBy(e.Delta > 0 ? 1.15f : 1 / 1.15f);
+            }
+            else
+            {
+                _owner.AdjustStrokeWidth(e.Delta > 0 ? 0.5f : -0.5f);
+            }
         }
+    }
+}
+
+/// Flat dark theme for the editor toolbar (hover + checked states).
+sealed class DarkToolRenderer : ToolStripProfessionalRenderer
+{
+    protected override void OnRenderToolStripBackground(ToolStripRenderEventArgs e)
+    {
+        e.Graphics.Clear(Color.FromArgb(22, 24, 29));
+    }
+
+    protected override void OnRenderButtonBackground(ToolStripItemRenderEventArgs e)
+    {
+        if (e.Item is ToolStripButton b && (b.Selected || b.Checked))
+        {
+            using var brush = new SolidBrush(
+                b.Checked ? Color.FromArgb(0, 120, 212) : Color.FromArgb(58, 62, 72));
+            var r = new Rectangle(Point.Empty, e.Item.Size);
+            r.Inflate(-1, -2);
+            e.Graphics.FillRectangle(brush, r);
+        }
+    }
+
+    protected override void OnRenderSeparator(ToolStripSeparatorRenderEventArgs e)
+    {
+        using var pen = new Pen(Color.FromArgb(52, 56, 66));
+        int x = e.Item.Width / 2;
+        e.Graphics.DrawLine(pen, x, 6, x, e.Item.Height - 6);
     }
 }

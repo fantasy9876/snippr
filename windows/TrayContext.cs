@@ -72,6 +72,8 @@ sealed class TrayContext : ApplicationContext
         Add("Capture Screen", CaptureFullscreen, HotkeyUtil.Display(s.HotkeyFullscreen));
         Add("Capture Area", CaptureArea, HotkeyUtil.Display(s.HotkeyArea));
         Add("Capture Active Window", CaptureWindow, HotkeyUtil.Display(s.HotkeyWindow));
+        Add("Scrolling Capture", StartScrollShot);
+        Add("Recognize Text (OCR)", RecognizeTextArea);
         Add("Delayed Screenshot (3s)", CaptureDelayed);
         Add("Repeat Area Capture", RepeatArea);
         menu.Items.Add(new ToolStripSeparator());
@@ -114,6 +116,20 @@ sealed class TrayContext : ApplicationContext
         var shot = CaptureUtil.ActiveWindow();
         if (shot == null) { ToastForm.Show("No window found"); return; }
         HandleResult(shot);
+    }
+
+    void StartScrollShot()
+    {
+        ScrollShotSession.Begin(bmp =>
+        {
+            if (bmp != null) HandleResult(bmp);
+        });
+    }
+
+    void RecognizeTextArea()
+    {
+        var (shot, _) = OverlayForm.SelectArea();
+        if (shot != null) TextResultForm.RunOcrFlow(shot);
     }
 
     void CaptureDelayed()

@@ -6,6 +6,9 @@ final class HotkeyManager {
     static let shared = HotkeyManager()
 
     var handler: (@MainActor (HotkeyAction) -> Void)?
+    /// Receives Carbon hotkey ids not owned by HotkeyManager (e.g. the
+    /// temporary Esc hotkey during scrolling capture).
+    var auxHandler: (@MainActor (UInt32) -> Void)?
 
     private var hotkeyRefs: [UInt32: EventHotKeyRef] = [:]
     private var idToAction: [UInt32: HotkeyAction] = [:]
@@ -71,9 +74,14 @@ final class HotkeyManager {
     }
 
     private func fire(id: UInt32) {
-        guard let action = idToAction[id] else { return }
-        Task { @MainActor [weak self] in
-            self?.handler?(action)
+        if let action = idToAction[id] {
+            Task { @MainActor [weak self] in
+                self?.handler?(action)
+            }
+        } else {
+            Task { @MainActor [weak self] in
+                self?.auxHandler?(id)
+            }
         }
     }
 }

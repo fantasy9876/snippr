@@ -222,6 +222,28 @@ final class Settings {
         static let diagnostics = "diagnostics"
         static let lastAreaRect = "lastAreaRect"
         static let uploadProvider = "uploadProvider"
+        static let lastAnnotationColor = "lastAnnotationColor"
+        static let translateTarget = "translateTarget"
+    }
+
+    /// Per-tool stroke width, remembered across sessions ("nét vẽ history").
+    func toolWidth(for toolRawValue: String) -> CGFloat {
+        let v = d.double(forKey: "toolWidth_\(toolRawValue)")
+        return v > 0 ? CGFloat(min(20, max(1, v))) : 3
+    }
+
+    func setToolWidth(_ width: CGFloat, for toolRawValue: String) {
+        d.set(Double(min(20, max(1, width))), forKey: "toolWidth_\(toolRawValue)")
+    }
+
+    var lastAnnotationColor: NSColor {
+        get { NSColor(hex: d.string(forKey: Keys.lastAnnotationColor) ?? "") ?? .systemRed }
+        set { d.set(newValue.hexString, forKey: Keys.lastAnnotationColor) }
+    }
+
+    var translateTarget: String {
+        get { d.string(forKey: Keys.translateTarget) ?? "vi" }
+        set { d.set(newValue, forKey: Keys.translateTarget) }
     }
 
     static func registerDefaults() {

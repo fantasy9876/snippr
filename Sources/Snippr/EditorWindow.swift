@@ -101,6 +101,7 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
         let saveBtn = makeButton(symbol: "square.and.arrow.down", tooltip: "Save (⌘S)", action: #selector(saveImage))
         let pinBtn = makeButton(symbol: "pin", tooltip: "Pin to screen (⌘P)", action: #selector(pinImage))
         let ocrBtn = makeButton(symbol: "text.viewfinder", tooltip: "Recognize text (OCR)", action: #selector(runOCR))
+        let translateBtn = makeButton(symbol: "globe", tooltip: "OCR + Translate", action: #selector(runTranslate))
 
         var toolViews: [NSView] = []
         for tool in EditorTool.allCases {
@@ -111,7 +112,8 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
         }
 
         colorWell = NSColorWell(style: .minimal)
-        colorWell.color = .systemRed
+        colorWell.color = Settings.shared.lastAnnotationColor
+        canvas.currentColor = Settings.shared.lastAnnotationColor
         colorWell.target = self
         colorWell.action = #selector(colorChanged)
         colorWell.translatesAutoresizingMaskIntoConstraints = false
@@ -141,7 +143,7 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
         leftPad.widthAnchor.constraint(equalToConstant: 62).isActive = true
 
         let stack = NSStackView(
-            views: [leftPad, copyBtn, saveBtn, pinBtn, ocrBtn, sep()] + toolViews +
+            views: [leftPad, copyBtn, saveBtn, pinBtn, ocrBtn, translateBtn, sep()] + toolViews +
                    [sep(), colorWell, NSView(), sizeLabel, sep(), zoomLabel]
         )
         stack.orientation = .horizontal
@@ -212,6 +214,7 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
 
     @objc private func colorChanged() {
         canvas.currentColor = colorWell.color
+        Settings.shared.lastAnnotationColor = colorWell.color
     }
 
     @objc func copyImage() {
@@ -257,7 +260,10 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
         window?.close()
     }
 
-    @objc func runOCR() {
+    @objc func runOCR() { recognizeText(autoTranslate: false) }
+    @objc func runTranslate() { recognizeText(autoTranslate: true) }
+
+    private func recognizeText(autoTranslate: Bool) {
         let flat = canvas.flattened()
         Task {
             let result = await OCRService.shared.recognize(flat.cgImage)
@@ -267,7 +273,7 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
                     ToastHUD.show("No text found", symbol: "text.magnifyingglass")
                 } else {
                     SaveService.copyText(text)
-                    ToastHUD.show("Text copied (\(text.count) chars)", symbol: "text.viewfinder")
+                    TextResultWindow.show(text: text, autoTranslate: autoTranslate)
                 }
             }
         }
@@ -329,6 +335,9 @@ final class EditorCanvasView: NSView {
     override var isFlipped: Bool { false }
 
     private var pxScale: CGFloat { image.scale }
+
+    /// Remembered stroke width for the current tool (persisted across sessions).
+    private var toolWidth: CGFloat { Settings.shared.toolWidth(for: currentTool.rawValue) }
 
     private func toPixel(_ viewPoint: CGPoint) -> CGPoint {
         CGPoint(x: viewPoint.x * pxScale, y: viewPoint.y * pxScale)
@@ -462,10 +471,12 @@ final class EditorCanvasView: NSView {
             let shape = ShapeAnnotation(kind: kind, start: pp, end: pp, uiScale: pxScale)
             shape.color = currentTool == .highlight && currentColor == .systemRed
                 ? .systemYellow : currentColor
+            shape.strokeWidthPt = toolWidth
             drafting = shape
         case .pen:
             let pen = PenAnnotation(uiScale: pxScale)
             pen.color = currentColor
+            pen.strokeWidthPt = toolWidth
             pen.points = [pp]
             drafting = pen
         case .blur:
@@ -481,6 +492,7 @@ final class EditorCanvasView: NSView {
             let counter = CounterAnnotation(uiScale: pxScale)
             counter.center = pp
             counter.color = currentColor
+            counter.radiusPt = 10 + toolWidth * 2
             counter.number = (annotations.compactMap { ($0 as? CounterAnnotation)?.number }.max() ?? 0) + 1
             annotations.append(counter)
             needsDisplay = true
@@ -581,6 +593,7 @@ final class EditorCanvasView: NSView {
         let ann = TextAnnotation(uiScale: pxScale)
         ann.color = currentColor
         ann.origin = pp
+        ann.fontSizePt = 12 + toolWidth * 3
         editingTextAnnotation = ann
     }
 
@@ -676,22 +689,71 @@ final class EditorCanvasView: NSView {
     }
 
     override func scrollWheel(with event: NSEvent) {
-        // mouse wheel zooms (Shottr behavior); trackpad two-finger pans normally
-        if event.hasPreciseScrollingDeltas && !event.modifierFlags.contains(.command) {
+        let mods = event.modifierFlags
+        // ⌘/Ctrl + scroll = zoom
+        if mods.contains(.command) || mods.contains(.control) {
+            guard let sv = enclosingScroll?() else { return }
+            var delta = event.scrollingDeltaY
+            if Settings.shared.zoomReverseScroll { delta = -delta }
+            let factor = 1 + delta / 120
+            let mouse = sv.contentView.convert(event.locationInWindow, from: nil)
+            sv.setMagnification(min(8, max(0.1, sv.magnification * factor)), centeredAt: mouse)
+            (window?.windowController as? EditorWindowController)?.refreshLabels()
+            return
+        }
+        // trackpad two-finger scroll pans normally
+        if event.hasPreciseScrollingDeltas {
             super.scrollWheel(with: event)
             return
         }
-        guard let sv = enclosingScroll?() else {
-            super.scrollWheel(with: event)
-            return
+        // plain mouse wheel: adjust stroke width (selected annotation, else current tool)
+        adjustStrokeWidth(by: event.scrollingDeltaY > 0 ? 0.5 : -0.5)
+    }
+
+    private func adjustStrokeWidth(by step: CGFloat) {
+        if let sel = selected {
+            sel.strokeWidthPt = min(20, max(1, sel.strokeWidthPt + step))
+            if let t = sel as? TextAnnotation {
+                t.fontSizePt = min(72, max(8, t.fontSizePt + step * 3))
+            }
+            if let c = sel as? CounterAnnotation {
+                c.radiusPt = min(50, max(6, c.radiusPt + step * 2))
+            }
+            Settings.shared.setToolWidth(sel.strokeWidthPt, for: currentTool.rawValue)
+            showStrokeHUD(sel.strokeWidthPt)
+        } else {
+            let w = min(20, max(1, toolWidth + step))
+            Settings.shared.setToolWidth(w, for: currentTool.rawValue)
+            showStrokeHUD(w)
         }
-        var delta = event.scrollingDeltaY
-        if Settings.shared.zoomReverseScroll { delta = -delta }
-        let factor = 1 + delta / 120
-        let mouse = sv.contentView.convert(event.locationInWindow, from: nil)
-        let newMag = min(8, max(0.1, sv.magnification * factor))
-        sv.setMagnification(newMag, centeredAt: mouse)
-        (window?.windowController as? EditorWindowController)?.refreshLabels()
+        needsDisplay = true
+    }
+
+    private var strokeHUDLabel: NSTextField?
+    private var strokeHUDHide: DispatchWorkItem?
+
+    private func showStrokeHUD(_ width: CGFloat) {
+        let label: NSTextField
+        if let existing = strokeHUDLabel {
+            label = existing
+        } else {
+            label = NSTextField(labelWithString: "")
+            label.font = .monospacedDigitSystemFont(ofSize: 12, weight: .semibold)
+            label.textColor = .white
+            label.backgroundColor = NSColor.black.withAlphaComponent(0.78)
+            label.drawsBackground = true
+            addSubview(label)
+            strokeHUDLabel = label
+        }
+        label.stringValue = String(format: "  ✏️ %.1f pt  ", width)
+        label.sizeToFit()
+        let vis = visibleRect
+        label.frame.origin = CGPoint(x: vis.minX + 10, y: vis.maxY - label.frame.height - 10)
+        label.isHidden = false
+        strokeHUDHide?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.strokeHUDLabel?.isHidden = true }
+        strokeHUDHide = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.9, execute: work)
     }
 
     override func resetCursorRects() {
