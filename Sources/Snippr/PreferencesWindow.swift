@@ -450,7 +450,14 @@ final class RecorderButton: NSButton {
             return
         }
         let combo = KeyCombo(nsEvent: event)
-        let isFKey = (UInt32(kVK_F1)...UInt32(kVK_F12)).contains(combo.keyCode)
+        // Carbon F-key codes are NOT contiguous (F1=122 … F12=111) — a range
+        // literal here traps at runtime, so use an explicit set
+        let fKeyCodes: Set<UInt32> = [
+            UInt32(kVK_F1), UInt32(kVK_F2), UInt32(kVK_F3), UInt32(kVK_F4),
+            UInt32(kVK_F5), UInt32(kVK_F6), UInt32(kVK_F7), UInt32(kVK_F8),
+            UInt32(kVK_F9), UInt32(kVK_F10), UInt32(kVK_F11), UInt32(kVK_F12),
+        ]
+        let isFKey = fKeyCodes.contains(combo.keyCode)
         guard combo.modifiers != 0 || isFKey else {
             refreshTitle()
             return
@@ -579,7 +586,7 @@ struct AboutTab: View {
                 .font(.system(size: 42, weight: .medium))
                 .foregroundStyle(.tint)
             Text("Snippr").font(.title).bold()
-            Text("Version 1.1.0 — native for Apple Silicon & Intel")
+            Text("Version 1.1.1 — native for Apple Silicon & Intel")
                 .foregroundStyle(.secondary)
             Divider().frame(width: 300)
             Text("Free for personal use. Screenshot, annotate, OCR,\nscrolling capture — everything stays on your Mac.")

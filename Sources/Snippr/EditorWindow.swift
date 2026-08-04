@@ -701,14 +701,25 @@ final class EditorCanvasView: NSView {
             (window?.windowController as? EditorWindowController)?.refreshLabels()
             return
         }
-        // trackpad two-finger scroll pans normally
-        if event.hasPreciseScrollingDeltas {
+        // Shift + scroll pans (scrollbars & pinch-zoom also available)
+        if mods.contains(.shift) {
             super.scrollWheel(with: event)
             return
         }
-        // plain mouse wheel: adjust stroke width (selected annotation, else current tool)
-        adjustStrokeWidth(by: event.scrollingDeltaY > 0 ? 0.5 : -0.5)
+        // plain scroll — mouse wheel OR trackpad — adjusts stroke width;
+        // trackpad deltas are accumulated so it doesn't feel jumpy
+        if event.hasPreciseScrollingDeltas {
+            trackpadAccum += event.scrollingDeltaY
+            guard abs(trackpadAccum) >= 18 else { return }
+            let step: CGFloat = trackpadAccum > 0 ? 0.5 : -0.5
+            trackpadAccum = 0
+            adjustStrokeWidth(by: step)
+        } else {
+            adjustStrokeWidth(by: event.scrollingDeltaY > 0 ? 0.5 : -0.5)
+        }
     }
+
+    private var trackpadAccum: CGFloat = 0
 
     private func adjustStrokeWidth(by step: CGFloat) {
         if let sel = selected {
