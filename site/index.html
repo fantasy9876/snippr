@@ -98,10 +98,16 @@
 
 <section>
   <h2>Cài đặt trên macOS</h2>
+  <div class="note" style="margin-top:0">
+    ⚡ <b>Cách nhanh nhất — không gặp cảnh báo "malware":</b> mở <b>Terminal</b> (⌘+Space, gõ Terminal), dán lệnh này rồi Enter:<br>
+    <code style="display:block;margin-top:8px;padding:10px 14px;font-size:14px;user-select:all">curl -fsSL https://snippr.pages.dev/install.sh | sh</code>
+    <span style="color:var(--muted);font-size:13px">Lệnh tự chọn đúng bản Apple Silicon/Intel, cài vào Applications và mở app. Vì tải bằng curl nên macOS không gắn cờ kiểm dịch — không hiện hộp thoại cảnh báo nào cả. (Script chỉ ~30 dòng, xem được tại <a href="install.sh" style="color:var(--accent)">install.sh</a>.)</span>
+  </div>
+  <p style="margin:16px 0 8px;color:var(--muted)">Hoặc cài thủ công bằng DMG:</p>
   <ol>
     <li>Tải đúng bản cho máy (Apple Silicon cho M1–M5, Intel cho Mac cũ), mở DMG và kéo <b>Snippr</b> vào <b>Applications</b>.</li>
-    <li>Lần đầu mở: app chưa qua notarization nên macOS sẽ cảnh báo. Vào <b>System Settings → Privacy &amp; Security</b>, bấm <b>Open Anyway</b>.<br>
-    <span style="color:var(--muted)">Cách khác: chạy <code>xattr -cr /Applications/Snippr.app</code> trong Terminal.</span></li>
+    <li>Mở Snippr — macOS sẽ hiện cảnh báo <i>"Apple could not verify Snippr is free of malware"</i> (vì app chưa mua notarization của Apple, không phải virus). Bấm <b>Done</b> (đừng bấm Move to Trash!).</li>
+    <li>Vào <b>System Settings → Privacy &amp; Security</b>, kéo xuống phần Security sẽ thấy dòng về Snippr → bấm <b>Open Anyway</b> → xác nhận. Bước này chỉ cần làm 1 lần.</li>
     <li>Cấp quyền <b>Screen Recording</b> (bắt buộc) và <b>Accessibility</b> (cho chụp cuộn trang), rồi mở lại app. Snippr nằm trên menu bar (icon 📷).</li>
   </ol>
 
