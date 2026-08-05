@@ -14,6 +14,10 @@ permissions:
 jobs:
   build:
     runs-on: windows-latest
+    env:
+      # Signing turns on automatically once the Azure Trusted Signing
+      # secrets are added in repo Settings → Secrets and variables → Actions.
+      ENABLE_SIGNING: ${{ secrets.AZURE_TENANT_ID != '' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -37,6 +41,22 @@ jobs:
           Write-Host "Found $($exe.FullName)"
           Copy-Item $exe.FullName windows/Snippr.exe
 
+      - name: Sign Snippr.exe (Azure Trusted Signing)
+        if: env.ENABLE_SIGNING == 'true'
+        uses: azure/trusted-signing-action@v0.5.1
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: ${{ secrets.TRUSTED_SIGNING_ENDPOINT }}
+          trusted-signing-account-name: ${{ secrets.TRUSTED_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.TRUSTED_SIGNING_PROFILE }}
+          files-folder: windows
+          files-folder-filter: exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
       - name: Install NSIS
         run: choco install nsis -y --no-progress
 
@@ -44,6 +64,22 @@ jobs:
         shell: pwsh
         working-directory: windows
         run: '& "C:\Program Files (x86)\NSIS\makensis.exe" installer.nsi'
+
+      - name: Sign installer (Azure Trusted Signing)
+        if: env.ENABLE_SIGNING == 'true'
+        uses: azure/trusted-signing-action@v0.5.1
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: ${{ secrets.TRUSTED_SIGNING_ENDPOINT }}
+          trusted-signing-account-name: ${{ secrets.TRUSTED_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.TRUSTED_SIGNING_PROFILE }}
+          files-folder: windows
+          files-folder-filter: exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
 
       - name: Portable ZIP
         shell: pwsh
