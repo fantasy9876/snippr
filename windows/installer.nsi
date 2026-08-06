@@ -2,7 +2,7 @@
 !include "MUI2.nsh"
 
 Name "Snippr"
-OutFile "SnipprSetup-1.2.4-win-x64.exe"
+OutFile "SnipprSetup-1.2.5-win-x64.exe"
 InstallDir "$PROGRAMFILES64\Snippr"
 InstallDirRegKey HKLM "Software\Snippr" "InstallDir"
 RequestExecutionLevel admin
@@ -36,7 +36,7 @@ Section "Snippr"
 
   ; Add/Remove Programs entry
   WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Snippr" "DisplayName" "Snippr"
-  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Snippr" "DisplayVersion" "1.2.4"
+  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Snippr" "DisplayVersion" "1.2.5"
   WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Snippr" "Publisher" "Snippr (open source)"
   WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Snippr" "URLInfoAbout" "https://snippr.pages.dev"
   WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Snippr" "DisplayIcon" "$INSTDIR\Snippr.exe"

@@ -310,9 +310,11 @@ final class ScrollPreviewView: NSView {
         let inset: CGFloat = 12
         let area = bounds.insetBy(dx: inset, dy: 0)
         guard let image else {
+            // explicit light gray — dynamic label colors can resolve to black
+            // here and look broken on the dark panel
             let attrs: [NSAttributedString.Key: Any] = [
                 .font: NSFont.systemFont(ofSize: 11),
-                .foregroundColor: NSColor.tertiaryLabelColor,
+                .foregroundColor: NSColor(calibratedWhite: 0.65, alpha: 1),
             ]
             ("Chờ khung hình đầu tiên…" as NSString).draw(
                 at: NSPoint(x: inset, y: bounds.midY), withAttributes: attrs)
@@ -373,34 +375,47 @@ final class VerticalStitcher {
     }
 
     /// How many rows of new content `next` has relative to `previous`;
-    /// nil when confidence is too low (scrolled too far, animations, ...).
+    /// nil when confidence is too low. Two safeguards against ugly output:
+    /// 4-band row signatures (a plain per-row mean can't tell repetitive UI
+    /// rows apart, which duplicated whole blocks), and a uniqueness margin —
+    /// if the second-best offset is nearly as good, the page is self-similar
+    /// there and guessing would corrupt the seam, so the frame is skipped.
     static func findOverlap(previous: CGImage, next: CGImage) -> Int? {
         let h = previous.height
         guard h == next.height, previous.width == next.width, h > 40 else { return nil }
-        guard let prevG = grayRows(previous), let nextG = grayRows(next) else { return nil }
+        guard let prevS = rowSignatures(previous), let nextS = rowSignatures(next) else { return nil }
 
-        let k = max(24, h / 5)
-        let template = Array(prevG[(h - k)...])
+        let k = max(32, h / 4)
         var bestOffset = -1
         var bestScore = Double.greatestFiniteMagnitude
+        var secondScore = Double.greatestFiniteMagnitude
 
         for s in 0...(h - k) {
             let start = h - k - s
             var diff: Double = 0
             for i in 0..<k {
-                diff += abs(template[i] - nextG[start + i])
+                let a = (h - k + i) * 4
+                let b = (start + i) * 4
+                diff += abs(prevS[a] - nextS[b])
+                    + abs(prevS[a + 1] - nextS[b + 1])
+                    + abs(prevS[a + 2] - nextS[b + 2])
+                    + abs(prevS[a + 3] - nextS[b + 3])
             }
-            diff /= Double(k)
+            diff /= Double(k * 4)
             if diff < bestScore {
+                if bestOffset >= 0, abs(s - bestOffset) > 2 { secondScore = bestScore }
                 bestScore = diff
                 bestOffset = s
+            } else if diff < secondScore, abs(s - bestOffset) > 2 {
+                secondScore = diff
             }
         }
-        guard bestOffset >= 0, bestScore < 6.0 else { return nil }
+        guard bestOffset > 0, bestScore < 4.0, secondScore - bestScore > 2.0 else { return nil }
         return bestOffset
     }
 
-    private static func grayRows(_ image: CGImage) -> [Double]? {
+    /// Per-row signature: mean gray of 4 horizontal bands (flat h*4 array).
+    private static func rowSignatures(_ image: CGImage) -> [Double]? {
         let w = image.width, h = image.height
         var buf = [UInt8](repeating: 0, count: w * h)
         guard let ctx = CGContext(
@@ -411,21 +426,26 @@ final class VerticalStitcher {
         ctx.interpolationQuality = .none
         ctx.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
 
-        let sampleCols = min(96, w)
-        let colStride = max(1, w / sampleCols)
-        var rows = [Double](repeating: 0, count: h)
+        let bandWidth = max(1, w / 4)
+        let colStride = max(1, bandWidth / 24)
+        var sig = [Double](repeating: 0, count: h * 4)
         for y in 0..<h {
-            var sum = 0
-            var count = 0
-            var x = 0
-            while x < w {
-                sum += Int(buf[y * w + x])
-                count += 1
-                x += colStride
+            let rowBase = y * w
+            for band in 0..<4 {
+                let x0 = band * bandWidth
+                let x1 = band == 3 ? w : (band + 1) * bandWidth
+                var sum = 0
+                var count = 0
+                var x = x0
+                while x < x1 {
+                    sum += Int(buf[rowBase + x])
+                    count += 1
+                    x += colStride
+                }
+                sig[y * 4 + band] = Double(sum) / Double(max(1, count))
             }
-            rows[y] = Double(sum) / Double(max(1, count))
         }
-        return rows
+        return sig
     }
 
     func compose() -> CGImage? {

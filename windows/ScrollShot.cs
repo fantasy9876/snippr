@@ -295,59 +295,81 @@ sealed class WinStitcher
         return result;
     }
 
+    /// Two safeguards mirror the macOS matcher: 4-band row signatures (a bare
+    /// per-row mean confuses repetitive UI rows → duplicated blocks) and a
+    /// uniqueness margin (near-tied second-best ⇒ self-similar content ⇒ skip
+    /// the frame instead of corrupting the seam).
     static int? FindOverlap(Bitmap prev, Bitmap next)
     {
         int h = prev.Height;
         if (h != next.Height || prev.Width != next.Width || h <= 40) return null;
-        var prevG = GrayRows(prev);
-        var nextG = GrayRows(next);
-        if (prevG == null || nextG == null) return null;
+        var prevS = RowSignatures(prev);
+        var nextS = RowSignatures(next);
+        if (prevS == null || nextS == null) return null;
 
-        int k = Math.Max(24, h / 5);
+        int k = Math.Max(32, h / 4);
         int bestOffset = -1;
         double bestScore = double.MaxValue;
+        double secondScore = double.MaxValue;
         for (int s = 0; s <= h - k; s++)
         {
             int start = h - k - s;
             double diff = 0;
             for (int i = 0; i < k; i++)
             {
-                diff += Math.Abs(prevG[h - k + i] - nextG[start + i]);
+                int a = (h - k + i) * 4;
+                int b = (start + i) * 4;
+                diff += Math.Abs(prevS[a] - nextS[b])
+                    + Math.Abs(prevS[a + 1] - nextS[b + 1])
+                    + Math.Abs(prevS[a + 2] - nextS[b + 2])
+                    + Math.Abs(prevS[a + 3] - nextS[b + 3]);
             }
-            diff /= k;
+            diff /= k * 4;
             if (diff < bestScore)
             {
+                if (bestOffset >= 0 && Math.Abs(s - bestOffset) > 2) secondScore = bestScore;
                 bestScore = diff;
                 bestOffset = s;
             }
+            else if (diff < secondScore && Math.Abs(s - bestOffset) > 2)
+            {
+                secondScore = diff;
+            }
         }
-        return bestOffset >= 0 && bestScore < 6.0 ? bestOffset : null;
+        return bestOffset > 0 && bestScore < 4.0 && secondScore - bestScore > 2.0
+            ? bestOffset : null;
     }
 
-    /// Mean gray per row, sampling ~96 columns (fast row signature).
-    static unsafe double[]? GrayRows(Bitmap bmp)
+    /// Per-row signature: mean gray of 4 horizontal bands (flat h*4 array).
+    static unsafe double[]? RowSignatures(Bitmap bmp)
     {
         var rect = new Rectangle(0, 0, bmp.Width, bmp.Height);
         var data = bmp.LockBits(rect, ImageLockMode.ReadOnly, PixelFormat.Format24bppRgb);
         try
         {
             int w = bmp.Width, h = bmp.Height;
-            int colStride = Math.Max(1, w / 96);
-            var rows = new double[h];
+            int bandWidth = Math.Max(1, w / 4);
+            int colStride = Math.Max(1, bandWidth / 24);
+            var sig = new double[h * 4];
             byte* basePtr = (byte*)data.Scan0;
             for (int y = 0; y < h; y++)
             {
                 byte* row = basePtr + y * data.Stride;
-                int sum = 0, count = 0;
-                for (int x = 0; x < w; x += colStride)
+                for (int band = 0; band < 4; band++)
                 {
-                    byte* px = row + x * 3;
-                    sum += (px[0] + px[1] + px[2]) / 3;
-                    count++;
+                    int x0 = band * bandWidth;
+                    int x1 = band == 3 ? w : (band + 1) * bandWidth;
+                    int sum = 0, count = 0;
+                    for (int x = x0; x < x1; x += colStride)
+                    {
+                        byte* px = row + x * 3;
+                        sum += (px[0] + px[1] + px[2]) / 3;
+                        count++;
+                    }
+                    sig[y * 4 + band] = (double)sum / Math.Max(1, count);
                 }
-                rows[y] = (double)sum / Math.Max(1, count);
             }
-            return rows;
+            return sig;
         }
         finally
         {

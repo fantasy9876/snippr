@@ -101,6 +101,20 @@ enum SelfTest {
             writePNG(composed, to: "\(outputDir)/stitched.png")
         }
 
+        // 2b. Self-similar content must be REJECTED, not guessed -------------------
+        // (repetitive chat-like UI used to produce duplicated blocks and
+        // corrupted seams — the matcher now requires a unique best offset)
+        let periodic = makePeriodicPattern(width: 400, height: 1000, period: 40)
+        if let f0 = periodic.cropping(to: CGRect(x: 0, y: 0, width: 400, height: 500)),
+           let f1 = periodic.cropping(to: CGRect(x: 0, y: 100, width: 400, height: 500)) {
+            let s2 = VerticalStitcher(first: f0)
+            let appended = s2.append(f1, direction: .down)
+            check("stitch-ambiguous-rejected", appended == 0,
+                  "appended \(appended) rows from ambiguous content")
+        } else {
+            check("stitch-ambiguous-crop", false)
+        }
+
         // 3. Save format heuristic --------------------------------------------------
         let flat = makeSolidImage(width: 500, height: 500, color: NSColor.systemTeal.cgColor)
         let noisy = makeNoiseImage(width: 500, height: 500)
@@ -175,6 +189,18 @@ enum SelfTest {
             let g = CGFloat((seed >> 41) & 0xFF) / 255
             let b = CGFloat((seed >> 49) & 0xFF) / 255
             c.setFillColor(CGColor(srgbRed: r, green: g, blue: b, alpha: 1))
+            c.fill(CGRect(x: 0, y: y, width: width, height: 1))
+        }
+        return c.makeImage()!
+    }
+
+    /// Rows repeat every `period` px — worst case for overlap matching.
+    private static func makePeriodicPattern(width: Int, height: Int, period: Int) -> CGImage {
+        let c = ctx(width, height)
+        for y in 0..<height {
+            let phase = y % period
+            let v = CGFloat(phase) / CGFloat(period)
+            c.setFillColor(CGColor(srgbRed: v, green: 0.3 + v * 0.5, blue: 1 - v, alpha: 1))
             c.fill(CGRect(x: 0, y: y, width: width, height: 1))
         }
         return c.makeImage()!
