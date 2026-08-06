@@ -26,6 +26,7 @@ MainActor.assumeIsolated {
         || arguments.contains("--benchmark")
         || arguments.contains("--test-firstopen")
         || arguments.contains("--test-scrollpreview")
+        || arguments.contains("--test-scrollstitch")
     if !isDevTool {
         let mine = ProcessInfo.processInfo.processIdentifier
         let bundleID = Bundle.main.bundleIdentifier ?? "com.manhhoang.snippr"

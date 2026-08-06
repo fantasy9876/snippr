@@ -124,6 +124,63 @@ enum Benchmark {
         }
     }
 
+    /// `--test-scrollstitch`: grabs a REAL screenshot and simulates scrolling
+    /// by cropping frames at known offsets — validates the matcher against
+    /// actual UI content (dark backgrounds, repetitive chat rows, text),
+    /// not just synthetic patterns. Prints accept/reject per step.
+    static var scrollStitchTestRequested: Bool {
+        CommandLine.arguments.contains("--test-scrollstitch")
+    }
+
+    static func runScrollStitchTest() {
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 500_000_000)
+            let screen = NSScreen.main ?? NSScreen.screens[0]
+            guard let full = try? await CaptureEngine.shared.captureDisplay(screen: screen) else {
+                print("capture failed"); exit(1)
+            }
+            let tall = full.cgImage
+            let vw = min(1100, tall.width - 200)
+            let vh = 700
+            guard tall.height > vh + 900 else { print("screen too small"); exit(1) }
+
+            // realistic mix: small nudges, medium scrolls, one big jump
+            let steps = [0, 120, 260, 420, 480, 900, 1000]
+            var expectedHeight = vh
+            var stitcher: VerticalStitcher?
+            var accepted = 0, rejected = 0
+
+            for (i, off) in steps.enumerated() {
+                guard let frame = tall.cropping(to: CGRect(x: 100, y: off, width: vw, height: vh)) else {
+                    print("crop fail"); exit(1)
+                }
+                if let s = stitcher {
+                    let rows = s.append(frame, direction: .down)
+                    let delta = off - steps[i - 1]
+                    if rows == delta {
+                        accepted += 1
+                        expectedHeight += rows
+                        print("step +\(delta)px → appended \(rows) ✓")
+                    } else if rows == 0 {
+                        rejected += 1
+                        print("step +\(delta)px → REJECTED")
+                    } else {
+                        print("step +\(delta)px → WRONG rows=\(rows) ✗✗")
+                        print("SCROLLSTITCH FAILED (wrong offset accepted)")
+                        exit(1)
+                    }
+                } else {
+                    stitcher = VerticalStitcher(first: frame)
+                }
+            }
+            let total = stitcher?.totalHeight ?? 0
+            print("accepted \(accepted)/\(steps.count - 1), rejected \(rejected), height \(total) (expect \(expectedHeight))")
+            let ok = accepted >= steps.count - 2 && total == expectedHeight
+            print(ok ? "SCROLLSTITCH OK" : "SCROLLSTITCH FAILED (too many rejections)")
+            exit(ok ? 0 : 1)
+        }
+    }
+
     /// Synthesises a real left-button drag (needs Accessibility permission).
     private static func dragMouse(from: CGPoint, to: CGPoint) {
         let src = CGEventSource(stateID: .hidSystemState)

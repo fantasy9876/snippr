@@ -67,6 +67,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if Benchmark.requested { Benchmark.run() }
         if Benchmark.firstOpenTestRequested { Benchmark.runFirstOpenTest() }
         if let dir = Benchmark.scrollPreviewOutDir { Benchmark.runScrollPreviewTest(outDir: dir) }
+        if Benchmark.scrollStitchTestRequested { Benchmark.runScrollStitchTest() }
         if UITest.requestedOutputDir == nil && !Benchmark.requested {
             UpdateChecker.checkOnLaunch()
         }

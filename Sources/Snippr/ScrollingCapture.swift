@@ -383,39 +383,64 @@ final class VerticalStitcher {
     static func findOverlap(previous: CGImage, next: CGImage) -> Int? {
         let h = previous.height
         guard h == next.height, previous.width == next.width, h > 40 else { return nil }
-        guard let prevS = rowSignatures(previous), let nextS = rowSignatures(next) else { return nil }
+        guard let ps = rowSignatures(previous), let ns = rowSignatures(next) else { return nil }
 
         let k = max(32, h / 4)
+        // rows are weighted by their detail (horizontal gradient energy):
+        // a misaligned text line then dominates the score, while empty
+        // background — which matches at EVERY offset — can neither hide the
+        // error nor drown the uniqueness signal
+        var weights = [Double](repeating: 0, count: k)
+        var weightSum = 0.0
+        for i in 0..<k {
+            let w = max(ps.energy[h - k + i], 0.5)
+            weights[i] = w
+            weightSum += w
+        }
+        guard weightSum > 0 else { return nil }
+
         var bestOffset = -1
         var bestScore = Double.greatestFiniteMagnitude
         var secondScore = Double.greatestFiniteMagnitude
-
         for s in 0...(h - k) {
             let start = h - k - s
             var diff: Double = 0
             for i in 0..<k {
                 let a = (h - k + i) * 4
                 let b = (start + i) * 4
-                diff += abs(prevS[a] - nextS[b])
-                    + abs(prevS[a + 1] - nextS[b + 1])
-                    + abs(prevS[a + 2] - nextS[b + 2])
-                    + abs(prevS[a + 3] - nextS[b + 3])
+                let d = (abs(ps.bands[a] - ns.bands[b])
+                    + abs(ps.bands[a + 1] - ns.bands[b + 1])
+                    + abs(ps.bands[a + 2] - ns.bands[b + 2])
+                    + abs(ps.bands[a + 3] - ns.bands[b + 3])) / 4
+                diff += weights[i] * d
             }
-            diff /= Double(k * 4)
+            diff /= weightSum
             if diff < bestScore {
-                if bestOffset >= 0, abs(s - bestOffset) > 2 { secondScore = bestScore }
+                if bestOffset >= 0, abs(s - bestOffset) > 6 { secondScore = bestScore }
                 bestScore = diff
                 bestOffset = s
-            } else if diff < secondScore, abs(s - bestOffset) > 2 {
+            } else if diff < secondScore, abs(s - bestOffset) > 6 {
                 secondScore = diff
             }
         }
-        guard bestOffset > 0, bestScore < 4.0, secondScore - bestScore > 2.0 else { return nil }
+        if Perf.enabled {
+            FileHandle.standardError.write(
+                "match off=\(bestOffset) best=\(String(format: "%.2f", bestScore)) second=\(String(format: "%.2f", secondScore))\n"
+                    .data(using: .utf8)!)
+        }
+        // The true overlap is a near-perfect match (~0.0) because both frames
+        // rasterize the same content; line-pitch aliases score low-but-nonzero
+        // (~0.4–2). So uniqueness is a RATIO test with a small epsilon, plus
+        // an absolute-gap fallback for noisy pages (animations in overlap).
+        guard bestOffset > 0, bestScore < 2.0 else { return nil }
+        let unique = secondScore > bestScore * 3 + 0.15
+            || secondScore - bestScore > 2.5
+        guard unique else { return nil }
         return bestOffset
     }
 
-    /// Per-row signature: mean gray of 4 horizontal bands (flat h*4 array).
-    private static func rowSignatures(_ image: CGImage) -> [Double]? {
+    /// Per-row: mean gray of 4 horizontal bands + gradient energy.
+    private static func rowSignatures(_ image: CGImage) -> (bands: [Double], energy: [Double])? {
         let w = image.width, h = image.height
         var buf = [UInt8](repeating: 0, count: w * h)
         guard let ctx = CGContext(
@@ -428,24 +453,35 @@ final class VerticalStitcher {
 
         let bandWidth = max(1, w / 4)
         let colStride = max(1, bandWidth / 24)
-        var sig = [Double](repeating: 0, count: h * 4)
+        var bands = [Double](repeating: 0, count: h * 4)
+        var energy = [Double](repeating: 0, count: h)
         for y in 0..<h {
             let rowBase = y * w
+            var grad = 0
+            var gradCount = 0
             for band in 0..<4 {
                 let x0 = band * bandWidth
                 let x1 = band == 3 ? w : (band + 1) * bandWidth
                 var sum = 0
                 var count = 0
                 var x = x0
+                var prevPx = -1
                 while x < x1 {
-                    sum += Int(buf[rowBase + x])
+                    let px = Int(buf[rowBase + x])
+                    sum += px
                     count += 1
+                    if prevPx >= 0 {
+                        grad += abs(px - prevPx)
+                        gradCount += 1
+                    }
+                    prevPx = px
                     x += colStride
                 }
-                sig[y * 4 + band] = Double(sum) / Double(max(1, count))
+                bands[y * 4 + band] = Double(sum) / Double(max(1, count))
             }
+            energy[y] = Double(grad) / Double(max(1, gradCount))
         }
-        return sig
+        return (bands, energy)
     }
 
     func compose() -> CGImage? {

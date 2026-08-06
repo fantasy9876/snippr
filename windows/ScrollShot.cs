@@ -303,11 +303,25 @@ sealed class WinStitcher
     {
         int h = prev.Height;
         if (h != next.Height || prev.Width != next.Width || h <= 40) return null;
-        var prevS = RowSignatures(prev);
-        var nextS = RowSignatures(next);
-        if (prevS == null || nextS == null) return null;
+        var prevSig = RowSignatures(prev);
+        var nextSig = RowSignatures(next);
+        if (prevSig == null || nextSig == null) return null;
+        var prevS = prevSig.Value;
+        var nextS = nextSig.Value;
 
         int k = Math.Max(32, h / 4);
+        // detail-weighted rows: misaligned text dominates the score, empty
+        // background (which matches everywhere) can't hide or fake a match
+        var weights = new double[k];
+        double weightSum = 0;
+        for (int i = 0; i < k; i++)
+        {
+            double w = Math.Max(prevS.Energy[h - k + i], 0.5);
+            weights[i] = w;
+            weightSum += w;
+        }
+        if (weightSum <= 0) return null;
+
         int bestOffset = -1;
         double bestScore = double.MaxValue;
         double secondScore = double.MaxValue;
@@ -319,29 +333,36 @@ sealed class WinStitcher
             {
                 int a = (h - k + i) * 4;
                 int b = (start + i) * 4;
-                diff += Math.Abs(prevS[a] - nextS[b])
-                    + Math.Abs(prevS[a + 1] - nextS[b + 1])
-                    + Math.Abs(prevS[a + 2] - nextS[b + 2])
-                    + Math.Abs(prevS[a + 3] - nextS[b + 3]);
+                double d = (Math.Abs(prevS.Bands[a] - nextS.Bands[b])
+                    + Math.Abs(prevS.Bands[a + 1] - nextS.Bands[b + 1])
+                    + Math.Abs(prevS.Bands[a + 2] - nextS.Bands[b + 2])
+                    + Math.Abs(prevS.Bands[a + 3] - nextS.Bands[b + 3])) / 4;
+                diff += weights[i] * d;
             }
-            diff /= k * 4;
+            diff /= weightSum;
             if (diff < bestScore)
             {
-                if (bestOffset >= 0 && Math.Abs(s - bestOffset) > 2) secondScore = bestScore;
+                if (bestOffset >= 0 && Math.Abs(s - bestOffset) > 6) secondScore = bestScore;
                 bestScore = diff;
                 bestOffset = s;
             }
-            else if (diff < secondScore && Math.Abs(s - bestOffset) > 2)
+            else if (diff < secondScore && Math.Abs(s - bestOffset) > 6)
             {
                 secondScore = diff;
             }
         }
-        return bestOffset > 0 && bestScore < 4.0 && secondScore - bestScore > 2.0
-            ? bestOffset : null;
+        // ratio uniqueness (true overlap ≈ 0.0, line-pitch aliases ~0.4–2)
+        // with an absolute-gap fallback for pages with animation noise
+        if (bestOffset <= 0 || bestScore >= 2.0) return null;
+        bool unique = secondScore > bestScore * 3 + 0.15
+            || secondScore - bestScore > 2.5;
+        return unique ? bestOffset : null;
     }
 
-    /// Per-row signature: mean gray of 4 horizontal bands (flat h*4 array).
-    static unsafe double[]? RowSignatures(Bitmap bmp)
+    readonly record struct Signatures(double[] Bands, double[] Energy);
+
+    /// Per-row: mean gray of 4 horizontal bands + horizontal gradient energy.
+    static unsafe Signatures? RowSignatures(Bitmap bmp)
     {
         var rect = new Rectangle(0, 0, bmp.Width, bmp.Height);
         var data = bmp.LockBits(rect, ImageLockMode.ReadOnly, PixelFormat.Format24bppRgb);
@@ -350,26 +371,32 @@ sealed class WinStitcher
             int w = bmp.Width, h = bmp.Height;
             int bandWidth = Math.Max(1, w / 4);
             int colStride = Math.Max(1, bandWidth / 24);
-            var sig = new double[h * 4];
+            var bands = new double[h * 4];
+            var energy = new double[h];
             byte* basePtr = (byte*)data.Scan0;
             for (int y = 0; y < h; y++)
             {
                 byte* row = basePtr + y * data.Stride;
+                int grad = 0, gradCount = 0;
                 for (int band = 0; band < 4; band++)
                 {
                     int x0 = band * bandWidth;
                     int x1 = band == 3 ? w : (band + 1) * bandWidth;
-                    int sum = 0, count = 0;
+                    int sum = 0, count = 0, prevPx = -1;
                     for (int x = x0; x < x1; x += colStride)
                     {
                         byte* px = row + x * 3;
-                        sum += (px[0] + px[1] + px[2]) / 3;
+                        int g = (px[0] + px[1] + px[2]) / 3;
+                        sum += g;
                         count++;
+                        if (prevPx >= 0) { grad += Math.Abs(g - prevPx); gradCount++; }
+                        prevPx = g;
                     }
-                    sig[y * 4 + band] = (double)sum / Math.Max(1, count);
+                    bands[y * 4 + band] = (double)sum / Math.Max(1, count);
                 }
+                energy[y] = (double)grad / Math.Max(1, gradCount);
             }
-            return sig;
+            return new Signatures(bands, energy);
         }
         finally
         {
