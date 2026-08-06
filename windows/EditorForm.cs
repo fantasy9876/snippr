@@ -62,6 +62,7 @@ sealed class EditorForm : Form
         Controls.Add(_scroller);
         Controls.Add(_bar);
         _previewTimer.Tick += (_, _) => { _previewTimer.Stop(); _canvas.Invalidate(); };
+        _scroller.Resize += (_, _) => CenterCanvas();
 
         ApplyZoom(1f);
         FormClosed += (_, _) => { _pixelated?.Dispose(); };
@@ -281,8 +282,19 @@ sealed class EditorForm : Form
         _zoom = Math.Clamp(zoom, 0.1f, 8f);
         _canvas.Size = new Size(
             (int)(_image.Width * _zoom), (int)(_image.Height * _zoom));
+        CenterCanvas();
         _canvas.Invalidate();
         RefreshLabels();
+    }
+
+    /// Keeps the shot centered when it's smaller than the viewport.
+    void CenterCanvas()
+    {
+        var vp = _scroller.ClientSize;
+        int x = Math.Max(0, (vp.Width - _canvas.Width) / 2);
+        int y = Math.Max(0, (vp.Height - _canvas.Height) / 2);
+        var scroll = _scroller.AutoScrollPosition;
+        _canvas.Location = new Point(x + scroll.X, y + scroll.Y);
     }
 
     internal void ZoomBy(float factor) => ApplyZoom(_zoom * factor);

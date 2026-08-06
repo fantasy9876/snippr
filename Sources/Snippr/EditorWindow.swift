@@ -12,11 +12,13 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
     private var toolButtons: [EditorTool: NSButton] = [:]
     private var scrollView: NSScrollView!
 
-    static func open(with image: CapturedImage) {
+    @discardableResult
+    static func open(with image: CapturedImage) -> EditorWindowController {
         let wc = EditorWindowController(image: image)
         controllers.append(wc)
         wc.showWindow(nil)
         NSApp.activate(ignoringOtherApps: true)
+        return wc
     }
 
     init(image: CapturedImage) {
@@ -71,6 +73,8 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
         scrollView.maxMagnification = 8
         scrollView.drawsBackground = true
         scrollView.backgroundColor = NSColor(white: 0.13, alpha: 1)
+        // keeps the shot centered when it's smaller than the window
+        scrollView.contentView = CenteringClipView()
         scrollView.documentView = canvas
         canvas.enclosingScroll = { [weak self] in self?.scrollView }
 
@@ -290,6 +294,23 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
 
     func windowWillClose(_ notification: Notification) {
         EditorWindowController.controllers.removeAll { $0 === self }
+    }
+}
+
+/// Clip view that centers the document view along any axis where the
+/// document is smaller than the visible area (instead of pinning it to a corner).
+final class CenteringClipView: NSClipView {
+    override func constrainBoundsRect(_ proposedBounds: NSRect) -> NSRect {
+        var rect = super.constrainBoundsRect(proposedBounds)
+        guard let doc = documentView else { return rect }
+        let docFrame = doc.frame
+        if rect.width > docFrame.width {
+            rect.origin.x = (docFrame.width - rect.width) / 2
+        }
+        if rect.height > docFrame.height {
+            rect.origin.y = (docFrame.height - rect.height) / 2
+        }
+        return rect
     }
 }
 

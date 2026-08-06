@@ -19,6 +19,10 @@ enum UITest {
         // sample capture: gradient test card @2x
         let sample = CapturedImage(cgImage: SelfTest.makeTestImage(width: 1440, height: 900), scale: 2)
         EditorWindowController.open(with: sample)
+        // small shot in a deliberately oversized window — proves centering
+        let small = CapturedImage(cgImage: SelfTest.makeTestImage(width: 600, height: 360), scale: 2)
+        EditorWindowController.open(with: small).window?
+            .setContentSize(NSSize(width: 820, height: 560))
         PreferencesWindowController.show()
         ToastHUD.show("Snippr UI test — toast OK", symbol: "checkmark.seal.fill", duration: 6)
         TextResultWindow.show(text: "Snippr — chụp màn hình, nhận diện chữ (OCR), dịch đa ngôn ngữ.\nScreenshot → OCR → Translate, everything on your machine.")
