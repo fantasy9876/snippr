@@ -51,7 +51,7 @@ sealed class ScrollShotSession
         _esc.HotkeyPressed += id => { if (id == EscId) Finish(); };
         Native.RegisterHotKey(_esc.Handle, EscId, 0, 0x1B /* VK_ESCAPE */);
 
-        _timer.Interval = 250;
+        _timer.Interval = 180;
         _timer.Tick += (_, _) => CaptureTick();
         _timer.Start();
     }
@@ -75,11 +75,13 @@ sealed class ScrollShotSession
         if (_stitcher == null)
         {
             _stitcher = new WinStitcher(bmp);
-            _label.Text = "  Cuộn trang từ từ — Snippr tự ghép ảnh";
+            AddPreviewSlice(bmp);
+            _label.Text = "  Cuộn từ từ — ảnh ghép hiện bên dưới";
         }
         else if (_stitcher.Append(bmp))
         {
-            _label.Text = $"  Đã ghép {_stitcher.TotalHeight}px — cuộn tiếp, xong bấm ✓ / Esc";
+            AddPreviewSlice(_stitcher.LastSlice);
+            _label.Text = $"  Đã ghép {_stitcher.TotalHeight}px — ✓ / Esc để xong";
             if (_stitcher.TotalHeight >= MaxHeightPx) Finish();
         }
         else
@@ -87,6 +89,44 @@ sealed class ScrollShotSession
             _label.Text = "  Chưa khớp được — cuộn chậm lại một chút";
             bmp.Dispose();
         }
+    }
+
+    // ----- live preview: the user watches the stitched page grow -----
+
+    const int PreviewWidth = 200;
+    readonly List<Bitmap> _previewSlices = new();
+    Bitmap? _previewComposite;
+    readonly ScrollPreviewControl _preview = new();
+
+    void AddPreviewSlice(Bitmap? slice)
+    {
+        if (slice == null) return;
+        float sc = PreviewWidth / (float)slice.Width;
+        int h = Math.Max(1, (int)(slice.Height * sc));
+        var scaled = new Bitmap(PreviewWidth, h);
+        using (var g = Graphics.FromImage(scaled))
+        {
+            g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.Bilinear;
+            g.DrawImage(slice, new Rectangle(0, 0, PreviewWidth, h));
+        }
+        _previewSlices.Add(scaled);
+
+        int total = 0;
+        foreach (var s in _previewSlices) total += s.Height;
+        var composite = new Bitmap(PreviewWidth, total);
+        using (var g = Graphics.FromImage(composite))
+        {
+            int y = 0;
+            foreach (var s in _previewSlices)
+            {
+                g.DrawImageUnscaled(s, 0, y);
+                y += s.Height;
+            }
+        }
+        _previewComposite?.Dispose();
+        _previewComposite = composite;
+        _preview.Composite = composite;
+        _preview.Invalidate();
     }
 
     void Finish()
@@ -127,40 +167,77 @@ sealed class ScrollShotSession
         Strip(_rect.X - t, _rect.Y, t, _rect.Height);                     // left
         Strip(_rect.Right, _rect.Y, t, _rect.Height);                     // right
 
-        // control bar above (below if no room)
+        // live preview panel beside the area — the user watches the stitched
+        // page grow while scrolling ("vừa chụp vừa xem")
         var wa = Screen.FromRectangle(_rect).WorkingArea;
-        int barW = Math.Min(520, Math.Max(360, _rect.Width));
-        int barH = 40;
-        int barY = _rect.Y - t - barH - 8;
-        if (barY < wa.Top) barY = _rect.Bottom + t + 8;
-        int barX = Math.Clamp(_rect.X + (_rect.Width - barW) / 2, wa.Left + 4, wa.Right - barW - 4);
+        int panelW = 230;
+        int panelH = Math.Min((int)(wa.Height * 0.72), 580);
+        int panelX = _rect.Right + t + 14;
+        if (panelX + panelW > wa.Right - 8) panelX = _rect.X - t - panelW - 14;
+        panelX = Math.Max(panelX, wa.Left + 8);
+        int panelY = Math.Clamp(_rect.Y - t, wa.Top + 8, wa.Bottom - panelH - 8);
 
-        var bar = new Form
+        var panel = new Form
         {
             FormBorderStyle = FormBorderStyle.None,
             StartPosition = FormStartPosition.Manual,
             ShowInTaskbar = false,
             TopMost = true,
             BackColor = Color.FromArgb(24, 26, 31),
-            Bounds = new Rectangle(barX, barY, barW, barH),
+            Bounds = new Rectangle(panelX, panelY, panelW, panelH),
         };
-        _label.Bounds = new Rectangle(4, 0, barW - 108, barH);
-        _label.Text = "  Cuộn trang từ từ — Snippr tự ghép ảnh";
+        _label.Bounds = new Rectangle(6, 6, panelW - 12, 40);
+        _label.Text = "  Cuộn từ từ — ảnh ghép hiện bên dưới";
         var done = new Button
         {
             Text = "✓ Xong",
             ForeColor = Color.White,
             BackColor = Color.FromArgb(0, 120, 212),
             FlatStyle = FlatStyle.Flat,
-            Bounds = new Rectangle(barW - 96, 5, 88, barH - 10),
+            Bounds = new Rectangle(10, 50, 92, 30),
             Font = new Font("Segoe UI", 10f, FontStyle.Bold),
         };
         done.FlatAppearance.BorderSize = 0;
         done.Click += (_, _) => Finish();
-        bar.Controls.Add(_label);
-        bar.Controls.Add(done);
-        bar.Show();
-        _chrome.Add(bar);
+        _preview.Bounds = new Rectangle(10, 88, panelW - 20, panelH - 98);
+        panel.Controls.Add(_label);
+        panel.Controls.Add(done);
+        panel.Controls.Add(_preview);
+        panel.Show();
+        _chrome.Add(panel);
+    }
+}
+
+/// Shows the stitched page scaled to the panel width, pinned to the bottom
+/// so the newest content is always visible.
+sealed class ScrollPreviewControl : Control
+{
+    public Bitmap? Composite;
+
+    public ScrollPreviewControl()
+    {
+        DoubleBuffered = true;
+        SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint
+            | ControlStyles.OptimizedDoubleBuffer, true);
+    }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        var g = e.Graphics;
+        g.Clear(Color.FromArgb(24, 26, 31));
+        if (Composite == null)
+        {
+            using var f = new Font("Segoe UI", 9f);
+            g.DrawString("Chờ khung hình đầu tiên…", f, Brushes.Gray, 4, Height / 2f);
+            return;
+        }
+        float sc = Width / (float)Composite.Width;
+        int dh = Math.Max(1, (int)(Composite.Height * sc));
+        int y = Height - dh; // bottom-aligned: newest slice always on screen
+        g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.Bilinear;
+        g.DrawImage(Composite, new Rectangle(0, y, Width, dh));
+        using var pen = new Pen(Color.FromArgb(90, Color.White));
+        g.DrawRectangle(pen, 0, Math.Max(0, y), Width - 1, Math.Min(dh, Height) - 1);
     }
 }
 
@@ -183,6 +260,9 @@ sealed class WinStitcher
         TotalHeight = first.Height;
     }
 
+    /// Most recently appended slice — consumed by the live preview.
+    public Bitmap? LastSlice { get; private set; }
+
     public bool Append(Bitmap next)
     {
         if (next.Width != Width) return false;
@@ -193,6 +273,7 @@ sealed class WinStitcher
         var slice = next.Clone(
             new Rectangle(0, next.Height - rows, Width, rows), next.PixelFormat);
         _slices.Add(slice);
+        LastSlice = slice;
         TotalHeight += rows;
 
         if (_ownsLastFrame) _lastFrame.Dispose();

@@ -127,9 +127,14 @@ final class CaptureEngine {
     /// Screenshot of one full display, at native pixel resolution.
     /// `excludingOwnWindows` hides Snippr's overlays (scrolling border, HUDs)
     /// from the capture so they never leak into stitched output.
-    func captureDisplay(screen: NSScreen, excludingOwnWindows: Bool = false) async throws -> CapturedImage {
-        // window list only matters when excluding our own windows
-        let content = try await shareableContent(maxAge: excludingOwnWindows ? 0.3 : 120)
+    func captureDisplay(
+        screen: NSScreen, excludingOwnWindows: Bool = false,
+        contentMaxAge: TimeInterval? = nil
+    ) async throws -> CapturedImage {
+        // window list only matters when excluding our own windows; scrolling
+        // sessions pass a long contentMaxAge because their chrome is static
+        let content = try await shareableContent(
+            maxAge: contentMaxAge ?? (excludingOwnWindows ? 0.3 : 120))
         let id = Self.displayID(of: screen)
         guard let display = content.displays.first(where: { $0.displayID == id }) else {
             throw CaptureError.noDisplay

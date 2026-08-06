@@ -87,6 +87,43 @@ enum Benchmark {
         }
     }
 
+    /// `--test-scrollpreview <outdir>`: starts a scrolling session on a fixed
+    /// rect, lets it grab a few frames, snapshots the live preview panel to
+    /// PNG and exits — visual proof the "vừa chụp vừa xem" panel works.
+    static var scrollPreviewOutDir: String? {
+        guard let i = CommandLine.arguments.firstIndex(of: "--test-scrollpreview"),
+              CommandLine.arguments.count > i + 1 else { return nil }
+        return CommandLine.arguments[i + 1]
+    }
+
+    static func runScrollPreviewTest(outDir: String) {
+        try? FileManager.default.createDirectory(atPath: outDir, withIntermediateDirectories: true)
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 800_000_000)
+            let screen = NSScreen.main ?? NSScreen.screens[0]
+            let rect = CGRect(x: 120, y: screen.frame.height - 620, width: 420, height: 340)
+            let session = ScrollingCapture(onFinish: { image in
+                print("scroll session finished, image: \(image.map { "\($0.cgImage.width)x\($0.cgImage.height)" } ?? "nil")")
+                exit(0)
+            })
+            ScrollingCapture.active = session
+            Task { @MainActor in await session.run(screen: screen, rect: rect) }
+
+            try? await Task.sleep(nanoseconds: 1_800_000_000) // a few ticks
+            if let panel = session.previewPanelForTesting, let view = panel.contentView,
+               let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) {
+                view.cacheDisplay(in: view.bounds, to: rep)
+                if let data = rep.representation(using: .png, properties: [:]) {
+                    try? data.write(to: URL(fileURLWithPath: outDir + "/scroll-preview.png"))
+                    print("preview panel snapshot saved")
+                }
+            } else {
+                print("NO PREVIEW PANEL")
+            }
+            session.finishForTesting()
+        }
+    }
+
     /// Synthesises a real left-button drag (needs Accessibility permission).
     private static func dragMouse(from: CGPoint, to: CGPoint) {
         let src = CGEventSource(stateID: .hidSystemState)

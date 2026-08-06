@@ -18,6 +18,8 @@ final class ScrollingCapture {
     private var borderWindow: NSWindow?
     private var controlPanel: NSPanel?
     private var progressLabel: NSTextField?
+    var previewView: ScrollPreviewView?
+    private var previewSlices: [CGImage] = []
     private var escLocalMonitor: Any?
     private var escHotkeyRef: EventHotKeyRef?
 
@@ -40,7 +42,7 @@ final class ScrollingCapture {
         }
     }
 
-    private func run(screen: NSScreen, rect: CGRect) async {
+    func run(screen: NSScreen, rect: CGRect) async {
         showChrome(screen: screen, rect: rect)
         installStop()
         defer {
@@ -48,6 +50,10 @@ final class ScrollingCapture {
             hideChrome()
             ScrollingCapture.active = nil
         }
+
+        // our chrome windows just appeared — refresh the window list once so
+        // they are excluded from every captured frame, then reuse it all session
+        CaptureEngine.shared.invalidateContentCache()
 
         let scale = screen.backingScaleFactor
         let maxHeightPx = CGFloat(Settings.shared.scrollMaxHeight)
@@ -60,18 +66,20 @@ final class ScrollingCapture {
             if hash != lastHash {
                 lastHash = hash
                 if let s = stitcher {
-                    if s.append(frame.cgImage, direction: .down) {
-                        updateProgress("Đã ghép \(Int(CGFloat(s.totalHeight) / scale)) pt — cuộn tiếp, xong thì bấm ✓ hoặc Esc")
+                    if s.append(frame.cgImage, direction: .down) > 0 {
+                        appendPreview(s.lastSlice)
+                        updateProgress("Đã ghép \(Int(CGFloat(s.totalHeight) / scale)) pt — cuộn tiếp, xong bấm ✓ / Esc")
                     } else {
                         updateProgress("Chưa khớp được — cuộn chậm lại một chút")
                     }
                     if CGFloat(s.totalHeight) >= maxHeightPx { break }
                 } else {
                     stitcher = VerticalStitcher(first: frame.cgImage)
-                    updateProgress("Cuộn trang từ từ — Snippr tự ghép · bấm ✓ hoặc Esc khi xong")
+                    startPreview(with: frame.cgImage)
+                    updateProgress("Cuộn từ từ — ảnh ghép hiện bên cạnh · ✓ / Esc để xong")
                 }
             }
-            try? await Task.sleep(nanoseconds: 250_000_000)
+            try? await Task.sleep(nanoseconds: 180_000_000)
         }
 
         let result = stitcher?.compose().map { CapturedImage(cgImage: $0, scale: scale) }
@@ -79,8 +87,55 @@ final class ScrollingCapture {
     }
 
     private func captureArea(screen: NSScreen, rect: CGRect) async throws -> CapturedImage? {
-        let full = try await CaptureEngine.shared.captureDisplay(screen: screen, excludingOwnWindows: true)
+        // window list cached for the whole session (chrome doesn't change)
+        let full = try await CaptureEngine.shared.captureDisplay(
+            screen: screen, excludingOwnWindows: true, contentMaxAge: 300)
         return full.cropping(toViewRect: rect)
+    }
+
+    // MARK: live preview (the user watches the stitched page grow)
+
+    private let previewPixelWidth = 400
+
+    private func scaledForPreview(_ image: CGImage) -> CGImage? {
+        let scale = CGFloat(previewPixelWidth) / CGFloat(image.width)
+        let h = max(1, Int(CGFloat(image.height) * scale))
+        guard let ctx = CGContext(
+            data: nil, width: previewPixelWidth, height: h, bitsPerComponent: 8, bytesPerRow: 0,
+            space: CGColorSpace(name: CGColorSpace.sRGB)!,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else { return nil }
+        ctx.interpolationQuality = .medium
+        ctx.draw(image, in: CGRect(x: 0, y: 0, width: previewPixelWidth, height: h))
+        return ctx.makeImage()
+    }
+
+    private func startPreview(with frame: CGImage) {
+        previewSlices = scaledForPreview(frame).map { [$0] } ?? []
+        refreshPreview()
+    }
+
+    private func appendPreview(_ slice: CGImage?) {
+        guard let slice, let scaled = scaledForPreview(slice) else { return }
+        previewSlices.append(scaled)
+        refreshPreview()
+    }
+
+    private func refreshPreview() {
+        guard !previewSlices.isEmpty else { return }
+        let totalH = previewSlices.reduce(0) { $0 + $1.height }
+        guard let ctx = CGContext(
+            data: nil, width: previewPixelWidth, height: totalH, bitsPerComponent: 8, bytesPerRow: 0,
+            space: CGColorSpace(name: CGColorSpace.sRGB)!,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else { return }
+        var y = totalH
+        for slice in previewSlices {
+            y -= slice.height
+            ctx.draw(slice, in: CGRect(x: 0, y: y, width: previewPixelWidth, height: slice.height))
+        }
+        previewView?.image = ctx.makeImage()
+        previewView?.needsDisplay = true
     }
 
     static func quickHash(_ image: CGImage) -> Int {
@@ -129,6 +184,10 @@ final class ScrollingCapture {
         finished = true
     }
 
+    // test hooks
+    func finishForTesting() { finished = true }
+    var previewPanelForTesting: NSPanel? { controlPanel }
+
     // MARK: chrome (border + control bar — both excluded from capture)
 
     private func showChrome(screen: NSScreen, rect: CGRect) {
@@ -155,20 +214,27 @@ final class ScrollingCapture {
         border.orderFrontRegardless()
         borderWindow = border
 
-        // control bar sits above the area (below it when there's no room)
-        let barWidth: CGFloat = 480
-        let barHeight: CGFloat = 34
-        var barY = rect.maxY + screen.frame.minY + 10
-        if barY + barHeight > screen.visibleFrame.maxY {
-            barY = rect.minY + screen.frame.minY - barHeight - 10
-        }
-        let barX = min(
-            max(rect.midX + screen.frame.minX - barWidth / 2, screen.frame.minX + 8),
-            screen.frame.maxX - barWidth - 8
+        // live preview panel beside the area: header (status + ✓) on top,
+        // the growing stitched page below — "vừa chụp vừa xem"
+        let panelWidth: CGFloat = 220
+        let headerHeight: CGFloat = 64
+        let panelHeight: CGFloat = min(screen.visibleFrame.height * 0.72, 620)
+
+        let rectGlobal = CGRect(
+            x: rect.minX + screen.frame.minX, y: rect.minY + screen.frame.minY,
+            width: rect.width, height: rect.height
         )
+        var panelX = rectGlobal.maxX + 14
+        if panelX + panelWidth > screen.visibleFrame.maxX - 8 {
+            panelX = rectGlobal.minX - panelWidth - 14
+        }
+        panelX = max(panelX, screen.visibleFrame.minX + 8)
+        var panelY = rectGlobal.maxY - panelHeight
+        panelY = min(max(panelY, screen.visibleFrame.minY + 8),
+                     screen.visibleFrame.maxY - panelHeight - 8)
 
         let panel = NSPanel(
-            contentRect: CGRect(x: barX, y: barY, width: barWidth, height: barHeight),
+            contentRect: CGRect(x: panelX, y: panelY, width: panelWidth, height: panelHeight),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered, defer: false
         )
@@ -180,13 +246,12 @@ final class ScrollingCapture {
 
         let container = NSView()
         container.wantsLayer = true
-        container.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.82).cgColor
-        container.layer?.cornerRadius = 9
+        container.layer?.backgroundColor = NSColor(white: 0.09, alpha: 0.94).cgColor
+        container.layer?.cornerRadius = 12
 
-        let label = NSTextField(labelWithString: "Cuộn trang từ từ — Snippr tự ghép ảnh")
-        label.font = .systemFont(ofSize: 12, weight: .semibold)
+        let label = NSTextField(wrappingLabelWithString: "Cuộn trang từ từ — ảnh ghép hiện tại đây")
+        label.font = .systemFont(ofSize: 11.5, weight: .semibold)
         label.textColor = .white
-        label.lineBreakMode = .byTruncatingTail
         progressLabel = label
 
         let done = NSButton(title: "✓ Xong", target: self, action: #selector(finishTapped))
@@ -194,17 +259,29 @@ final class ScrollingCapture {
         done.controlSize = .small
         done.font = .systemFont(ofSize: 12, weight: .semibold)
 
-        let stack = NSStackView(views: [label, NSView(), done])
-        stack.orientation = .horizontal
-        stack.spacing = 8
-        stack.edgeInsets = NSEdgeInsets(top: 5, left: 12, bottom: 5, right: 8)
-        stack.translatesAutoresizingMaskIntoConstraints = false
-        container.addSubview(stack)
+        let header = NSStackView(views: [label, done])
+        header.orientation = .vertical
+        header.alignment = .leading
+        header.spacing = 6
+        header.edgeInsets = NSEdgeInsets(top: 10, left: 12, bottom: 4, right: 12)
+
+        let preview = ScrollPreviewView()
+        previewView = preview
+
+        let column = NSStackView(views: [header, preview])
+        column.orientation = .vertical
+        column.alignment = .leading
+        column.spacing = 4
+        column.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(column)
         NSLayoutConstraint.activate([
-            stack.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-            stack.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-            stack.topAnchor.constraint(equalTo: container.topAnchor),
-            stack.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+            column.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            column.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            column.topAnchor.constraint(equalTo: container.topAnchor),
+            column.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -10),
+            header.widthAnchor.constraint(equalTo: column.widthAnchor),
+            preview.widthAnchor.constraint(equalTo: column.widthAnchor),
+            header.heightAnchor.constraint(equalToConstant: headerHeight),
         ])
         panel.contentView = container
         panel.orderFrontRegardless()
@@ -220,6 +297,38 @@ final class ScrollingCapture {
         borderWindow = nil
         controlPanel?.orderOut(nil)
         controlPanel = nil
+    }
+}
+
+/// Shows the stitched page scaled to fit the panel width, pinned to the
+/// bottom so the newest content is always what the user sees.
+final class ScrollPreviewView: NSView {
+    var image: CGImage?
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard let ctx = NSGraphicsContext.current?.cgContext else { return }
+        let inset: CGFloat = 12
+        let area = bounds.insetBy(dx: inset, dy: 0)
+        guard let image else {
+            let attrs: [NSAttributedString.Key: Any] = [
+                .font: NSFont.systemFont(ofSize: 11),
+                .foregroundColor: NSColor.tertiaryLabelColor,
+            ]
+            ("Chờ khung hình đầu tiên…" as NSString).draw(
+                at: NSPoint(x: inset, y: bounds.midY), withAttributes: attrs)
+            return
+        }
+        let scale = area.width / CGFloat(image.width)
+        let drawH = CGFloat(image.height) * scale
+        ctx.saveGState()
+        ctx.clip(to: area)
+        // bottom-aligned: image bottom (= newest slice) sits at the view bottom
+        ctx.interpolationQuality = .medium
+        ctx.draw(image, in: CGRect(x: area.minX, y: area.minY, width: area.width, height: drawH))
+        ctx.restoreGState()
+        ctx.setStrokeColor(NSColor.white.withAlphaComponent(0.25).cgColor)
+        ctx.stroke(CGRect(x: area.minX, y: area.minY,
+                          width: area.width, height: min(drawH, area.height)), width: 1)
     }
 }
 
@@ -241,21 +350,26 @@ final class VerticalStitcher {
         totalHeight = first.height
     }
 
-    /// Append new content from `frame`. Returns false when the frame brought
-    /// nothing new or couldn't be matched (caller may ask the user to scroll slower).
-    func append(_ frame: CGImage, direction: ScrollingCapture.Direction) -> Bool {
-        guard frame.width == width else { return false }
+    /// The most recently appended slice — used for the live preview.
+    private(set) var lastSlice: CGImage?
+
+    /// Append new content from `frame`. Returns the number of new rows
+    /// (0 when nothing new or the frame couldn't be matched).
+    @discardableResult
+    func append(_ frame: CGImage, direction: ScrollingCapture.Direction) -> Int {
+        guard frame.width == width else { return 0 }
         guard let offset = Self.findOverlap(previous: lastFrame, next: frame), offset > 0 else {
-            return false
+            return 0
         }
         let rows = min(offset, frame.height)
         guard let slice = frame.cropping(to: CGRect(
             x: 0, y: frame.height - rows, width: width, height: rows
-        )) else { return false }
+        )) else { return 0 }
         slices.append(slice)
+        lastSlice = slice
         totalHeight += rows
         lastFrame = frame
-        return true
+        return rows
     }
 
     /// How many rows of new content `next` has relative to `previous`;
