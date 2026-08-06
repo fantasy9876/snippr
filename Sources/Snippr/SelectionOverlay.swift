@@ -26,7 +26,7 @@ final class SelectionOverlay {
     private var windows: [OverlayWindow] = []
     private let mode: OverlayMode
     private let completion: @MainActor (OverlayResult) -> Void
-    private var finished = false
+    fileprivate var finished = false
 
     init(mode: OverlayMode, completion: @escaping @MainActor (OverlayResult) -> Void) {
         self.mode = mode
@@ -44,54 +44,84 @@ final class SelectionOverlay {
 
     @MainActor
     private func start() async {
-        var frozenByScreen: [NSScreen: CapturedImage] = [:]
-        if mode == .area {
-            for screen in NSScreen.screens {
-                do {
-                    frozenByScreen[screen] = try await CaptureEngine.shared.captureDisplay(screen: screen)
-                } catch {
-                    finish(.cancelled)
-                    AppServices.handleCaptureError(error)
-                    return
-                }
-            }
-        }
-
+        let screens = NSScreen.screens
+        let cursorScreen = screens.first { $0.frame.contains(NSEvent.mouseLocation) }
+            ?? NSScreen.main ?? screens[0]
         let windowList = mode == .windowPick ? CaptureEngine.onScreenWindows() : []
 
-        for screen in NSScreen.screens {
-            let win = OverlayWindow(
-                contentRect: screen.frame,
-                styleMask: .borderless,
-                backing: .buffered,
-                defer: false
-            )
-            win.level = .screenSaver
-            win.isOpaque = mode == .area
-            win.backgroundColor = .clear
-            win.hasShadow = false
-            win.ignoresMouseEvents = false
-            win.acceptsMouseMovedEvents = true
-            win.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient]
-            let view = SelectionOverlayView(
-                mode: mode,
-                screen: screen,
-                frozen: frozenByScreen[screen],
-                windowList: windowList,
-                owner: self
-            )
-            win.contentView = view
-            win.makeFirstResponder(view)
-            windows.append(win)
-            win.makeKeyAndOrderFront(nil)
+        // The screen under the cursor goes up first so the overlay appears as
+        // soon as possible; the rest are frozen concurrently right after.
+        if mode == .area {
+            do {
+                let frozen = try await CaptureEngine.shared.captureDisplay(screen: cursorScreen)
+                guard !finished else { return }
+                addOverlay(for: cursorScreen, frozen: frozen, windowList: windowList, makeKey: true)
+            } catch {
+                finish(.cancelled)
+                AppServices.handleCaptureError(error)
+                return
+            }
+            NSApp.activate(ignoringOtherApps: true)
+            NSCursor.crosshair.set()
+
+            let others = screens.filter { $0 != cursorScreen }
+            guard !others.isEmpty else { return }
+            Task { @MainActor [weak self] in
+                await withTaskGroup(of: (NSScreen, CapturedImage?).self) { group in
+                    for screen in others {
+                        group.addTask { @MainActor in
+                            (screen, try? await CaptureEngine.shared.captureDisplay(screen: screen))
+                        }
+                    }
+                    for await (screen, frozen) in group {
+                        guard let self, !self.finished, let frozen else { continue }
+                        self.addOverlay(for: screen, frozen: frozen, windowList: windowList, makeKey: false)
+                    }
+                }
+            }
+            return
+        }
+
+        for screen in screens {
+            addOverlay(for: screen, frozen: nil, windowList: windowList, makeKey: screen == cursorScreen)
         }
         NSApp.activate(ignoringOtherApps: true)
-        // Key window should be the one under the mouse
-        if let screen = NSScreen.screens.first(where: { $0.frame.contains(NSEvent.mouseLocation) }),
-           let idx = NSScreen.screens.firstIndex(of: screen), idx < windows.count {
-            windows[idx].makeKeyAndOrderFront(nil)
-        }
         NSCursor.crosshair.set()
+    }
+
+    @MainActor
+    private func addOverlay(
+        for screen: NSScreen, frozen: CapturedImage?,
+        windowList: [WindowInfo], makeKey: Bool
+    ) {
+        let win = OverlayWindow(
+            contentRect: screen.frame,
+            styleMask: .borderless,
+            backing: .buffered,
+            defer: false
+        )
+        win.level = .screenSaver
+        win.isOpaque = mode == .area
+        win.backgroundColor = .clear
+        win.hasShadow = false
+        win.ignoresMouseEvents = false
+        win.acceptsMouseMovedEvents = true
+        win.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient]
+        let view = SelectionOverlayView(
+            mode: mode,
+            screen: screen,
+            frozen: frozen,
+            windowList: windowList,
+            owner: self
+        )
+        win.contentView = view
+        win.makeFirstResponder(view)
+        windows.append(win)
+        if makeKey {
+            win.makeKeyAndOrderFront(nil)
+        } else {
+            win.orderFront(nil)
+        }
     }
 
     func finish(_ result: OverlayResult) {

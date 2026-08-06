@@ -23,6 +23,16 @@ sealed class TrayContext : ApplicationContext
 
         ToastForm.Show($"Snippr is running — {HotkeyUtil.Display(AppSettings.Current.HotkeyArea)} to capture");
         UpdateChecker.Check(manual: false);
+
+        // warm the editor while the user is idle so the first capture opens fast
+        var warm = new System.Windows.Forms.Timer { Interval = 800 };
+        warm.Tick += (_, _) =>
+        {
+            warm.Stop();
+            warm.Dispose();
+            EditorForm.Prewarm();
+        };
+        warm.Start();
     }
 
     public void QuitApp() => Quit();

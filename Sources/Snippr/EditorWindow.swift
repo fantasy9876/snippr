@@ -12,6 +12,23 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
     private var toolButtons: [EditorTool: NSButton] = [:]
     private var scrollView: NSScrollView!
 
+    /// Builds (but never shows) an editor so AppKit, the scroll view and the
+    /// SF Symbol toolbar images are all warm before the first real capture.
+    static func prewarm() {
+        guard controllers.isEmpty else { return }
+        let tiny = CapturedImage(
+            cgImage: CGContext(
+                data: nil, width: 8, height: 8, bitsPerComponent: 8, bytesPerRow: 0,
+                space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+            )!.makeImage()!,
+            scale: 1
+        )
+        let wc = EditorWindowController(image: tiny)
+        wc.window?.layoutIfNeeded()
+        wc.window?.close()
+    }
+
     @discardableResult
     static func open(with image: CapturedImage) -> EditorWindowController {
         let wc = EditorWindowController(image: image)

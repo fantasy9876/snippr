@@ -38,6 +38,20 @@ sealed class EditorForm : Form
         f.Activate();
     }
 
+    /// Builds an editor (never shown) so WinForms, GDI+ and the toolbar are
+    /// warm before the first capture — the first open is otherwise noticeably
+    /// slower than the rest.
+    internal static void Prewarm()
+    {
+        try
+        {
+            var f = new EditorForm(new Bitmap(8, 8));
+            _ = f.Handle; // force handle + control creation
+            f.Dispose();
+        }
+        catch { /* warming is best-effort */ }
+    }
+
     EditorForm(Bitmap image)
     {
         _image = image;
@@ -65,7 +79,7 @@ sealed class EditorForm : Form
         _scroller.Resize += (_, _) => CenterCanvas();
 
         ApplyZoom(1f);
-        FormClosed += (_, _) => { _pixelated?.Dispose(); };
+        FormClosed += (_, _) => { _pixelated?.Dispose(); _scaledCache?.Dispose(); };
     }
 
     // ---------- toolbar ----------
@@ -328,6 +342,7 @@ sealed class EditorForm : Form
             _image = state.img;
             _pixelated?.Dispose();
             _pixelated = null;
+            InvalidateScaledCache();
         }
         _annotations.Clear();
         _annotations.AddRange(state.anns);
@@ -345,6 +360,44 @@ sealed class EditorForm : Form
     }
 
     Bitmap Pixelated => _pixelated ??= AnnotationRenderer.Pixelate(_image);
+
+    Bitmap? _scaledCache;
+    float _scaledCacheZoom = -1;
+
+    /// Pre-scaled copy of the shot for painting: rescaling a multi-megapixel
+    /// bitmap on every paint made scrolling and drawing feel sluggish, so it
+    /// is done once per zoom level and then blitted.
+    internal Bitmap ScaledImage
+    {
+        get
+        {
+            if (_scaledCache != null && Math.Abs(_scaledCacheZoom - _zoom) < 0.0005f)
+                return _scaledCache;
+
+            int w = Math.Max(1, (int)(_image.Width * _zoom));
+            int h = Math.Max(1, (int)(_image.Height * _zoom));
+            var scaled = new Bitmap(w, h, System.Drawing.Imaging.PixelFormat.Format32bppPArgb);
+            using (var g = Graphics.FromImage(scaled))
+            {
+                g.InterpolationMode = _zoom < 1
+                    ? InterpolationMode.HighQualityBicubic
+                    : InterpolationMode.NearestNeighbor;
+                g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                g.DrawImage(_image, new Rectangle(0, 0, w, h));
+            }
+            _scaledCache?.Dispose();
+            _scaledCache = scaled;
+            _scaledCacheZoom = _zoom;
+            return scaled;
+        }
+    }
+
+    void InvalidateScaledCache()
+    {
+        _scaledCache?.Dispose();
+        _scaledCache = null;
+        _scaledCacheZoom = -1;
+    }
 
     void CopyAndClose()
     {
@@ -557,6 +610,7 @@ sealed class EditorForm : Form
         _image = cropped;
         _pixelated?.Dispose();
         _pixelated = null;
+        InvalidateScaledCache();
         foreach (var a in _annotations) a.Move(-cropPx.X, -cropPx.Y);
         _selected = null;
         ApplyZoom(_zoom);
@@ -632,8 +686,7 @@ sealed class EditorForm : Form
         {
             var g = e.Graphics;
             var o = _owner;
-            g.InterpolationMode = o._zoom < 1 ? InterpolationMode.HighQualityBicubic : InterpolationMode.NearestNeighbor;
-            g.DrawImage(o._image, 0, 0, o._image.Width * o._zoom, o._image.Height * o._zoom);
+            g.DrawImageUnscaled(o.ScaledImage, 0, 0);
 
             g.SmoothingMode = SmoothingMode.AntiAlias;
             var state = g.Save();

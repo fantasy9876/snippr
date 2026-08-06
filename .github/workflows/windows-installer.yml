@@ -26,11 +26,15 @@ jobs:
           dotnet-version: "8.0.x"
 
       - name: Publish self-contained exe
+        # ReadyToRun precompiles IL to native code: the tray app and the
+        # editor open without paying JIT cost on first use.
         run: >
           dotnet publish windows/Snippr.Win.csproj -c Release -r win-x64
           --self-contained -p:PublishSingleFile=true
           -p:IncludeNativeLibrariesForSelfExtract=true
           -p:EnableCompressionInSingleFile=true
+          -p:PublishReadyToRun=true
+          -p:TieredPGO=true
 
       - name: Stage exe next to installer script
         shell: pwsh

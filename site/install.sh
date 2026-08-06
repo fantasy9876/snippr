@@ -6,9 +6,9 @@ set -e
 
 ARCH=$(uname -m)
 if [ "$ARCH" = "arm64" ]; then
-  DMG="Snippr-1.1.3.dmg"
+  DMG="Snippr-1.1.4.dmg"
 else
-  DMG="Snippr-1.1.3-intel.dmg"
+  DMG="Snippr-1.1.4-intel.dmg"
 fi
 
 echo "→ Tải $DMG ..."

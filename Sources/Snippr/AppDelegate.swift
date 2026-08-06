@@ -47,8 +47,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             ToastHUD.show("Snippr is running — ⇧⌘1 screen · ⇧⌘2 area", symbol: "camera.viewfinder", duration: 3)
         }
 
+        // warm the slow paths while the user is idle: display list (~30 ms)
+        // and the editor's AppKit machinery (~35 ms on first open)
+        CaptureEngine.shared.prewarm()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+            EditorWindowController.prewarm()
+        }
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification,
+            object: nil, queue: .main
+        ) { _ in
+            Task { @MainActor in
+                CaptureEngine.shared.invalidateContentCache()
+                CaptureEngine.shared.prewarm()
+            }
+        }
+
         UITest.runIfRequested()
-        if UITest.requestedOutputDir == nil {
+        if Benchmark.requested { Benchmark.run() }
+        if UITest.requestedOutputDir == nil && !Benchmark.requested {
             UpdateChecker.checkOnLaunch()
         }
     }
@@ -279,10 +296,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func captureFullscreen() {
         let screen = screenUnderMouse()
+        let t0 = Date()
         Task { @MainActor in
             do {
                 let shot = try await CaptureEngine.shared.captureDisplay(screen: screen)
+                Perf.log("capture total", since: t0)
+                let tEditor = Date()
                 handleResult(shot, source: .fullscreen)
+                Perf.log("handleResult→editor", since: tEditor)
+                Perf.log("END-TO-END", since: t0)
             } catch {
                 AppServices.handleCaptureError(error)
             }
@@ -405,5 +427,7 @@ extension AppDelegate: NSMenuDelegate {
         if let item = menu.items.first(where: { $0.title == "Launch at Startup" }) {
             item.state = LaunchAtLogin.isEnabled ? .on : .off
         }
+        // a capture is likely seconds away — make sure the pipeline is hot
+        CaptureEngine.shared.prewarm()
     }
 }

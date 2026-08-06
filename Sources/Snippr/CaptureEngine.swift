@@ -71,16 +71,54 @@ struct WindowInfo {
     }
 }
 
+@MainActor
 final class CaptureEngine {
     static let shared = CaptureEngine()
+
+    /// Enumerating shareable content costs ~30 ms, so the display list is
+    /// cached (displays rarely change) and refreshed on screen changes.
+    private var cachedContent: SCShareableContent?
+    private var cachedAt = Date.distantPast
 
     static func displayID(of screen: NSScreen) -> CGDirectDisplayID {
         (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value ?? 0
     }
 
-    func shareableContent() async throws -> SCShareableContent {
+    /// Warm the display list *and* the ScreenCaptureKit pipeline in the
+    /// background. Without this the first real capture pays ~75 ms of
+    /// one-time SCK setup on top of the shot itself.
+    func prewarm() {
+        Task { @MainActor in
+            guard let content = try? await shareableContent(maxAge: 0),
+                  let display = content.displays.first else { return }
+            let filter = SCContentFilter(display: display, excludingWindows: [])
+            let config = SCStreamConfiguration()
+            config.width = 32
+            config.height = 32
+            config.showsCursor = false
+            let t = Date()
+            _ = try? await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
+            Perf.log("prewarm capture", since: t)
+        }
+    }
+
+    func invalidateContentCache() {
+        cachedContent = nil
+    }
+
+    /// - Parameter maxAge: how stale a cached snapshot may be. Display capture
+    ///   tolerates a long age; window capture/picking always refreshes.
+    func shareableContent(maxAge: TimeInterval = 0) async throws -> SCShareableContent {
+        if maxAge > 0, let c = cachedContent, Date().timeIntervalSince(cachedAt) < maxAge {
+            return c
+        }
+        let t = Date()
         do {
-            return try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+            let c = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+            cachedContent = c
+            cachedAt = Date()
+            Perf.log("shareableContent", since: t)
+            return c
         } catch {
             throw CaptureError.permission
         }
@@ -90,7 +128,8 @@ final class CaptureEngine {
     /// `excludingOwnWindows` hides Snippr's overlays (scrolling border, HUDs)
     /// from the capture so they never leak into stitched output.
     func captureDisplay(screen: NSScreen, excludingOwnWindows: Bool = false) async throws -> CapturedImage {
-        let content = try await shareableContent()
+        // window list only matters when excluding our own windows
+        let content = try await shareableContent(maxAge: excludingOwnWindows ? 0.3 : 120)
         let id = Self.displayID(of: screen)
         guard let display = content.displays.first(where: { $0.displayID == id }) else {
             throw CaptureError.noDisplay
@@ -105,7 +144,9 @@ final class CaptureEngine {
         config.width = Int(screen.frame.width * scale)
         config.height = Int(screen.frame.height * scale)
         config.showsCursor = false
+        let t = Date()
         let img = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
+        Perf.log("captureImage", since: t)
         return CapturedImage(cgImage: img, scale: scale)
     }
 
@@ -181,7 +222,7 @@ final class CaptureEngine {
     // MARK: - Window shot composition (background styles)
 
     /// Compose a window capture with the user's chosen background, Shottr-style.
-    static func composeWindowShot(_ shot: CapturedImage, style: WindowBGStyle, screen: NSScreen?) -> CapturedImage {
+    nonisolated static func composeWindowShot(_ shot: CapturedImage, style: WindowBGStyle, screen: NSScreen?) -> CapturedImage {
         guard style != .trimShadow else { return shot }
 
         let scale = shot.scale
