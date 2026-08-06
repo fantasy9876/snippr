@@ -23,7 +23,8 @@ enum UITest {
         let small = CapturedImage(cgImage: SelfTest.makeTestImage(width: 600, height: 360), scale: 2)
         EditorWindowController.open(with: small).window?
             .setContentSize(NSSize(width: 820, height: 560))
-        PreferencesWindowController.show()
+        // opened the way the menu's "About Snippr" does — must land on About
+        PreferencesWindowController.show(tab: .about)
         ToastHUD.show("Snippr UI test — toast OK", symbol: "checkmark.seal.fill", duration: 6)
         TextResultWindow.show(text: "Snippr — chụp màn hình, nhận diện chữ (OCR), dịch đa ngôn ngữ.\nScreenshot → OCR → Translate, everything on your machine.")
         ThumbnailHUD.show(sample) { _ in }

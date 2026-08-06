@@ -56,8 +56,9 @@ final class TextResultWindow {
     static func show(text: String, autoTranslate: Bool = false) {
         let w = TextResultWindow(text: text)
         current = w
+        w.window.orderFrontRegardless()
         w.window.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
+        AppActivation.activateNow()
         if autoTranslate {
             w.translateTapped()
         }

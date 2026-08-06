@@ -12,29 +12,31 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
     private var toolButtons: [EditorTool: NSButton] = [:]
     private var scrollView: NSScrollView!
 
-    /// Builds (but never shows) an editor so AppKit, the scroll view and the
-    /// SF Symbol toolbar images are all warm before the first real capture.
+    /// Warms the toolbar's SF Symbols and the text/graphics stacks. Deliberately
+    /// does NOT build a window: a throwaway window left the first real editor
+    /// opening behind the frontmost app.
     static func prewarm() {
-        guard controllers.isEmpty else { return }
-        let tiny = CapturedImage(
-            cgImage: CGContext(
-                data: nil, width: 8, height: 8, bitsPerComponent: 8, bytesPerRow: 0,
-                space: CGColorSpace(name: CGColorSpace.sRGB)!,
-                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-            )!.makeImage()!,
-            scale: 1
-        )
-        let wc = EditorWindowController(image: tiny)
-        wc.window?.layoutIfNeeded()
-        wc.window?.close()
+        let symbols = ["doc.on.doc", "square.and.arrow.down", "pin", "text.viewfinder", "globe"]
+            + EditorTool.allCases.map(\.symbol)
+        for name in symbols {
+            _ = NSImage(systemSymbolName: name, accessibilityDescription: nil)
+        }
     }
 
     @discardableResult
     static func open(with image: CapturedImage) -> EditorWindowController {
         let wc = EditorWindowController(image: image)
         controllers.append(wc)
+        AppActivation.beginWindowSession()
+        // macOS 14+ can refuse activation for a menu-bar app, which used to
+        // leave the first capture's editor stranded behind the frontmost app.
+        // Open floating so it is always visible, then drop to a normal window
+        // as soon as it takes focus (see windowDidBecomeKey).
+        wc.window?.level = .floating
         wc.showWindow(nil)
-        NSApp.activate(ignoringOtherApps: true)
+        wc.window?.makeKeyAndOrderFront(nil)
+        wc.window?.orderFrontRegardless()
+        AppActivation.activateNow()
         return wc
     }
 
@@ -309,8 +311,17 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
         window?.close()
     }
 
+    /// Once the editor actually has focus it behaves like a normal window, so
+    /// switching apps puts it behind them as users expect.
+    func windowDidBecomeKey(_ notification: Notification) {
+        if !Settings.shared.alwaysOnTop, window?.level == .floating {
+            window?.level = .normal
+        }
+    }
+
     func windowWillClose(_ notification: Notification) {
         EditorWindowController.controllers.removeAll { $0 === self }
+        AppActivation.endWindowSession()
     }
 }
 
@@ -371,6 +382,9 @@ final class EditorCanvasView: NSView {
 
     override var acceptsFirstResponder: Bool { true }
     override var isFlipped: Bool { false }
+
+    /// Draw on the first click instead of spending it on focusing the window.
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
     private var pxScale: CGFloat { image.scale }
 

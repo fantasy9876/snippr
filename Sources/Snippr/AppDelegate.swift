@@ -65,6 +65,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         UITest.runIfRequested()
         if Benchmark.requested { Benchmark.run() }
+        if Benchmark.firstOpenTestRequested { Benchmark.runFirstOpenTest() }
         if UITest.requestedOutputDir == nil && !Benchmark.requested {
             UpdateChecker.checkOnLaunch()
         }
@@ -202,6 +203,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return menu
     }
 
+    /// Test hook: drives the exact same path a global hotkey does.
+    func runHotkeyForTesting(_ action: HotkeyAction) {
+        perform(hotkey: action)
+    }
+
     // MARK: hotkey routing
 
     private func perform(hotkey: HotkeyAction) {
@@ -263,7 +269,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         openInEditor(nsImage: img)
     }
 
-    @objc private func openAbout() { PreferencesWindowController.show() }
+    @objc private func openAbout() { PreferencesWindowController.show(tab: .about) }
 
     @objc private func checkUpdates() {
         Task { await UpdateChecker.check(manual: true) }

@@ -23,13 +23,29 @@ enum LaunchAtLogin {
 
 // MARK: - Window controller
 
-final class PreferencesWindowController {
-    private static var window: NSWindow?
+/// Which Preferences tab is showing — lets the menu open a specific one.
+@MainActor
+final class PreferencesSelection: ObservableObject {
+    static let shared = PreferencesSelection()
+    @Published var tab: PreferencesTab = .general
+}
 
-    static func show() {
+enum PreferencesTab: Hashable {
+    case general, hotkeys, uploading, advanced, about
+}
+
+final class PreferencesWindowController: NSObject, NSWindowDelegate {
+    private static var window: NSWindow?
+    private static var delegateHolder: PreferencesWindowController?
+
+    @MainActor
+    static func show(tab: PreferencesTab = .general) {
+        PreferencesSelection.shared.tab = tab
         if let window {
+            AppActivation.beginWindowSession()
+            window.orderFrontRegardless()
             window.makeKeyAndOrderFront(nil)
-            NSApp.activate(ignoringOtherApps: true)
+            AppActivation.activateNow()
             return
         }
         let hosting = NSHostingController(rootView: PreferencesRoot())
@@ -38,27 +54,43 @@ final class PreferencesWindowController {
         win.styleMask = [.titled, .closable, .miniaturizable]
         win.isReleasedWhenClosed = false
         win.center()
+        let holder = PreferencesWindowController()
+        win.delegate = holder
+        delegateHolder = holder
         window = win
+        AppActivation.beginWindowSession()
+        win.orderFrontRegardless()
         win.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
+        AppActivation.activateNow()
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        Task { @MainActor in AppActivation.endWindowSession() }
     }
 }
 
 // MARK: - Root
 
 struct PreferencesRoot: View {
+    @ObservedObject private var selection = PreferencesSelection.shared
+
     var body: some View {
-        TabView {
+        TabView(selection: $selection.tab) {
             GeneralTab()
                 .tabItem { Label("General", systemImage: "gearshape") }
+                .tag(PreferencesTab.general)
             HotkeysTab()
                 .tabItem { Label("Hotkeys", systemImage: "keyboard") }
+                .tag(PreferencesTab.hotkeys)
             UploadingTab()
                 .tabItem { Label("Uploading", systemImage: "icloud.and.arrow.up") }
+                .tag(PreferencesTab.uploading)
             AdvancedTab()
                 .tabItem { Label("Advanced", systemImage: "wand.and.stars") }
+                .tag(PreferencesTab.advanced)
             AboutTab()
                 .tabItem { Label("About", systemImage: "info.circle") }
+                .tag(PreferencesTab.about)
         }
         .frame(width: 600)
         .padding(.bottom, 8)
@@ -586,7 +618,7 @@ struct AboutTab: View {
                 .font(.system(size: 42, weight: .medium))
                 .foregroundStyle(.tint)
             Text("Snippr").font(.title).bold()
-            Text("Version 1.1.4 — native for Apple Silicon & Intel")
+            Text("Version 1.1.5 — native for Apple Silicon & Intel")
                 .foregroundStyle(.secondary)
             Divider().frame(width: 300)
             Text("Free for personal use. Screenshot, annotate, OCR,\nscrolling capture — everything stays on your Mac.")

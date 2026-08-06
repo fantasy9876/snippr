@@ -1,7 +1,7 @@
 {
-  "mac": "1.1.4",
-  "macUrlArm": "https://snippr.pages.dev/Snippr-1.1.4.dmg",
-  "macUrlIntel": "https://snippr.pages.dev/Snippr-1.1.4-intel.dmg",
+  "mac": "1.1.5",
+  "macUrlArm": "https://snippr.pages.dev/Snippr-1.1.5.dmg",
+  "macUrlIntel": "https://snippr.pages.dev/Snippr-1.1.5-intel.dmg",
   "win": "1.2.3",
   "winUrl": "https://github.com/fantasy9876/snippr/releases/download/v1.1.4/SnipprSetup-1.2.3-win-x64.exe"
 }

@@ -61,7 +61,7 @@ final class SelectionOverlay {
                 AppServices.handleCaptureError(error)
                 return
             }
-            NSApp.activate(ignoringOtherApps: true)
+            AppActivation.activateNow()
             NSCursor.crosshair.set()
 
             let others = screens.filter { $0 != cursorScreen }
@@ -85,7 +85,7 @@ final class SelectionOverlay {
         for screen in screens {
             addOverlay(for: screen, frozen: nil, windowList: windowList, makeKey: screen == cursorScreen)
         }
-        NSApp.activate(ignoringOtherApps: true)
+        AppActivation.activateNow()
         NSCursor.crosshair.set()
     }
 
@@ -117,10 +117,9 @@ final class SelectionOverlay {
         win.contentView = view
         win.makeFirstResponder(view)
         windows.append(win)
+        win.orderFrontRegardless() // reliable even when activation is denied
         if makeKey {
             win.makeKeyAndOrderFront(nil)
-        } else {
-            win.orderFront(nil)
         }
     }
 
@@ -162,6 +161,10 @@ final class SelectionOverlayView: NSView {
     required init?(coder: NSCoder) { fatalError() }
 
     override var acceptsFirstResponder: Bool { true }
+
+    /// Without this the very first drag after a capture is swallowed just to
+    /// activate Snippr, so the user has to select the area twice.
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
