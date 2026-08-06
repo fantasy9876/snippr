@@ -27,16 +27,15 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
     static func open(with image: CapturedImage) -> EditorWindowController {
         let wc = EditorWindowController(image: image)
         controllers.append(wc)
-        AppActivation.beginWindowSession()
         // macOS 14+ can refuse activation for a menu-bar app, which used to
         // leave the first capture's editor stranded behind the frontmost app.
         // Open floating so it is always visible, then drop to a normal window
-        // as soon as it takes focus (see windowDidBecomeKey).
+        // once the app truly holds focus (see windowDidBecomeKey).
         wc.window?.level = .floating
         wc.showWindow(nil)
-        wc.window?.makeKeyAndOrderFront(nil)
         wc.window?.orderFrontRegardless()
         AppActivation.activateNow()
+        wc.window?.makeKeyAndOrderFront(nil)
         return wc
     }
 
@@ -311,17 +310,18 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
         window?.close()
     }
 
-    /// Once the editor actually has focus it behaves like a normal window, so
-    /// switching apps puts it behind them as users expect.
+    /// Once the app truly holds focus the editor behaves like a normal
+    /// window, so switching apps layers it as users expect. The NSApp.isActive
+    /// check matters: dropping the level while another app still has focus
+    /// would sink the window behind it — the "jumping" bug.
     func windowDidBecomeKey(_ notification: Notification) {
-        if !Settings.shared.alwaysOnTop, window?.level == .floating {
+        if NSApp.isActive, !Settings.shared.alwaysOnTop, window?.level == .floating {
             window?.level = .normal
         }
     }
 
     func windowWillClose(_ notification: Notification) {
         EditorWindowController.controllers.removeAll { $0 === self }
-        AppActivation.endWindowSession()
     }
 }
 

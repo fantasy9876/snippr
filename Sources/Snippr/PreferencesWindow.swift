@@ -42,10 +42,9 @@ final class PreferencesWindowController: NSObject, NSWindowDelegate {
     static func show(tab: PreferencesTab = .general) {
         PreferencesSelection.shared.tab = tab
         if let window {
-            AppActivation.beginWindowSession()
             window.orderFrontRegardless()
-            window.makeKeyAndOrderFront(nil)
             AppActivation.activateNow()
+            window.makeKeyAndOrderFront(nil)
             return
         }
         let hosting = NSHostingController(rootView: PreferencesRoot())
@@ -58,14 +57,9 @@ final class PreferencesWindowController: NSObject, NSWindowDelegate {
         win.delegate = holder
         delegateHolder = holder
         window = win
-        AppActivation.beginWindowSession()
         win.orderFrontRegardless()
-        win.makeKeyAndOrderFront(nil)
         AppActivation.activateNow()
-    }
-
-    func windowWillClose(_ notification: Notification) {
-        Task { @MainActor in AppActivation.endWindowSession() }
+        win.makeKeyAndOrderFront(nil)
     }
 }
 
@@ -618,7 +612,7 @@ struct AboutTab: View {
                 .font(.system(size: 42, weight: .medium))
                 .foregroundStyle(.tint)
             Text("Snippr").font(.title).bold()
-            Text("Version 1.1.5 — native for Apple Silicon & Intel")
+            Text("Version 1.1.6 — native for Apple Silicon & Intel")
                 .foregroundStyle(.secondary)
             Divider().frame(width: 300)
             Text("Free for personal use. Screenshot, annotate, OCR,\nscrolling capture — everything stays on your Mac.")
