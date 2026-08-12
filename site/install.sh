@@ -4,11 +4,17 @@
 # "could not verify free of malware" dialog never appears.
 set -e
 
+# always install the latest published version (read from version.json,
+# fall back to a known-good release if the fetch fails)
+VER=$(curl -fsSL "https://snippr.pages.dev/version.json" 2>/dev/null \
+  | sed -n 's/.*"mac": *"\([0-9.]*\)".*/\1/p')
+[ -n "$VER" ] || VER="1.2.0"
+
 ARCH=$(uname -m)
 if [ "$ARCH" = "arm64" ]; then
-  DMG="Snippr-1.1.9.dmg"
+  DMG="Snippr-$VER.dmg"
 else
-  DMG="Snippr-1.1.9-intel.dmg"
+  DMG="Snippr-$VER-intel.dmg"
 fi
 
 echo "→ Tải $DMG ..."
