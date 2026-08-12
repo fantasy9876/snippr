@@ -201,7 +201,6 @@ final class Settings {
         static let saveFormat = "saveFormat"
         static let downscaleRetina = "downscaleRetina"
         static let scrollMaxHeight = "scrollMaxHeight"
-        static let scrollSpeed = "scrollSpeed"
         static let afterShow = "afterShow"
         static let afterCopy = "afterCopy"
         static let afterSave = "afterSave"
@@ -213,7 +212,6 @@ final class Settings {
         static let noSplash = "noSplash"
         static let alwaysOnTop = "alwaysOnTop"
         static let zoomReverseScroll = "zoomReverseScroll"
-        static let scrollingReverse = "scrollingReverse"
         static let preferZoom100 = "preferZoom100"
         static let escCopy = "escCopy"
         static let escSave = "escSave"
@@ -253,7 +251,6 @@ final class Settings {
             Keys.saveFormat: SaveFormat.auto.rawValue,
             Keys.downscaleRetina: false,
             Keys.scrollMaxHeight: 20_000,
-            Keys.scrollSpeed: 0.6,
             Keys.afterShow: true,
             Keys.afterCopy: false,
             Keys.afterSave: false,
@@ -265,7 +262,6 @@ final class Settings {
             Keys.noSplash: false,
             Keys.alwaysOnTop: false,
             Keys.zoomReverseScroll: false,
-            Keys.scrollingReverse: false,
             Keys.preferZoom100: true,
             Keys.escCopy: true,
             Keys.escSave: false,
@@ -307,15 +303,10 @@ final class Settings {
         set { d.set(newValue, forKey: Keys.downscaleRetina) }
     }
 
+    /// Page-length cap for scrolling capture, in points.
     var scrollMaxHeight: Int {
         get { max(1000, d.integer(forKey: Keys.scrollMaxHeight)) }
         set { d.set(newValue, forKey: Keys.scrollMaxHeight) }
-    }
-
-    /// 0...1, higher = faster (shorter delay between scroll steps)
-    var scrollSpeed: Double {
-        get { min(1, max(0, d.double(forKey: Keys.scrollSpeed))) }
-        set { d.set(newValue, forKey: Keys.scrollSpeed) }
     }
 
     var afterShow: Bool {
@@ -364,11 +355,6 @@ final class Settings {
     var zoomReverseScroll: Bool {
         get { d.bool(forKey: Keys.zoomReverseScroll) }
         set { d.set(newValue, forKey: Keys.zoomReverseScroll) }
-    }
-
-    var scrollingReverse: Bool {
-        get { d.bool(forKey: Keys.scrollingReverse) }
-        set { d.set(newValue, forKey: Keys.scrollingReverse) }
     }
 
     var preferZoom100: Bool {

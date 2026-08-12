@@ -79,7 +79,26 @@ sealed class EditorForm : Form
         _scroller.Resize += (_, _) => CenterCanvas();
 
         ApplyZoom(1f);
-        FormClosed += (_, _) => { _pixelated?.Dispose(); _scaledCache?.Dispose(); };
+        // Disposed (not FormClosed) so the prewarm instance — which is
+        // disposed without ever being shown — cleans up the same way.
+        Disposed += (_, _) => DisposeBitmaps();
+    }
+
+    /// The shot, the pixelate/scale caches, and every bitmap held by the
+    /// undo/redo stacks are unmanaged GDI+ memory; leaving them to finalizers
+    /// used to leak ~100 MB per editing session while the app idled in tray.
+    void DisposeBitmaps()
+    {
+        _previewTimer.Dispose();
+        _pixelated?.Dispose();
+        _pixelated = null;
+        InvalidateScaledCache();
+        var seen = new HashSet<Bitmap>(ReferenceEqualityComparer.Instance) { _image };
+        foreach (var (img, _) in _undo) seen.Add(img);
+        foreach (var (img, _) in _redo) seen.Add(img);
+        _undo.Clear();
+        _redo.Clear();
+        foreach (var bmp in seen) bmp.Dispose();
     }
 
     // ---------- toolbar ----------
@@ -318,7 +337,18 @@ sealed class EditorForm : Form
     void PushUndo()
     {
         _undo.Push((_image, _annotations.Select(a => a.Clone()).ToList()));
-        _redo.Clear();
+        // bitmaps dropped from the redo stack are unreachable from now on —
+        // dispose the ones not still referenced by the undo stack or the canvas
+        if (_redo.Count > 0)
+        {
+            var live = new HashSet<Bitmap>(ReferenceEqualityComparer.Instance) { _image };
+            foreach (var (img, _) in _undo) live.Add(img);
+            foreach (var (img, _) in _redo)
+            {
+                if (!live.Contains(img)) img.Dispose();
+            }
+            _redo.Clear();
+        }
     }
 
     void Undo()
@@ -402,7 +432,17 @@ sealed class EditorForm : Form
     void CopyAndClose()
     {
         using var flat = Flatten();
-        Clipboard.SetImage(flat);
+        // Clipboard.SetImage throws when another process holds the clipboard
+        // (clipboard managers, RDP) — don't lose the shot behind a crash dialog
+        try
+        {
+            Clipboard.SetImage(flat);
+        }
+        catch
+        {
+            ToastForm.Show("Clipboard đang bận — thử lại sau giây lát");
+            return; // keep the editor open so the shot isn't lost
+        }
         ToastForm.Show("Copied to clipboard");
         Close();
     }
@@ -451,7 +491,11 @@ sealed class EditorForm : Form
             case Keys.Control | Keys.D0: ApplyZoom(1f); return true;
             case Keys.Control | Keys.Oemplus: ZoomBy(1.25f); return true;
             case Keys.Control | Keys.OemMinus: ZoomBy(0.8f); return true;
-            case Keys.Escape: CopyAndClose(); return true;
+            case Keys.Escape:
+                // mirrors the macOS escCopy setting; turning it off makes Esc
+                // a plain discard that leaves the clipboard alone
+                if (AppSettings.Current.EscCopy) CopyAndClose(); else Close();
+                return true;
             case Keys.Delete:
             case Keys.Back:
                 if (_selected != null)
@@ -686,7 +730,16 @@ sealed class EditorForm : Form
         {
             var g = e.Graphics;
             var o = _owner;
-            g.DrawImageUnscaled(o.ScaledImage, 0, 0);
+            // at 100% (the default) blit the original directly — building the
+            // pre-scaled cache there just duplicated the shot's RAM for nothing.
+            // Explicit pixel rects avoid any DPI-based rescale ambiguity.
+            if (Math.Abs(o._zoom - 1f) < 0.0005f)
+                g.DrawImage(o._image, new Rectangle(0, 0, o._image.Width, o._image.Height));
+            else
+            {
+                var scaled = o.ScaledImage;
+                g.DrawImage(scaled, new Rectangle(0, 0, scaled.Width, scaled.Height));
+            }
 
             g.SmoothingMode = SmoothingMode.AntiAlias;
             var state = g.Save();

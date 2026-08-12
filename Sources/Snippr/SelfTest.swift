@@ -89,7 +89,7 @@ enum SelfTest {
                 check("stitch-crop", false); break
             }
             if let s = stitcher {
-                _ = s.append(frame, direction: .down)
+                _ = s.append(frame)
             } else {
                 stitcher = VerticalStitcher(first: frame)
             }
@@ -108,11 +108,122 @@ enum SelfTest {
         if let f0 = periodic.cropping(to: CGRect(x: 0, y: 0, width: 400, height: 500)),
            let f1 = periodic.cropping(to: CGRect(x: 0, y: 100, width: 400, height: 500)) {
             let s2 = VerticalStitcher(first: f0)
-            let appended = s2.append(f1, direction: .down)
+            let appended = s2.append(f1)
             check("stitch-ambiguous-rejected", appended == 0,
                   "appended \(appended) rows from ambiguous content")
         } else {
             check("stitch-ambiguous-crop", false)
+        }
+
+        // 2c. Sticky footer inside the viewport ------------------------------------
+        // A fixed bottom bar (chat input, cookie banner…) used to either stall
+        // matching entirely or get baked into every seam. The stitcher must
+        // keep matching AND move the footer to the very end of the page.
+        do {
+            let fW = 400, fViewport = 500, fFooterH = 60
+            let bodyH = fViewport - fFooterH
+            let content = makeStripePattern(width: fW, height: 2000, seed: 0xC0FFEE42)
+            let footerBand = makeStripePattern(width: fW, height: fFooterH, seed: 0x0DDBA11)
+
+            func footerFrame(offset: Int) -> CGImage? {
+                guard let body = content.cropping(to: CGRect(x: 0, y: offset, width: fW, height: bodyH))
+                else { return nil }
+                let c = ctx(fW, fViewport)
+                // CG drawing is bottom-left: footer at the bottom, body above
+                c.draw(footerBand, in: CGRect(x: 0, y: 0, width: fW, height: fFooterH))
+                c.draw(body, in: CGRect(x: 0, y: fFooterH, width: fW, height: bodyH))
+                return c.makeImage()
+            }
+
+            let offsets = [0, 320, 640, 900]
+            var s3: VerticalStitcher?
+            var appendsOK = true
+            for (i, off) in offsets.enumerated() {
+                guard let frame = footerFrame(offset: off) else { appendsOK = false; break }
+                if let s = s3 {
+                    let rows = s.append(frame)
+                    let want = off - offsets[i - 1]
+                    if rows != want {
+                        appendsOK = false
+                        print("  footer step +\(want) → got \(rows)")
+                    }
+                } else {
+                    s3 = VerticalStitcher(first: frame)
+                }
+            }
+            check("stitch-footer-appends", appendsOK)
+
+            if let composed3 = s3?.compose() {
+                // expected: body content [0, bodyH + 900) then the footer once
+                let totalBody = bodyH + 900
+                let expected = ctx(fW, totalBody + fFooterH)
+                if let allBody = content.cropping(to: CGRect(x: 0, y: 0, width: fW, height: totalBody)) {
+                    expected.draw(footerBand, in: CGRect(x: 0, y: 0, width: fW, height: fFooterH))
+                    expected.draw(allBody, in: CGRect(x: 0, y: fFooterH, width: fW, height: totalBody))
+                }
+                let expectedImg = expected.makeImage()!
+                check("stitch-footer-height", composed3.height == totalBody + fFooterH,
+                      "got \(composed3.height), want \(totalBody + fFooterH)")
+                check("stitch-footer-content", imagesRoughlyEqual(expectedImg, composed3),
+                      "footer relocated wrong")
+                writePNG(composed3, to: "\(outputDir)/stitched-footer.png")
+            } else {
+                check("stitch-footer-compose", false)
+            }
+        }
+
+        // 2d. Sticky footer with a BLINKING cursor row ------------------------------
+        // The bar's cursor toggles between frames; the footer estimate must be
+        // latched once for the session (a flapping per-pair estimate used to
+        // bake bar fragments into the page mid-seam) and detection must bridge
+        // the small dynamic band so the full bar height is latched up front.
+        do {
+            let fW = 400, fViewport = 500, fFooterH = 60, cursorH = 6, cursorFromBottom = 24
+            let bodyH = fViewport - fFooterH
+            let content = makeStripePattern(width: fW, height: 2000, seed: 0xB114_CAFE)
+            let barA = makeStripePattern(width: fW, height: fFooterH, seed: 0xFEE7)
+            // variant B: same bar, one bright "cursor" band toggled
+            let barB: CGImage = {
+                let c = ctx(fW, fFooterH)
+                c.draw(barA, in: CGRect(x: 0, y: 0, width: fW, height: fFooterH))
+                c.setFillColor(CGColor(srgbRed: 1, green: 1, blue: 1, alpha: 1))
+                c.fill(CGRect(x: 20, y: cursorFromBottom, width: 80, height: cursorH))
+                return c.makeImage()!
+            }()
+
+            func blinkFrame(offset: Int, phase: Int) -> CGImage? {
+                guard let body = content.cropping(to: CGRect(x: 0, y: offset, width: fW, height: bodyH))
+                else { return nil }
+                let c = ctx(fW, fViewport)
+                c.draw(phase % 2 == 0 ? barA : barB, in: CGRect(x: 0, y: 0, width: fW, height: fFooterH))
+                c.draw(body, in: CGRect(x: 0, y: fFooterH, width: fW, height: bodyH))
+                return c.makeImage()
+            }
+
+            let offsets = [0, 300, 620, 880]
+            var s4: VerticalStitcher?
+            var blinkOK = true
+            for (i, off) in offsets.enumerated() {
+                guard let frame = blinkFrame(offset: off, phase: i) else { blinkOK = false; break }
+                if let s = s4 {
+                    let rows = s.append(frame)
+                    let want = off - offsets[i - 1]
+                    if rows != want {
+                        blinkOK = false
+                        print("  blink step +\(want) → got \(rows)")
+                    }
+                } else {
+                    s4 = VerticalStitcher(first: frame)
+                }
+            }
+            check("stitch-footer-blink-appends", blinkOK)
+            if let s4, let composed4 = s4.compose() {
+                let totalBody = bodyH + 880
+                check("stitch-footer-blink-height", composed4.height == totalBody + fFooterH,
+                      "got \(composed4.height), want \(totalBody + fFooterH)")
+            } else {
+                check("stitch-footer-blink-compose", false)
+            }
         }
 
         // 3. Save format heuristic --------------------------------------------------
@@ -180,9 +291,9 @@ enum SelfTest {
         return c.makeImage()!
     }
 
-    private static func makeStripePattern(width: Int, height: Int) -> CGImage {
+    private static func makeStripePattern(width: Int, height: Int, seed: UInt64 = 0x5EED_1234) -> CGImage {
         let c = ctx(width, height)
-        var seed: UInt64 = 0x5EED_1234
+        var seed = seed
         for y in 0..<height {
             seed = seed &* 6364136223846793005 &+ 1442695040888963407
             let r = CGFloat((seed >> 33) & 0xFF) / 255

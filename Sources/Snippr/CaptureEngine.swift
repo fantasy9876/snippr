@@ -24,6 +24,11 @@ struct CapturedImage {
     }
 
     /// Crop using a rect in screen-local points with bottom-left origin (AppKit view coords).
+    ///
+    /// The crop is materialized into its own tightly-sized bitmap instead of
+    /// using `CGImage.cropping`, which shares (and therefore retains) the whole
+    /// parent buffer — a small area shot used to pin the entire frozen-display
+    /// bitmap (~24–57 MB) in memory for as long as the crop lived.
     func cropping(toViewRect rect: CGRect) -> CapturedImage? {
         let px = CGRect(
             x: rect.minX * scale,
@@ -31,8 +36,9 @@ struct CapturedImage {
             width: rect.width * scale,
             height: rect.height * scale
         ).integral
-        guard let cropped = cgImage.cropping(to: px) else { return nil }
-        return CapturedImage(cgImage: cropped, scale: scale)
+        guard let cropped = cgImage.cropping(to: px),
+              let owned = cropped.materialized() else { return nil }
+        return CapturedImage(cgImage: owned, scale: scale)
     }
 
     func downscaledTo1x() -> CapturedImage {
@@ -79,6 +85,7 @@ final class CaptureEngine {
     /// cached (displays rarely change) and refreshed on screen changes.
     private var cachedContent: SCShareableContent?
     private var cachedAt = Date.distantPast
+    private var lastPrewarm = Date.distantPast
 
     static func displayID(of screen: NSScreen) -> CGDirectDisplayID {
         (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value ?? 0
@@ -88,8 +95,13 @@ final class CaptureEngine {
     /// background. Without this the first real capture pays ~75 ms of
     /// one-time SCK setup on top of the shot itself.
     func prewarm() {
+        // menuWillOpen calls this on every status-menu open — a fresh SCK
+        // enumeration + screenshot each time is wasted daemon work when the
+        // pipeline was warmed seconds ago
+        guard Date().timeIntervalSince(lastPrewarm) > 60 else { return }
+        lastPrewarm = Date()
         Task { @MainActor in
-            guard let content = try? await shareableContent(maxAge: 0),
+            guard let content = try? await shareableContent(maxAge: 60),
                   let display = content.displays.first else { return }
             let filter = SCContentFilter(display: display, excludingWindows: [])
             let config = SCStreamConfiguration()
@@ -104,6 +116,7 @@ final class CaptureEngine {
 
     func invalidateContentCache() {
         cachedContent = nil
+        lastPrewarm = .distantPast // display changed — allow an immediate re-warm
     }
 
     /// - Parameter maxAge: how stale a cached snapshot may be. Display capture
@@ -152,6 +165,39 @@ final class CaptureEngine {
         let t = Date()
         let img = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
         Perf.log("captureImage", since: t)
+        return CapturedImage(cgImage: img, scale: scale)
+    }
+
+    /// Screenshot of a sub-rectangle of one display (rect in screen-local
+    /// points, bottom-left origin), at native pixel resolution. Capturing only
+    /// the region keeps scrolling-capture ticks proportional to the selection
+    /// instead of rendering the whole display and cropping it.
+    func captureRect(
+        screen: NSScreen, rect: CGRect,
+        excludingOwnWindows: Bool = false, contentMaxAge: TimeInterval? = nil
+    ) async throws -> CapturedImage {
+        let content = try await shareableContent(
+            maxAge: contentMaxAge ?? (excludingOwnWindows ? 0.3 : 120))
+        let id = Self.displayID(of: screen)
+        guard let display = content.displays.first(where: { $0.displayID == id }) else {
+            throw CaptureError.noDisplay
+        }
+        let scale = screen.backingScaleFactor
+        let myPID = NSRunningApplication.current.processIdentifier
+        let excluded = excludingOwnWindows
+            ? content.windows.filter { $0.owningApplication?.processID == myPID }
+            : []
+        let filter = SCContentFilter(display: display, excludingWindows: excluded)
+        let config = SCStreamConfiguration()
+        // sourceRect is in display-local points with a TOP-left origin
+        config.sourceRect = CGRect(
+            x: rect.minX, y: screen.frame.height - rect.maxY,
+            width: rect.width, height: rect.height
+        )
+        config.width = Int(rect.width * scale)
+        config.height = Int(rect.height * scale)
+        config.showsCursor = false
+        let img = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
         return CapturedImage(cgImage: img, scale: scale)
     }
 
@@ -288,6 +334,27 @@ final class CaptureEngine {
 
 extension CGRect {
     var area: CGFloat { isNull || isEmpty ? 0 : width * height }
+}
+
+extension CGImage {
+    /// Redraws this image into its own exactly-sized buffer. Crops made with
+    /// `CGImage.cropping(to:)` share the parent's backing store; copying breaks
+    /// that tie so the (potentially huge) parent can be released.
+    ///
+    /// The copy keeps the source's RGB color space — forcing sRGB here would
+    /// clamp Display P3 screenshots and visibly desaturate area shots.
+    func materialized() -> CGImage? {
+        let space = (colorSpace?.model == .rgb ? colorSpace : nil)
+            ?? CGColorSpace(name: CGColorSpace.sRGB)!
+        guard let ctx = CGContext(
+            data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
+            space: space,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else { return nil }
+        ctx.interpolationQuality = .none
+        ctx.draw(self, in: CGRect(x: 0, y: 0, width: width, height: height))
+        return ctx.makeImage()
+    }
 }
 
 /// Opens System Settings at the Screen Recording privacy pane.

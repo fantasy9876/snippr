@@ -63,48 +63,125 @@ final class SaveService {
         }
     }
 
-    /// Save to the configured screenshots folder. Returns the file URL.
-    @discardableResult
-    func save(_ image: CapturedImage) -> URL? {
-        var img = image
-        if Settings.shared.downscaleRetina {
-            img = img.downscaledTo1x()
-        }
-        let format = Self.decideFormat(for: img.cgImage)
-        guard let data = Self.data(for: img.cgImage, format: format) else { return nil }
-
-        let folder = Settings.shared.screenshotsFolder
-        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-
+    private static let fileNameFormatter: DateFormatter = {
         let df = DateFormatter()
         df.dateFormat = "yyyy-MM-dd 'at' HH.mm.ss"
-        let ext = format == .png ? "png" : "jpg"
-        var url = folder.appendingPathComponent("Snippr \(df.string(from: Date())).\(ext)")
-        var counter = 2
-        while FileManager.default.fileExists(atPath: url.path) {
-            url = folder.appendingPathComponent("Snippr \(df.string(from: Date())) (\(counter)).\(ext)")
-            counter += 1
+        return df
+    }()
+
+    static func suggestedFileName(ext: String) -> String {
+        "Snippr \(fileNameFormatter.string(from: Date())).\(ext)"
+    }
+
+    /// Saves still in flight — the app must not terminate under them, or the
+    /// user's screenshot silently vanishes (or lands truncated) mid-write.
+    @MainActor private(set) static var inFlightSaves = 0
+
+    /// For background writes that don't go through save() (the editor's
+    /// Save-As panel) so they too block termination until finished.
+    @MainActor static func beginBackgroundWrite() { inFlightSaves += 1 }
+    @MainActor static func endBackgroundWrite() {
+        inFlightSaves -= 1
+        if inFlightSaves == 0, let drained = onSavesDrained {
+            onSavesDrained = nil
+            drained()
         }
-        do {
-            try data.write(to: url)
-            return url
-        } catch {
-            NSLog("Snippr: save failed: \(error)")
-            return nil
+    }
+    /// One-shot hook fired when the last in-flight save lands; used by
+    /// applicationShouldTerminate to delay quitting until writes finish.
+    @MainActor static var onSavesDrained: (() -> Void)?
+
+    /// Name-pick + write are serialized so two saves in the same second can't
+    /// race the exists-check and overwrite each other's file.
+    private static let ioQueue = DispatchQueue(label: "com.manhhoang.snippr.save-io", qos: .userInitiated)
+
+    /// Save to the configured screenshots folder. Encoding + file I/O run off
+    /// the main thread (a 5K PNG encode is 1–2.5 s — it used to beachball the
+    /// UI on every save); `completion` is called on the main actor with the
+    /// file URL, or nil on failure.
+    @MainActor
+    func save(_ image: CapturedImage, completion: @escaping @MainActor (URL?) -> Void = { _ in }) {
+        let downscale = Settings.shared.downscaleRetina
+        let folder = Settings.shared.screenshotsFolder
+        Self.inFlightSaves += 1
+        Task.detached(priority: .userInitiated) {
+            var img = image
+            if downscale { img = img.downscaledTo1x() }
+            let format = Self.decideFormat(for: img.cgImage)
+            var url: URL?
+            if let data = Self.data(for: img.cgImage, format: format) {
+                Self.ioQueue.sync {
+                    try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+                    let ext = format == .png ? "png" : "jpg"
+                    let base = Self.suggestedFileName(ext: ext)
+                    var candidate = folder.appendingPathComponent(base)
+                    var counter = 2
+                    while FileManager.default.fileExists(atPath: candidate.path) {
+                        let stem = (base as NSString).deletingPathExtension
+                        candidate = folder.appendingPathComponent("\(stem) (\(counter)).\(ext)")
+                        counter += 1
+                    }
+                    do {
+                        try data.write(to: candidate)
+                        url = candidate
+                    } catch {
+                        NSLog("Snippr: save failed: \(error)")
+                    }
+                }
+            }
+            let saved = url
+            await MainActor.run {
+                Self.inFlightSaves -= 1
+                completion(saved)
+                if Self.inFlightSaves == 0, let drained = Self.onSavesDrained {
+                    Self.onSavesDrained = nil
+                    drained()
+                }
+            }
+        }
+    }
+
+    /// Provides PNG/TIFF lazily: the pasteboard is claimed instantly and the
+    /// expensive encode runs only when a paste actually requests the data.
+    /// ONE pasteboard item carries both representations — the old code wrote
+    /// two items (setData + writeObjects), which pasted the screenshot twice
+    /// in multi-item-aware apps like Notes.
+    private final class ImagePasteboardProvider: NSObject, NSPasteboardItemDataProvider {
+        private let image: CapturedImage
+        private let downscale: Bool
+
+        init(image: CapturedImage, downscale: Bool) {
+            self.image = image
+            self.downscale = downscale
+        }
+
+        func pasteboard(
+            _ pasteboard: NSPasteboard?, item: NSPasteboardItem,
+            provideDataForType type: NSPasteboard.PasteboardType
+        ) {
+            var img = image
+            if downscale { img = img.downscaledTo1x() }
+            let rep = NSBitmapImageRep(cgImage: img.cgImage)
+            let data: Data?
+            switch type {
+            case .png: data = rep.representation(using: .png, properties: [:])
+            case .tiff: data = rep.representation(using: .tiff, properties: [:])
+            default: data = nil
+            }
+            if let data {
+                item.setData(data, forType: type)
+            }
         }
     }
 
     func copyToClipboard(_ image: CapturedImage) {
-        var img = image
-        if Settings.shared.downscaleRetina {
-            img = img.downscaledTo1x()
-        }
         let pb = NSPasteboard.general
         pb.clearContents()
-        if let png = Self.data(for: img.cgImage, format: .png) {
-            pb.setData(png, forType: .png)
-        }
-        pb.writeObjects([img.nsImage])
+        let item = NSPasteboardItem()
+        let provider = ImagePasteboardProvider(
+            image: image, downscale: Settings.shared.downscaleRetina)
+        item.setDataProvider(provider, forTypes: [.png, .tiff])
+        pb.writeObjects([item])
     }
 
     static func copyText(_ text: String) {

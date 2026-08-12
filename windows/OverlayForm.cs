@@ -9,15 +9,28 @@ sealed class OverlayForm : Form
     Point _current;
     public Rectangle? SelectedVirtualRect { get; private set; }
 
+    /// True while the frozen-desktop picker is on screen — lets hotkey
+    /// handlers refuse re-entrant captures that would photograph the overlay.
+    public static bool IsActive { get; private set; }
+
     public static (Bitmap? shot, Rectangle virtualRect) SelectArea()
     {
         var frozen = CaptureUtil.VirtualScreen(out var bounds);
         using var overlay = new OverlayForm(frozen, bounds);
-        overlay.ShowDialog();
+        IsActive = true;
+        try
+        {
+            overlay.ShowDialog();
+        }
+        finally
+        {
+            IsActive = false;
+        }
         if (overlay.SelectedVirtualRect is Rectangle rect && rect.Width > 3 && rect.Height > 3)
         {
             var cropped = CaptureUtil.CropVirtual(frozen, bounds, rect);
             frozen.Dispose();
+            if (cropped == null) return (null, Rectangle.Empty);
             return (cropped, rect);
         }
         frozen.Dispose();
@@ -97,10 +110,33 @@ sealed class OverlayForm : Form
         else Close(); // right-click cancels
     }
 
+    /// Areas the marquee/crosshair touched on the previous frame — only these
+    /// (plus the new ones) are repainted, instead of the whole virtual screen
+    /// on every mouse move.
+    Rectangle[] _dirty = Array.Empty<Rectangle>();
+
+    Rectangle[] CurrentDirty()
+    {
+        if (SelectionLocal is Rectangle r)
+        {
+            // selection border + interior (dim area changes as it grows/shrinks)
+            // + room for the size bubble at bottom-right
+            return new[] { Rectangle.Inflate(r, 4, 4), new Rectangle(r.Right, r.Bottom, 200, 48) };
+        }
+        return new[]
+        {
+            new Rectangle(_current.X - 2, 0, 5, Height),
+            new Rectangle(0, _current.Y - 2, Width, 5),
+        };
+    }
+
     protected override void OnMouseMove(MouseEventArgs e)
     {
+        var prev = _dirty;
         _current = e.Location;
-        Invalidate();
+        _dirty = CurrentDirty();
+        foreach (var rect in prev) Invalidate(rect);
+        foreach (var rect in _dirty) Invalidate(rect);
     }
 
     protected override void OnMouseUp(MouseEventArgs e)

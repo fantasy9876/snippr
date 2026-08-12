@@ -252,10 +252,8 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
         if Settings.shared.downscaleRetina {
             flat = flat.downscaledTo1x()
         }
-        let df = DateFormatter()
-        df.dateFormat = "yyyy-MM-dd 'at' HH.mm.ss"
         let panel = NSSavePanel()
-        panel.nameFieldStringValue = "Snippr \(df.string(from: Date())).png"
+        panel.nameFieldStringValue = SaveService.suggestedFileName(ext: "png")
         panel.directoryURL = Settings.shared.screenshotsFolder
         panel.allowedContentTypes = [.png, .jpeg]
         panel.canCreateDirectories = true
@@ -264,12 +262,24 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
             guard response == .OK, let url = panel.url else { return }
             let ext = url.pathExtension.lowercased()
             let format: ImageFileFormat = (ext == "jpg" || ext == "jpeg") ? .jpeg : .png
-            if let data = SaveService.data(for: image.cgImage, format: format) {
-                do {
-                    try data.write(to: url)
-                    ToastHUD.show("Saved \(url.lastPathComponent)", symbol: "square.and.arrow.down.fill")
-                } catch {
-                    ToastHUD.show("Save failed", symbol: "exclamationmark.triangle.fill")
+            // encode + write off the main thread — a 5K PNG encode is seconds.
+            // Tracked so quitting mid-write can't truncate the file.
+            SaveService.beginBackgroundWrite()
+            Task.detached(priority: .userInitiated) {
+                let data = SaveService.data(for: image.cgImage, format: format)
+                var ok = false
+                if let data {
+                    do {
+                        try data.write(to: url)
+                        ok = true
+                    } catch {}
+                }
+                let succeeded = ok
+                await MainActor.run {
+                    ToastHUD.show(
+                        succeeded ? "Saved \(url.lastPathComponent)" : "Save failed",
+                        symbol: succeeded ? "square.and.arrow.down.fill" : "exclamationmark.triangle.fill")
+                    SaveService.endBackgroundWrite()
                 }
             }
         }
@@ -302,10 +312,26 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
     }
 
     func escPressed() {
-        if Settings.shared.escCopy { SaveService.shared.copyToClipboard(canvas.flattened()) }
-        if Settings.shared.escSave { _ = SaveService.shared.save(canvas.flattened()) }
-        if Settings.shared.escCopy || Settings.shared.escSave {
-            ToastHUD.show(Settings.shared.escCopy ? "Copied to clipboard" : "Saved")
+        let s = Settings.shared
+        if s.escCopy || s.escSave {
+            // flatten ONCE and share it — escCopy+escSave used to render the
+            // whole image twice back to back
+            let flat = canvas.flattened()
+            if s.escCopy {
+                SaveService.shared.copyToClipboard(flat)
+                ToastHUD.show("Copied to clipboard")
+            }
+            if s.escSave {
+                let announce = !s.escCopy
+                SaveService.shared.save(flat) { url in
+                    // toast only when the save actually landed (or failed)
+                    if let url {
+                        if announce { ToastHUD.show("Saved \(url.lastPathComponent)") }
+                    } else {
+                        ToastHUD.show("Save failed", symbol: "exclamationmark.triangle.fill")
+                    }
+                }
+            }
         }
         window?.close()
     }
@@ -423,6 +449,9 @@ final class EditorCanvasView: NSView {
         ctx.scaleBy(x: 1 / pxScale, y: 1 / pxScale)
         let needsPixellated = annotations.contains(where: { $0 is BlurAnnotation })
             || drafting is BlurAnnotation
+        if !needsPixellated && pixellatedCache != nil {
+            pixellatedCache = nil // last blur removed — free the full-size copy
+        }
         let pix = needsPixellated ? pixellated : nil
         for a in annotations { a.draw(in: ctx, pixellated: pix) }
         drafting?.draw(in: ctx, pixellated: pix)
@@ -470,10 +499,11 @@ final class EditorCanvasView: NSView {
     func registerUndoSnapshot() {
         let snap = snapshot()
         undoManager?.registerUndo(withTarget: self) { canvas in
-            let redoSnap = canvas.snapshot()
-            canvas.undoManager?.registerUndo(withTarget: canvas) { c2 in
-                c2.restore(redoSnap)
-            }
+            // Symmetric: registrations made during undo land on the redo stack
+            // and vice versa, so an edit stays undoable after redo. (The old
+            // one-shot redo closure registered no inverse — redoing an edit
+            // made it permanently un-undoable.)
+            canvas.registerUndoSnapshot()
             canvas.restore(snap)
         }
     }
@@ -550,6 +580,19 @@ final class EditorCanvasView: NSView {
         }
     }
 
+    /// Repaint only the region an interactive change touched. Invalidating the
+    /// whole view per mouse event forced a full multi-megapixel redraw and
+    /// dropped pen/shape dragging to ~25-40 fps on retina fullscreen shots.
+    /// Padding covers stroke width, selection handles and arrowheads.
+    private func invalidate(pixelRect: CGRect) {
+        let pad: CGFloat = 60
+        let view = CGRect(
+            x: pixelRect.minX / pxScale, y: pixelRect.minY / pxScale,
+            width: pixelRect.width / pxScale, height: pixelRect.height / pxScale
+        ).insetBy(dx: -pad, dy: -pad)
+        setNeedsDisplay(view)
+    }
+
     override func mouseDragged(with event: NSEvent) {
         let vp = convert(event.locationInWindow, from: nil)
         let pp = toPixel(vp)
@@ -557,31 +600,50 @@ final class EditorCanvasView: NSView {
         switch currentTool {
         case .select:
             if isMovingSelection, let sel = selected {
+                let before = sel.bounds
                 sel.move(by: CGPoint(x: pp.x - dragStartPoint.x, y: pp.y - dragStartPoint.y))
                 dragStartPoint = pp
-                needsDisplay = true
+                invalidate(pixelRect: before.union(sel.bounds))
             }
         case .arrow, .line, .rect, .oval, .highlight:
-            (drafting as? ShapeAnnotation)?.end = pp
-            needsDisplay = true
+            if let shape = drafting as? ShapeAnnotation {
+                let before = shape.bounds
+                shape.end = pp
+                invalidate(pixelRect: before.union(shape.bounds))
+            }
         case .pen:
-            (drafting as? PenAnnotation)?.points.append(pp)
-            needsDisplay = true
+            if let pen = drafting as? PenAnnotation {
+                pen.points.append(pp)
+                // the quad-curve smoothing reshapes the PREVIOUS segment when a
+                // point lands, so the dirty area must span the last few points
+                var rect = CGRect(origin: pp, size: .zero)
+                for p in pen.points.suffix(4) {
+                    rect = rect.union(CGRect(origin: p, size: .zero))
+                }
+                invalidate(pixelRect: rect)
+            }
         case .blur:
             if let blur = drafting as? BlurAnnotation {
+                let before = blur.rect
                 blur.rect = CGRect(
                     x: min(dragStartPoint.x, pp.x), y: min(dragStartPoint.y, pp.y),
                     width: abs(pp.x - dragStartPoint.x), height: abs(pp.y - dragStartPoint.y)
                 )
-                needsDisplay = true
+                invalidate(pixelRect: before.union(blur.rect))
             }
         case .crop:
             let startVp = CGPoint(x: dragStartPoint.x / pxScale, y: dragStartPoint.y / pxScale)
+            let old = cropRect
             cropRect = CGRect(
                 x: min(startVp.x, vp.x), y: min(startVp.y, vp.y),
                 width: abs(vp.x - startVp.x), height: abs(vp.y - startVp.y)
             )
-            needsDisplay = true
+            if let old, let new = cropRect, old.width > 1 || old.height > 1 {
+                // the dim region only changes between the old and new rects
+                setNeedsDisplay(old.union(new).insetBy(dx: -4, dy: -4))
+            } else {
+                needsDisplay = true // first frame dims the whole canvas
+            }
         default:
             break
         }
@@ -656,7 +718,10 @@ final class EditorCanvasView: NSView {
         if !text.isEmpty {
             registerUndoSnapshot()
             ann.text = text
-            // origin currently marks click point; align so text draws above-right of it
+            // Align the committed annotation with the text the user just saw
+            // in the field (bezel + inset offsets) — using the raw click point
+            // made the text visibly jump ~10 pt up-left on every commit.
+            ann.origin = toPixel(CGPoint(x: field.frame.minX + 2, y: field.frame.minY + 4))
             annotations.append(ann)
         }
         needsDisplay = true
@@ -668,7 +733,18 @@ final class EditorCanvasView: NSView {
 
     // MARK: keyboard & zoom
 
+    /// True while the text-annotation field owns the keyboard — editing
+    /// keystrokes (⌘C to copy typed text, ⌘Z to undo typing, tool letters)
+    /// must stay in the field instead of triggering canvas shortcuts.
+    private var isEditingText: Bool {
+        textField != nil && window?.firstResponder is NSTextView
+    }
+
     override func keyDown(with event: NSEvent) {
+        if isEditingText {
+            super.keyDown(with: event)
+            return
+        }
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
         let chars = event.charactersIgnoringModifiers?.lowercased() ?? ""
 
@@ -699,6 +775,11 @@ final class EditorCanvasView: NSView {
     }
 
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        // typing in the text-annotation field: ⌘C/⌘Z/etc. belong to the field
+        // editor — hijacking them here used to close the editor mid-typing
+        if isEditingText {
+            return super.performKeyEquivalent(with: event)
+        }
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
         let chars = event.charactersIgnoringModifiers?.lowercased() ?? ""
         guard let wc = window?.windowController as? EditorWindowController else {
@@ -818,7 +899,11 @@ final class EditorCanvasView: NSView {
             color = currentColor
         }
         showStrokeHUD(width: width, color: color)
-        needsDisplay = true
+        // only a selected annotation changes on screen; a bare tool-width
+        // tweak needs no canvas repaint at all
+        if let sel = selected {
+            invalidate(pixelRect: sel.bounds)
+        }
     }
 
     private var strokeHUD: StrokePreviewView?

@@ -43,9 +43,17 @@ static class TranslateService
 
     public static async Task<string> TranslateAsync(string text, string lang)
     {
+        // POST with the text in the body: a GET URL breaks past ~8 KB, which is
+        // exactly the dense/scroll captures where translation matters most
         var url = "https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl="
-            + Uri.EscapeDataString(lang) + "&dt=t&q=" + Uri.EscapeDataString(text);
-        var json = await Http.GetStringAsync(url);
+            + Uri.EscapeDataString(lang) + "&dt=t";
+        using var body = new FormUrlEncodedContent(new[]
+        {
+            new KeyValuePair<string, string>("q", text),
+        });
+        using var resp = await Http.PostAsync(url, body);
+        resp.EnsureSuccessStatusCode();
+        var json = await resp.Content.ReadAsStringAsync();
         using var doc = JsonDocument.Parse(json);
         var sb = new StringBuilder();
         foreach (var seg in doc.RootElement[0].EnumerateArray())

@@ -89,6 +89,7 @@ static class Native2
 sealed class PinForm : Form
 {
     readonly Bitmap _image;
+    Bitmap? _scaledCache; // rebuilt once per size change; paints are cheap blits
     float _scale = 1f;
 
     public PinForm(Bitmap image)
@@ -105,15 +106,30 @@ sealed class PinForm : Form
         Location = new Point(wa.Left + (wa.Width - size.Width) / 2, wa.Top + (wa.Height - size.Height) / 2);
         ClientSize = size;
         KeyPreview = true;
-        FormClosed += (_, _) => _image.Dispose();
+        FormClosed += (_, _) => { _image.Dispose(); _scaledCache?.Dispose(); };
     }
 
     Size FitSize() => new((int)(_image.Width * _scale), (int)(_image.Height * _scale));
 
     protected override void OnPaint(PaintEventArgs e)
     {
-        e.Graphics.InterpolationMode = InterpolationMode.HighQualityBicubic;
-        e.Graphics.DrawImage(_image, ClientRectangle);
+        // the old path re-ran a full-resolution bicubic rescale on EVERY paint
+        // (each wheel notch, each expose) — cache the scaled copy instead
+        if (_scaledCache == null || _scaledCache.Size != ClientSize)
+        {
+            _scaledCache?.Dispose();
+            var scaled = new Bitmap(Math.Max(1, ClientSize.Width), Math.Max(1, ClientSize.Height),
+                System.Drawing.Imaging.PixelFormat.Format32bppPArgb);
+            using (var g = Graphics.FromImage(scaled))
+            {
+                g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                g.DrawImage(_image, new Rectangle(Point.Empty, scaled.Size));
+            }
+            _scaledCache = scaled;
+        }
+        // explicit destination rect: cache size == ClientSize so this is a 1:1
+        // blit with no DPI-dependent rescale ambiguity on mixed-DPI monitors
+        e.Graphics.DrawImage(_scaledCache, ClientRectangle);
         e.Graphics.DrawRectangle(Pens.DimGray,
             new Rectangle(0, 0, ClientSize.Width - 1, ClientSize.Height - 1));
     }
@@ -142,8 +158,15 @@ sealed class PinForm : Form
         if (e.KeyCode == Keys.Escape) Close();
         else if (e.Control && e.KeyCode == Keys.C)
         {
-            Clipboard.SetImage(_image);
-            ToastForm.Show("Copied to clipboard");
+            try
+            {
+                Clipboard.SetImage(_image);
+                ToastForm.Show("Copied to clipboard");
+            }
+            catch
+            {
+                ToastForm.Show("Clipboard đang bận — thử lại sau giây lát");
+            }
         }
     }
 }
@@ -207,6 +230,7 @@ sealed class SettingsForm : Form
     readonly CheckBox _copy = new() { Text = "Copy to clipboard" };
     readonly CheckBox _save = new() { Text = "Save to folder" };
     readonly CheckBox _startup = new() { Text = "Launch Snippr at startup" };
+    readonly CheckBox _escCopy = new() { Text = "Esc in editor copies image, then closes" };
     readonly HotkeyBox _hkFullscreen = new();
     readonly HotkeyBox _hkArea = new();
     readonly HotkeyBox _hkWindow = new();
@@ -265,7 +289,12 @@ sealed class SettingsForm : Form
         _startup.Checked = s.LaunchAtStartup;
         _startup.SetBounds(160, y, 280, 24);
         Controls.Add(_startup);
-        y += 36;
+        y += 30;
+
+        _escCopy.Checked = s.EscCopy;
+        _escCopy.SetBounds(160, y, 290, 24);
+        Controls.Add(_escCopy);
+        y += 32;
 
         y += 8;
         var hotkeyHeader = new Label
@@ -314,6 +343,7 @@ sealed class SettingsForm : Form
         s.AfterCopy = _copy.Checked;
         s.AfterSave = _save.Checked;
         s.LaunchAtStartup = _startup.Checked;
+        s.EscCopy = _escCopy.Checked;
         s.HotkeyFullscreen = _hkFullscreen.Combo;
         s.HotkeyArea = _hkArea.Combo;
         s.HotkeyWindow = _hkWindow.Combo;

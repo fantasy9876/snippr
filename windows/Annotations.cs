@@ -170,13 +170,20 @@ sealed class TextAnnotation : Annotation
 
     Font MakeFont() => new("Segoe UI", FontSize, FontStyle.Bold, GraphicsUnit.Pixel);
 
+    // Measure with the SAME engine that draws (GDI+ DrawString). The old
+    // TextRenderer.MeasureText is GDI, whose metrics drift from DrawString's
+    // by several px on long strings — selection marquee and hit-testing then
+    // miss the visible glyphs.
+    static readonly Bitmap MeasureBitmap = new(1, 1);
+    static readonly Graphics MeasureGraphics = Graphics.FromImage(MeasureBitmap);
+
     public override Rectangle Bounds
     {
         get
         {
             using var f = MakeFont();
-            var size = TextRenderer.MeasureText(Text.Length == 0 ? " " : Text, f);
-            return new Rectangle(Origin, size);
+            var size = MeasureGraphics.MeasureString(Text.Length == 0 ? " " : Text, f);
+            return new Rectangle(Origin, Size.Ceiling(size));
         }
     }
 

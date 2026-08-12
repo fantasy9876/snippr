@@ -102,8 +102,14 @@ sealed class TrayContext : ApplicationContext
         return menu;
     }
 
+    /// True while the selection overlay or a scroll session owns the screen.
+    /// The modal overlay still pumps WM_HOTKEY, so without this guard a second
+    /// hotkey press captured the dimmed overlay (or the scroll chrome) itself.
+    static bool CaptureBusy => OverlayForm.IsActive || ScrollShotSession.IsActive;
+
     void OnHotkey(int id)
     {
+        if (CaptureBusy) return;
         switch (id)
         {
             case HkFullscreen: CaptureFullscreen(); break;
@@ -114,10 +120,15 @@ sealed class TrayContext : ApplicationContext
 
     // ---------- flows ----------
 
-    void CaptureFullscreen() => HandleResult(CaptureUtil.ScreenUnderCursor());
+    void CaptureFullscreen()
+    {
+        if (CaptureBusy) return;
+        HandleResult(CaptureUtil.ScreenUnderCursor());
+    }
 
     void CaptureArea()
     {
+        if (CaptureBusy) return;
         var (shot, rect) = OverlayForm.SelectArea();
         if (shot == null) return;
         AppSettings.Current.LastArea = rect;
@@ -127,6 +138,7 @@ sealed class TrayContext : ApplicationContext
 
     void CaptureWindow()
     {
+        if (CaptureBusy) return;
         var shot = CaptureUtil.ActiveWindow();
         if (shot == null) { ToastForm.Show("No window found"); return; }
         HandleResult(shot);
@@ -134,6 +146,7 @@ sealed class TrayContext : ApplicationContext
 
     void StartScrollShot()
     {
+        if (CaptureBusy) return;
         ScrollShotSession.Begin(bmp =>
         {
             if (bmp != null) HandleResult(bmp);
@@ -142,6 +155,7 @@ sealed class TrayContext : ApplicationContext
 
     void RecognizeTextArea()
     {
+        if (CaptureBusy) return;
         var (shot, _) = OverlayForm.SelectArea();
         if (shot != null) TextResultForm.RunOcrFlow(shot);
     }
@@ -149,20 +163,38 @@ sealed class TrayContext : ApplicationContext
     void CaptureDelayed()
     {
         var timer = new System.Windows.Forms.Timer { Interval = 3000 };
-        timer.Tick += (_, _) => { timer.Dispose(); CaptureFullscreen(); };
+        timer.Tick += (_, _) =>
+        {
+            // an overlay/scroll session may be up when the timer fires — retry
+            // shortly instead of silently dropping the delayed shot
+            if (CaptureBusy)
+            {
+                timer.Interval = 1000;
+                return;
+            }
+            timer.Dispose();
+            CaptureFullscreen();
+        };
         timer.Start();
     }
 
     void RepeatArea()
     {
+        if (CaptureBusy) return;
         if (AppSettings.Current.LastArea is not Rectangle rect)
         {
             CaptureArea();
             return;
         }
-        var full = CaptureUtil.VirtualScreen(out var bounds);
-        var shot = CaptureUtil.CropVirtual(full, bounds, rect);
-        full.Dispose();
+        // capture just the remembered rect (the old path grabbed the whole
+        // virtual desktop to crop a fraction of it); null = the saved area is
+        // no longer on any monitor — used to crash inside Bitmap.Clone
+        if (CaptureUtil.Rect(rect) is not Bitmap shot)
+        {
+            ToastForm.Show("Vùng đã lưu không còn trên màn hình — chọn lại nhé");
+            CaptureArea();
+            return;
+        }
         HandleResult(shot);
     }
 
@@ -195,36 +227,77 @@ sealed class TrayContext : ApplicationContext
         }
     }
 
+    /// Clipboard.SetImage throws when another process holds the clipboard
+    /// (clipboard managers, Office, RDP) — a routine condition that must not
+    /// crash the app or lose the capture.
+    static bool TryCopyImage(Bitmap bmp)
+    {
+        try
+        {
+            Clipboard.SetImage(bmp);
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
     void HandleResult(Bitmap shot)
     {
         var s = AppSettings.Current;
         var actions = new List<string>();
+        bool preserved = false; // the shot reached the clipboard, a file, or the editor
 
         if (s.AfterCopy)
         {
-            Clipboard.SetImage(shot);
-            actions.Add("copied");
+            if (TryCopyImage(shot)) { actions.Add("copied"); preserved = true; }
+            else actions.Add("clipboard busy");
         }
-        if (s.AfterSave && CaptureUtil.SaveToFolder(shot) is string path)
+        if (s.AfterSave)
         {
-            actions.Add($"saved {Path.GetFileName(path)}");
+            if (CaptureUtil.SaveToFolder(shot) is string path)
+            {
+                actions.Add($"saved {Path.GetFileName(path)}");
+                preserved = true;
+            }
+            else
+            {
+                actions.Add("save failed"); // don't hide a partial failure
+            }
         }
 
         if (s.AfterShow)
         {
             EditorForm.OpenWith(shot);
+            return;
         }
-        else if (actions.Count > 0)
+
+        if (!preserved)
         {
-            ToastForm.Show("Screenshot " + string.Join(" · ", actions));
-            shot.Dispose();
+            // every configured action failed (or none configured) — rescue the
+            // shot instead of disposing it behind a toast
+            if (actions.Count == 0 && TryCopyImage(shot))
+            {
+                ToastForm.Show("Screenshot copied to clipboard");
+                shot.Dispose();
+                return;
+            }
+            if (CaptureUtil.SaveToFolder(shot) is string saved)
+            {
+                ToastForm.Show($"Clipboard bận — đã lưu {Path.GetFileName(saved)}");
+                shot.Dispose();
+                return;
+            }
+            // absolute last resort: clipboard AND disk failed — open the
+            // editor so the capture is never destroyed with no artifact
+            ToastForm.Show("Không copy/lưu được — mở editor");
+            EditorForm.OpenWith(shot);
+            return;
         }
-        else
-        {
-            Clipboard.SetImage(shot);
-            ToastForm.Show("Screenshot copied to clipboard");
-            shot.Dispose();
-        }
+
+        ToastForm.Show("Screenshot " + string.Join(" · ", actions));
+        shot.Dispose();
     }
 
     void Quit()

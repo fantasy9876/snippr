@@ -23,15 +23,24 @@ enum TranslateService {
     ]
 
     static func translate(_ text: String, to lang: String) async throws -> String {
+        // POST with the text in the body: a GET URL breaks past ~8 KB, which
+        // is exactly the dense OCR/scroll captures where translation matters
         var comps = URLComponents(string: "https://translate.googleapis.com/translate_a/single")!
         comps.queryItems = [
             URLQueryItem(name: "client", value: "gtx"),
             URLQueryItem(name: "sl", value: "auto"),
             URLQueryItem(name: "tl", value: lang),
             URLQueryItem(name: "dt", value: "t"),
-            URLQueryItem(name: "q", value: text),
         ]
-        let (data, _) = try await URLSession.shared.data(from: comps.url!)
+        var req = URLRequest(url: comps.url!)
+        req.httpMethod = "POST"
+        req.setValue("application/x-www-form-urlencoded; charset=utf-8",
+                     forHTTPHeaderField: "Content-Type")
+        var allowed = CharacterSet.urlQueryAllowed
+        allowed.remove(charactersIn: "+&=?")
+        let encoded = text.addingPercentEncoding(withAllowedCharacters: allowed) ?? ""
+        req.httpBody = "q=\(encoded)".data(using: .utf8)
+        let (data, _) = try await URLSession.shared.data(for: req)
         guard let json = try JSONSerialization.jsonObject(with: data) as? [Any],
               let sentences = json.first as? [Any] else {
             throw URLError(.cannotParseResponse)
@@ -45,8 +54,11 @@ enum TranslateService {
 // MARK: - OCR result window (text + translate, Lark-style)
 
 @MainActor
-final class TextResultWindow {
-    private static var current: TextResultWindow?
+final class TextResultWindow: NSObject, NSWindowDelegate {
+    /// Every open result window keeps its controller alive here. A single
+    /// static slot deallocated the previous controller when a second OCR ran,
+    /// leaving its window on screen with dead (weak-target) buttons.
+    private static var open: [TextResultWindow] = []
 
     private let window: NSWindow
     private let textView = NSTextView()
@@ -55,13 +67,17 @@ final class TextResultWindow {
 
     static func show(text: String, autoTranslate: Bool = false) {
         let w = TextResultWindow(text: text)
-        current = w
+        open.append(w)
         w.window.orderFrontRegardless()
         w.window.makeKeyAndOrderFront(nil)
         AppActivation.activateNow()
         if autoTranslate {
             w.translateTapped()
         }
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        TextResultWindow.open.removeAll { $0 === self }
     }
 
     private init(text: String) {
@@ -73,6 +89,8 @@ final class TextResultWindow {
         window.title = "Recognized Text"
         window.isReleasedWhenClosed = false
         window.center()
+        super.init()
+        window.delegate = self
 
         let content = NSView()
 

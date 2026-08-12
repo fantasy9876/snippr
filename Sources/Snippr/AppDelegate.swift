@@ -73,6 +73,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// A quit (user, or the updater's terminate-and-relaunch) must not drop an
+    /// in-flight background save — the screenshot would vanish or land as a
+    /// truncated file. Waits for pending writes, with a 10 s failsafe.
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard SaveService.inFlightSaves > 0 else { return .terminateNow }
+        SaveService.onSavesDrained = {
+            NSApp.reply(toApplicationShouldTerminate: true)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 10) {
+            if SaveService.onSavesDrained != nil {
+                SaveService.onSavesDrained = nil
+                NSApp.reply(toApplicationShouldTerminate: true)
+            }
+        }
+        return .terminateLater
+    }
+
     /// Debug breadcrumb: lets tooling confirm the app booted and see its TCC state.
     private func writeLaunchStatus() {
         let status = """
@@ -100,7 +117,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 switch type {
                 case "fullscreen": captureFullscreen()
                 case "window": captureActiveWindow()
-                case "scrolling": startScrolling(direction: .down)
+                case "scrolling": startScrolling()
                 default: captureArea()
                 }
             case "ocr":
@@ -115,17 +132,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func logEvent(_ line: String) {
-        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("Snippr")
-        let url = dir.appendingPathComponent("events.log")
-        let entry = "\(Date()) \(line)\n"
-        if let handle = try? FileHandle(forWritingTo: url) {
-            handle.seekToEndOfFile()
-            handle.write(entry.data(using: .utf8)!)
-            try? handle.close()
-        } else {
-            try? entry.write(to: url, atomically: true, encoding: .utf8)
-        }
+        EventLog.append(line)
     }
 
     @objc private func defaultsChanged() {
@@ -219,7 +226,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case .repeatArea: repeatAreaCapture()
         case .anyWindow: captureAnyWindow()
         case .activeWindow: captureActiveWindow()
-        case .scrolling: startScrolling(direction: .down)
+        case .scrolling: startScrolling()
         case .showApp: reopen()
         case .ocr: OCRService.shared.instantOCRFlow()
         }
@@ -237,8 +244,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func menuCaptureScreen() { captureFullscreen() }
     @objc private func menuCaptureArea() { captureArea() }
-    @objc private func menuScrolling() { startScrolling(direction: .down) }
-    @objc private func menuScrollingUp() { startScrolling(direction: .up) }
+    @objc private func menuScrolling() { startScrolling() }
     @objc private func menuOCR() { OCRService.shared.instantOCRFlow() }
     @objc private func menuRepeatArea() { repeatAreaCapture() }
     @objc private func menuActiveWindow() { captureActiveWindow() }
@@ -339,17 +345,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             captureArea()
             return
         }
-        guard let screen = NSScreen.screens.first(where: { $0.frame.intersects(global) }) else { return }
+        // pick the screen holding MOST of the saved rect (first-intersect chose
+        // primary-first and silently cropped the wrong region), and fall back
+        // loudly when the display layout changed and the rect is gone
+        let screen = NSScreen.screens.max(by: {
+            $0.frame.intersection(global).area < $1.frame.intersection(global).area
+        })
+        let visible = screen.map { $0.frame.intersection(global) } ?? .null
+        guard let screen, visible.width >= 4, visible.height >= 4 else {
+            ToastHUD.show("Vùng đã lưu không còn trên màn hình — chọn lại nhé", symbol: "rectangle.dashed")
+            captureArea()
+            return
+        }
         let local = CGRect(
-            x: global.minX - screen.frame.minX, y: global.minY - screen.frame.minY,
-            width: global.width, height: global.height
+            x: visible.minX - screen.frame.minX, y: visible.minY - screen.frame.minY,
+            width: visible.width, height: visible.height
         )
         Task { @MainActor in
             do {
-                let full = try await CaptureEngine.shared.captureDisplay(screen: screen)
-                if let cropped = full.cropping(toViewRect: local) {
-                    handleResult(cropped, source: .area)
-                }
+                let shot = try await CaptureEngine.shared.captureRect(screen: screen, rect: local)
+                handleResult(shot, source: .area)
             } catch {
                 AppServices.handleCaptureError(error)
             }
@@ -386,8 +401,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func startScrolling(direction: ScrollingCapture.Direction) {
-        ScrollingCapture.begin(direction: direction) { [weak self] image in
+    private func startScrolling() {
+        ScrollingCapture.begin { [weak self] image in
             guard let image else { return }
             self?.handleResult(image, source: .scrolling)
         }
@@ -399,15 +414,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         lastCapture = image
         logEvent("capture source=\(source) px=\(image.cgImage.width)x\(image.cgImage.height)")
         let s = Settings.shared
-        var toasts: [String] = []
+        let copied = s.afterCopy
 
-        if s.afterCopy {
+        if copied {
             SaveService.shared.copyToClipboard(image)
-            toasts.append("copied")
         }
         if s.afterSave {
-            if let url = SaveService.shared.save(image) {
-                toasts.append("saved \(url.lastPathComponent)")
+            // encoding runs in the background; announce when it lands (only
+            // when no editor opens — same visibility rule as before)
+            let announce = !s.afterShow
+            SaveService.shared.save(image) { url in
+                guard announce else { return }
+                var toasts: [String] = copied ? ["copied"] : []
+                if let url {
+                    toasts.append("saved \(url.lastPathComponent)")
+                } else {
+                    // the only configured action failed — rescue the shot
+                    if !copied { SaveService.shared.copyToClipboard(image) }
+                    toasts.append(copied ? "save failed" : "save failed — copied instead")
+                }
+                ToastHUD.show("Screenshot \(toasts.joined(separator: " · "))")
             }
         }
 
@@ -419,8 +445,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             } else {
                 EditorWindowController.open(with: image)
             }
-        } else if !toasts.isEmpty {
-            ToastHUD.show("Screenshot \(toasts.joined(separator: " · "))")
+        } else if s.afterSave {
+            // toast arrives from the save completion above
+        } else if copied {
+            ToastHUD.show("Screenshot copied")
         } else {
             // nothing configured — at least copy so the shot isn't lost
             SaveService.shared.copyToClipboard(image)

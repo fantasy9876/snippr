@@ -223,7 +223,6 @@ struct GeneralTab: View {
     @AppStorage(Settings.Keys.saveFormat) private var saveFormat = SaveFormat.auto.rawValue
     @AppStorage(Settings.Keys.downscaleRetina) private var downscale = false
     @AppStorage(Settings.Keys.scrollMaxHeight) private var scrollMax = 20_000
-    @AppStorage(Settings.Keys.scrollSpeed) private var scrollSpeed = 0.6
     @AppStorage(Settings.Keys.afterShow) private var afterShow = true
     @AppStorage(Settings.Keys.afterCopy) private var afterCopy = false
     @AppStorage(Settings.Keys.afterSave) private var afterSave = false
@@ -294,11 +293,7 @@ struct GeneralTab: View {
             Row(label: "Scrolling screenshot max height") {
                 TextField("", value: $scrollMax, format: .number)
                     .frame(width: 90)
-                Text("px").foregroundStyle(.secondary)
-            }
-            Row(label: "Scrolling screenshot speed") {
-                Slider(value: $scrollSpeed, in: 0...1)
-                    .frame(width: 240)
+                Text("pt").foregroundStyle(.secondary)
             }
 
             Divider()
@@ -532,7 +527,6 @@ struct AdvancedTab: View {
     @AppStorage(Settings.Keys.noSplash) private var noSplash = false
     @AppStorage(Settings.Keys.alwaysOnTop) private var alwaysOnTop = false
     @AppStorage(Settings.Keys.zoomReverseScroll) private var zoomReverse = false
-    @AppStorage(Settings.Keys.scrollingReverse) private var scrollReverse = false
     @AppStorage(Settings.Keys.preferZoom100) private var prefer100 = true
     @AppStorage(Settings.Keys.escCopy) private var escCopy = true
     @AppStorage(Settings.Keys.escSave) private var escSave = false
@@ -566,9 +560,6 @@ struct AdvancedTab: View {
             }
             Row(label: "Zoom with mouse wheel") {
                 Toggle("Reverse scroll direction", isOn: $zoomReverse)
-            }
-            Row(label: "Scrolling capture") {
-                Toggle("Reverse scroll direction", isOn: $scrollReverse)
             }
             Row(label: "Default zoom level") {
                 Toggle("Prefer 100%", isOn: $prefer100)
@@ -612,7 +603,7 @@ struct AboutTab: View {
                 .font(.system(size: 42, weight: .medium))
                 .foregroundStyle(.tint)
             Text("Snippr").font(.title).bold()
-            Text("Version 1.1.9 — native for Apple Silicon & Intel")
+            Text("Version 1.2.0 — native for Apple Silicon & Intel")
                 .foregroundStyle(.secondary)
             Divider().frame(width: 300)
             Text("Free for personal use. Screenshot, annotate, OCR,\nscrolling capture — everything stays on your Mac.")

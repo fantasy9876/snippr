@@ -155,7 +155,7 @@ enum Benchmark {
                     print("crop fail"); exit(1)
                 }
                 if let s = stitcher {
-                    let rows = s.append(frame, direction: .down)
+                    let rows = s.append(frame)
                     let delta = off - steps[i - 1]
                     if rows == delta {
                         accepted += 1

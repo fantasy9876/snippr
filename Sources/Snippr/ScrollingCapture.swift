@@ -9,8 +9,6 @@ import Carbon.HIToolbox
 final class ScrollingCapture {
     static var active: ScrollingCapture?
 
-    enum Direction { case down, up } // legacy menu compatibility; stitching is top-to-bottom
-
     static let escHotkeyID: UInt32 = 999
 
     private let onFinish: @MainActor (CapturedImage?) -> Void
@@ -19,18 +17,29 @@ final class ScrollingCapture {
     private var controlPanel: NSPanel?
     private var progressLabel: NSTextField?
     var previewView: ScrollPreviewView?
-    private var previewSlices: [CGImage] = []
     private var escLocalMonitor: Any?
     private var escHotkeyRef: EventHotKeyRef?
+    private var escRegistered = false
+
+    /// "✓ / Esc để xong" khi Esc đăng ký được, nếu không thì chỉ còn nút ✓.
+    private var stopHint: String { escRegistered ? "✓ / Esc để xong" : "bấm ✓ để xong" }
 
     init(onFinish: @escaping @MainActor (CapturedImage?) -> Void) {
         self.onFinish = onFinish
     }
 
-    static func begin(direction: Direction, onFinish: @escaping @MainActor (CapturedImage?) -> Void) {
+    static func begin(onFinish: @escaping @MainActor (CapturedImage?) -> Void) {
         guard active == nil else { return }
         SelectionOverlay.begin(mode: .area) { result in
             guard case let .area(screen, _, rect) = result else {
+                onFinish(nil)
+                return
+            }
+            // Too-short selections can never stitch (the matcher needs enough
+            // rows for a template) — refuse up front, mirroring Windows.
+            guard rect.width >= 40, rect.height >= 60 else {
+                ToastHUD.show("Vùng quá nhỏ cho chụp cuộn — chọn vùng cao hơn 60 pt",
+                              symbol: "rectangle.dashed")
                 onFinish(nil)
                 return
             }
@@ -56,7 +65,9 @@ final class ScrollingCapture {
         CaptureEngine.shared.invalidateContentCache()
 
         let scale = screen.backingScaleFactor
-        let maxHeightPx = CGFloat(Settings.shared.scrollMaxHeight)
+        // The setting is a page-length cap in points, so both platforms cap the
+        // same logical page length regardless of pixel density.
+        let maxHeightPx = CGFloat(Settings.shared.scrollMaxHeight) * scale
         var stitcher: VerticalStitcher?
         var lastHash = 0
 
@@ -66,17 +77,17 @@ final class ScrollingCapture {
             if hash != lastHash {
                 lastHash = hash
                 if let s = stitcher {
-                    if s.append(frame.cgImage, direction: .down) > 0 {
+                    if s.append(frame.cgImage) > 0 {
                         appendPreview(s.lastSlice)
-                        updateProgress("Đã ghép \(Int(CGFloat(s.totalHeight) / scale)) pt — cuộn tiếp, xong bấm ✓ / Esc")
+                        updateProgress("Đã ghép \(Int(CGFloat(s.totalHeight) / scale)) pt — cuộn tiếp, xong \(stopHint)")
                     } else {
                         updateProgress("Chưa khớp được — cuộn chậm lại một chút")
                     }
                     if CGFloat(s.totalHeight) >= maxHeightPx { break }
                 } else {
-                    stitcher = VerticalStitcher(first: frame.cgImage)
+                    stitcher = VerticalStitcher(first: frame.cgImage, scale: scale)
                     startPreview(with: frame.cgImage)
-                    updateProgress("Cuộn từ từ — ảnh ghép hiện bên cạnh · ✓ / Esc để xong")
+                    updateProgress("Cuộn từ từ — ảnh ghép hiện bên cạnh · \(stopHint)")
                 }
             }
             try? await Task.sleep(nanoseconds: 180_000_000)
@@ -86,16 +97,22 @@ final class ScrollingCapture {
         onFinish(result)
     }
 
+    /// Captures ONLY the selected rect (SCStreamConfiguration.sourceRect), so a
+    /// tick costs the rect's pixels instead of the whole display's. The window
+    /// list is cached for the whole session (our chrome doesn't change).
     private func captureArea(screen: NSScreen, rect: CGRect) async throws -> CapturedImage? {
-        // window list cached for the whole session (chrome doesn't change)
-        let full = try await CaptureEngine.shared.captureDisplay(
-            screen: screen, excludingOwnWindows: true, contentMaxAge: 300)
-        return full.cropping(toViewRect: rect)
+        try await CaptureEngine.shared.captureRect(
+            screen: screen, rect: rect, excludingOwnWindows: true, contentMaxAge: 300)
     }
 
     // MARK: live preview (the user watches the stitched page grow)
 
     private let previewPixelWidth = 400
+    /// Rolling window: only the most recent content is kept, matching what the
+    /// bottom-aligned panel can actually show. Keeps per-tick preview work O(1)
+    /// instead of recompositing the whole page every frame.
+    private let previewMaxHeight = 1400
+    private var previewImage: CGImage?
 
     private func scaledForPreview(_ image: CGImage) -> CGImage? {
         let scale = CGFloat(previewPixelWidth) / CGFloat(image.width)
@@ -111,42 +128,51 @@ final class ScrollingCapture {
     }
 
     private func startPreview(with frame: CGImage) {
-        previewSlices = scaledForPreview(frame).map { [$0] } ?? []
-        refreshPreview()
+        previewImage = scaledForPreview(frame)
+        pushPreview()
     }
 
     private func appendPreview(_ slice: CGImage?) {
         guard let slice, let scaled = scaledForPreview(slice) else { return }
-        previewSlices.append(scaled)
-        refreshPreview()
-    }
-
-    private func refreshPreview() {
-        guard !previewSlices.isEmpty else { return }
-        let totalH = previewSlices.reduce(0) { $0 + $1.height }
+        let prevH = previewImage?.height ?? 0
+        let newH = min(previewMaxHeight, prevH + scaled.height)
         guard let ctx = CGContext(
-            data: nil, width: previewPixelWidth, height: totalH, bitsPerComponent: 8, bytesPerRow: 0,
+            data: nil, width: previewPixelWidth, height: newH, bitsPerComponent: 8, bytesPerRow: 0,
             space: CGColorSpace(name: CGColorSpace.sRGB)!,
             bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
         ) else { return }
-        var y = totalH
-        for slice in previewSlices {
-            y -= slice.height
-            ctx.draw(slice, in: CGRect(x: 0, y: y, width: previewPixelWidth, height: slice.height))
+        // newest slice at the bottom; older content above, clipped at the top
+        ctx.draw(scaled, in: CGRect(x: 0, y: 0, width: previewPixelWidth, height: scaled.height))
+        if let prev = previewImage {
+            ctx.draw(prev, in: CGRect(
+                x: 0, y: CGFloat(scaled.height),
+                width: CGFloat(previewPixelWidth), height: CGFloat(prev.height)
+            ))
         }
-        previewView?.image = ctx.makeImage()
+        previewImage = ctx.makeImage()
+        pushPreview()
+    }
+
+    private func pushPreview() {
+        previewView?.image = previewImage
         previewView?.needsDisplay = true
     }
 
+    /// Cheap change detector: downsample the frame to a fixed tiny buffer and
+    /// hash those bytes. Unlike hashing `dataProvider.data`, this never
+    /// materializes (or strides over) the full-size frame buffer.
     static func quickHash(_ image: CGImage) -> Int {
-        guard let data = image.dataProvider?.data as Data? else { return 0 }
+        let w = 64, h = 64
+        var buf = [UInt8](repeating: 0, count: w * h * 4)
+        guard let ctx = CGContext(
+            data: &buf, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+            space: CGColorSpace(name: CGColorSpace.sRGB)!,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else { return 0 }
+        ctx.interpolationQuality = .low
+        ctx.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
         var hasher = Hasher()
-        let stride = max(1, data.count / 4096)
-        var i = 0
-        while i < data.count {
-            hasher.combine(data[i])
-            i += stride
-        }
+        buf.withUnsafeBytes { hasher.combine(bytes: $0) }
         return hasher.finalize()
     }
 
@@ -154,7 +180,12 @@ final class ScrollingCapture {
 
     private func installStop() {
         var hotKeyID = EventHotKeyID(signature: OSType(0x534E4553) /* 'SNES' */, id: Self.escHotkeyID)
-        RegisterEventHotKey(UInt32(kVK_Escape), 0, hotKeyID, GetApplicationEventTarget(), 0, &escHotkeyRef)
+        let status = RegisterEventHotKey(
+            UInt32(kVK_Escape), 0, hotKeyID, GetApplicationEventTarget(), 0, &escHotkeyRef)
+        escRegistered = status == noErr && escHotkeyRef != nil
+        if !escRegistered {
+            NSLog("Snippr: could not register global Esc for scrolling capture (status \(status))")
+        }
         _ = hotKeyID
         HotkeyManager.shared.auxHandler = { [weak self] id in
             if id == Self.escHotkeyID { self?.finished = true }
@@ -173,6 +204,7 @@ final class ScrollingCapture {
             UnregisterEventHotKey(ref)
             escHotkeyRef = nil
         }
+        escRegistered = false
         HotkeyManager.shared.auxHandler = nil
         if let m = escLocalMonitor {
             NSEvent.removeMonitor(m)
@@ -339,17 +371,46 @@ final class ScrollPreviewView: NSView {
 /// Stitches equal-width frames vertically by locating the previous frame's
 /// bottom strip inside each new frame. Frames that can't be matched reliably
 /// are skipped instead of guessed, so output never contains corrupt seams.
+///
+/// Memory: every stored slice is materialized into its own tightly-sized
+/// buffer. (CGImage.cropping shares the parent's backing store — before this,
+/// each accepted slice kept that tick's ENTIRE captured frame alive, which on
+/// long sessions added up to gigabytes.)
 final class VerticalStitcher {
     private(set) var slices: [CGImage] = []
     private var lastFrame: CGImage
+    private var lastSig: RowSig?
+    /// Signatures of the session's FIRST frame — the reference a claimed
+    /// sticky footer is validated against on every later append.
+    private var firstSig: RowSig?
     let width: Int
+    /// Backing scale of the frames (2 on retina). Pixel-unit thresholds are
+    /// multiplied by this so both platforms compare identical content-space
+    /// quantities (Windows runs at 1).
+    let scale: CGFloat
     private(set) var totalHeight: Int
+    /// Sticky rows detected at the bottom of the viewport (e.g. a fixed
+    /// footer/chat bar). LATCHED on the first accepted append and constant for
+    /// the whole session: per-pair estimates flap when a cursor blinks inside
+    /// the bar, and slicing each frame with a different footer value baked bar
+    /// fragments into the page mid-seam. compose() re-attaches the footer once
+    /// at the very end.
+    private(set) var footerRows = 0
+    private var footerLatched = false
 
-    init(first: CGImage) {
-        slices = [first]
-        lastFrame = first
-        width = first.width
-        totalHeight = first.height
+    struct RowSig {
+        let bands: [Double]   // h * 4 mean-gray band values
+        let energy: [Double]  // h horizontal-gradient energies
+    }
+
+    init(first: CGImage, scale: CGFloat = 1) {
+        let owned = first.materialized() ?? first
+        slices = [owned]
+        lastFrame = owned
+        lastSig = nil
+        width = owned.width
+        totalHeight = owned.height
+        self.scale = max(1, scale)
     }
 
     /// The most recently appended slice — used for the live preview.
@@ -358,74 +419,191 @@ final class VerticalStitcher {
     /// Append new content from `frame`. Returns the number of new rows
     /// (0 when nothing new or the frame couldn't be matched).
     @discardableResult
-    func append(_ frame: CGImage, direction: ScrollingCapture.Direction) -> Int {
-        guard frame.width == width else { return 0 }
-        guard let offset = Self.findOverlap(previous: lastFrame, next: frame), offset > 0 else {
+    func append(_ frame: CGImage) -> Int {
+        guard frame.width == width, frame.height == lastFrame.height else { return 0 }
+        guard let nextSig = Self.rowSignatures(frame) else { return 0 }
+        let prevSig: RowSig
+        if let cached = lastSig {
+            prevSig = cached
+        } else {
+            guard let computed = Self.rowSignatures(lastFrame) else { return 0 }
+            prevSig = computed
+            lastSig = computed // rejected ticks must not recompute this
+        }
+        if firstSig == nil { firstSig = prevSig } // prev of the 1st append IS frame #1
+
+        guard let match = Self.findOverlap(
+            prev: prevSig, next: nextSig, height: frame.height, scale: scale,
+            lockedFooter: footerLatched ? footerRows : nil
+        ) else {
             return 0
         }
-        let rows = min(offset, frame.height)
+        let footer = footerLatched ? footerRows : match.footerRows
+
+        // A true sticky footer is identical to the FIRST frame's bottom band
+        // for the whole session. Pitch-aligned scrolling content that merely
+        // matched the previous frame drifts away from it — reject the frame
+        // instead of silently dropping/duplicating page rows.
+        if footer > 0, let first = firstSig {
+            var stable = 0
+            for y in (frame.height - footer)..<frame.height {
+                let b = y * 4
+                let d = (abs(first.bands[b] - nextSig.bands[b])
+                    + abs(first.bands[b + 1] - nextSig.bands[b + 1])
+                    + abs(first.bands[b + 2] - nextSig.bands[b + 2])
+                    + abs(first.bands[b + 3] - nextSig.bands[b + 3])) / 4
+                if d < 2.0 { stable += 1 } // tolerates a blinking cursor row
+            }
+            guard stable * 10 >= footer * 7 else { return 0 } // ≥70% unchanged
+        }
+
+        let contentHeight = frame.height - footer
+        let rows = min(match.offset, contentHeight)
+        guard rows > 0 else { return 0 }
+        // new content sits just above the (possibly empty) footer band
         guard let slice = frame.cropping(to: CGRect(
-            x: 0, y: frame.height - rows, width: width, height: rows
-        )) else { return 0 }
+            x: 0, y: contentHeight - rows, width: width, height: rows
+        ))?.materialized() else { return 0 }
         slices.append(slice)
         lastSlice = slice
         totalHeight += rows
-        lastFrame = frame
+        lastFrame = frame.materialized() ?? frame
+        lastSig = nextSig
+        footerRows = footer
+        footerLatched = true
         return rows
     }
 
-    /// How many rows of new content `next` has relative to `previous`;
-    /// nil when confidence is too low. Two safeguards against ugly output:
-    /// 4-band row signatures (a plain per-row mean can't tell repetitive UI
-    /// rows apart, which duplicated whole blocks), and a uniqueness margin —
-    /// if the second-best offset is nearly as good, the page is self-similar
-    /// there and guessing would corrupt the seam, so the frame is skipped.
-    static func findOverlap(previous: CGImage, next: CGImage) -> Int? {
-        let h = previous.height
-        guard h == next.height, previous.width == next.width, h > 40 else { return nil }
-        guard let ps = rowSignatures(previous), let ns = rowSignatures(next) else { return nil }
+    struct Match {
+        let offset: Int
+        let footerRows: Int
+    }
 
-        let k = max(32, h / 4)
-        // rows are weighted by their detail (horizontal gradient energy):
-        // a misaligned text line then dominates the score, while empty
-        // background — which matches at EVERY offset — can neither hide the
-        // error nor drown the uniqueness signal
+    /// How many rows of new content `next` has relative to `previous`;
+    /// nil when confidence is too low. Safeguards against ugly output:
+    /// - 4-band row signatures (a plain per-row mean can't tell repetitive UI
+    ///   rows apart, which duplicated whole blocks);
+    /// - detail-weighted rows (misaligned text dominates the score; empty
+    ///   background can't hide the error or drown the uniqueness signal);
+    /// - static-bottom detection (a sticky footer inside the rect used to
+    ///   corrupt every seam or stall matching entirely);
+    /// - a two-pass uniqueness margin — if the second-best offset outside the
+    ///   winner's plateau is nearly as good, the page is self-similar there
+    ///   and guessing would corrupt the seam, so the frame is skipped.
+    static func findOverlap(
+        prev: RowSig, next: RowSig, height h: Int, scale: CGFloat,
+        lockedFooter: Int? = nil
+    ) -> Match? {
+        let minHeight = Int(40 * scale)
+        guard h > minHeight, prev.bands.count == h * 4, next.bands.count == h * 4 else { return nil }
+
+        // Per-row difference at offset 0: identifies rows that did NOT move.
+        var rowDiff = [Double](repeating: 0, count: h)
+        var changedRows = 0
+        let changeEps = 1.5
+        for y in 0..<h {
+            let base = y * 4
+            let d = (abs(prev.bands[base] - next.bands[base])
+                + abs(prev.bands[base + 1] - next.bands[base + 1])
+                + abs(prev.bands[base + 2] - next.bands[base + 2])
+                + abs(prev.bands[base + 3] - next.bands[base + 3])) / 4
+            rowDiff[y] = d
+            if d > changeEps { changedRows += 1 }
+        }
+        // essentially identical frames → no scroll happened
+        guard changedRows > h / 20 else { return nil }
+
+        // Trailing static run at the bottom = sticky footer candidate. Only
+        // meaningful because other rows DID change (checked above). Once the
+        // session latched a footer, that value is used verbatim so every
+        // slice is cut with the same geometry.
+        var footer: Int
+        if let locked = lockedFooter {
+            footer = min(locked, h / 3)
+        } else {
+            // Trailing static run, allowed to bridge ONE small dynamic band
+            // (a blinking cursor / spinner inside the sticky bar would
+            // otherwise truncate the detected footer on half the frame pairs).
+            let staticEps = 0.8
+            let maxGap = Int(8 * scale)
+            let limit = h / 3
+            footer = 0
+            var i = 0
+            var gapUsed = false
+            while i < limit {
+                if rowDiff[h - 1 - i] < staticEps {
+                    i += 1
+                    footer = i
+                    continue
+                }
+                var gap = 0
+                while i + gap < limit, gap < maxGap, rowDiff[h - 1 - i - gap] >= staticEps {
+                    gap += 1
+                }
+                if !gapUsed, gap < maxGap, i + gap < limit, rowDiff[h - 1 - i - gap] < staticEps {
+                    gapUsed = true
+                    i += gap
+                    continue
+                }
+                break
+            }
+            let minFooter = Int(6 * scale)
+            if footer < minFooter { footer = 0 }
+        }
+
+        let hEff = h - footer
+        guard hEff > minHeight else { return nil }
+
+        let k = max(Int(32 * scale), hEff / 4)
+        guard hEff - k >= 1 else { return nil }
+
+        // rows are weighted by their detail (horizontal gradient energy)
         var weights = [Double](repeating: 0, count: k)
         var weightSum = 0.0
         for i in 0..<k {
-            let w = max(ps.energy[h - k + i], 0.5)
+            let w = max(prev.energy[hEff - k + i], 0.5)
             weights[i] = w
             weightSum += w
         }
         guard weightSum > 0 else { return nil }
 
+        // Pass 1: score every offset. (Storing the scores keeps pass 2 free of
+        // the order-dependence the old single-pass second-best tracking had:
+        // a chain of small improvements could silently swallow a real alias.)
+        let count = hEff - k + 1
+        var scores = [Double](repeating: 0, count: count)
         var bestOffset = -1
         var bestScore = Double.greatestFiniteMagnitude
-        var secondScore = Double.greatestFiniteMagnitude
-        for s in 0...(h - k) {
-            let start = h - k - s
+        for s in 0..<count {
+            let start = hEff - k - s
             var diff: Double = 0
             for i in 0..<k {
-                let a = (h - k + i) * 4
+                let a = (hEff - k + i) * 4
                 let b = (start + i) * 4
-                let d = (abs(ps.bands[a] - ns.bands[b])
-                    + abs(ps.bands[a + 1] - ns.bands[b + 1])
-                    + abs(ps.bands[a + 2] - ns.bands[b + 2])
-                    + abs(ps.bands[a + 3] - ns.bands[b + 3])) / 4
+                let d = (abs(prev.bands[a] - next.bands[b])
+                    + abs(prev.bands[a + 1] - next.bands[b + 1])
+                    + abs(prev.bands[a + 2] - next.bands[b + 2])
+                    + abs(prev.bands[a + 3] - next.bands[b + 3])) / 4
                 diff += weights[i] * d
             }
             diff /= weightSum
+            scores[s] = diff
             if diff < bestScore {
-                if bestOffset >= 0, abs(s - bestOffset) > 6 { secondScore = bestScore }
                 bestScore = diff
                 bestOffset = s
-            } else if diff < secondScore, abs(s - bestOffset) > 6 {
-                secondScore = diff
             }
         }
+
+        // Pass 2: the runner-up must sit OUTSIDE the winner's plateau.
+        let exclusion = max(6, Int(6 * scale))
+        var secondScore = Double.greatestFiniteMagnitude
+        for s in 0..<count where abs(s - bestOffset) > exclusion {
+            if scores[s] < secondScore { secondScore = scores[s] }
+        }
+
         if Perf.enabled {
             FileHandle.standardError.write(
-                "match off=\(bestOffset) best=\(String(format: "%.2f", bestScore)) second=\(String(format: "%.2f", secondScore))\n"
+                "match off=\(bestOffset) best=\(String(format: "%.2f", bestScore)) second=\(String(format: "%.2f", secondScore)) footer=\(footer)\n"
                     .data(using: .utf8)!)
         }
         // The true overlap is a near-perfect match (~0.0) because both frames
@@ -433,14 +611,17 @@ final class VerticalStitcher {
         // (~0.4–2). So uniqueness is a RATIO test with a small epsilon, plus
         // an absolute-gap fallback for noisy pages (animations in overlap).
         guard bestOffset > 0, bestScore < 2.0 else { return nil }
+        // no offsets outside the winner's plateau = zero uniqueness evidence
+        // (tiny effective heights after footer subtraction) — don't guess
+        guard secondScore < Double.greatestFiniteMagnitude else { return nil }
         let unique = secondScore > bestScore * 3 + 0.15
             || secondScore - bestScore > 2.5
         guard unique else { return nil }
-        return bestOffset
+        return Match(offset: bestOffset, footerRows: footer)
     }
 
     /// Per-row: mean gray of 4 horizontal bands + gradient energy.
-    private static func rowSignatures(_ image: CGImage) -> (bands: [Double], energy: [Double])? {
+    static func rowSignatures(_ image: CGImage) -> RowSig? {
         let w = image.width, h = image.height
         var buf = [UInt8](repeating: 0, count: w * h)
         guard let ctx = CGContext(
@@ -481,19 +662,40 @@ final class VerticalStitcher {
             }
             energy[y] = Double(grad) / Double(max(1, gradCount))
         }
-        return (bands, energy)
+        return RowSig(bands: bands, energy: energy)
     }
 
     func compose() -> CGImage? {
         guard !slices.isEmpty else { return nil }
-        let h = slices.reduce(0) { $0 + $1.height }
+
+        // A detected sticky footer was excluded from every appended slice, but
+        // the FIRST frame still carries it at its bottom — which would land in
+        // the middle of the page. Move it: trim it off the first slice and
+        // re-attach the footer band (from the last frame) at the very end.
+        var parts = slices
+        if footerRows > 0, parts.count > 1,
+           let first = parts.first, first.height > footerRows,
+           lastFrame.height > footerRows {
+            let trimmed = first.cropping(to: CGRect(
+                x: 0, y: 0, width: width, height: first.height - footerRows
+            ))?.materialized()
+            let footer = lastFrame.cropping(to: CGRect(
+                x: 0, y: lastFrame.height - footerRows, width: width, height: footerRows
+            ))?.materialized()
+            if let trimmed, let footer {
+                parts[0] = trimmed
+                parts.append(footer)
+            }
+        }
+
+        let h = parts.reduce(0) { $0 + $1.height }
         guard let ctx = CGContext(
             data: nil, width: width, height: h, bitsPerComponent: 8, bytesPerRow: 0,
             space: CGColorSpace(name: CGColorSpace.sRGB)!,
             bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
         ) else { return nil }
         var y = h
-        for slice in slices {
+        for slice in parts {
             y -= slice.height
             ctx.draw(slice, in: CGRect(x: 0, y: y, width: slice.width, height: slice.height))
         }

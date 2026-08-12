@@ -212,7 +212,7 @@ final class PenAnnotation: Annotation {
 
 final class TextAnnotation: Annotation {
     var text: String = ""
-    var origin: CGPoint = .zero // top-left of text box in image px (flipped ctx handled at draw)
+    var origin: CGPoint = .zero // BOTTOM-left of the text's bounding box, image px (unflipped ctx)
     var fontSizePt: CGFloat = 18
 
     var font: NSFont { .boldSystemFont(ofSize: fontSizePt * uiScale) }
@@ -361,6 +361,10 @@ enum AnnotationRenderer {
         return ctx.makeImage() ?? base
     }
 
+    /// One CIContext for the process: creating one per pixellate call paid
+    /// ~50-150 ms of Metal pipeline setup again after every crop/undo.
+    private static let ciContext = CIContext()
+
     /// CIPixellate over the whole image; BlurAnnotation clips regions out of this.
     static func pixellate(_ image: CGImage, scale: CGFloat) -> CGImage? {
         let ci = CIImage(cgImage: image)
@@ -369,8 +373,7 @@ enum AnnotationRenderer {
         filter.setValue(max(8, 8 * scale), forKey: kCIInputScaleKey)
         filter.setValue(CIVector(x: 0, y: 0), forKey: kCIInputCenterKey)
         guard let out = filter.outputImage else { return nil }
-        let context = CIContext()
-        return context.createCGImage(out, from: CGRect(x: 0, y: 0, width: image.width, height: image.height))
+        return ciContext.createCGImage(out, from: CGRect(x: 0, y: 0, width: image.width, height: image.height))
     }
 }
 

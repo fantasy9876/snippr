@@ -18,6 +18,9 @@ class AppSettings
     // Editor preferences remembered across sessions
     public Dictionary<string, float> ToolWidths { get; set; } = new();
     public string LastColor { get; set; } = "#FF0000";
+    /// Esc in the editor copies to clipboard before closing (mirrors macOS
+    /// escCopy). Off = Esc discards without touching the clipboard.
+    public bool EscCopy { get; set; } = true;
     public string TranslateTarget { get; set; } = "vi";
     public int LastAreaX { get; set; } = -1;
     public int LastAreaY { get; set; }
