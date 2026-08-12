@@ -68,6 +68,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if Benchmark.firstOpenTestRequested { Benchmark.runFirstOpenTest() }
         if let dir = Benchmark.scrollPreviewOutDir { Benchmark.runScrollPreviewTest(outDir: dir) }
         if Benchmark.scrollStitchTestRequested { Benchmark.runScrollStitchTest() }
+        if let dir = Benchmark.scrollRealOutDir { Benchmark.runScrollRealTest(outDir: dir) }
+        if Benchmark.scrollAppRequested { Benchmark.runScrollAppTest() }
         if UITest.requestedOutputDir == nil && !Benchmark.requested {
             UpdateChecker.checkOnLaunch()
         }
@@ -363,8 +365,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
         Task { @MainActor in
             do {
-                let shot = try await CaptureEngine.shared.captureRect(screen: screen, rect: local)
-                handleResult(shot, source: .area)
+                // one-shot: full capture + crop has proven coordinate math;
+                // sourceRect stays reserved for the (validated) scroll loop
+                let full = try await CaptureEngine.shared.captureDisplay(screen: screen)
+                if let cropped = full.cropping(toViewRect: local) {
+                    handleResult(cropped, source: .area)
+                }
             } catch {
                 AppServices.handleCaptureError(error)
             }

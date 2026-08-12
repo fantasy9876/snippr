@@ -70,9 +70,48 @@ final class ScrollingCapture {
         let maxHeightPx = CGFloat(Settings.shared.scrollMaxHeight) * scale
         var stitcher: VerticalStitcher?
         var lastHash = 0
+        var captureFailures = 0
+
+        // SCStreamConfiguration.sourceRect semantics have varied across macOS
+        // releases and scaled-display modes. Validate it ONCE against the
+        // known-correct full-capture+crop path; on any mismatch the whole
+        // session silently uses the slower-but-correct path instead of
+        // producing frames of the wrong region (which the matcher would
+        // reject forever — the "nothing ever stitches" failure).
+        var useRectCapture = true
+        if let sub = try? await CaptureEngine.shared.captureRect(
+               screen: screen, rect: rect, excludingOwnWindows: true, contentMaxAge: 300),
+           let full = try? await CaptureEngine.shared.captureDisplay(
+               screen: screen, excludingOwnWindows: true, contentMaxAge: 300),
+           let ref = full.cropping(toViewRect: rect) {
+            let sizeOK = sub.cgImage.width == ref.cgImage.width
+                && sub.cgImage.height == ref.cgImage.height
+            let diff = sizeOK ? Self.meanAbsDiff(sub.cgImage, ref.cgImage) : 255
+            useRectCapture = sizeOK && diff < 8
+            if !useRectCapture {
+                NSLog("Snippr: sourceRect capture mismatch (diff \(diff)) — falling back to full-display crop for this session")
+            }
+        } else {
+            useRectCapture = false
+        }
 
         while !finished {
-            guard let frame = try? await captureArea(screen: screen, rect: rect) else { break }
+            let frame: CapturedImage?
+            if useRectCapture {
+                frame = try? await captureArea(screen: screen, rect: rect)
+            } else {
+                frame = (try? await CaptureEngine.shared.captureDisplay(
+                    screen: screen, excludingOwnWindows: true, contentMaxAge: 300))?
+                    .cropping(toViewRect: rect)
+            }
+            guard let frame else {
+                // transient SCK error must not silently end the session
+                captureFailures += 1
+                if captureFailures > 10 { break }
+                try? await Task.sleep(nanoseconds: 250_000_000)
+                continue
+            }
+            captureFailures = 0
             let hash = Self.quickHash(frame.cgImage)
             if hash != lastHash {
                 lastHash = hash
@@ -161,13 +200,46 @@ final class ScrollingCapture {
     /// Cheap change detector: downsample the frame to a fixed tiny buffer and
     /// hash those bytes. Unlike hashing `dataProvider.data`, this never
     /// materializes (or strides over) the full-size frame buffer.
+    /// Sampled mean absolute channel difference between two same-sized images.
+    static func meanAbsDiff(_ a: CGImage, _ b: CGImage) -> Double {
+        guard a.width == b.width, a.height == b.height else { return 255 }
+        func bytes(_ img: CGImage) -> [UInt8]? {
+            var buf = [UInt8](repeating: 0, count: img.width * img.height * 4)
+            guard let ctx = CGContext(
+                data: &buf, width: img.width, height: img.height, bitsPerComponent: 8,
+                bytesPerRow: img.width * 4,
+                space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+            ) else { return nil }
+            ctx.interpolationQuality = .none
+            ctx.draw(img, in: CGRect(x: 0, y: 0, width: img.width, height: img.height))
+            return buf
+        }
+        guard let ba = bytes(a), let bb = bytes(b) else { return 255 }
+        var diff = 0
+        var samples = 0
+        var i = 0
+        while i < ba.count {
+            diff += abs(Int(ba[i]) - Int(bb[i]))
+            samples += 1
+            i += 397 * 4
+        }
+        return Double(diff) / Double(max(1, samples))
+    }
+
+    /// The buffer keeps (almost) full VERTICAL resolution and only compresses
+    /// horizontally: a 64x64 thumbnail averaged text rows away — sparse gray
+    /// text on white has near-constant density per block, so the hash barely
+    /// changed while a real page scrolled and every frame was dropped as
+    /// "no change" (the v1.2.0 "nothing ever stitches" bug).
     static func quickHash(_ image: CGImage) -> Int {
-        let w = 64, h = 64
-        var buf = [UInt8](repeating: 0, count: w * h * 4)
+        let w = 64
+        let h = min(1024, max(64, image.height / 2))
+        var buf = [UInt8](repeating: 0, count: w * h)
         guard let ctx = CGContext(
-            data: &buf, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
-            space: CGColorSpace(name: CGColorSpace.sRGB)!,
-            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+            data: &buf, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w,
+            space: CGColorSpaceCreateDeviceGray(),
+            bitmapInfo: CGImageAlphaInfo.none.rawValue
         ) else { return 0 }
         ctx.interpolationQuality = .low
         ctx.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
@@ -454,7 +526,10 @@ final class VerticalStitcher {
                     + abs(first.bands[b + 3] - nextSig.bands[b + 3])) / 4
                 if d < 2.0 { stable += 1 } // tolerates a blinking cursor row
             }
-            guard stable * 10 >= footer * 7 else { return 0 } // ≥70% unchanged
+            guard stable * 10 >= footer * 7 else {
+                Perf.reject("footer drift \(stable)/\(footer) vs first frame")
+                return 0
+            }
         }
 
         let contentHeight = frame.height - footer
@@ -511,7 +586,10 @@ final class VerticalStitcher {
             if d > changeEps { changedRows += 1 }
         }
         // essentially identical frames → no scroll happened
-        guard changedRows > h / 20 else { return nil }
+        guard changedRows > h / 20 else {
+            Perf.reject("static changed=\(changedRows)/\(h)")
+            return nil
+        }
 
         // Trailing static run at the bottom = sticky footer candidate. Only
         // meaningful because other rows DID change (checked above). Once the
@@ -552,10 +630,16 @@ final class VerticalStitcher {
         }
 
         let hEff = h - footer
-        guard hEff > minHeight else { return nil }
+        guard hEff > minHeight else {
+            Perf.reject("hEff \(hEff) too small (footer \(footer))")
+            return nil
+        }
 
         let k = max(Int(32 * scale), hEff / 4)
-        guard hEff - k >= 1 else { return nil }
+        guard hEff - k >= 1 else {
+            Perf.reject("k \(k) >= hEff \(hEff)")
+            return nil
+        }
 
         // rows are weighted by their detail (horizontal gradient energy)
         var weights = [Double](repeating: 0, count: k)
@@ -610,13 +694,22 @@ final class VerticalStitcher {
         // rasterize the same content; line-pitch aliases score low-but-nonzero
         // (~0.4–2). So uniqueness is a RATIO test with a small epsilon, plus
         // an absolute-gap fallback for noisy pages (animations in overlap).
-        guard bestOffset > 0, bestScore < 2.0 else { return nil }
+        guard bestOffset > 0, bestScore < 2.0 else {
+            Perf.reject("gate off=\(bestOffset) best=\(String(format: "%.2f", bestScore))")
+            return nil
+        }
         // no offsets outside the winner's plateau = zero uniqueness evidence
         // (tiny effective heights after footer subtraction) — don't guess
-        guard secondScore < Double.greatestFiniteMagnitude else { return nil }
+        guard secondScore < Double.greatestFiniteMagnitude else {
+            Perf.reject("vacuous second (count \(count))")
+            return nil
+        }
         let unique = secondScore > bestScore * 3 + 0.15
             || secondScore - bestScore > 2.5
-        guard unique else { return nil }
+        guard unique else {
+            Perf.reject("not unique best=\(String(format: "%.2f", bestScore)) second=\(String(format: "%.2f", secondScore)) off=\(bestOffset)")
+            return nil
+        }
         return Match(offset: bestOffset, footerRows: footer)
     }
 

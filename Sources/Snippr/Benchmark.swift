@@ -181,6 +181,302 @@ enum Benchmark {
         }
     }
 
+    /// `--test-scrollreal <outdir>`: END-TO-END scrolling-capture test on the
+    /// live machine. Opens a window with tall deterministic content, captures
+    /// its rect through the REAL SCK pipeline (captureRect), scrolls the
+    /// window programmatically and stitches — validating (1) sourceRect
+    /// coordinate math against captureDisplay+crop, (2) hash stability,
+    /// (3) the matcher on real screen-rendered content.
+    static var scrollRealOutDir: String? {
+        guard let i = CommandLine.arguments.firstIndex(of: "--test-scrollreal"),
+              CommandLine.arguments.count > i + 1 else { return nil }
+        return CommandLine.arguments[i + 1]
+    }
+
+    static func runScrollRealTest(outDir: String) {
+        try? FileManager.default.createDirectory(atPath: outDir, withIntermediateDirectories: true)
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 600_000_000)
+            let screen = NSScreen.main ?? NSScreen.screens[0]
+            var failures = 0
+            func check(_ name: String, _ ok: Bool, _ detail: String = "") {
+                print(ok ? "PASS \(name)" : "FAIL \(name) \(detail)")
+                if !ok { failures += 1 }
+            }
+
+            // --- tall scrollable window with deterministic content
+            let viewW: CGFloat = 500, viewH: CGFloat = 600, docH: CGFloat = 4000
+            let origin = CGPoint(x: screen.frame.minX + 200, y: screen.frame.minY + 150)
+            let win = NSWindow(
+                contentRect: CGRect(origin: origin, size: CGSize(width: viewW, height: viewH)),
+                styleMask: .borderless, backing: .buffered, defer: false)
+            win.level = .screenSaver // nothing may cover the content mid-test
+            win.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+            let scroll = NSScrollView(frame: CGRect(x: 0, y: 0, width: viewW, height: viewH))
+            scroll.hasVerticalScroller = false
+            scroll.verticalScrollElasticity = .none
+            let doc = StripeDocView(frame: CGRect(x: 0, y: 0, width: viewW, height: docH))
+            scroll.documentView = doc
+            win.contentView = scroll
+            win.orderFrontRegardless()
+            scroll.contentView.scroll(to: CGPoint(x: 0, y: 0))
+            scroll.reflectScrolledClipView(scroll.contentView)
+            try? await Task.sleep(nanoseconds: 700_000_000)
+
+            // window frame in screen-local points (bottom-left origin)
+            let rect = CGRect(
+                x: win.frame.minX - screen.frame.minX,
+                y: win.frame.minY - screen.frame.minY,
+                width: viewW, height: viewH)
+
+            // --- 1) sourceRect coordinate validation
+            guard let full = try? await CaptureEngine.shared.captureDisplay(screen: screen),
+                  let cropRef = full.cropping(toViewRect: rect),
+                  let sub = try? await CaptureEngine.shared.captureRect(screen: screen, rect: rect)
+            else { print("FAIL capture unavailable (screen asleep/locked?)"); exit(1) }
+            SelfTest.writePNG(cropRef.cgImage, to: "\(outDir)/ref-crop.png")
+            SelfTest.writePNG(sub.cgImage, to: "\(outDir)/sourcerect.png")
+            check("sizes-match",
+                  sub.cgImage.width == cropRef.cgImage.width
+                  && sub.cgImage.height == cropRef.cgImage.height,
+                  "sub \(sub.cgImage.width)x\(sub.cgImage.height) vs crop \(cropRef.cgImage.width)x\(cropRef.cgImage.height)")
+            let diff = ScrollingCapture.meanAbsDiff(sub.cgImage, cropRef.cgImage)
+            check("sourcerect-region", diff < 8.0, "mean abs diff \(diff)")
+
+            // --- 2) hash stability + change detection
+            let h1 = ScrollingCapture.quickHash(sub.cgImage)
+            guard let sub2 = try? await CaptureEngine.shared.captureRect(screen: screen, rect: rect)
+            else { print("FAIL second capture"); exit(1) }
+            let h2 = ScrollingCapture.quickHash(sub2.cgImage)
+            check("hash-stable", h1 == h2)
+
+            // --- 3) real scroll + stitch through the actual pipeline
+            let scale = screen.backingScaleFactor
+            let stitcher = VerticalStitcher(first: sub.cgImage, scale: scale)
+            let stepPt: CGFloat = 150
+            var accepted = 0
+            for step in 1...6 {
+                doc.scrollOffset += stepPt
+                scroll.contentView.scroll(to: CGPoint(x: 0, y: doc.scrollOffset))
+                scroll.reflectScrolledClipView(scroll.contentView)
+                win.display()
+                try? await Task.sleep(nanoseconds: 400_000_000)
+                guard let frame = try? await CaptureEngine.shared.captureRect(screen: screen, rect: rect)
+                else { check("capture-step-\(step)", false); continue }
+                let rows = stitcher.append(frame.cgImage)
+                let want = Int(stepPt * scale)
+                if rows == want { accepted += 1 }
+                print("  step \(step): +\(want)px → appended \(rows)\(rows == want ? " ✓" : " ✗")")
+            }
+            let composed = stitcher.compose()
+            if let composed {
+                SelfTest.writePNG(composed, to: "\(outDir)/scrollreal.png")
+            }
+            let expected = Int((viewH + 6 * stepPt) * scale)
+            check("stitch-accepted", accepted >= 5, "only \(accepted)/6 accepted")
+            check("stitch-height", composed?.height == expected,
+                  "got \(composed?.height ?? -1), want \(expected)")
+
+            win.orderOut(nil)
+
+            // ---- Phase B: realistic hard case — chat-like low-contrast page,
+            // sticky composer bar with a blinking caret, small/fractional
+            // trackpad-style scroll steps.
+            let chatDoc = ChatDocView(frame: CGRect(x: 0, y: 0, width: viewW, height: docH))
+            let win2 = NSWindow(
+                contentRect: CGRect(origin: origin, size: CGSize(width: viewW, height: viewH)),
+                styleMask: .borderless, backing: .buffered, defer: false)
+            win2.level = .screenSaver
+            win2.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+            let scroll2 = NSScrollView(frame: CGRect(x: 0, y: 0, width: viewW, height: viewH))
+            scroll2.hasVerticalScroller = false
+            scroll2.verticalScrollElasticity = .none
+            scroll2.documentView = chatDoc
+            let composer = ComposerBarView(frame: CGRect(x: 0, y: 0, width: viewW, height: 60))
+            let container = NSView(frame: CGRect(x: 0, y: 0, width: viewW, height: viewH))
+            scroll2.frame = CGRect(x: 0, y: 60, width: viewW, height: viewH - 60)
+            container.addSubview(scroll2)
+            container.addSubview(composer)
+            win2.contentView = container
+            win2.orderFrontRegardless()
+            try? await Task.sleep(nanoseconds: 700_000_000)
+
+            guard let first2 = try? await CaptureEngine.shared.captureRect(screen: screen, rect: rect)
+            else { print("FAIL phase-B capture"); exit(1) }
+            let s2 = VerticalStitcher(first: first2.cgImage, scale: scale)
+            // small, fractional, and mixed steps — what a trackpad really does
+            let steps: [CGFloat] = [7, 11, 23.5, 90, 16, 150]
+            var offset: CGFloat = 0
+            var accepted2 = 0
+            var caret = false
+            for (i, step) in steps.enumerated() {
+                offset += step
+                scroll2.contentView.scroll(to: CGPoint(x: 0, y: offset))
+                scroll2.reflectScrolledClipView(scroll2.contentView)
+                caret.toggle()
+                composer.caretOn = caret // blinks between ticks, like a real input
+                composer.needsDisplay = true
+                win2.display()
+                try? await Task.sleep(nanoseconds: 400_000_000)
+                guard let frame = try? await CaptureEngine.shared.captureRect(screen: screen, rect: rect)
+                else { check("phaseB-capture-\(i)", false); continue }
+                let rows = s2.append(frame.cgImage)
+                let want = Int(round(step * scale))
+                if rows == want { accepted2 += 1 }
+                print("  chat step \(i + 1) (+\(want)px): appended \(rows)\(rows == want ? " ✓" : " ✗")")
+            }
+            let composed2 = s2.compose()
+            if let composed2 {
+                SelfTest.writePNG(composed2, to: "\(outDir)/scrollreal-chat.png")
+            }
+            let totalSteps = steps.reduce(0, +)
+            let expected2 = Int(round((viewH + totalSteps) * scale))
+            check("chat-accepted", accepted2 >= 5, "only \(accepted2)/\(steps.count) accepted")
+            check("chat-footer-latched", s2.footerRows >= Int(50 * scale),
+                  "footerRows \(s2.footerRows), composer is \(Int(60 * scale))px")
+            check("chat-height", composed2?.height == expected2,
+                  "got \(composed2?.height ?? -1), want \(expected2)")
+
+            win2.orderOut(nil)
+
+            // ---- Phase C: sourceRect COMBINED with a non-empty window
+            // exclusion list — exactly what a real scroll session does (its
+            // chrome windows are excluded). This pairing is the one thing the
+            // phases above don't cover.
+            let decoy = NSWindow(
+                contentRect: CGRect(x: screen.frame.minX + 8, y: screen.frame.minY + 8, width: 120, height: 40),
+                styleMask: .borderless, backing: .buffered, defer: false)
+            decoy.level = .screenSaver
+            decoy.backgroundColor = .systemBlue
+            decoy.orderFrontRegardless()
+            try? await Task.sleep(nanoseconds: 400_000_000)
+            CaptureEngine.shared.invalidateContentCache()
+            if let subEx = try? await CaptureEngine.shared.captureRect(
+                   screen: screen, rect: rect, excludingOwnWindows: true, contentMaxAge: 300),
+               let fullEx = try? await CaptureEngine.shared.captureDisplay(
+                   screen: screen, excludingOwnWindows: true, contentMaxAge: 300),
+               let refEx = fullEx.cropping(toViewRect: rect) {
+                let sizeOK = subEx.cgImage.width == refEx.cgImage.width
+                    && subEx.cgImage.height == refEx.cgImage.height
+                let dEx = sizeOK ? ScrollingCapture.meanAbsDiff(subEx.cgImage, refEx.cgImage) : 255
+                check("sourcerect-with-exclusion", sizeOK && dEx < 8.0,
+                      "size \(subEx.cgImage.width)x\(subEx.cgImage.height) vs \(refEx.cgImage.width)x\(refEx.cgImage.height), diff \(dEx)")
+                SelfTest.writePNG(subEx.cgImage, to: "\(outDir)/sourcerect-excl.png")
+                SelfTest.writePNG(refEx.cgImage, to: "\(outDir)/ref-excl.png")
+            } else {
+                check("sourcerect-with-exclusion", false, "capture failed")
+            }
+            decoy.orderOut(nil)
+
+            print(failures == 0 ? "SCROLLREAL OK" : "SCROLLREAL FAILED (\(failures))")
+            exit(failures == 0 ? 0 : 1)
+        }
+    }
+
+    /// Chat-like page: white background, sparse gray "message" rows with
+    /// avatars — low contrast, lots of whitespace, 34-pt line pitch (the
+    /// self-similar structure that stresses the matcher's uniqueness test).
+    final class ChatDocView: NSView {
+        override var isFlipped: Bool { true }
+        override func draw(_ dirtyRect: NSRect) {
+            guard let ctx = NSGraphicsContext.current?.cgContext else { return }
+            ctx.setFillColor(CGColor(srgbRed: 1, green: 1, blue: 1, alpha: 1))
+            ctx.fill(bounds)
+            var y: CGFloat = 8
+            var seed: UInt64 = 0xCAFE_D00D
+            func next() -> CGFloat {
+                seed = seed &* 6364136223846793005 &+ 1442695040888963407
+                return CGFloat((seed >> 33) & 0xFF) / 255
+            }
+            while y < bounds.height {
+                // avatar
+                ctx.setFillColor(CGColor(srgbRed: 0.7 + next() * 0.25, green: 0.7 + next() * 0.25, blue: 0.75 + next() * 0.2, alpha: 1))
+                ctx.fillEllipse(in: CGRect(x: 10, y: y, width: 24, height: 24))
+                // 1-3 gray text lines, varying widths
+                let lines = 1 + Int(next() * 2.6)
+                var ly = y + 2
+                for _ in 0..<lines {
+                    ctx.setFillColor(CGColor(gray: 0.35 + next() * 0.2, alpha: 1))
+                    ctx.fill(CGRect(x: 44, y: ly, width: 80 + next() * 300, height: 9))
+                    ly += 14
+                }
+                y = max(ly, y + 34) + 8
+            }
+        }
+    }
+
+    /// Sticky composer bar with a blinking caret — the classic footer case.
+    final class ComposerBarView: NSView {
+        var caretOn = false
+        override var isFlipped: Bool { true }
+        override func draw(_ dirtyRect: NSRect) {
+            guard let ctx = NSGraphicsContext.current?.cgContext else { return }
+            ctx.setFillColor(CGColor(srgbRed: 0.95, green: 0.95, blue: 0.97, alpha: 1))
+            ctx.fill(bounds)
+            ctx.setFillColor(CGColor(srgbRed: 1, green: 1, blue: 1, alpha: 1))
+            ctx.fill(CGRect(x: 10, y: 14, width: bounds.width - 80, height: 32))
+            ctx.setStrokeColor(CGColor(gray: 0.75, alpha: 1))
+            ctx.stroke(CGRect(x: 10, y: 14, width: bounds.width - 80, height: 32), width: 1)
+            ctx.setFillColor(CGColor(srgbRed: 0.0, green: 0.45, blue: 0.9, alpha: 1))
+            ctx.fill(CGRect(x: bounds.width - 60, y: 14, width: 50, height: 32))
+            if caretOn {
+                ctx.setFillColor(CGColor(gray: 0.1, alpha: 1))
+                ctx.fill(CGRect(x: 18, y: 20, width: 2, height: 20))
+            }
+        }
+    }
+
+    /// `--test-scrollapp`: drives the REAL ScrollingCapture session against
+    /// the frontmost window of ANOTHER app (open a tall page first), scrolling
+    /// it with synthesized wheel events — chrome exclusion, overlay
+    /// scrollbars, real content: the exact end-user flow.
+    static var scrollAppRequested: Bool {
+        CommandLine.arguments.contains("--test-scrollapp")
+    }
+
+    static func runScrollAppTest() {
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            guard let info = CaptureEngine.frontmostWindow() else {
+                print("no frontmost window"); exit(1)
+            }
+            let screen = CaptureEngine.screenContaining(cgRect: info.frameCG)
+                ?? NSScreen.main ?? NSScreen.screens[0]
+            let fA = info.frameAppKit
+            // inside the window, skipping the title bar region at the top
+            let local = CGRect(
+                x: fA.minX - screen.frame.minX + 12,
+                y: fA.minY - screen.frame.minY + 12,
+                width: fA.width - 24,
+                height: fA.height - 110)
+            guard local.width >= 200, local.height >= 200 else {
+                print("front window too small: \(info.ownerName) \(fA)"); exit(1)
+            }
+            print("target: \(info.ownerName) rect \(Int(local.width))x\(Int(local.height))pt")
+            let viewportPx = Int(local.height * screen.backingScaleFactor)
+
+            let session = ScrollingCapture(onFinish: { image in
+                guard let image else { print("SCROLLAPP FAILED (no image)"); exit(1) }
+                let h = image.cgImage.height
+                print("stitched \(image.cgImage.width)x\(h)px (viewport \(viewportPx)px)")
+                SelfTest.writePNG(image.cgImage, to: NSTemporaryDirectory() + "/scrollapp.png")
+                print("saved \(NSTemporaryDirectory())scrollapp.png")
+                let grew = h > viewportPx + 200
+                print(grew ? "SCROLLAPP OK" : "SCROLLAPP FAILED (no growth)")
+                exit(grew ? 0 : 1)
+            })
+            ScrollingCapture.active = session
+            Task { @MainActor in await session.run(screen: screen, rect: local) }
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+
+            // the target page auto-scrolls itself (discrete then smooth phases)
+            // — synthesized wheel events silently no-op without Accessibility,
+            // which produced a false "nothing scrolled" reproduction earlier
+            try? await Task.sleep(nanoseconds: 18_000_000_000)
+            session.finishForTesting()
+        }
+    }
+
     /// Synthesises a real left-button drag (needs Accessibility permission).
     private static func dragMouse(from: CGPoint, to: CGPoint) {
         let src = CGEventSource(stateID: .hidSystemState)
@@ -201,6 +497,36 @@ enum Benchmark {
         }
         CGEvent(mouseEventSource: src, mouseType: .leftMouseUp,
                 mouseCursorPosition: to, mouseButton: .left)?.post(tap: .cghidEventTap)
+    }
+
+    /// Deterministic tall content: 4-pt color bands from a seeded LCG with
+    /// darker inner blocks so rows carry horizontal detail (gradient energy).
+    final class StripeDocView: NSView {
+        var scrollOffset: CGFloat = 0
+        override var isFlipped: Bool { true }
+
+        override func draw(_ dirtyRect: NSRect) {
+            guard let ctx = NSGraphicsContext.current?.cgContext else { return }
+            let band: CGFloat = 4
+            var y: CGFloat = 0
+            while y < bounds.height {
+                var seed = UInt64(y / band) &* 6364136223846793005 &+ 1442695040888963407
+                func next() -> CGFloat {
+                    seed = seed &* 6364136223846793005 &+ 1442695040888963407
+                    return CGFloat((seed >> 33) & 0xFF) / 255
+                }
+                ctx.setFillColor(CGColor(srgbRed: next(), green: next(), blue: next(), alpha: 1))
+                ctx.fill(CGRect(x: 0, y: y, width: bounds.width, height: band))
+                // horizontal detail: a few darker blocks at row-dependent x
+                ctx.setFillColor(CGColor(srgbRed: next() * 0.4, green: next() * 0.4, blue: next() * 0.4, alpha: 1))
+                var x: CGFloat = next() * 60
+                while x < bounds.width {
+                    ctx.fill(CGRect(x: x, y: y, width: 14 + next() * 30, height: band))
+                    x += 60 + next() * 90
+                }
+                y += band
+            }
+        }
     }
 
     private static func editorWindows() -> [NSWindow] {

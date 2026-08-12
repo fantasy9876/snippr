@@ -390,7 +390,7 @@ enum SelfTest {
         return Double(diff) / Double(max(1, samples)) < 3.0
     }
 
-    private static func writePNG(_ image: CGImage, to path: String) {
+    static func writePNG(_ image: CGImage, to path: String) {
         let rep = NSBitmapImageRep(cgImage: image)
         if let data = rep.representation(using: .png, properties: [:]) {
             try? data.write(to: URL(fileURLWithPath: path))

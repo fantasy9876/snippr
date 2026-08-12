@@ -61,6 +61,12 @@ enum Perf {
         }
     }
 
+    /// Stitcher reject-reason diagnostics (SNIPPR_PERF=1 only).
+    static func reject(_ reason: String) {
+        guard enabled else { return }
+        FileHandle.standardError.write("reject \(reason)\n".data(using: .utf8)!)
+    }
+
     static func measure<T>(_ label: String, _ body: () throws -> T) rethrows -> T {
         let t = Date()
         defer { log(label, since: t) }
