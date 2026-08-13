@@ -22,13 +22,13 @@ final class OCRService {
     func recognize(_ image: CGImage) async -> OCRResult {
         await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
-                let result = self.recognizeSync(image)
+                let result = Self.recognizeSync(image)
                 continuation.resume(returning: result)
             }
         }
     }
 
-    private func recognizeSync(_ image: CGImage) -> OCRResult {
+    private static func recognizeSync(_ image: CGImage) -> OCRResult {
         var lines: [String] = []
         var qrPayloads: [String] = []
 

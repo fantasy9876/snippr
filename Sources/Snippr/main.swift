@@ -17,18 +17,20 @@ if arguments.contains("--check-permissions") {
     exit(0)
 }
 
-Settings.registerDefaults()
+let devToolFlags = [
+    "--uitest", "--benchmark", "--test-firstopen", "--test-scrollpreview",
+    "--test-scrollstitch", "--test-scrollreal", "--test-scrollapp",
+]
+let isDevTool = devToolFlags.contains { arguments.contains($0) }
+
+// Test harnesses share the installed app's defaults domain when launched from
+// an app bundle. Register fallback values for them, but never run a persistent
+// behavior migration against the user's real preferences.
+Settings.registerDefaults(applyMigrations: !isDevTool)
 MainActor.assumeIsolated {
     // Single instance: a stray copy (e.g. a dev/test build) silently steals
     // the global hotkeys from the real one — never allow two Snipprs.
     // Dev tool flags bypass the guard because those runs exit by themselves.
-    let isDevTool = arguments.contains("--uitest")
-        || arguments.contains("--benchmark")
-        || arguments.contains("--test-firstopen")
-        || arguments.contains("--test-scrollpreview")
-        || arguments.contains("--test-scrollstitch")
-        || arguments.contains("--test-scrollreal")
-        || arguments.contains("--test-scrollapp")
     if !isDevTool {
         let mine = ProcessInfo.processInfo.processIdentifier
         let bundleID = Bundle.main.bundleIdentifier ?? "com.manhhoang.snippr"

@@ -34,7 +34,7 @@ final class HotkeyManager {
     private func register(combo: KeyCombo, action: HotkeyAction) {
         let id = nextID
         nextID += 1
-        var hotKeyID = EventHotKeyID(signature: OSType(0x534E5052) /* 'SNPR' */, id: id)
+        let hotKeyID = EventHotKeyID(signature: OSType(0x534E5052) /* 'SNPR' */, id: id)
         var ref: EventHotKeyRef?
         let status = RegisterEventHotKey(
             combo.keyCode, combo.modifiers, hotKeyID,
@@ -46,7 +46,6 @@ final class HotkeyManager {
         } else {
             NSLog("Snippr: failed to register hotkey \(combo.display) for \(action.rawValue) (status \(status))")
         }
-        _ = hotKeyID // silence unused warning on some toolchains
     }
 
     private func installEventHandler() {

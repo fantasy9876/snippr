@@ -1,4 +1,6 @@
 import AppKit
+import CoreImage
+import CoreMedia
 import ScreenCaptureKit
 
 enum CaptureError: Error {
@@ -6,6 +8,62 @@ enum CaptureError: Error {
     case noWindow
     case cancelled
     case permission
+    case wrongRegion
+}
+
+/// One immutable, pixel-aligned selection shared by sourceRect capture and
+/// full-display fallback. Quantizing both edges once avoids the scaled-display
+/// trap where `Int(width * scale)` produced 800 pixels while `.integral` crop
+/// expanded the same fractional selection to 801 pixels.
+struct CanonicalCaptureRegion {
+    let screenSize: CGSize
+    let scale: CGFloat
+    /// Display-local points, TOP-left origin (ScreenCaptureKit coordinates).
+    let sourceRect: CGRect
+    /// Native display pixels, TOP-left origin (CGImage coordinates).
+    let pixelRect: CGRect
+
+    init?(screenSize: CGSize, viewRect: CGRect, scale: CGFloat) {
+        guard scale.isFinite, scale > 0,
+              screenSize.width.isFinite, screenSize.height.isFinite,
+              screenSize.width > 0, screenSize.height > 0,
+              [viewRect.minX, viewRect.minY, viewRect.maxX, viewRect.maxY]
+                .allSatisfy(\.isFinite)
+        else { return nil }
+
+        let rawPixels = CGRect(
+            x: viewRect.minX * scale,
+            y: (screenSize.height - viewRect.maxY) * scale,
+            width: viewRect.width * scale,
+            height: viewRect.height * scale).standardized.integral
+        let displayPixels = CGRect(
+            x: 0, y: 0,
+            width: screenSize.width * scale,
+            height: screenSize.height * scale).integral
+        let pixels = rawPixels.intersection(displayPixels)
+        guard !pixels.isNull, pixels.width >= 1, pixels.height >= 1 else { return nil }
+
+        self.screenSize = screenSize
+        self.scale = scale
+        pixelRect = pixels
+        sourceRect = CGRect(
+            x: pixels.minX / scale,
+            y: pixels.minY / scale,
+            width: pixels.width / scale,
+            height: pixels.height / scale)
+    }
+
+    var pixelWidth: Int { Int(pixelRect.width) }
+    var pixelHeight: Int { Int(pixelRect.height) }
+
+    /// Screen-local points, bottom-left origin (AppKit view coordinates).
+    var viewRect: CGRect {
+        CGRect(
+            x: sourceRect.minX,
+            y: screenSize.height - sourceRect.maxY,
+            width: sourceRect.width,
+            height: sourceRect.height)
+    }
 }
 
 /// A captured bitmap plus its backing scale, so point sizes stay correct on Retina.
@@ -41,6 +99,21 @@ struct CapturedImage {
         return CapturedImage(cgImage: owned, scale: scale)
     }
 
+    /// Exact fallback crop for a canonical scrolling region. No second
+    /// `.integral` conversion is allowed here: `pixelRect` is already the
+    /// single quantized geometry used to configure sourceRect output.
+    func cropping(to region: CanonicalCaptureRegion) -> CapturedImage? {
+        guard abs(scale - region.scale) < 0.01,
+              CGRect(x: 0, y: 0, width: cgImage.width, height: cgImage.height)
+                .contains(region.pixelRect),
+              let cropped = cgImage.cropping(to: region.pixelRect),
+              cropped.width == region.pixelWidth,
+              cropped.height == region.pixelHeight,
+              let owned = cropped.materialized()
+        else { return nil }
+        return CapturedImage(cgImage: owned, scale: scale)
+    }
+
     func downscaledTo1x() -> CapturedImage {
         guard scale > 1 else { return self }
         let w = Int(CGFloat(cgImage.width) / scale)
@@ -54,6 +127,50 @@ struct CapturedImage {
         ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: w, height: h))
         guard let out = ctx.makeImage() else { return self }
         return CapturedImage(cgImage: out, scale: 1)
+    }
+}
+
+/// Metadata returned with a ScreenCaptureKit sample-buffer screenshot. Unlike
+/// pixel comparison with a later full-screen shot, `screenRect` describes the
+/// exact compositor frame that supplied the pixels, so animated/scrolling
+/// content cannot make coordinate validation fail spuriously.
+struct ValidatedRectCapture {
+    let image: CapturedImage
+    let screenRect: CGRect?
+    let requestedScreenRect: CGRect
+
+    /// Fail closed when ScreenCaptureKit omits the same-frame metadata. The
+    /// full-display crop backend is slower, but it is known to use the right
+    /// coordinate space on the scaled-display configurations that motivated
+    /// this check.
+    var containsRequestedRegion: Bool {
+        Self.matches(screenRect, requested: requestedScreenRect)
+            && abs(CGFloat(image.cgImage.width) - requestedScreenRect.width * image.scale) <= 1
+            && abs(CGFloat(image.cgImage.height) - requestedScreenRect.height * image.scale) <= 1
+    }
+
+    static func matches(
+        _ reported: CGRect?, requested: CGRect, tolerance: CGFloat = 1.25
+    ) -> Bool {
+        guard let reported,
+              reported.width > 0, reported.height > 0,
+              requested.width > 0, requested.height > 0,
+              [reported.minX, reported.minY, reported.width, reported.height,
+               requested.minX, requested.minY, requested.width, requested.height]
+                .allSatisfy(\.isFinite)
+        else { return false }
+        return abs(reported.minX - requested.minX) <= tolerance
+            && abs(reported.minY - requested.minY) <= tolerance
+            && abs(reported.width - requested.width) <= tolerance
+            && abs(reported.height - requested.height) <= tolerance
+    }
+
+    static func requestedScreenRect(displayFrame: CGRect, sourceRect: CGRect) -> CGRect {
+        CGRect(
+            x: displayFrame.minX + sourceRect.minX,
+            y: displayFrame.minY + sourceRect.minY,
+            width: sourceRect.width,
+            height: sourceRect.height)
     }
 }
 
@@ -80,6 +197,8 @@ struct WindowInfo {
 @MainActor
 final class CaptureEngine {
     static let shared = CaptureEngine()
+
+    private let screenshotContext = CIContext(options: [.cacheIntermediates: false])
 
     /// Enumerating shareable content costs ~30 ms, so the display list is
     /// cached (displays rarely change) and refreshed on screen changes.
@@ -176,6 +295,20 @@ final class CaptureEngine {
         screen: NSScreen, rect: CGRect,
         excludingOwnWindows: Bool = false, contentMaxAge: TimeInterval? = nil
     ) async throws -> CapturedImage {
+        guard let region = CanonicalCaptureRegion(
+            screenSize: screen.frame.size, viewRect: rect,
+            scale: screen.backingScaleFactor)
+        else { throw CaptureError.cancelled }
+        return try await captureRect(
+            screen: screen, region: region,
+            excludingOwnWindows: excludingOwnWindows,
+            contentMaxAge: contentMaxAge)
+    }
+
+    func captureRect(
+        screen: NSScreen, region: CanonicalCaptureRegion,
+        excludingOwnWindows: Bool = false, contentMaxAge: TimeInterval? = nil
+    ) async throws -> CapturedImage {
         let content = try await shareableContent(
             maxAge: contentMaxAge ?? (excludingOwnWindows ? 0.3 : 120))
         let id = Self.displayID(of: screen)
@@ -189,16 +322,114 @@ final class CaptureEngine {
             : []
         let filter = SCContentFilter(display: display, excludingWindows: excluded)
         let config = SCStreamConfiguration()
-        // sourceRect is in display-local points with a TOP-left origin
-        config.sourceRect = CGRect(
-            x: rect.minX, y: screen.frame.height - rect.maxY,
-            width: rect.width, height: rect.height
-        )
-        config.width = Int(rect.width * scale)
-        config.height = Int(rect.height * scale)
+        config.sourceRect = region.sourceRect
+        config.width = region.pixelWidth
+        config.height = region.pixelHeight
         config.showsCursor = false
         let img = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
         return CapturedImage(cgImage: img, scale: scale)
+    }
+
+    /// Same capture as `captureRect`, plus same-frame ScreenCaptureKit metadata
+    /// used by scrolling capture to reject a success response for the wrong
+    /// display region on affected scaled-display/macOS combinations.
+    func captureRectValidated(
+        screen: NSScreen, rect: CGRect,
+        excludingOwnWindows: Bool = false, contentMaxAge: TimeInterval? = nil
+    ) async throws -> ValidatedRectCapture {
+        guard let region = CanonicalCaptureRegion(
+            screenSize: screen.frame.size, viewRect: rect,
+            scale: screen.backingScaleFactor)
+        else { throw CaptureError.cancelled }
+        return try await captureRectValidated(
+            screen: screen, region: region,
+            excludingOwnWindows: excludingOwnWindows,
+            contentMaxAge: contentMaxAge)
+    }
+
+    func captureRectValidated(
+        screen: NSScreen, region: CanonicalCaptureRegion,
+        excludingOwnWindows: Bool = false, contentMaxAge: TimeInterval? = nil
+    ) async throws -> ValidatedRectCapture {
+        let content = try await shareableContent(
+            maxAge: contentMaxAge ?? (excludingOwnWindows ? 0.3 : 120))
+        let id = Self.displayID(of: screen)
+        guard let display = content.displays.first(where: { $0.displayID == id }) else {
+            throw CaptureError.noDisplay
+        }
+        let scale = screen.backingScaleFactor
+        let myPID = NSRunningApplication.current.processIdentifier
+        let excluded = excludingOwnWindows
+            ? content.windows.filter { $0.owningApplication?.processID == myPID }
+            : []
+        let filter = SCContentFilter(display: display, excludingWindows: excluded)
+        let config = SCStreamConfiguration()
+        config.sourceRect = region.sourceRect
+        config.width = region.pixelWidth
+        config.height = region.pixelHeight
+        config.showsCursor = false
+
+        let sample = try await SCScreenshotManager.captureSampleBuffer(
+            contentFilter: filter, configuration: config)
+        guard let pixelBuffer = CMSampleBufferGetImageBuffer(sample),
+              let image = screenshotContext.createCGImage(
+                CIImage(cvPixelBuffer: pixelBuffer),
+                from: CGRect(x: 0, y: 0,
+                             width: CVPixelBufferGetWidth(pixelBuffer),
+                             height: CVPixelBufferGetHeight(pixelBuffer)))
+        else { throw CaptureError.cancelled }
+
+        var screenRect: CGRect?
+        if let raw = CMSampleBufferGetSampleAttachmentsArray(
+               sample, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
+           let first = raw.first {
+            if let value = first[.screenRect] as? NSValue {
+                screenRect = value.rectValue
+            } else if let dict = first[.screenRect] as? NSDictionary {
+                screenRect = CGRect(dictionaryRepresentation: dict)
+            }
+        }
+        let requestedScreenRect = ValidatedRectCapture.requestedScreenRect(
+            displayFrame: display.frame, sourceRect: config.sourceRect)
+        return ValidatedRectCapture(
+            image: CapturedImage(cgImage: image, scale: scale),
+            screenRect: screenRect,
+            requestedScreenRect: requestedScreenRect)
+    }
+
+    /// Validated fast-path used on every scrolling tick. Keeping both the
+    /// startup frame and later frames on captureSampleBuffer also avoids mixing
+    /// subtly different captureImage/CI rasterization paths in one stitcher.
+    func captureVerifiedRect(
+        screen: NSScreen, rect: CGRect,
+        excludingOwnWindows: Bool = false, contentMaxAge: TimeInterval? = nil
+    ) async throws -> CapturedImage {
+        guard let region = CanonicalCaptureRegion(
+            screenSize: screen.frame.size, viewRect: rect,
+            scale: screen.backingScaleFactor)
+        else { throw CaptureError.cancelled }
+        return try await captureVerifiedRect(
+            screen: screen, region: region,
+            excludingOwnWindows: excludingOwnWindows,
+            contentMaxAge: contentMaxAge)
+    }
+
+    func captureVerifiedRect(
+        screen: NSScreen, region: CanonicalCaptureRegion,
+        excludingOwnWindows: Bool = false, contentMaxAge: TimeInterval? = nil
+    ) async throws -> CapturedImage {
+        let capture = try await captureRectValidated(
+            screen: screen, region: region,
+            excludingOwnWindows: excludingOwnWindows,
+            contentMaxAge: contentMaxAge)
+        guard capture.containsRequestedRegion else { throw CaptureError.wrongRegion }
+        return capture.image
+    }
+
+    static func sourceRect(screen: NSScreen, rect: CGRect) -> CGRect {
+        CanonicalCaptureRegion(
+            screenSize: screen.frame.size, viewRect: rect,
+            scale: screen.backingScaleFactor)?.sourceRect ?? .zero
     }
 
     /// Screenshot of a single window (no shadow), at native pixel resolution.

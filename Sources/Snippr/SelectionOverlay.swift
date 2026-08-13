@@ -67,15 +67,20 @@ final class SelectionOverlay {
             let others = screens.filter { $0 != cursorScreen }
             guard !others.isEmpty else { return }
             Task { @MainActor [weak self] in
-                await withTaskGroup(of: (NSScreen, CapturedImage?).self) { group in
-                    for screen in others {
+                // Pass a Sendable index through the task group; NSScreen is
+                // explicitly non-Sendable and stays isolated to MainActor.
+                await withTaskGroup(of: (Int, CapturedImage?).self) { group in
+                    for (index, screen) in others.enumerated() {
                         group.addTask { @MainActor in
-                            (screen, try? await CaptureEngine.shared.captureDisplay(screen: screen))
+                            (index, try? await CaptureEngine.shared.captureDisplay(screen: screen))
                         }
                     }
-                    for await (screen, frozen) in group {
+                    for await (index, frozen) in group {
                         guard let self, !self.finished, let frozen else { continue }
-                        self.addOverlay(for: screen, frozen: frozen, windowList: windowList, makeKey: false)
+                        self.addOverlay(
+                            for: others[index], frozen: frozen,
+                            windowList: windowList, makeKey: false
+                        )
                     }
                 }
             }
@@ -132,6 +137,16 @@ final class SelectionOverlay {
         SelectionOverlay.current = nil
         completion(result)
     }
+
+    /// Area overlays exist on every display. Starting a selection on one must
+    /// clear a stale selection on another so there is always one unambiguous
+    /// region for Return/the Capture button to confirm.
+    fileprivate func areaSelectionDidBegin(in activeView: SelectionOverlayView) {
+        for window in windows {
+            guard let view = window.contentView as? SelectionOverlayView, view !== activeView else { continue }
+            view.clearAreaSelection()
+        }
+    }
 }
 
 // MARK: - Overlay view
@@ -143,8 +158,15 @@ final class SelectionOverlayView: NSView {
     private let windowList: [WindowInfo]
     private weak var owner: SelectionOverlay?
 
-    private var dragStart: CGPoint?
-    private var dragCurrent: CGPoint?
+    private enum AreaDrag {
+        case creating(anchor: CGPoint)
+        case moving(start: CGPoint, original: CGRect)
+        case resizing(handle: SelectionHandle, original: CGRect)
+        case captureButton
+    }
+
+    private var areaSelection: CGRect?
+    private var areaDrag: AreaDrag?
     private var mousePos: CGPoint = .zero
     private var hoverWindow: WindowInfo?
 
@@ -176,12 +198,12 @@ final class SelectionOverlayView: NSView {
         ))
     }
 
-    private var selectionRect: CGRect? {
-        guard let a = dragStart, let b = dragCurrent else { return nil }
-        return CGRect(
-            x: min(a.x, b.x), y: min(a.y, b.y),
-            width: abs(a.x - b.x), height: abs(a.y - b.y)
-        )
+    fileprivate func clearAreaSelection() {
+        guard areaSelection != nil else { return }
+        areaSelection = nil
+        areaDrag = nil
+        needsDisplay = true
+        window?.invalidateCursorRects(for: self)
     }
 
     // MARK: Drawing
@@ -195,7 +217,7 @@ final class SelectionOverlayView: NSView {
 
         // dim everything except selection
         ctx.setFillColor(NSColor.black.withAlphaComponent(mode == .area ? 0.4 : 0.25).cgColor)
-        if let sel = selectionRect {
+        if let sel = areaSelection {
             ctx.beginPath()
             ctx.addRect(bounds)
             ctx.addRect(sel)
@@ -211,12 +233,14 @@ final class SelectionOverlayView: NSView {
 
         let accent = NSColor.controlAccentColor
 
-        if let sel = selectionRect {
+        if let sel = areaSelection {
             // border
             ctx.setStrokeColor(accent.cgColor)
             ctx.setLineWidth(1.5)
             ctx.stroke(sel.insetBy(dx: -0.75, dy: -0.75))
+            drawSelectionHandles(for: sel, in: ctx)
             drawSizeLabel(for: sel)
+            drawCaptureButton(in: ctx)
         } else if mode == .area {
             // crosshair
             ctx.setStrokeColor(NSColor.white.withAlphaComponent(0.7).cgColor)
@@ -238,12 +262,58 @@ final class SelectionOverlayView: NSView {
         }
     }
 
+    private func drawSelectionHandles(for rect: CGRect, in ctx: CGContext) {
+        ctx.saveGState()
+        defer { ctx.restoreGState() }
+        ctx.setFillColor(NSColor.white.cgColor)
+        ctx.setStrokeColor(NSColor.controlAccentColor.cgColor)
+        ctx.setLineWidth(1)
+        for (_, handleRect) in EditableSelectionGeometry.handleRects(for: rect) {
+            ctx.fill(handleRect)
+            ctx.stroke(handleRect)
+        }
+    }
+
     private func drawSizeLabel(for sel: CGRect) {
         let text = "\(Int(sel.width)) × \(Int(sel.height))"
-        var pos = CGPoint(x: sel.maxX + 8, y: sel.minY - 24)
-        if pos.y < 4 { pos.y = sel.minY + 6 }
-        if pos.x > bounds.width - 90 { pos.x = sel.maxX - 90 }
+        var pos = CGPoint(x: sel.minX, y: sel.maxY + 8)
+        if pos.y > bounds.maxY - 20 { pos.y = sel.maxY - 24 }
+        if pos.x > bounds.maxX - 90 { pos.x = bounds.maxX - 90 }
         drawBubble(text: text, at: pos, centered: false)
+    }
+
+    private var captureButtonRect: CGRect? {
+        guard let sel = areaSelection, sel.width >= 4, sel.height >= 4 else { return nil }
+        let size = CGSize(width: 100, height: 30)
+        let margin: CGFloat = 8
+        var x = sel.maxX - size.width
+        var y = sel.minY - size.height - margin
+        x = min(bounds.maxX - size.width - margin, max(bounds.minX + margin, x))
+        if y < bounds.minY + margin {
+            y = sel.maxY + margin
+        }
+        if y + size.height > bounds.maxY - margin {
+            // Full-height selections have no outside edge: keep the action
+            // reachable inside the clear region near its lower-right corner.
+            y = min(bounds.maxY - size.height - margin, max(bounds.minY + margin, sel.minY + margin))
+        }
+        return CGRect(origin: CGPoint(x: x, y: y), size: size)
+    }
+
+    private func drawCaptureButton(in ctx: CGContext) {
+        guard let rect = captureButtonRect else { return }
+        let path = NSBezierPath(roundedRect: rect, xRadius: 7, yRadius: 7)
+        NSColor.controlAccentColor.setFill()
+        path.fill()
+
+        let text = "Capture  ↵" as NSString
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 12, weight: .semibold),
+            .foregroundColor: NSColor.white,
+        ]
+        let size = text.size(withAttributes: attrs)
+        text.draw(at: CGPoint(x: rect.midX - size.width / 2, y: rect.midY - size.height / 2),
+                  withAttributes: attrs)
     }
 
     private func drawBubble(text: String, at point: CGPoint, centered: Bool) {
@@ -286,32 +356,84 @@ final class SelectionOverlayView: NSView {
 
     override func mouseMoved(with event: NSEvent) {
         mousePos = convert(event.locationInWindow, from: nil)
-        if mode == .windowPick { updateHover(at: mousePos) }
+        if mode == .windowPick {
+            updateHover(at: mousePos)
+        } else {
+            updateAreaCursor(at: mousePos)
+        }
         needsDisplay = true
     }
 
     override func mouseDown(with event: NSEvent) {
         let p = convert(event.locationInWindow, from: nil)
-        if mode == .area {
-            dragStart = p
-            dragCurrent = p
+        guard mode == .area else { return }
+
+        if event.clickCount >= 2, let selection = areaSelection, selection.contains(p) {
+            confirmAreaSelection()
+            return
         }
+        if let button = captureButtonRect, button.contains(p) {
+            areaDrag = .captureButton
+            return
+        }
+        if let selection = areaSelection,
+           let handle = EditableSelectionGeometry.handle(at: p, in: selection) {
+            areaDrag = .resizing(handle: handle, original: selection)
+            handle.cursor.set()
+            return
+        }
+        if let selection = areaSelection, selection.contains(p) {
+            areaDrag = .moving(start: p, original: selection)
+            NSCursor.closedHand.set()
+            return
+        }
+
+        owner?.areaSelectionDidBegin(in: self)
+        let clamped = EditableSelectionGeometry.clampedPoint(p, to: bounds)
+        areaSelection = CGRect(origin: clamped, size: .zero)
+        areaDrag = .creating(anchor: clamped)
+        needsDisplay = true
     }
 
     override func mouseDragged(with event: NSEvent) {
         guard mode == .area else { return }
-        dragCurrent = convert(event.locationInWindow, from: nil)
+        let p = convert(event.locationInWindow, from: nil)
+        switch areaDrag {
+        case .creating(let anchor):
+            areaSelection = EditableSelectionGeometry.rect(from: anchor, to: p, within: bounds)
+        case .moving(let start, let original):
+            areaSelection = EditableSelectionGeometry.moved(
+                original,
+                by: CGPoint(x: p.x - start.x, y: p.y - start.y),
+                within: bounds
+            )
+        case .resizing(let handle, let original):
+            areaSelection = EditableSelectionGeometry.resized(
+                original, using: handle, to: p, within: bounds
+            )
+        case .captureButton, .none:
+            break
+        }
         needsDisplay = true
+        window?.invalidateCursorRects(for: self)
     }
 
     override func mouseUp(with event: NSEvent) {
         switch mode {
         case .area:
-            if let sel = selectionRect, sel.width > 3, sel.height > 3, let frozen {
-                owner?.finish(.area(screen: screen, frozen: frozen, rect: sel))
-            } else {
-                owner?.finish(.cancelled)
+            let p = convert(event.locationInWindow, from: nil)
+            if case .captureButton = areaDrag,
+               let button = captureButtonRect, button.contains(p) {
+                confirmAreaSelection()
+                return
             }
+            areaDrag = nil
+            if let selection = areaSelection, selection.width < 4 || selection.height < 4 {
+                areaSelection = nil
+            }
+            updateAreaCursor(at: p)
+            needsDisplay = true
+            window?.invalidateCursorRects(for: self)
         case .windowPick:
             if let hover = hoverWindow {
                 owner?.finish(.window(hover))
@@ -324,10 +446,49 @@ final class SelectionOverlayView: NSView {
     override func keyDown(with event: NSEvent) {
         if event.keyCode == 53 { // Esc
             owner?.finish(.cancelled)
+            return
         }
+        if mode == .area, (event.keyCode == 36 || event.keyCode == 76) { // Return / keypad Enter
+            confirmAreaSelection()
+            return
+        }
+        super.keyDown(with: event)
     }
 
     override func resetCursorRects() {
+        guard mode == .area else {
+            addCursorRect(bounds, cursor: .crosshair)
+            return
+        }
         addCursorRect(bounds, cursor: .crosshair)
+        if let selection = areaSelection {
+            addCursorRect(selection, cursor: .openHand)
+            for (handle, rect) in EditableSelectionGeometry.handleRects(for: selection, size: 18) {
+                addCursorRect(rect, cursor: handle.cursor)
+            }
+        }
+        if let button = captureButtonRect {
+            addCursorRect(button, cursor: .pointingHand)
+        }
+    }
+
+    private func updateAreaCursor(at point: CGPoint) {
+        if let button = captureButtonRect, button.contains(point) {
+            NSCursor.pointingHand.set()
+        } else if let selection = areaSelection,
+                  let handle = EditableSelectionGeometry.handle(at: point, in: selection) {
+            handle.cursor.set()
+        } else if let selection = areaSelection, selection.contains(point) {
+            NSCursor.openHand.set()
+        } else {
+            NSCursor.crosshair.set()
+        }
+    }
+
+    private func confirmAreaSelection() {
+        guard let selection = areaSelection?.intersection(bounds),
+              selection.width >= 4, selection.height >= 4,
+              let frozen else { return }
+        owner?.finish(.area(screen: screen, frozen: frozen, rect: selection))
     }
 }

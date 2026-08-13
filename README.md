@@ -1,8 +1,8 @@
 # Snippr ✂️
 
-A fast, native screenshot tool for Apple Silicon Macs — capture, annotate, OCR and scrolling screenshots, all offline. Inspired by the excellent [Shottr](https://shottr.cc), rebuilt from scratch in Swift.
+A fast, native screenshot tool for Apple Silicon and Intel Macs — capture, annotate, OCR and scrolling screenshots, all offline. Inspired by the excellent [Shottr](https://shottr.cc), rebuilt from scratch in Swift.
 
-**[⬇ Download Snippr](https://snippr.pages.dev)** · macOS 14+ · arm64 only
+**[⬇ Download Snippr](https://snippr.pages.dev)** · macOS 14+ · Apple Silicon & Intel
 
 ![Editor](docs/editor.png)
 

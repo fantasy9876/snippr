@@ -3,12 +3,14 @@
 Từ macOS ≥ 1.2.0 / Windows ≥ 1.2.7, **updater xác minh tính toàn vẹn trước khi
 cài** — release thiếu hash sẽ khiến client từ chối auto-update (fail-closed).
 
-## macOS (vd. 1.2.0)
+## macOS (vd. 1.2.2)
 
 1. Bump version: `Support/Info.plist` (`CFBundleShortVersionString` + `CFBundleVersion`),
    `PreferencesWindow.swift` (AboutTab).
-2. `./build.sh` → đóng DMG cho arm64 + intel, copy vào `site/`.
-3. `shasum -a 256 site/Snippr-<ver>.dmg site/Snippr-<ver>-intel.dmg`
+2. `./build.sh release` build app arm64. Build Intel riêng bằng
+   `swift build -c release --arch x86_64`, sau đó đóng hai DMG và copy vào
+   thư mục staging deploy (các DMG bị gitignore, không nằm sẵn trong `site/`).
+3. `shasum -a 256 <staging>/Snippr-<ver>.dmg <staging>/Snippr-<ver>-intel.dmg`
 4. Cập nhật `site/version.json`: `mac`, `macUrlArm`, `macUrlIntel`,
    **`macSha256Arm`, `macSha256Intel`** (bắt buộc — client mới sẽ so khớp).
 5. Cập nhật nút tải trong `site/index.html`.

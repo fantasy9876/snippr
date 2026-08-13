@@ -8,7 +8,7 @@ set -e
 # fall back to a known-good release if the fetch fails)
 VER=$(curl -fsSL "https://snippr.pages.dev/version.json" 2>/dev/null \
   | sed -n 's/.*"mac": *"\([0-9.]*\)".*/\1/p')
-[ -n "$VER" ] || VER="1.2.0"
+[ -n "$VER" ] || VER="1.2.2"
 
 ARCH=$(uname -m)
 if [ "$ARCH" = "arm64" ]; then

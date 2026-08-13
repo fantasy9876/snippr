@@ -23,43 +23,60 @@ enum AppServices {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem?
     private var lastCapture: CapturedImage?
+    private var screenParametersObserver: NSObjectProtocol?
 
     // MARK: lifecycle
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        setupStatusItem()
-        writeLaunchStatus()
-        if !CGPreflightScreenCaptureAccess() {
+        let devToolFlags = [
+            "--uitest", "--benchmark", "--test-firstopen", "--test-scrollpreview",
+            "--test-scrollstitch", "--test-scrollreal", "--test-scrollapp",
+        ]
+        let isDevTool = devToolFlags.contains { CommandLine.arguments.contains($0) }
+        let captureDevToolFlags = [
+            "--benchmark", "--test-firstopen", "--test-scrollpreview", "--test-scrollstitch",
+            "--test-scrollreal", "--test-scrollapp",
+        ]
+        let needsCaptureServices = !isDevTool
+            || captureDevToolFlags.contains { CommandLine.arguments.contains($0) }
+
+        // Dev harnesses must not change global hotkeys or write launch state.
+        // Only capture-specific harnesses opt into Screen Recording and SCK.
+        if !isDevTool {
+            setupStatusItem()
+            writeLaunchStatus()
+            HotkeyManager.shared.handler = { [weak self] action in
+                self?.perform(hotkey: action)
+            }
+            HotkeyManager.shared.start()
+            NotificationCenter.default.addObserver(
+                self, selector: #selector(defaultsChanged),
+                name: UserDefaults.didChangeNotification, object: nil
+            )
+        }
+        if needsCaptureServices, !CGPreflightScreenCaptureAccess() {
             CGRequestScreenCaptureAccess()
         }
 
-        HotkeyManager.shared.handler = { [weak self] action in
-            self?.perform(hotkey: action)
-        }
-        HotkeyManager.shared.start()
-
-        NotificationCenter.default.addObserver(
-            self, selector: #selector(defaultsChanged),
-            name: UserDefaults.didChangeNotification, object: nil
-        )
-
-        if !UserDefaults.standard.bool(forKey: Settings.Keys.noSplash) {
+        if !isDevTool, !UserDefaults.standard.bool(forKey: Settings.Keys.noSplash) {
             ToastHUD.show("Snippr is running — ⇧⌘1 screen · ⇧⌘2 area", symbol: "camera.viewfinder", duration: 3)
         }
 
         // warm the slow paths while the user is idle: display list (~30 ms)
         // and the editor's AppKit machinery (~35 ms on first open)
-        CaptureEngine.shared.prewarm()
+        if needsCaptureServices { CaptureEngine.shared.prewarm() }
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
             EditorWindowController.prewarm()
         }
-        NotificationCenter.default.addObserver(
-            forName: NSApplication.didChangeScreenParametersNotification,
-            object: nil, queue: .main
-        ) { _ in
-            Task { @MainActor in
-                CaptureEngine.shared.invalidateContentCache()
-                CaptureEngine.shared.prewarm()
+        if needsCaptureServices {
+            screenParametersObserver = NotificationCenter.default.addObserver(
+                forName: NSApplication.didChangeScreenParametersNotification,
+                object: nil, queue: .main
+            ) { _ in
+                Task { @MainActor in
+                    CaptureEngine.shared.invalidateContentCache()
+                    CaptureEngine.shared.prewarm()
+                }
             }
         }
 
@@ -70,7 +87,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if Benchmark.scrollStitchTestRequested { Benchmark.runScrollStitchTest() }
         if let dir = Benchmark.scrollRealOutDir { Benchmark.runScrollRealTest(outDir: dir) }
         if Benchmark.scrollAppRequested { Benchmark.runScrollAppTest() }
-        if UITest.requestedOutputDir == nil && !Benchmark.requested {
+        if !isDevTool {
             UpdateChecker.checkOnLaunch()
         }
     }
@@ -90,6 +107,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
         return .terminateLater
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        if let screenParametersObserver {
+            NotificationCenter.default.removeObserver(screenParametersObserver)
+            self.screenParametersObserver = nil
+        }
     }
 
     /// Debug breadcrumb: lets tooling confirm the app booted and see its TCC state.

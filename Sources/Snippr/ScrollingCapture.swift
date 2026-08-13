@@ -21,6 +21,30 @@ final class ScrollingCapture {
     private var escHotkeyRef: EventHotKeyRef?
     private var escRegistered = false
 
+    /// A single capture backend for a session. Keeping the fallback state
+    /// explicit also prevents frames from two backends (which can differ by a
+    /// pixel on scaled displays) being fed into the same stitcher.
+    enum CaptureBackend {
+        case sourceRect
+        case fullDisplayCrop
+
+        mutating func switchToFallback(afterConsecutiveFailures failures: Int) -> Bool {
+            guard self == .sourceRect, failures >= 3 else { return false }
+            self = .fullDisplayCrop
+            return true
+        }
+    }
+
+    /// A backend transition may retain accumulated content only when its first
+    /// frame has the same geometry and confidently overlaps the current
+    /// stitcher baseline. A wrong-region/success frame is never appended.
+    nonisolated static func validateBackendTransition(
+        stitcher: VerticalStitcher?, frame: CGImage
+    ) -> Bool {
+        guard let stitcher else { return true }
+        return stitcher.canAccept(frame)
+    }
+
     /// "✓ / Esc để xong" khi Esc đăng ký được, nếu không thì chỉ còn nút ✓.
     private var stopHint: String { escRegistered ? "✓ / Esc để xong" : "bấm ✓ để xong" }
 
@@ -65,55 +89,86 @@ final class ScrollingCapture {
         CaptureEngine.shared.invalidateContentCache()
 
         let scale = screen.backingScaleFactor
+        guard let captureRegion = CanonicalCaptureRegion(
+            screenSize: screen.frame.size, viewRect: rect, scale: scale)
+        else {
+            onFinish(nil)
+            return
+        }
         // The setting is a page-length cap in points, so both platforms cap the
         // same logical page length regardless of pixel density.
         let maxHeightPx = CGFloat(Settings.shared.scrollMaxHeight) * scale
         var stitcher: VerticalStitcher?
         var lastHash = 0
         var captureFailures = 0
+        var captureBackend = CaptureBackend.sourceRect
 
-        // SCStreamConfiguration.sourceRect semantics have varied across macOS
-        // releases and scaled-display modes. Validate it ONCE against the
-        // known-correct full-capture+crop path; on any mismatch the whole
-        // session silently uses the slower-but-correct path instead of
-        // producing frames of the wrong region (which the matcher would
-        // reject forever — the "nothing ever stitches" failure).
-        var useRectCapture = true
-        if let sub = try? await CaptureEngine.shared.captureRect(
-               screen: screen, rect: rect, excludingOwnWindows: true, contentMaxAge: 300),
-           let full = try? await CaptureEngine.shared.captureDisplay(
-               screen: screen, excludingOwnWindows: true, contentMaxAge: 300),
-           let ref = full.cropping(toViewRect: rect) {
-            let sizeOK = sub.cgImage.width == ref.cgImage.width
-                && sub.cgImage.height == ref.cgImage.height
-            let diff = sizeOK ? Self.meanAbsDiff(sub.cgImage, ref.cgImage) : 255
-            useRectCapture = sizeOK && diff < 8
-            if !useRectCapture {
-                NSLog("Snippr: sourceRect capture mismatch (diff \(diff)) — falling back to full-display crop for this session")
-            }
+        // Validate an ACTUAL sourceRect screenshot using metadata attached to
+        // that same compositor frame. This catches the macOS/scaled-display
+        // failure mode where ScreenCaptureKit succeeds but returns another
+        // region, without comparing against a later full-screen frame whose
+        // animated/scrolling pixels may legitimately differ.
+        var firstFrame: CapturedImage?
+        if let verified = try? await CaptureEngine.shared.captureVerifiedRect(
+               screen: screen, region: captureRegion,
+               excludingOwnWindows: true, contentMaxAge: 300) {
+            firstFrame = verified
         } else {
-            useRectCapture = false
+            captureBackend = .fullDisplayCrop
+            NSLog("Snippr: sourceRect same-frame region validation failed — using full-display crop")
         }
 
+        var backendNeedsHandshake = false
+
         while !finished {
+            let tickStarted = Date()
             let frame: CapturedImage?
-            if useRectCapture {
-                frame = try? await captureArea(screen: screen, rect: rect)
+            if let initial = firstFrame {
+                frame = initial
+                firstFrame = nil
+            } else if captureBackend == .sourceRect {
+                frame = try? await captureArea(screen: screen, region: captureRegion)
             } else {
                 frame = (try? await CaptureEngine.shared.captureDisplay(
                     screen: screen, excludingOwnWindows: true, contentMaxAge: 300))?
-                    .cropping(toViewRect: rect)
+                    .cropping(to: captureRegion)
             }
             guard let frame else {
                 // transient SCK error must not silently end the session
                 captureFailures += 1
-                if captureFailures > 10 { break }
-                try? await Task.sleep(nanoseconds: 250_000_000)
+                if captureBackend.switchToFallback(afterConsecutiveFailures: captureFailures) {
+                    // A few macOS/display combinations reject sourceRect even
+                    // though full-display capture works. Switch only on an
+                    // actual capture error. The old pixel-by-pixel "probe"
+                    // compared two captures taken at different times; moving
+                    // pages and video routinely looked like a coordinate
+                    // mismatch and forced every tick onto the much slower
+                    // full-display path.
+                    captureFailures = 0
+                    backendNeedsHandshake = stitcher != nil
+                    updateProgress("Đang dùng chế độ tương thích — cuộn tiếp, xong \(stopHint)")
+                    NSLog("Snippr: sourceRect capture failed repeatedly — switching to full-display crop")
+                } else if captureFailures > 10 {
+                    break
+                }
+                try? await Task.sleep(nanoseconds: 80_000_000)
                 continue
             }
             captureFailures = 0
+            if backendNeedsHandshake {
+                guard Self.validateBackendTransition(stitcher: stitcher, frame: frame.cgImage) else {
+                    // Same pixel dimensions are not enough: scaled-display
+                    // backends can rasterize a different region. Keep all
+                    // accumulated content, but do not mix an unverified frame.
+                    updateProgress("Đang đồng bộ chế độ tương thích — giữ nguyên trang đã ghép")
+                    try? await Task.sleep(nanoseconds: 80_000_000)
+                    continue
+                }
+                backendNeedsHandshake = false
+            }
             let hash = Self.quickHash(frame.cgImage)
-            if hash != lastHash {
+            let changed = hash != lastHash
+            if changed {
                 lastHash = hash
                 if let s = stitcher {
                     if s.append(frame.cgImage) > 0 {
@@ -129,7 +184,18 @@ final class ScrollingCapture {
                     updateProgress("Cuộn từ từ — ảnh ghép hiện bên cạnh · \(stopHint)")
                 }
             }
-            try? await Task.sleep(nanoseconds: 180_000_000)
+
+            // SCScreenshotManager itself can take tens of milliseconds. Adding
+            // a fixed 180 ms afterwards made the effective macOS sampling rate
+            // far lower than Windows' 180 ms timer; a normal trackpad gesture
+            // could move beyond the overlap before the next frame and the
+            // session could never recover. Target a total cadence instead,
+            // polling faster while pixels are moving and backing off at rest.
+            let targetInterval = changed ? 0.075 : 0.14
+            let remaining = targetInterval - Date().timeIntervalSince(tickStarted)
+            if remaining > 0 {
+                try? await Task.sleep(nanoseconds: UInt64(remaining * 1_000_000_000))
+            }
         }
 
         let result = stitcher?.compose().map { CapturedImage(cgImage: $0, scale: scale) }
@@ -139,9 +205,12 @@ final class ScrollingCapture {
     /// Captures ONLY the selected rect (SCStreamConfiguration.sourceRect), so a
     /// tick costs the rect's pixels instead of the whole display's. The window
     /// list is cached for the whole session (our chrome doesn't change).
-    private func captureArea(screen: NSScreen, rect: CGRect) async throws -> CapturedImage? {
-        try await CaptureEngine.shared.captureRect(
-            screen: screen, rect: rect, excludingOwnWindows: true, contentMaxAge: 300)
+    private func captureArea(
+        screen: NSScreen, region: CanonicalCaptureRegion
+    ) async throws -> CapturedImage? {
+        try await CaptureEngine.shared.captureVerifiedRect(
+            screen: screen, region: region,
+            excludingOwnWindows: true, contentMaxAge: 300)
     }
 
     // MARK: live preview (the user watches the stitched page grow)
@@ -251,14 +320,13 @@ final class ScrollingCapture {
     // MARK: stop signals (Esc works globally via Carbon — no Accessibility needed)
 
     private func installStop() {
-        var hotKeyID = EventHotKeyID(signature: OSType(0x534E4553) /* 'SNES' */, id: Self.escHotkeyID)
+        let hotKeyID = EventHotKeyID(signature: OSType(0x534E4553) /* 'SNES' */, id: Self.escHotkeyID)
         let status = RegisterEventHotKey(
             UInt32(kVK_Escape), 0, hotKeyID, GetApplicationEventTarget(), 0, &escHotkeyRef)
         escRegistered = status == noErr && escHotkeyRef != nil
         if !escRegistered {
             NSLog("Snippr: could not register global Esc for scrolling capture (status \(status))")
         }
-        _ = hotKeyID
         HotkeyManager.shared.auxHandler = { [weak self] id in
             if id == Self.escHotkeyID { self?.finished = true }
         }
@@ -469,6 +537,10 @@ final class VerticalStitcher {
     /// at the very end.
     private(set) var footerRows = 0
     private var footerLatched = false
+    /// Raster output can only append whole rows, while a 1x trackpad may move
+    /// content by half a backing pixel. Carry the rounding remainder forward
+    /// so 23.5 + 23.5 appends 24 + 23 rows, not 24 + 24.
+    private var fractionalRowResidual = 0.0
 
     struct RowSig {
         let bands: [Double]   // h * 4 mean-gray band values
@@ -487,6 +559,22 @@ final class VerticalStitcher {
 
     /// The most recently appended slice — used for the live preview.
     private(set) var lastSlice: CGImage?
+
+    /// Non-mutating transition probe used when capture falls back from
+    /// sourceRect to a full-display crop. Equal dimensions alone are not proof
+    /// of equal coordinates; require the same unique content overlap that a
+    /// real append would require before mixing backend frames.
+    func canAccept(_ frame: CGImage) -> Bool {
+        guard frame.width == width, frame.height == lastFrame.height,
+              let nextSig = Self.rowSignatures(frame),
+              let prevSig = lastSig ?? Self.rowSignatures(lastFrame),
+              let match = Self.findOverlap(
+                prev: prevSig, next: nextSig, height: frame.height, scale: scale,
+                lockedFooter: footerLatched ? footerRows : nil)
+        else { return false }
+        let footer = footerLatched ? footerRows : match.footerRows
+        return footerIsStable(footer, next: nextSig)
+    }
 
     /// Append new content from `frame`. Returns the number of new rows
     /// (0 when nothing new or the frame couldn't be matched).
@@ -516,24 +604,11 @@ final class VerticalStitcher {
         // for the whole session. Pitch-aligned scrolling content that merely
         // matched the previous frame drifts away from it — reject the frame
         // instead of silently dropping/duplicating page rows.
-        if footer > 0, let first = firstSig {
-            var stable = 0
-            for y in (frame.height - footer)..<frame.height {
-                let b = y * 4
-                let d = (abs(first.bands[b] - nextSig.bands[b])
-                    + abs(first.bands[b + 1] - nextSig.bands[b + 1])
-                    + abs(first.bands[b + 2] - nextSig.bands[b + 2])
-                    + abs(first.bands[b + 3] - nextSig.bands[b + 3])) / 4
-                if d < 2.0 { stable += 1 } // tolerates a blinking cursor row
-            }
-            guard stable * 10 >= footer * 7 else {
-                Perf.reject("footer drift \(stable)/\(footer) vs first frame")
-                return 0
-            }
-        }
+        guard footerIsStable(footer, next: nextSig) else { return 0 }
 
         let contentHeight = frame.height - footer
-        let rows = min(match.offset, contentHeight)
+        let accumulatedOffset = match.preciseOffset + fractionalRowResidual
+        let rows = min(Int(accumulatedOffset.rounded()), contentHeight)
         guard rows > 0 else { return 0 }
         // new content sits just above the (possibly empty) footer band
         guard let slice = frame.cropping(to: CGRect(
@@ -542,6 +617,7 @@ final class VerticalStitcher {
         slices.append(slice)
         lastSlice = slice
         totalHeight += rows
+        fractionalRowResidual = accumulatedOffset - Double(rows)
         lastFrame = frame.materialized() ?? frame
         lastSig = nextSig
         footerRows = footer
@@ -549,8 +625,26 @@ final class VerticalStitcher {
         return rows
     }
 
+    private func footerIsStable(_ footer: Int, next: RowSig) -> Bool {
+        guard footer > 0, let first = firstSig else { return true }
+        var stable = 0
+        for y in (lastFrame.height - footer)..<lastFrame.height {
+            let b = y * 4
+            let d = (abs(first.bands[b] - next.bands[b])
+                + abs(first.bands[b + 1] - next.bands[b + 1])
+                + abs(first.bands[b + 2] - next.bands[b + 2])
+                + abs(first.bands[b + 3] - next.bands[b + 3])) / 4
+            if d < 2.0 { stable += 1 } // tolerates a blinking cursor row
+        }
+        guard stable * 10 >= footer * 7 else {
+            Perf.reject("footer drift \(stable)/\(footer) vs first frame")
+            return false
+        }
+        return true
+    }
+
     struct Match {
-        let offset: Int
+        let preciseOffset: Double
         let footerRows: Int
     }
 
@@ -685,16 +779,66 @@ final class VerticalStitcher {
             if scores[s] < secondScore { secondScore = scores[s] }
         }
 
+        // Fractional trackpad positions are a special refinement, not extra
+        // global candidates. Let the integer matcher locate the only plausible
+        // overlap first, then test half-row interpolation just around it. If
+        // interpolation competed at every offset, smoothing could create a
+        // tempting false minimum at offset zero on detailed pages.
+        var subpixelScore = Double.greatestFiniteMagnitude
+        var subpixelOffset = -1.0
+        if bestOffset > 0 {
+            let templateStart = hEff - k
+            let nearby = max(1, bestOffset - 1)...min(count - 1, bestOffset + 1)
+            // (previous-row delta, next-row delta, round result upward)
+            let phases = [(-1, 0, false), (1, 0, true),
+                          (0, -1, true), (0, 1, false)]
+            for s in nearby {
+                let start = hEff - k - s
+                for (prevDelta, nextDelta, roundUp) in phases {
+                    var diff = 0.0
+                    var localWeight = 0.0
+                    for i in 0..<k {
+                        let py = templateStart + i
+                        let ny = start + i
+                        let py2 = py + prevDelta
+                        let ny2 = ny + nextDelta
+                        guard py2 >= 0, py2 < hEff, ny2 >= 0, ny2 < hEff else { continue }
+                        let a = py * 4
+                        let a2 = py2 * 4
+                        let b = ny * 4
+                        let b2 = ny2 * 4
+                        var d = 0.0
+                        for band in 0..<4 {
+                            let p = (prev.bands[a + band] + prev.bands[a2 + band]) * 0.5
+                            let n = (next.bands[b + band] + next.bands[b2 + band]) * 0.5
+                            d += abs(p - n)
+                        }
+                        diff += weights[i] * d / 4
+                        localWeight += weights[i]
+                    }
+                    guard localWeight > weightSum * 0.9 else { continue }
+                    diff /= localWeight
+                    if diff < subpixelScore {
+                        subpixelScore = diff
+                        // `roundUp` identifies s + 0.5; the mirrored phase is
+                        // s - 0.5. Preserve it as a real-valued displacement —
+                        // append() carries its rounding residual across frames.
+                        subpixelOffset = Double(s) + (roundUp ? 0.5 : -0.5)
+                    }
+                }
+            }
+        }
+
         if Perf.enabled {
             FileHandle.standardError.write(
-                "match off=\(bestOffset) best=\(String(format: "%.2f", bestScore)) second=\(String(format: "%.2f", secondScore)) footer=\(footer)\n"
+                "match off=\(bestOffset) best=\(String(format: "%.2f", bestScore)) sub=\(String(format: "%.1f", subpixelOffset)):\(String(format: "%.2f", subpixelScore)) second=\(String(format: "%.2f", secondScore)) footer=\(footer)\n"
                     .data(using: .utf8)!)
         }
         // The true overlap is a near-perfect match (~0.0) because both frames
         // rasterize the same content; line-pitch aliases score low-but-nonzero
         // (~0.4–2). So uniqueness is a RATIO test with a small epsilon, plus
         // an absolute-gap fallback for noisy pages (animations in overlap).
-        guard bestOffset > 0, bestScore < 2.0 else {
+        guard bestOffset > 0 else {
             Perf.reject("gate off=\(bestOffset) best=\(String(format: "%.2f", bestScore))")
             return nil
         }
@@ -706,16 +850,37 @@ final class VerticalStitcher {
         }
         let unique = secondScore > bestScore * 3 + 0.15
             || secondScore - bestScore > 2.5
-        guard unique else {
+        // On a 1x display a trackpad can stop at half a backing pixel. Core
+        // Animation then re-rasterizes every text edge and raises the absolute
+        // difference (3–6 instead of ~0), even though the correct offset remains
+        // overwhelmingly better than every alternative. Accept that case only
+        // with much stronger uniqueness evidence; this is deliberately not a
+        // blanket threshold increase, so repetitive pages remain rejected.
+        let fractionalButCertain = bestScore < 6.0
+            && secondScore > bestScore * 4
+            && secondScore - bestScore > 12
+        let modeledSubpixel = subpixelOffset > 0
+            && subpixelScore < 6.0
+            && subpixelScore < bestScore * 0.75
+            && secondScore > subpixelScore * 4
+            && secondScore - subpixelScore > 12
+        guard (bestScore < 2.0 || fractionalButCertain || modeledSubpixel), unique else {
             Perf.reject("not unique best=\(String(format: "%.2f", bestScore)) second=\(String(format: "%.2f", secondScore)) off=\(bestOffset)")
             return nil
         }
-        return Match(offset: bestOffset, footerRows: footer)
+        return Match(
+            preciseOffset: modeledSubpixel ? subpixelOffset : Double(bestOffset),
+            footerRows: footer)
     }
 
-    /// Per-row: mean gray of 4 horizontal bands + gradient energy.
+    /// Per-row: mean gray of 4 horizontal bands + gradient energy. A narrow
+    /// margin is deliberately ignored on both sides. macOS draws its overlay
+    /// scroller on top of page pixels at the edge; the thumb moves and fades
+    /// between captures even when the page overlap is exact. Sampling it made
+    /// the right-most band alone push a correct match over the rejection gate.
     static func rowSignatures(_ image: CGImage) -> RowSig? {
         let w = image.width, h = image.height
+        guard w >= 8, h > 0 else { return nil }
         var buf = [UInt8](repeating: 0, count: w * h)
         guard let ctx = CGContext(
             data: &buf, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w,
@@ -725,7 +890,11 @@ final class VerticalStitcher {
         ctx.interpolationQuality = .none
         ctx.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
 
-        let bandWidth = max(1, w / 4)
+        let edgeInset = min(32, max(8, w / 25))
+        let sampleStart = min(edgeInset, (w - 4) / 2)
+        let sampleEnd = w - sampleStart
+        let sampledWidth = max(4, sampleEnd - sampleStart)
+        let bandWidth = max(1, sampledWidth / 4)
         let colStride = max(1, bandWidth / 24)
         var bands = [Double](repeating: 0, count: h * 4)
         var energy = [Double](repeating: 0, count: h)
@@ -734,8 +903,8 @@ final class VerticalStitcher {
             var grad = 0
             var gradCount = 0
             for band in 0..<4 {
-                let x0 = band * bandWidth
-                let x1 = band == 3 ? w : (band + 1) * bandWidth
+                let x0 = sampleStart + band * bandWidth
+                let x1 = band == 3 ? sampleEnd : sampleStart + (band + 1) * bandWidth
                 var sum = 0
                 var count = 0
                 var x = x0

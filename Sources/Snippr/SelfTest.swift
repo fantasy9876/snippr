@@ -5,7 +5,9 @@ import Vision
 /// Exercises everything that doesn't need Screen Recording permission.
 enum SelfTest {
     static func run(outputDir: String) -> Int32 {
-        Settings.registerDefaults()
+        // Headless tests may run from the installed bundle and therefore share
+        // its preferences domain. Never mutate real user settings here.
+        Settings.registerDefaults(applyMigrations: false)
         try? FileManager.default.createDirectory(atPath: outputDir, withIntermediateDirectories: true)
         var failures = 0
 
@@ -225,6 +227,273 @@ enum SelfTest {
                 check("stitch-footer-blink-compose", false)
             }
         }
+
+        // 2e. macOS overlay scroller -------------------------------------------------
+        // NSScroller is drawn on top of the page and its thumb moves/fades while
+        // the user scrolls.  It is not page content, so a changing strip at the
+        // viewport edge must not make an otherwise exact overlap fail.
+        do {
+            let fW = 400, fViewport = 500
+            let content: CGImage = {
+                let c = ctx(fW, 1800)
+                c.setFillColor(CGColor(gray: 0.98, alpha: 1))
+                c.fill(CGRect(x: 0, y: 0, width: fW, height: 1800))
+                var seed: UInt64 = 0x5C20_11E2
+                func next() -> CGFloat {
+                    seed = seed &* 6364136223846793005 &+ 1442695040888963407
+                    return CGFloat((seed >> 33) & 0xFF) / 255
+                }
+                var y = 12
+                while y < 1780 {
+                    let lines = 1 + Int(next() * 3)
+                    c.setFillColor(CGColor(gray: 0.72 + next() * 0.12, alpha: 1))
+                    c.fillEllipse(in: CGRect(x: 12, y: y, width: 22, height: 22))
+                    for line in 0..<lines {
+                        c.setFillColor(CGColor(gray: 0.35 + next() * 0.22, alpha: 1))
+                        c.fill(CGRect(x: 48, y: y + line * 13,
+                                      width: 70 + Int(next() * 260), height: 7))
+                    }
+                    y += 34 + Int(next() * 23)
+                }
+                return c.makeImage()!
+            }()
+
+            func scrollerFrame(offset: Int, thumbY: Int) -> CGImage? {
+                guard let body = content.cropping(to: CGRect(
+                    x: 0, y: offset, width: fW, height: fViewport
+                )) else { return nil }
+                let c = ctx(fW, fViewport)
+                c.draw(body, in: CGRect(x: 0, y: 0, width: fW, height: fViewport))
+                // Deliberately high-contrast to cover both light and dark pages.
+                c.setFillColor(CGColor(gray: 0.08, alpha: 0.85))
+                c.fill(CGRect(x: fW - 14, y: thumbY, width: 10, height: 96))
+                return c.makeImage()
+            }
+
+            let offsets = [0, 120, 260, 430]
+            let thumbPositions = [350, 290, 205, 105]
+            var s5: VerticalStitcher?
+            var scrollerOK = true
+            for (i, off) in offsets.enumerated() {
+                guard let frame = scrollerFrame(offset: off, thumbY: thumbPositions[i])
+                else { scrollerOK = false; break }
+                if let s = s5 {
+                    let rows = s.append(frame)
+                    let want = off - offsets[i - 1]
+                    if rows != want {
+                        scrollerOK = false
+                        print("  overlay-scroller step +\(want) → got \(rows)")
+                    }
+                } else {
+                    s5 = VerticalStitcher(first: frame)
+                }
+            }
+            check("stitch-overlay-scroller", scrollerOK)
+        }
+
+        // 2f. fractional-pixel trackpad scroll -------------------------------------
+        // A 23.5-point scroll on a 1x display re-rasterizes horizontal edges
+        // between pixel rows. Multiple half-pixel stops must carry their
+        // residual: 23.5 + 23.5 is 47 rows, not two rounded 24-row slices.
+        do {
+            let fW = 400, fViewport = 500
+            let content = makeStripePattern(width: fW, height: 1200, seed: 0xF12A_C710)
+            func frame(offset: Int) -> CGImage? {
+                content.cropping(to: CGRect(
+                    x: 0, y: offset, width: fW, height: fViewport
+                ))
+            }
+            func blend(_ a: CGImage, _ b: CGImage, fraction: CGFloat) -> CGImage? {
+                let c = ctx(fW, fViewport)
+                c.interpolationQuality = .high
+                c.draw(a, in: CGRect(x: 0, y: 0, width: fW, height: fViewport))
+                c.setAlpha(fraction)
+                c.draw(b, in: CGRect(x: 0, y: 0, width: fW, height: fViewport))
+                return c.makeImage()
+            }
+            func frame(offset: Double) -> CGImage? {
+                let low = Int(floor(offset))
+                let fraction = CGFloat(offset - Double(low))
+                guard fraction > 0.001 else { return frame(offset: low) }
+                guard let a = frame(offset: low), let b = frame(offset: low + 1) else { return nil }
+                return blend(a, b, fraction: fraction)
+            }
+            let positions = [0.0, 23.5, 47.0, 70.5, 94.0]
+            let expectedRows = [24, 23, 24, 23]
+            if let first = frame(offset: positions[0]) {
+                let fractional = VerticalStitcher(first: first)
+                var rows: [Int] = []
+                for position in positions.dropFirst() {
+                    guard let next = frame(offset: position) else { break }
+                    rows.append(fractional.append(next))
+                }
+                check("stitch-fractional-trackpad-sequence", rows == expectedRows,
+                      "got \(rows), want \(expectedRows)")
+                check("stitch-fractional-trackpad-no-drift",
+                      fractional.totalHeight == fViewport + 94,
+                      "got \(fractional.totalHeight), want \(fViewport + 94)")
+                check("stitch-fractional-trackpad-compose-height",
+                      fractional.compose()?.height == fViewport + 94)
+            } else {
+                check("stitch-fractional-trackpad-frame", false)
+            }
+        }
+
+        // 2g. capture backend fallback state ---------------------------------------
+        // A transient sourceRect error must keep the fast path. Three consecutive
+        // failures switch once to full-display crop without discarding content
+        // already stitched from sourceRect (both backends produce the same pixel
+        // geometry; append's size/confidence guards still reject a bad frame).
+        do {
+            var backend = ScrollingCapture.CaptureBackend.sourceRect
+            check("scroll-fallback-transient-keeps-fast-path",
+                  !backend.switchToFallback(afterConsecutiveFailures: 2)
+                  && backend == .sourceRect)
+            let switched = backend.switchToFallback(afterConsecutiveFailures: 3)
+            check("scroll-fallback-after-three-errors", switched && backend == .fullDisplayCrop)
+
+            // `screenRect` is attached to the same ScreenCaptureKit frame as
+            // the pixels. Include a negative-origin display to catch accidental
+            // NSScreen/global-coordinate assumptions on multi-monitor Macs.
+            let requested = ValidatedRectCapture.requestedScreenRect(
+                displayFrame: CGRect(x: -1728, y: 240, width: 1728, height: 1117),
+                sourceRect: CGRect(x: 125, y: 210, width: 500, height: 400))
+            check("scroll-sourcerect-metadata-global-origin",
+                  requested == CGRect(x: -1603, y: 450, width: 500, height: 400),
+                  "got \(requested)")
+            check("scroll-sourcerect-metadata-valid",
+                  ValidatedRectCapture.matches(
+                    CGRect(x: -1602.5, y: 449.5, width: 500, height: 400),
+                    requested: requested))
+            check("scroll-sourcerect-success-wrong-region-rejected",
+                  !ValidatedRectCapture.matches(
+                    CGRect(x: -1478, y: 450, width: 500, height: 400),
+                    requested: requested))
+            check("scroll-sourcerect-missing-metadata-rejected",
+                  !ValidatedRectCapture.matches(nil, requested: requested))
+
+            // Canonicalize a fractional @2x selection once. Both SCK output
+            // and a full-display fallback must use this exact 801x601 bitmap,
+            // rather than independently rounding to 800/801 pixels.
+            let fractionalRegion = CanonicalCaptureRegion(
+                screenSize: CGSize(width: 1440, height: 900),
+                viewRect: CGRect(x: 100.25, y: 80.25, width: 400.1, height: 300.1),
+                scale: 2)
+            check("scroll-canonical-fractional-2x-size",
+                  fractionalRegion?.pixelWidth == 801
+                  && fractionalRegion?.pixelHeight == 601,
+                  "got \(String(describing: fractionalRegion?.pixelRect))")
+            check("scroll-canonical-fractional-2x-source-size",
+                  fractionalRegion.map {
+                    Int(($0.sourceRect.width * $0.scale).rounded()) == $0.pixelWidth
+                    && Int(($0.sourceRect.height * $0.scale).rounded()) == $0.pixelHeight
+                  } ?? false)
+
+            if let fractionalRegion {
+                let full = makeStripePattern(
+                    width: 2880, height: 1800, seed: 0xCA90_21CA)
+                let captured = CapturedImage(cgImage: full, scale: 2)
+                check("scroll-canonical-fallback-crop-size",
+                      captured.cropping(to: fractionalRegion).map {
+                        $0.cgImage.width == fractionalRegion.pixelWidth
+                        && $0.cgImage.height == fractionalRegion.pixelHeight
+                      } ?? false)
+            }
+
+            let content = makeStripePattern(width: 200, height: 900, seed: 0xFA11_BACC)
+            if let f0 = content.cropping(to: CGRect(x: 0, y: 0, width: 200, height: 400)),
+               let f1 = content.cropping(to: CGRect(x: 0, y: 120, width: 200, height: 400)),
+               let f2 = content.cropping(to: CGRect(x: 0, y: 240, width: 200, height: 400)) {
+                let retained = VerticalStitcher(first: f0)
+                _ = retained.append(f1) // content accumulated on sourceRect
+                check("scroll-fallback-overlap-handshake",
+                      ScrollingCapture.validateBackendTransition(
+                        stitcher: retained, frame: f2))
+                _ = retained.append(f2) // first validated full-crop frame
+                check("scroll-fallback-retains-accumulated-content",
+                      retained.totalHeight == 640, "got \(retained.totalHeight), want 640")
+                if let f3 = content.cropping(to: CGRect(
+                    x: 0, y: 360, width: 200, height: 400)) {
+                    let continued = retained.append(f3)
+                    check("scroll-fallback-continues-after-switch", continued == 120,
+                          "appended \(continued), want 120")
+                    check("scroll-fallback-continued-height", retained.totalHeight == 760,
+                          "got \(retained.totalHeight), want 760")
+                } else {
+                    check("scroll-fallback-continuation-frame", false)
+                }
+
+                let unrelated = makeStripePattern(
+                    width: 200, height: 400, seed: 0xBAD0_C00D)
+                check("scroll-fallback-wrong-region-not-mixed",
+                      !ScrollingCapture.validateBackendTransition(
+                        stitcher: retained, frame: unrelated))
+                if let wrongGeometry = unrelated.cropping(to: CGRect(
+                    x: 0, y: 0, width: 199, height: 400)) {
+                    check("scroll-fallback-geometry-not-mixed",
+                          !ScrollingCapture.validateBackendTransition(
+                            stitcher: retained, frame: wrongGeometry))
+                } else {
+                    check("scroll-fallback-geometry-frame", false)
+                }
+            } else {
+                check("scroll-fallback-retains-frames", false)
+            }
+            check("scroll-fallback-switches-once",
+                  !backend.switchToFallback(afterConsecutiveFailures: 4))
+        }
+
+        // 2f. Editable capture/crop selection geometry -----------------------------
+        // Both the full-screen overlay and editor crop UI use these helpers.
+        let selectionBounds = CGRect(x: 0, y: 0, width: 1000, height: 700)
+        let initialSelection = EditableSelectionGeometry.rect(
+            from: CGPoint(x: 500, y: 500),
+            to: CGPoint(x: 100, y: 120),
+            within: selectionBounds
+        )
+        check("selection-normalizes-reverse-drag",
+              initialSelection == CGRect(x: 100, y: 120, width: 400, height: 380))
+        let movedSelection = EditableSelectionGeometry.moved(
+            initialSelection,
+            by: CGPoint(x: 900, y: -400),
+            within: selectionBounds
+        )
+        check("selection-move-clamps",
+              movedSelection == CGRect(x: 600, y: 0, width: 400, height: 380),
+              "got \(movedSelection)")
+        let resizedSelection = EditableSelectionGeometry.resized(
+            initialSelection,
+            using: .topRight,
+            to: CGPoint(x: 1200, y: 900),
+            within: selectionBounds
+        )
+        check("selection-resize-clamps",
+              resizedSelection == CGRect(x: 100, y: 120, width: 900, height: 580),
+              "got \(resizedSelection)")
+        check("selection-handle-hit",
+              EditableSelectionGeometry.handle(
+                at: CGPoint(x: initialSelection.maxX + 3, y: initialSelection.maxY - 2),
+                in: initialSelection
+              ) == .topRight)
+        let pixelCrop = EditableSelectionGeometry.pixelCropRect(
+            for: initialSelection, in: selectionBounds, scale: 2
+        )
+        check("selection-pixel-crop-orientation",
+              pixelCrop == CGRect(x: 200, y: 400, width: 800, height: 760),
+              "got \(pixelCrop)")
+        let fractionalPixelCrop = EditableSelectionGeometry.pixelCropRect(
+            for: CGRect(x: 10.25, y: 20.25, width: 100.1, height: 80.1),
+            in: selectionBounds, scale: 2
+        )
+        let annotationOffset = EditableSelectionGeometry.annotationOffset(
+            forPixelCrop: fractionalPixelCrop,
+            imageHeight: selectionBounds.height * 2
+        )
+        check("selection-crop-annotation-integral-offset",
+              annotationOffset == CGPoint(
+                x: fractionalPixelCrop.minX,
+                y: selectionBounds.height * 2 - fractionalPixelCrop.maxY
+              ), "got \(annotationOffset)")
 
         // 3. Save format heuristic --------------------------------------------------
         let flat = makeSolidImage(width: 500, height: 500, color: NSColor.systemTeal.cgColor)

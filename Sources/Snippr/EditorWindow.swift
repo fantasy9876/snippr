@@ -10,7 +10,12 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
     private var zoomLabel: NSTextField!
     private var colorWell: NSColorWell!
     private var toolButtons: [EditorTool: NSButton] = [:]
+    private var cropApplyButton: NSButton!
+    private var cropCancelButton: NSButton!
+    private var cropActionBar: NSStackView!
     private var scrollView: NSScrollView!
+    private var keepsImageFitted = true
+    private let forceFitForTesting: Bool
 
     /// Warms the toolbar's SF Symbols and the text/graphics stacks. Deliberately
     /// does NOT build a window: a throwaway window left the first real editor
@@ -24,8 +29,10 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
     }
 
     @discardableResult
-    static func open(with image: CapturedImage) -> EditorWindowController {
-        let wc = EditorWindowController(image: image)
+    static func open(
+        with image: CapturedImage, forceFitForTesting: Bool = false
+    ) -> EditorWindowController {
+        let wc = EditorWindowController(image: image, forceFitForTesting: forceFitForTesting)
         controllers.append(wc)
         // macOS 14+ can refuse activation for a menu-bar app, which used to
         // leave the first capture's editor stranded behind the frontmost app.
@@ -39,8 +46,9 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
         return wc
     }
 
-    init(image: CapturedImage) {
+    init(image: CapturedImage, forceFitForTesting: Bool = false) {
         canvas = EditorCanvasView(image: image)
+        self.forceFitForTesting = forceFitForTesting
 
         let toolbarHeight: CGFloat = 46
         let contentSize = image.pointSize
@@ -72,6 +80,18 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
 
         buildUI(toolbarHeight: toolbarHeight)
         canvas.onStateChange = { [weak self] in self?.refreshLabels() }
+        canvas.onImageChange = { [weak self] in
+            guard let self, self.keepsImageFitted else { return }
+            // NSScrollView updates its document geometry on the next layout
+            // pass after a crop/undo. Fit after that pass, not against stale bounds.
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.keepsImageFitted else { return }
+                self.fitImageToWindow()
+            }
+        }
+        canvas.onCropSelectionChange = { [weak self] isValid in
+            self?.cropApplyButton?.isEnabled = isValid
+        }
         refreshLabels()
         applyInitialZoom()
     }
@@ -86,8 +106,13 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
         scrollView.translatesAutoresizingMaskIntoConstraints = false
         scrollView.hasVerticalScroller = true
         scrollView.hasHorizontalScroller = true
+        scrollView.autohidesScrollers = true
+        scrollView.scrollerStyle = .overlay
         scrollView.allowsMagnification = true
-        scrollView.minMagnification = 0.1
+        // A 20,000-pt scrolling screenshot can need well below 10% to fit a
+        // laptop viewport. Keeping the old 10% floor forced scrollbars even in
+        // Fit mode—the exact long-image layout Fit is meant to avoid.
+        scrollView.minMagnification = 0.01
         scrollView.maxMagnification = 8
         scrollView.drawsBackground = true
         scrollView.backgroundColor = NSColor(white: 0.13, alpha: 1)
@@ -132,6 +157,25 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
             toolButtons[tool] = b
             toolViews.append(b)
         }
+
+        // Crop actions float over the scroll viewport at a fixed screen size.
+        // A very tall/narrow scrolling capture can be only a few screen pixels
+        // wide when fitted, so image-relative or crowded toolbar controls are
+        // not reliably visible/clickable.
+        let cropApply = NSButton(title: "Crop", target: self, action: #selector(applyCropFromToolbar))
+        cropApply.bezelStyle = .rounded
+        cropApply.keyEquivalent = "\r"
+        cropApply.toolTip = "Apply crop (Return)"
+        cropApply.translatesAutoresizingMaskIntoConstraints = false
+        cropApply.widthAnchor.constraint(equalToConstant: 78).isActive = true
+        cropApply.isEnabled = false
+        let cropCancel = NSButton(title: "Cancel", target: self, action: #selector(cancelCropFromToolbar))
+        cropCancel.bezelStyle = .rounded
+        cropCancel.toolTip = "Cancel crop (Esc)"
+        cropCancel.translatesAutoresizingMaskIntoConstraints = false
+        cropCancel.widthAnchor.constraint(equalToConstant: 70).isActive = true
+        cropApplyButton = cropApply
+        cropCancelButton = cropCancel
 
         colorWell = NSColorWell(style: .minimal)
         colorWell.color = Settings.shared.lastAnnotationColor
@@ -179,8 +223,20 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
         }
         bar.addSubview(stack)
 
+        let cropActions = NSStackView(views: [cropApply, cropCancel])
+        cropActions.orientation = .horizontal
+        cropActions.spacing = 6
+        cropActions.edgeInsets = NSEdgeInsets(top: 5, left: 6, bottom: 5, right: 6)
+        cropActions.translatesAutoresizingMaskIntoConstraints = false
+        cropActions.wantsLayer = true
+        cropActions.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.82).cgColor
+        cropActions.layer?.cornerRadius = 9
+        cropActions.isHidden = true
+        cropActionBar = cropActions
+
         contentView.addSubview(scrollView)
         contentView.addSubview(bar)
+        contentView.addSubview(cropActions)
         NSLayoutConstraint.activate([
             bar.topAnchor.constraint(equalTo: contentView.topAnchor),
             bar.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
@@ -194,23 +250,100 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
             scrollView.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
             scrollView.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
             scrollView.bottomAnchor.constraint(equalTo: contentView.bottomAnchor),
+            cropActions.centerXAnchor.constraint(equalTo: scrollView.centerXAnchor),
+            cropActions.bottomAnchor.constraint(equalTo: scrollView.bottomAnchor, constant: -12),
+            cropActions.heightAnchor.constraint(equalToConstant: 38),
         ])
 
         selectTool(.select)
         window.makeFirstResponder(canvas)
+        scrollView.contentView.postsBoundsChangedNotifications = true
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(liveMagnifyWillStart(_:)),
+            name: NSScrollView.willStartLiveMagnifyNotification, object: scrollView
+        )
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(scrollGeometryDidChange(_:)),
+            name: NSView.boundsDidChangeNotification, object: scrollView.contentView
+        )
     }
 
     private func applyInitialZoom() {
         guard let scrollView else { return }
-        if Settings.shared.preferZoom100 {
+        if Settings.shared.preferZoom100 && !forceFitForTesting {
+            keepsImageFitted = false
             scrollView.magnification = 1
         } else {
-            let visible = scrollView.contentView.bounds.size
-            let img = canvas.image.pointSize
-            let fit = min(visible.width / img.width, visible.height / img.height, 1)
-            scrollView.magnification = fit
+            fitImageToWindow()
         }
         refreshLabels()
+    }
+
+    /// Fits the entire image in the actual clip viewport. A tiny inset avoids
+    /// a fractional-point overflow that otherwise makes both macOS scrollers
+    /// flash for images whose aspect ratio nearly matches the editor window.
+    func fitImageToWindow() {
+        guard let scrollView else { return }
+        window?.contentView?.layoutSubtreeIfNeeded()
+        scrollView.layoutSubtreeIfNeeded()
+        // `clipView.bounds` is expressed in document coordinates and therefore
+        // changes with magnification. `contentSize` is the physical viewport,
+        // so repeated fits after resize/crop stay stable instead of oscillating.
+        let visible = scrollView.contentSize
+        let imageSize = canvas.image.pointSize
+        guard visible.width > 2, visible.height > 2,
+              imageSize.width > 0, imageSize.height > 0 else { return }
+        let fit = min(
+            (visible.width - 2) / imageSize.width,
+            (visible.height - 2) / imageSize.height,
+            1
+        )
+        keepsImageFitted = true
+        scrollView.magnification = max(scrollView.minMagnification, fit)
+        scrollView.reflectScrolledClipView(scrollView.contentView)
+        refreshLabels()
+    }
+
+    func userDidChangeZoom() {
+        keepsImageFitted = false
+        refreshLabels()
+        canvas.magnificationDidChange()
+    }
+
+    @objc private func liveMagnifyWillStart(_ notification: Notification) {
+        // Native trackpad pinch is performed by NSScrollView, bypassing the
+        // canvas' command/scroll zoom handlers. Mark it as a user zoom before
+        // the first geometry change so a later resize does not snap back to Fit.
+        keepsImageFitted = false
+        refreshLabels()
+    }
+
+    @objc private func scrollGeometryDidChange(_ notification: Notification) {
+        refreshLabels()
+        canvas.magnificationDidChange()
+    }
+
+    /// UI-test hook: checks geometry rather than `NSScroller.isHidden`, whose
+    /// overlay fade animation is timing-dependent. If the image fits in the
+    /// clip view's document-coordinate bounds, neither scrollbar is needed.
+    func imageFitsViewportForTesting(tolerance: CGFloat = 1) -> Bool {
+        window?.contentView?.layoutSubtreeIfNeeded()
+        scrollView.layoutSubtreeIfNeeded()
+        let visibleDocumentRect = scrollView.contentView.bounds
+        let imageSize = canvas.image.pointSize
+        return imageSize.width <= visibleDocumentRect.width + tolerance
+            && imageSize.height <= visibleDocumentRect.height + tolerance
+    }
+
+    /// UI-test hook for the fixed crop actions used when the fitted image is
+    /// too narrow to contain image-relative controls.
+    func cropActionControlsReadyForTesting() -> Bool {
+        window?.contentView?.layoutSubtreeIfNeeded()
+        guard let content = window?.contentView, let cropActionBar else { return false }
+        let barFrame = cropActionBar.convert(cropActionBar.bounds, to: content)
+        return cropActionBar.isHidden == false
+            && content.bounds.contains(barFrame)
+            && cropApplyButton.isEnabled == false
     }
 
     func refreshLabels() {
@@ -222,6 +355,9 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
 
     func selectTool(_ tool: EditorTool) {
         canvas.currentTool = tool
+        let cropping = tool == .crop
+        cropActionBar?.isHidden = !cropping
+        cropApplyButton?.isEnabled = cropping && canvas.hasValidCropSelection
         for (t, b) in toolButtons {
             b.contentTintColor = t == tool ? .controlAccentColor : .lightGray
         }
@@ -232,6 +368,15 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
     @objc private func toolTapped(_ sender: NSButton) {
         guard let id = sender.identifier?.rawValue, let tool = EditorTool(rawValue: id) else { return }
         selectTool(tool)
+    }
+
+    @objc private func applyCropFromToolbar() {
+        canvas.applyCropSelection()
+    }
+
+    @objc private func cancelCropFromToolbar() {
+        canvas.cancelCropSelection()
+        selectTool(.select)
     }
 
     @objc private func colorChanged() {
@@ -346,7 +491,12 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
         }
     }
 
+    func windowDidResize(_ notification: Notification) {
+        if keepsImageFitted { fitImageToWindow() }
+    }
+
     func windowWillClose(_ notification: Notification) {
+        NotificationCenter.default.removeObserver(self)
         EditorWindowController.controllers.removeAll { $0 === self }
     }
 }
@@ -376,7 +526,13 @@ final class EditorCanvasView: NSView {
 
     var annotations: [Annotation] = []
     var currentTool: EditorTool = .select {
-        didSet { window?.invalidateCursorRects(for: self); needsDisplay = true }
+        didSet {
+            if oldValue == .crop, currentTool != .crop {
+                cancelCropSelection()
+            }
+            window?.invalidateCursorRects(for: self)
+            needsDisplay = true
+        }
     }
     var currentColor: NSColor = .systemRed {
         didSet {
@@ -388,6 +544,8 @@ final class EditorCanvasView: NSView {
         }
     }
     var onStateChange: (() -> Void)?
+    var onImageChange: (() -> Void)?
+    var onCropSelectionChange: ((Bool) -> Void)?
     var enclosingScroll: (() -> NSScrollView?)?
 
     private var selected: Annotation?
@@ -395,6 +553,20 @@ final class EditorCanvasView: NSView {
     private var dragStartPoint: CGPoint = .zero
     private var isMovingSelection = false
     private var cropRect: CGRect?
+    var hasValidCropSelection: Bool {
+        guard let cropRect else { return false }
+        return cropRect.width >= 4 && cropRect.height >= 4
+    }
+
+    private func notifyCropSelectionChange() {
+        onCropSelectionChange?(hasValidCropSelection)
+    }
+    private enum CropDrag {
+        case creating(anchor: CGPoint)
+        case moving(start: CGPoint, original: CGRect)
+        case resizing(handle: SelectionHandle, original: CGRect)
+    }
+    private var cropDrag: CropDrag?
     private var textField: NSTextField?
     private var editingTextAnnotation: TextAnnotation?
 
@@ -430,6 +602,7 @@ final class EditorCanvasView: NSView {
 
     func flattened() -> CapturedImage {
         commitTextEditing()
+        if currentTool == .crop { applyCropSelection() }
         let cg = AnnotationRenderer.render(
             base: image.cgImage, annotations: annotations,
             pixellated: annotations.contains(where: { $0 is BlurAnnotation }) ? pixellated : nil
@@ -461,16 +634,50 @@ final class EditorCanvasView: NSView {
         }
         ctx.restoreGState()
 
-        if let crop = cropRect {
-            ctx.setFillColor(NSColor.black.withAlphaComponent(0.45).cgColor)
-            ctx.beginPath()
-            ctx.addRect(bounds)
-            ctx.addRect(crop)
-            ctx.fillPath(using: .evenOdd)
-            ctx.setStrokeColor(NSColor.white.cgColor)
-            ctx.setLineWidth(1)
-            ctx.stroke(crop)
+        if let crop = cropRect { drawCropChrome(for: crop, in: ctx) }
+    }
+
+    private var cropChromeScale: CGFloat {
+        let scroll = enclosingScroll?()
+        return 1 / max(scroll?.minMagnification ?? 0.01, scroll?.magnification ?? 1)
+    }
+
+    private func drawCropChrome(for crop: CGRect, in ctx: CGContext) {
+        let unit = cropChromeScale
+        ctx.saveGState()
+        defer { ctx.restoreGState() }
+
+        ctx.setFillColor(NSColor.black.withAlphaComponent(0.48).cgColor)
+        ctx.beginPath()
+        ctx.addRect(bounds)
+        ctx.addRect(crop)
+        ctx.fillPath(using: .evenOdd)
+
+        ctx.setStrokeColor(NSColor.white.cgColor)
+        ctx.setLineWidth(unit)
+        ctx.stroke(crop)
+
+        // Rule-of-thirds guides make precise post-capture composition easier.
+        ctx.setStrokeColor(NSColor.white.withAlphaComponent(0.38).cgColor)
+        ctx.setLineWidth(0.75 * unit)
+        for fraction in [CGFloat(1) / 3, CGFloat(2) / 3] {
+            let x = crop.minX + crop.width * fraction
+            let y = crop.minY + crop.height * fraction
+            ctx.move(to: CGPoint(x: x, y: crop.minY))
+            ctx.addLine(to: CGPoint(x: x, y: crop.maxY))
+            ctx.move(to: CGPoint(x: crop.minX, y: y))
+            ctx.addLine(to: CGPoint(x: crop.maxX, y: y))
         }
+        ctx.strokePath()
+
+        ctx.setFillColor(NSColor.white.cgColor)
+        ctx.setStrokeColor(NSColor.controlAccentColor.cgColor)
+        ctx.setLineWidth(unit)
+        for (_, handleRect) in EditableSelectionGeometry.handleRects(for: crop, size: 7 * unit) {
+            ctx.fill(handleRect)
+            ctx.stroke(handleRect)
+        }
+
     }
 
     private func drawSelectionChrome(around rect: CGRect, in ctx: CGContext) {
@@ -524,6 +731,7 @@ final class EditorCanvasView: NSView {
         setFrameSize(newImage.pointSize)
         needsDisplay = true
         onStateChange?()
+        onImageChange?()
     }
 
     // MARK: mouse
@@ -566,7 +774,25 @@ final class EditorCanvasView: NSView {
             blur.rect = CGRect(origin: pp, size: .zero)
             drafting = blur
         case .crop:
-            cropRect = CGRect(origin: vp, size: .zero)
+            selected = nil
+            if event.clickCount >= 2, let crop = cropRect, crop.contains(vp) {
+                applyCropSelection()
+            } else if let crop = cropRect,
+                      let handle = EditableSelectionGeometry.handle(
+                        at: vp, in: crop, tolerance: 9 * cropChromeScale
+                      ) {
+                cropDrag = .resizing(handle: handle, original: crop)
+                handle.cursor.set()
+            } else if let crop = cropRect, crop.contains(vp) {
+                cropDrag = .moving(start: vp, original: crop)
+                NSCursor.closedHand.set()
+            } else {
+                let anchor = EditableSelectionGeometry.clampedPoint(vp, to: bounds)
+                cropRect = CGRect(origin: anchor, size: .zero)
+                cropDrag = .creating(anchor: anchor)
+            }
+            notifyCropSelectionChange()
+            needsDisplay = true
         case .text:
             beginTextEditing(atViewPoint: vp, pixelPoint: pp)
         case .counter:
@@ -632,18 +858,24 @@ final class EditorCanvasView: NSView {
                 invalidate(pixelRect: before.union(blur.rect))
             }
         case .crop:
-            let startVp = CGPoint(x: dragStartPoint.x / pxScale, y: dragStartPoint.y / pxScale)
-            let old = cropRect
-            cropRect = CGRect(
-                x: min(startVp.x, vp.x), y: min(startVp.y, vp.y),
-                width: abs(vp.x - startVp.x), height: abs(vp.y - startVp.y)
-            )
-            if let old, let new = cropRect, old.width > 1 || old.height > 1 {
-                // the dim region only changes between the old and new rects
-                setNeedsDisplay(old.union(new).insetBy(dx: -4, dy: -4))
-            } else {
-                needsDisplay = true // first frame dims the whole canvas
+            switch cropDrag {
+            case .creating(let anchor):
+                cropRect = EditableSelectionGeometry.rect(from: anchor, to: vp, within: bounds)
+            case .moving(let start, let original):
+                cropRect = EditableSelectionGeometry.moved(
+                    original,
+                    by: CGPoint(x: vp.x - start.x, y: vp.y - start.y),
+                    within: bounds
+                )
+            case .resizing(let handle, let original):
+                cropRect = EditableSelectionGeometry.resized(
+                    original, using: handle, to: vp, within: bounds
+                )
+            case .none:
+                break
             }
+            notifyCropSelectionChange()
+            needsDisplay = true
         default:
             break
         }
@@ -659,32 +891,56 @@ final class EditorCanvasView: NSView {
             drafting = nil
             needsDisplay = true
         }
-        if currentTool == .crop, let crop = cropRect {
-            cropRect = nil
-            if crop.width > 4, crop.height > 4 {
-                performCrop(viewRect: crop)
-            }
+        if currentTool == .crop {
+            cropDrag = nil
+            if let crop = cropRect, crop.width < 4 || crop.height < 4 { cropRect = nil }
+            notifyCropSelectionChange()
             needsDisplay = true
+            window?.invalidateCursorRects(for: self)
         }
         isMovingSelection = false
     }
 
+    func applyCropSelection() {
+        guard let crop = cropRect, crop.width >= 4, crop.height >= 4 else { return }
+        cropRect = nil
+        cropDrag = nil
+        notifyCropSelectionChange()
+        performCrop(viewRect: crop)
+        (window?.windowController as? EditorWindowController)?.selectTool(.select)
+    }
+
+    func cancelCropSelection() {
+        guard cropRect != nil || cropDrag != nil else { return }
+        cropRect = nil
+        cropDrag = nil
+        notifyCropSelectionChange()
+        needsDisplay = true
+        window?.invalidateCursorRects(for: self)
+    }
+
     private func performCrop(viewRect: CGRect) {
+        let viewRect = viewRect.intersection(bounds)
+        guard !viewRect.isNull, viewRect.width >= 4, viewRect.height >= 4 else { return }
+        let requestedPixels = EditableSelectionGeometry.pixelCropRect(
+            for: viewRect, in: bounds, scale: pxScale
+        )
+        let imageBounds = CGRect(x: 0, y: 0, width: image.cgImage.width, height: image.cgImage.height)
+        let px = requestedPixels.intersection(imageBounds)
+        guard !px.isNull, px.width >= 1, px.height >= 1,
+              let cropped = image.cgImage.cropping(to: px),
+              let owned = cropped.materialized() else { return }
         registerUndoSnapshot()
-        let px = CGRect(
-            x: viewRect.minX * pxScale,
-            y: (bounds.height - viewRect.maxY) * pxScale,
-            width: viewRect.width * pxScale,
-            height: viewRect.height * pxScale
-        ).integral
-        guard let cropped = image.cgImage.cropping(to: px) else { return }
-        // shift annotations: new origin in bottom-left pixel coords
-        let dx = viewRect.minX * pxScale
-        let dy = viewRect.minY * pxScale
+        // Shift annotations by the exact integral bitmap crop, not the
+        // fractional view rectangle. This keeps them pixel-aligned across
+        // repeated crops and converts CG's top-left Y to AppKit bottom-left Y.
+        let offset = EditableSelectionGeometry.annotationOffset(
+            forPixelCrop: px, imageHeight: CGFloat(image.cgImage.height)
+        )
         for a in annotations {
-            a.move(by: CGPoint(x: -dx, y: -dy))
+            a.move(by: CGPoint(x: -offset.x, y: -offset.y))
         }
-        setImage(CapturedImage(cgImage: cropped, scale: pxScale))
+        setImage(CapturedImage(cgImage: owned, scale: pxScale))
     }
 
     // MARK: text tool
@@ -749,7 +1005,16 @@ final class EditorCanvasView: NSView {
         let chars = event.charactersIgnoringModifiers?.lowercased() ?? ""
 
         if event.keyCode == 53 { // Esc
+            if currentTool == .crop {
+                cancelCropSelection()
+                (window?.windowController as? EditorWindowController)?.selectTool(.select)
+                return
+            }
             (window?.windowController as? EditorWindowController)?.escPressed()
+            return
+        }
+        if currentTool == .crop, (event.keyCode == 36 || event.keyCode == 76) { // Return / keypad Enter
+            applyCropSelection()
             return
         }
         if event.keyCode == 51 || event.keyCode == 117 { // delete
@@ -794,7 +1059,10 @@ final class EditorCanvasView: NSView {
             case "w": window?.close(); return true
             case "0":
                 enclosingScroll?()?.magnification = 1
-                wc.refreshLabels()
+                wc.userDidChangeZoom()
+                return true
+            case "9":
+                wc.fitImageToWindow()
                 return true
             case "=", "+":
                 zoom(by: 1.25); return true
@@ -815,8 +1083,9 @@ final class EditorCanvasView: NSView {
 
     private func zoom(by factor: CGFloat) {
         guard let sv = enclosingScroll?() else { return }
-        sv.magnification = min(8, max(0.1, sv.magnification * factor))
-        (window?.windowController as? EditorWindowController)?.refreshLabels()
+        sv.magnification = min(sv.maxMagnification,
+                               max(sv.minMagnification, sv.magnification * factor))
+        (window?.windowController as? EditorWindowController)?.userDidChangeZoom()
     }
 
     override func scrollWheel(with event: NSEvent) {
@@ -828,8 +1097,12 @@ final class EditorCanvasView: NSView {
             if Settings.shared.zoomReverseScroll { delta = -delta }
             let factor = 1 + delta / 120
             let mouse = sv.contentView.convert(event.locationInWindow, from: nil)
-            sv.setMagnification(min(8, max(0.1, sv.magnification * factor)), centeredAt: mouse)
-            (window?.windowController as? EditorWindowController)?.refreshLabels()
+            sv.setMagnification(
+                min(sv.maxMagnification,
+                    max(sv.minMagnification, sv.magnification * factor)),
+                centeredAt: mouse
+            )
+            (window?.windowController as? EditorWindowController)?.userDidChangeZoom()
             return
         }
         // Shift + scroll pans (scrollbars & pinch-zoom also available)
@@ -857,6 +1130,12 @@ final class EditorCanvasView: NSView {
     }
 
     private var trackpadAccum: CGFloat = 0
+
+    func magnificationDidChange() {
+        guard cropRect != nil else { return }
+        needsDisplay = true
+        window?.invalidateCursorRects(for: self)
+    }
 
     static func isStrokeTool(_ tool: EditorTool) -> Bool {
         switch tool {
@@ -935,6 +1214,15 @@ final class EditorCanvasView: NSView {
         switch currentTool {
         case .select: addCursorRect(bounds, cursor: .arrow)
         case .text: addCursorRect(bounds, cursor: .iBeam)
+        case .crop:
+            addCursorRect(bounds, cursor: .crosshair)
+            if let crop = cropRect {
+                addCursorRect(crop, cursor: .openHand)
+                let targetSize = 18 * cropChromeScale
+                for (handle, rect) in EditableSelectionGeometry.handleRects(for: crop, size: targetSize) {
+                    addCursorRect(rect, cursor: handle.cursor)
+                }
+            }
         default: addCursorRect(bounds, cursor: .crosshair)
         }
     }

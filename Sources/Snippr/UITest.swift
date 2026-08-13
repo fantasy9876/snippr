@@ -18,11 +18,16 @@ enum UITest {
 
         // sample capture: gradient test card @2x
         let sample = CapturedImage(cgImage: SelfTest.makeTestImage(width: 1440, height: 900), scale: 2)
-        EditorWindowController.open(with: sample)
+        let fittedEditor = EditorWindowController.open(with: sample, forceFitForTesting: true)
         // small shot in a deliberately oversized window — proves centering
         let small = CapturedImage(cgImage: SelfTest.makeTestImage(width: 600, height: 360), scale: 2)
-        EditorWindowController.open(with: small).window?
-            .setContentSize(NSSize(width: 820, height: 560))
+        let smallEditor = EditorWindowController.open(with: small, forceFitForTesting: true)
+        smallEditor.window?.setContentSize(NSSize(width: 820, height: 560))
+        // Tall scrolling result: its fit factor is below the old 10% zoom
+        // floor, which used to leave both scrollers visible in "Fit" mode.
+        let tall = CapturedImage(cgImage: SelfTest.makeTestImage(width: 400, height: 24_000), scale: 2)
+        let tallEditor = EditorWindowController.open(with: tall, forceFitForTesting: true)
+        tallEditor.selectTool(.crop)
         // opened the way the menu's "About Snippr" does — must land on About
         PreferencesWindowController.show(tab: .about)
         ToastHUD.show("Snippr UI test — toast OK", symbol: "checkmark.seal.fill", duration: 6)
@@ -50,6 +55,12 @@ enum UITest {
         }
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+            let fitOK = fittedEditor.imageFitsViewportForTesting()
+                && smallEditor.imageFitsViewportForTesting()
+                && tallEditor.imageFitsViewportForTesting()
+            let tallCropControlsOK = tallEditor.cropActionControlsReadyForTesting()
+            print("UITEST editor-fit \(fitOK ? "PASS" : "FAIL")")
+            print("UITEST tall-crop-controls \(tallCropControlsOK ? "PASS" : "FAIL")")
             var index = 0
             for window in NSApp.windows where window.isVisible {
                 guard let view = window.contentView, view.bounds.width > 10 else { continue }
@@ -62,7 +73,7 @@ enum UITest {
                 index += 1
             }
             print("UITEST captured \(index) windows → \(outDir)")
-            exit(index >= 3 ? 0 : 1)
+            exit(index >= 3 && fitOK && tallCropControlsOK ? 0 : 1)
         }
     }
 }

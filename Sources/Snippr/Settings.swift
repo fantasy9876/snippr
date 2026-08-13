@@ -222,6 +222,8 @@ final class Settings {
         static let uploadProvider = "uploadProvider"
         static let lastAnnotationColor = "lastAnnotationColor"
         static let translateTarget = "translateTarget"
+        // One-time behavior migrations. These are deliberately not shown in UI.
+        static let didMigrateEditorFit = "didMigrateEditorFit_v1"
     }
 
     /// Per-tool stroke width, remembered across sessions ("nét vẽ history").
@@ -244,8 +246,9 @@ final class Settings {
         set { d.set(newValue, forKey: Keys.translateTarget) }
     }
 
-    static func registerDefaults() {
-        UserDefaults.standard.register(defaults: [
+    static func registerDefaults(applyMigrations: Bool = true) {
+        let defaults = UserDefaults.standard
+        defaults.register(defaults: [
             Keys.windowBGStyle: WindowBGStyle.transparent.rawValue,
             Keys.windowBGColor: "#FFFFFF",
             Keys.saveFormat: SaveFormat.auto.rawValue,
@@ -262,7 +265,7 @@ final class Settings {
             Keys.noSplash: false,
             Keys.alwaysOnTop: false,
             Keys.zoomReverseScroll: false,
-            Keys.preferZoom100: true,
+            Keys.preferZoom100: false,
             Keys.escCopy: true,
             Keys.escSave: false,
             Keys.confirmationStyle: ConfirmationStyle.custom.rawValue,
@@ -270,6 +273,13 @@ final class Settings {
             Keys.diagnostics: true,
             Keys.uploadProvider: "disabled",
         ])
+        // Older releases defaulted to 100%, leaving larger/near-edge images
+        // behind macOS scrollbars. Move every existing install to Fit once;
+        // users can still explicitly turn "Prefer 100%" back on afterwards.
+        if applyMigrations, !defaults.bool(forKey: Keys.didMigrateEditorFit) {
+            defaults.set(false, forKey: Keys.preferZoom100)
+            defaults.set(true, forKey: Keys.didMigrateEditorFit)
+        }
     }
 
     var windowBGStyle: WindowBGStyle {

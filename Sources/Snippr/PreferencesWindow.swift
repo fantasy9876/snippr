@@ -527,7 +527,7 @@ struct AdvancedTab: View {
     @AppStorage(Settings.Keys.noSplash) private var noSplash = false
     @AppStorage(Settings.Keys.alwaysOnTop) private var alwaysOnTop = false
     @AppStorage(Settings.Keys.zoomReverseScroll) private var zoomReverse = false
-    @AppStorage(Settings.Keys.preferZoom100) private var prefer100 = true
+    @AppStorage(Settings.Keys.preferZoom100) private var prefer100 = false
     @AppStorage(Settings.Keys.escCopy) private var escCopy = true
     @AppStorage(Settings.Keys.escSave) private var escSave = false
     @AppStorage(Settings.Keys.confirmationStyle) private var confirmStyle = ConfirmationStyle.custom.rawValue
@@ -603,7 +603,7 @@ struct AboutTab: View {
                 .font(.system(size: 42, weight: .medium))
                 .foregroundStyle(.tint)
             Text("Snippr").font(.title).bold()
-            Text("Version 1.2.1 — native for Apple Silicon & Intel")
+            Text("Version 1.2.2 — native for Apple Silicon & Intel")
                 .foregroundStyle(.secondary)
             Divider().frame(width: 300)
             Text("Free for personal use. Screenshot, annotate, OCR,\nscrolling capture — everything stays on your Mac.")
