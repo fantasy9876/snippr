@@ -362,16 +362,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func captureArea() {
-        SelectionOverlay.begin(purpose: .areaReview) { [weak self] result in
-            guard case let .area(screen, frozen, rect) = result,
-                  let cropped = frozen.cropping(toViewRect: rect) else { return }
-            // remember for Repeat Area Capture (global AppKit coords)
-            let global = CGRect(
-                x: rect.minX + screen.frame.minX, y: rect.minY + screen.frame.minY,
-                width: rect.width, height: rect.height
-            )
-            Settings.shared.lastAreaRect = global
-            self?.handleResult(cropped, source: .area)
+        // The area-review overlay runs the whole flow in place: the action
+        // router performs copy/save/lastAreaRect and any presentation, so
+        // there is deliberately NO handleResult here — a second routing path
+        // would double every side effect (QA: cấm hai đường cùng chạy).
+        SelectionOverlay.begin(purpose: .areaReview) { result in
+            switch result {
+            case .handled, .cancelled, .area, .window:
+                break
+            }
         }
     }
 

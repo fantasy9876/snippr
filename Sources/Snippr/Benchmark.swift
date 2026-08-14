@@ -70,22 +70,26 @@ enum Benchmark {
                 let overlayUp = SelectionOverlay.current != nil
                 dragMouse(from: CGPoint(x: 400, y: 400), to: CGPoint(x: 900, y: 720))
                 try? await Task.sleep(nanoseconds: 350_000_000)
-                // Lightshot-style selection deliberately remains editable
-                // after mouse-up. Confirm that state, then exercise the Return
-                // shortcut that commits the adjusted region.
-                let selectionPersisted = SelectionOverlay.current != nil
-                pressKey(36) // Return
+                // Mouse-up IS the capture: the overlay must be in in-place
+                // REVIEW (toolbar up, no Capture button). Return = Copy and
+                // close — and area review never opens a titled editor.
+                let reviewing = SelectionOverlay.current?
+                    .activeReviewViewForTesting?.isReviewingForTesting ?? false
+                let toolbarUp = SelectionOverlay.current?
+                    .activeReviewViewForTesting?
+                    .reviewToolbarFrameForTesting != nil
+                pressKey(36) // Return → Copy & close
                 try? await Task.sleep(nanoseconds: 1_500_000_000)
 
                 let fresh = editorWindows().filter { w in !before.contains { $0 === w } }
-                let visible = fresh.contains { $0.isVisible }
                 let front = NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "?"
                 let overlayStillUp = SelectionOverlay.current != nil
-                print("area #\(round): overlayShown=\(overlayUp) selectionPersisted=\(selectionPersisted) "
-                      + "overlayStillUp=\(overlayStillUp) "
-                      + "newWindows=\(fresh.count) visible=\(visible) front=\(front)")
+                print("area #\(round): overlayShown=\(overlayUp) reviewing=\(reviewing) "
+                      + "toolbar=\(toolbarUp) overlayStillUp=\(overlayStillUp) "
+                      + "newEditors=\(fresh.count) front=\(front)")
                 if overlayStillUp { SelectionOverlay.current?.finish(.cancelled) }
-                if !overlayUp || !selectionPersisted || overlayStillUp || !visible { failures += 1 }
+                if !overlayUp || !reviewing || !toolbarUp || overlayStillUp
+                    || !fresh.isEmpty { failures += 1 }
                 fresh.forEach { $0.close() }
             }
 

@@ -10,6 +10,9 @@ enum OverlayResult {
     /// Area selected: frozen screen image + selection rect in screen-local points (bottom-left origin).
     case area(screen: NSScreen, frozen: CapturedImage, rect: CGRect)
     case window(WindowInfo)
+    /// Area-review ran its whole flow in place (router side effects done) —
+    /// the caller has nothing left to route.
+    case handled
     case cancelled
 }
 
@@ -29,16 +32,22 @@ final class SelectionOverlay {
     /// display consults (exactly-once initialCapture, phase, pixel rect).
     let session: OverlaySession
     private let completion: @MainActor (OverlayResult) -> Void
+    /// Tests inject router spies here; production leaves it nil (= .live).
+    var routerDependenciesOverride: CaptureActionRouter.Dependencies?
     /// SINGLE source of truth for "this session is over": derived from the
     /// session phase, never a separate flag — a separate bool and the phase
     /// could disagree, letting a late secondary-display capture add windows
     /// to a completed session (or a completed phase leave windows alive).
     fileprivate var finished: Bool { session.phase == .completed }
 
-    init(purpose: OverlayPurpose, completion: @escaping @MainActor (OverlayResult) -> Void) {
+    init(
+        purpose: OverlayPurpose,
+        inputs: OverlaySessionInputs? = nil,
+        completion: @escaping @MainActor (OverlayResult) -> Void
+    ) {
         self.mode = purpose == .windowPick ? .windowPick : .area
         self.session = OverlaySession(
-            purpose: purpose, inputs: .snapshot())
+            purpose: purpose, inputs: inputs ?? .snapshot())
         self.completion = completion
     }
 
@@ -179,6 +188,40 @@ final class SelectionOverlay {
         completion(result)
     }
 
+    /// The review began on one display's view: make its window key so
+    /// keyboard shortcuts land there, and leave every other display dimmed.
+    fileprivate func reviewDidBegin(in activeView: SelectionOverlayView) {
+        activeView.window?.makeKeyAndOrderFront(nil)
+        activeView.window?.makeFirstResponder(activeView)
+    }
+
+    /// Factory entry for UI-harness tests: builds the overlay around an
+    /// injected frozen image instead of capturing displays, driving the same
+    /// production windows/views/session.
+    static func beginForTesting(
+        purpose: OverlayPurpose,
+        frozen: CapturedImage,
+        screen: NSScreen,
+        completion: @escaping @MainActor (OverlayResult) -> Void
+    ) -> SelectionOverlay? {
+        guard current == nil else { return nil }
+        let overlay = SelectionOverlay(purpose: purpose, completion: completion)
+        current = overlay
+        overlay.addOverlay(
+            for: screen, frozen: frozen, windowList: [], makeKey: false)
+        return overlay
+    }
+
+    var activeReviewViewForTesting: SelectionOverlayView? {
+        for window in windows {
+            if let view = window.contentView as? SelectionOverlayView,
+               view.hasAreaSelectionForTesting {
+                return view
+            }
+        }
+        return windows.first?.contentView as? SelectionOverlayView
+    }
+
     /// Area overlays exist on every display. Starting a selection on one must
     /// clear a stale selection on another so there is always one unambiguous
     /// region for Return/the Capture button to confirm.
@@ -203,7 +246,6 @@ final class SelectionOverlayView: NSView {
         case creating(anchor: CGPoint)
         case moving(start: CGPoint, original: CGRect)
         case resizing(handle: SelectionHandle, original: CGRect)
-        case captureButton
     }
 
     private var areaSelection: CGRect?
@@ -237,6 +279,225 @@ final class SelectionOverlayView: NSView {
             options: [.mouseMoved, .activeAlways, .mouseEnteredAndExited],
             owner: self, userInfo: nil
         ))
+    }
+
+    /// Reviewing = the SESSION is reviewing (or a save is in flight). Every
+    /// view on every display reads the same session state.
+    fileprivate var isReviewing: Bool {
+        let phase = owner?.session.phase
+        return phase == .reviewing || phase == .saving
+    }
+
+    /// While the Save sheet is up the WHOLE canvas is locked: no drags, no
+    /// Esc/outside-click teardown, no Close — the native sheet owns
+    /// cancellation and the typed callback returns the session to review.
+    fileprivate var isSaving: Bool { owner?.session.phase == .saving }
+
+    fileprivate func handleEscape() {
+        if isSaving { return }
+        owner?.finish(.cancelled)
+    }
+    func handleEscapeForTesting() { handleEscape() }
+    func handleOutsideClickForTesting() {
+        if isSaving { return }
+        owner?.finish(.cancelled)
+    }
+
+    var hasAreaSelectionForTesting: Bool { areaSelection != nil }
+    var isReviewingForTesting: Bool { isReviewing }
+    var reviewToolbarFrameForTesting: CGRect? {
+        reviewToolbar?.isHidden == false ? reviewToolbar?.frame : nil
+    }
+
+    /// Test hook: runs the production selection→commit path without raw
+    /// mouse plumbing (QA prefers small state hooks over synthesized clicks).
+    func selectForTesting(rect: CGRect) {
+        owner?.areaSelectionDidBegin(in: self)
+        areaSelection = rect
+        commitInitialSelection(rect)
+        needsDisplay = true
+    }
+
+    func performReviewActionForTesting(_ intent: CaptureIntent) {
+        performReviewAction(intent)
+    }
+
+    /// Test hook: a review-phase resize/move lands on this exact production
+    /// path (selection + pixel-rect + toolbar relayout).
+    func adjustSelectionForTesting(rect: CGRect) {
+        guard isReviewing else { return }
+        areaSelection = rect
+        syncSessionPixelRect()
+        layoutReviewToolbar()
+        needsDisplay = true
+    }
+
+    // MARK: Review toolbar
+
+    private var reviewToolbar: NSView?
+    private var toolbarButtons: [NSButton] = []
+
+    private static let toolbarItems: [(symbol: String, tooltip: String, intent: CaptureIntent)] = [
+        ("doc.on.doc", "Copy (Enter, ⌘C)", .copy),
+        ("square.and.arrow.down", "Save…", .save),
+        ("pin", "Pin to screen", .pin),
+        ("text.viewfinder", "Copy text (OCR)", .ocr),
+        ("macwindow", "Open in editor window", .openEditor),
+    ]
+
+    private func buildReviewToolbar() -> NSView {
+        let container = NSView(frame: .zero)
+        container.wantsLayer = true
+        container.layer?.backgroundColor =
+            NSColor.black.withAlphaComponent(0.82).cgColor
+        container.layer?.cornerRadius = 8
+        var buttons: [NSButton] = []
+        for (index, item) in Self.toolbarItems.enumerated() {
+            let button = NSButton(frame: .zero)
+            button.bezelStyle = .regularSquare
+            button.isBordered = false
+            button.image = NSImage(
+                systemSymbolName: item.symbol, accessibilityDescription: item.tooltip)
+            button.contentTintColor = .white
+            button.toolTip = item.tooltip
+            button.tag = index
+            button.target = self
+            button.action = #selector(reviewToolbarButtonPressed(_:))
+            container.addSubview(button)
+            buttons.append(button)
+        }
+        let close = NSButton(frame: .zero)
+        close.bezelStyle = .regularSquare
+        close.isBordered = false
+        close.image = NSImage(
+            systemSymbolName: "xmark", accessibilityDescription: "Close (Esc)")
+        close.contentTintColor = .white
+        close.toolTip = "Close (Esc)"
+        close.tag = -1
+        close.target = self
+        close.action = #selector(reviewToolbarButtonPressed(_:))
+        container.addSubview(close)
+        buttons.append(close)
+        toolbarButtons = buttons
+        return container
+    }
+
+    /// Attach the toolbar to the selection edge: below the frame when there
+    /// is room, above otherwise, always clamped inside this screen's bounds
+    /// and never overlapping the resize-handle hit rects (QA invariant 3).
+    fileprivate func layoutReviewToolbar() {
+        guard isReviewing, let selection = areaSelection else {
+            reviewToolbar?.isHidden = true
+            return
+        }
+        let toolbar: NSView
+        if let existing = reviewToolbar {
+            toolbar = existing
+        } else {
+            toolbar = buildReviewToolbar()
+            addSubview(toolbar)
+            reviewToolbar = toolbar
+        }
+        toolbar.isHidden = false
+        let buttonSize = CGSize(width: 34, height: 30)
+        let spacing: CGFloat = 2
+        let padding: CGFloat = 6
+        let count = CGFloat(toolbarButtons.count)
+        let width = count * buttonSize.width + (count - 1) * spacing + padding * 2
+        let height = buttonSize.height + padding * 2
+        let margin: CGFloat = 10 // stays clear of the 18-pt handle hit rects
+        var x = selection.maxX - width
+        x = max(bounds.minX + margin, min(bounds.maxX - width - margin, x))
+        var y = selection.minY - height - margin
+        if y < bounds.minY + margin {
+            y = selection.maxY + margin
+        }
+        if y + height > bounds.maxY - margin {
+            // full-height selection: keep the bar inside, near the bottom
+            y = max(bounds.minY + margin, min(
+                bounds.maxY - height - margin, selection.minY + margin))
+        }
+        toolbar.frame = CGRect(x: x, y: y, width: width, height: height)
+        for (index, button) in toolbarButtons.enumerated() {
+            button.frame = CGRect(
+                x: padding + CGFloat(index) * (buttonSize.width + spacing),
+                y: padding, width: buttonSize.width, height: buttonSize.height)
+        }
+        // ALL buttons (Close included) lock while a save is in flight.
+        let enabled = owner?.session.acceptsCommits ?? false
+        for button in toolbarButtons { button.isEnabled = enabled }
+    }
+
+    @objc private func reviewToolbarButtonPressed(_ sender: NSButton) {
+        if isSaving { return }
+        if sender.tag == -1 {
+            owner?.finish(.cancelled)
+            return
+        }
+        guard sender.tag >= 0, sender.tag < Self.toolbarItems.count else { return }
+        performReviewAction(Self.toolbarItems[sender.tag].intent)
+    }
+
+    /// One review intention = one router commit with the CURRENT crop.
+    /// Terminal lifecycle per QA: Copy commits then closes; Pin/OCR/editor
+    /// tear the overlay down BEFORE presenting; Save keeps the overlay in
+    /// `.saving` and returns to review on cancel/failure.
+    fileprivate func performReviewAction(_ intent: CaptureIntent) {
+        guard let owner, owner.session.acceptsCommits,
+              let selection = areaSelection?.intersection(bounds),
+              selection.width >= 4, selection.height >= 4,
+              let frozen,
+              let snapshot = frozen.cropping(toViewRect: selection)
+        else { return }
+        syncSessionPixelRect()
+        let global = globalRect(for: selection)
+        let inputs = owner.session.inputs
+
+        let baseDependencies = owner.routerDependenciesOverride
+
+        switch intent {
+        case .copy:
+            CaptureActionRouter.commit(
+                snapshot, source: .areaReview, intent: .copy,
+                inputs: inputs, finalGlobalRect: global,
+                dependencies: baseDependencies)
+            owner.finish(.handled)
+        case .save:
+            guard owner.session.transition(to: .saving) else { return }
+            layoutReviewToolbar() // disable buttons while the panel is up
+            // The panel must attach to the overlay window as a sheet — a
+            // detached panel would sit BEHIND the .screenSaver-level overlay.
+            var dependencies = baseDependencies ?? .live
+            if baseDependencies == nil {
+                let hostWindow = window
+                dependencies.saveAs = { image, done in
+                    SaveService.shared.saveAs(image, for: hostWindow, completion: done)
+                }
+            }
+            CaptureActionRouter.commit(
+                snapshot, source: .areaReview, intent: .save,
+                inputs: inputs, finalGlobalRect: global,
+                dependencies: dependencies,
+                resolution: { [weak owner, weak self] outcome in
+                    guard let owner else { return }
+                    if outcome == .completed {
+                        owner.finish(.handled)
+                    } else {
+                        owner.session.transition(to: .reviewing)
+                        self?.layoutReviewToolbar()
+                    }
+                })
+        case .pin, .ocr, .openEditor:
+            // teardown BEFORE presenting so the .screenSaver-level overlay
+            // can't cover the new surface
+            owner.finish(.handled)
+            CaptureActionRouter.commit(
+                snapshot, source: .areaReview, intent: intent,
+                inputs: inputs, finalGlobalRect: global,
+                dependencies: baseDependencies)
+        case .initialCapture, .scrollFinished:
+            break
+        }
     }
 
     fileprivate func clearAreaSelection() {
@@ -281,7 +542,6 @@ final class SelectionOverlayView: NSView {
             ctx.stroke(sel.insetBy(dx: -0.75, dy: -0.75))
             drawSelectionHandles(for: sel, in: ctx)
             drawSizeLabel(for: sel)
-            drawCaptureButton(in: ctx)
         } else if mode == .area {
             // crosshair
             ctx.setStrokeColor(NSColor.white.withAlphaComponent(0.7).cgColor)
@@ -323,39 +583,6 @@ final class SelectionOverlayView: NSView {
         drawBubble(text: text, at: pos, centered: false)
     }
 
-    private var captureButtonRect: CGRect? {
-        guard let sel = areaSelection, sel.width >= 4, sel.height >= 4 else { return nil }
-        let size = CGSize(width: 100, height: 30)
-        let margin: CGFloat = 8
-        var x = sel.maxX - size.width
-        var y = sel.minY - size.height - margin
-        x = min(bounds.maxX - size.width - margin, max(bounds.minX + margin, x))
-        if y < bounds.minY + margin {
-            y = sel.maxY + margin
-        }
-        if y + size.height > bounds.maxY - margin {
-            // Full-height selections have no outside edge: keep the action
-            // reachable inside the clear region near its lower-right corner.
-            y = min(bounds.maxY - size.height - margin, max(bounds.minY + margin, sel.minY + margin))
-        }
-        return CGRect(origin: CGPoint(x: x, y: y), size: size)
-    }
-
-    private func drawCaptureButton(in ctx: CGContext) {
-        guard let rect = captureButtonRect else { return }
-        let path = NSBezierPath(roundedRect: rect, xRadius: 7, yRadius: 7)
-        NSColor.controlAccentColor.setFill()
-        path.fill()
-
-        let text = "Capture  ↵" as NSString
-        let attrs: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: 12, weight: .semibold),
-            .foregroundColor: NSColor.white,
-        ]
-        let size = text.size(withAttributes: attrs)
-        text.draw(at: CGPoint(x: rect.midX - size.width / 2, y: rect.midY - size.height / 2),
-                  withAttributes: attrs)
-    }
 
     private func drawBubble(text: String, at point: CGPoint, centered: Bool) {
         let attrs: [NSAttributedString.Key: Any] = [
@@ -408,13 +635,12 @@ final class SelectionOverlayView: NSView {
     override func mouseDown(with event: NSEvent) {
         let p = convert(event.locationInWindow, from: nil)
         guard mode == .area else { return }
+        if isSaving { return }
 
-        if event.clickCount >= 2, let selection = areaSelection, selection.contains(p) {
-            confirmAreaSelection()
-            return
-        }
-        if let button = captureButtonRect, button.contains(p) {
-            areaDrag = .captureButton
+        if event.clickCount >= 2, isReviewing,
+           let selection = areaSelection, selection.contains(p) {
+            // double-click in the frame = Copy and close (QA invariant 5)
+            performReviewAction(.copy)
             return
         }
         if let selection = areaSelection,
@@ -426,6 +652,11 @@ final class SelectionOverlayView: NSView {
         if let selection = areaSelection, selection.contains(p) {
             areaDrag = .moving(start: p, original: selection)
             NSCursor.closedHand.set()
+            return
+        }
+        if isReviewing {
+            // click outside the frame during review = cancel (Lightshot)
+            owner?.finish(.cancelled)
             return
         }
 
@@ -452,7 +683,7 @@ final class SelectionOverlayView: NSView {
             areaSelection = EditableSelectionGeometry.resized(
                 original, using: handle, to: p, within: bounds
             )
-        case .captureButton, .none:
+        case .none:
             break
         }
         needsDisplay = true
@@ -463,14 +694,20 @@ final class SelectionOverlayView: NSView {
         switch mode {
         case .area:
             let p = convert(event.locationInWindow, from: nil)
-            if case .captureButton = areaDrag,
-               let button = captureButtonRect, button.contains(p) {
-                confirmAreaSelection()
-                return
-            }
+            let wasCreating: Bool
+            if case .creating = areaDrag { wasCreating = true } else { wasCreating = false }
+            let wasAdjusting = areaDrag != nil && !wasCreating
             areaDrag = nil
             if let selection = areaSelection, selection.width < 4 || selection.height < 4 {
                 areaSelection = nil
+            }
+            // Mouse-up IS the capture (no Capture button, no Enter needed).
+            if wasCreating, let selection = areaSelection {
+                commitInitialSelection(selection)
+            } else if wasAdjusting, isReviewing {
+                // review resize/move finished: selection is the new live crop
+                syncSessionPixelRect()
+                layoutReviewToolbar()
             }
             updateAreaCursor(at: p)
             needsDisplay = true
@@ -486,14 +723,27 @@ final class SelectionOverlayView: NSView {
 
     override func keyDown(with event: NSEvent) {
         if event.keyCode == 53 { // Esc
-            owner?.finish(.cancelled)
+            handleEscape()
             return
         }
-        if mode == .area, (event.keyCode == 36 || event.keyCode == 76) { // Return / keypad Enter
-            confirmAreaSelection()
+        if isReviewing, (event.keyCode == 36 || event.keyCode == 76) {
+            // Return / keypad Enter during review = Copy and close. (Esc and
+            // click-outside cancel; the overlay never applies the editor's
+            // escCopy/escSave settings — QA invariant 5.)
+            performReviewAction(.copy)
             return
         }
         super.keyDown(with: event)
+    }
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        if isReviewing,
+           event.modifierFlags.contains(.command),
+           event.charactersIgnoringModifiers?.lowercased() == "c" {
+            performReviewAction(.copy)
+            return true
+        }
+        return super.performKeyEquivalent(with: event)
     }
 
     override func resetCursorRects() {
@@ -508,15 +758,10 @@ final class SelectionOverlayView: NSView {
                 addCursorRect(rect, cursor: handle.cursor)
             }
         }
-        if let button = captureButtonRect {
-            addCursorRect(button, cursor: .pointingHand)
-        }
     }
 
     private func updateAreaCursor(at point: CGPoint) {
-        if let button = captureButtonRect, button.contains(point) {
-            NSCursor.pointingHand.set()
-        } else if let selection = areaSelection,
+        if let selection = areaSelection,
                   let handle = EditableSelectionGeometry.handle(at: point, in: selection) {
             handle.cursor.set()
         } else if let selection = areaSelection, selection.contains(point) {
@@ -526,10 +771,62 @@ final class SelectionOverlayView: NSView {
         }
     }
 
-    private func confirmAreaSelection() {
-        guard let selection = areaSelection?.intersection(bounds),
-              selection.width >= 4, selection.height >= 4,
-              let frozen else { return }
-        owner?.finish(.area(screen: screen, frozen: frozen, rect: selection))
+    /// Mouse-up commit, by purpose: scroll/OCR hand the rect over exactly
+    /// once and close; area-review fires the one initialCapture and either
+    /// enters in-place review or (headless) finishes right away.
+    private func commitInitialSelection(_ rawSelection: CGRect) {
+        guard let owner else { return }
+        let selection = rawSelection.intersection(bounds)
+        guard selection.width >= 4, selection.height >= 4, let frozen else { return }
+
+        switch owner.session.purpose {
+        case .scrollRegion, .instantOCRRegion:
+            owner.finish(.area(screen: screen, frozen: frozen, rect: selection))
+        case .windowPick:
+            break
+        case .areaReview:
+            guard owner.session.commitInitialCapture() else { return }
+            syncSessionPixelRect()
+            guard let snapshot = frozen.cropping(toViewRect: selection) else {
+                owner.finish(.cancelled)
+                return
+            }
+            CaptureActionRouter.commit(
+                snapshot, source: .areaReview, intent: .initialCapture,
+                inputs: owner.session.inputs,
+                finalGlobalRect: globalRect(for: selection),
+                dependencies: owner.routerDependenciesOverride)
+            if owner.session.phase == .reviewing {
+                owner.reviewDidBegin(in: self)
+                layoutReviewToolbar()
+                needsDisplay = true
+            } else {
+                owner.finish(.handled)
+            }
+        }
+    }
+
+    /// Screen-local selection → global AppKit coords (the Repeat-Area rect
+    /// contract, AppDelegate legacy parity).
+    private func globalRect(for selection: CGRect) -> CGRect {
+        CGRect(
+            x: selection.minX + screen.frame.minX,
+            y: selection.minY + screen.frame.minY,
+            width: selection.width, height: selection.height)
+    }
+
+    /// Pixel contract: the session always holds the image-local INTEGRAL
+    /// pixel rect for the current selection (same quantization rule as
+    /// CapturedImage.cropping(toViewRect:)).
+    private func syncSessionPixelRect() {
+        guard let owner, let frozen, let selection = areaSelection else { return }
+        let scale = frozen.scale
+        let px = CGRect(
+            x: selection.minX * scale,
+            y: (CGFloat(frozen.cgImage.height) / scale - selection.maxY) * scale,
+            width: selection.width * scale,
+            height: selection.height * scale
+        ).integral
+        owner.session.pixelRect = px
     }
 }

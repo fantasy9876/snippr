@@ -54,6 +54,33 @@ enum UITest {
             }
         }
 
+        // In-place area review factory case: real overlay window with an
+        // injected frozen image (no Screen Recording), driven through the
+        // production selection→review→escape-hatch path.
+        var overlayReviewOK = false
+        if let screen = NSScreen.main {
+            let frozen = CapturedImage(
+                cgImage: SelfTest.makeTestImage(width: 1200, height: 800), scale: 1)
+            let editorsBefore = NSApp.windows.filter { $0.windowController is EditorWindowController }.count
+            let overlay = SelectionOverlay.beginForTesting(
+                purpose: .areaReview,
+                frozen: frozen, screen: screen, completion: { _ in })
+            if let overlay,
+               let view = overlay.activeReviewViewForTesting {
+                view.selectForTesting(rect: CGRect(x: 120, y: 140, width: 360, height: 240))
+                let toolbarFrame = view.reviewToolbarFrameForTesting
+                let reviewing = view.isReviewingForTesting
+                    && overlay.session.phase == .reviewing
+                let toolbarInside = toolbarFrame.map { view.bounds.contains($0) } ?? false
+                // escape hatch: exactly one editor presented AFTER teardown
+                view.performReviewActionForTesting(.openEditor)
+                let editorsAfter = NSApp.windows.filter { $0.windowController is EditorWindowController }.count
+                overlayReviewOK = reviewing && toolbarInside
+                    && SelectionOverlay.current == nil
+                    && editorsAfter == editorsBefore + 1
+            }
+        }
+
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
             let fitOK = fittedEditor.imageFitsViewportForTesting()
                 && smallEditor.imageFitsViewportForTesting()
@@ -61,6 +88,7 @@ enum UITest {
             let tallCropControlsOK = tallEditor.cropActionControlsReadyForTesting()
             print("UITEST editor-fit \(fitOK ? "PASS" : "FAIL")")
             print("UITEST tall-crop-controls \(tallCropControlsOK ? "PASS" : "FAIL")")
+            print("UITEST overlay-review \(overlayReviewOK ? "PASS" : "FAIL")")
             var index = 0
             for window in NSApp.windows where window.isVisible {
                 guard let view = window.contentView, view.bounds.width > 10 else { continue }
@@ -73,7 +101,7 @@ enum UITest {
                 index += 1
             }
             print("UITEST captured \(index) windows → \(outDir)")
-            exit(index >= 3 && fitOK && tallCropControlsOK ? 0 : 1)
+            exit(index >= 3 && fitOK && tallCropControlsOK && overlayReviewOK ? 0 : 1)
         }
     }
 }

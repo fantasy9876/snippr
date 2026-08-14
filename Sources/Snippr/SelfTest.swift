@@ -3608,6 +3608,178 @@ enum SelfTest {
             }
         }
 
+        // 9. Overlay slice 2: in-place area review (production paths, headless) ----
+        MainActor.assumeIsolated {
+            guard let screen = NSScreen.main else {
+                check("overlay2-environment", true) // headless display: reducer
+                return                              // paths covered in section 8
+            }
+            let frozenImage = CapturedImage(
+                cgImage: makeStripePattern(width: 800, height: 600, seed: 0x0F0E_0D0C),
+                scale: 1)
+
+            final class Spy2 {
+                var copies: [CapturedImage] = []
+                var toasts: [String] = []
+                var areaRects: [CGRect] = []
+                var logs = 0
+                var editors: [(phase: OverlaySessionPhase, completionDone: Bool)] = []
+                var saveAsDone: (@MainActor (SaveAsOutcome) -> Void)?
+                var saveAsCalls = 0
+                var completionDone = false
+            }
+            @MainActor func makeOverlay(
+                afterShow: Bool, afterCopy: Bool = false, afterSave: Bool = false,
+                spy: Spy2
+            ) -> (SelectionOverlay, SelectionOverlayView) {
+                let overlay = SelectionOverlay(
+                    purpose: .areaReview,
+                    inputs: OverlaySessionInputs(
+                        afterShow: afterShow, afterCopy: afterCopy,
+                        afterSave: afterSave),
+                    completion: { [weak spy] result in
+                        if case .handled = result { spy?.completionDone = true }
+                        if case .cancelled = result { spy?.completionDone = true }
+                    })
+                overlay.routerDependenciesOverride =
+                    CaptureActionRouter.Dependencies(
+                        copyToClipboard: { spy.copies.append($0) },
+                        autoSave: { _, _ in },
+                        saveAs: { _, done in
+                            spy.saveAsCalls += 1; spy.saveAsDone = done },
+                        pin: { _ in },
+                        ocr: { _ in },
+                        openEditor: { [weak overlay] _ in
+                            spy.editors.append((
+                                overlay?.session.phase ?? .selecting,
+                                spy.completionDone)) },
+                        toast: { spy.toasts.append($0) },
+                        setLastCapture: { _ in },
+                        setLastAreaRect: { spy.areaRects.append($0) },
+                        logEvent: { _ in spy.logs += 1 })
+                let view = SelectionOverlayView(
+                    mode: .area, screen: screen, frozen: frozenImage,
+                    windowList: [], owner: overlay)
+                return (overlay, view)
+            }
+
+            // Headless mouse-up: one initialCapture, rescue copy + toast +
+            // Repeat-Area rect, overlay handled, snapshot pixel-exact.
+            let h = Spy2()
+            let (headlessOverlay, headlessView) = makeOverlay(
+                afterShow: false, spy: h)
+            let rect1 = CGRect(x: 40, y: 50, width: 120, height: 90)
+            headlessView.selectForTesting(rect: rect1)
+            let wantGlobal1 = CGRect(
+                x: 40 + screen.frame.minX, y: 50 + screen.frame.minY,
+                width: 120, height: 90)
+            var snapshotExact = false
+            if let image = h.copies.first,
+               let want = frozenImage.cropping(toViewRect: rect1) {
+                snapshotExact = imagesEqual(want.cgImage, image.cgImage)
+            }
+            check("overlay2-headless-flow",
+                  h.copies.count == 1 && h.toasts.count == 1 && h.logs == 1
+                    && h.areaRects == [wantGlobal1]
+                    && headlessOverlay.session.phase == .completed
+                    && h.completionDone && snapshotExact,
+                  "copies \(h.copies.count) toasts \(h.toasts) rects \(h.areaRects) phase \(headlessOverlay.session.phase)")
+
+            // Review mouse-up: auto-copy runs silently, session reviews,
+            // toolbar laid out inside bounds, completion NOT called yet.
+            let r = Spy2()
+            let (reviewOverlay, reviewView) = makeOverlay(
+                afterShow: true, afterCopy: true, spy: r)
+            reviewView.selectForTesting(rect: rect1)
+            let toolbarFrame = reviewView.reviewToolbarFrameForTesting
+            check("overlay2-review-begins",
+                  r.copies.count == 1 && r.toasts.isEmpty && r.logs == 1
+                    && r.areaRects.isEmpty
+                    && reviewOverlay.session.phase == .reviewing
+                    && !r.completionDone
+                    && toolbarFrame != nil
+                    && reviewView.bounds.contains(toolbarFrame ?? .null),
+                  "copies \(r.copies.count) phase \(reviewOverlay.session.phase) toolbar \(String(describing: toolbarFrame))")
+
+            // Competing second mouse-up (late display / double gesture): no
+            // second initialCapture side effects.
+            let (_, competingView) = (reviewOverlay, SelectionOverlayView(
+                mode: .area, screen: screen, frozen: frozenImage,
+                windowList: [], owner: reviewOverlay))
+            competingView.selectForTesting(rect: rect1)
+            check("overlay2-competing-mouseup",
+                  r.copies.count == 1 && r.logs == 1
+                    && reviewOverlay.session.phase == .reviewing,
+                  "copies \(r.copies.count) logs \(r.logs)")
+
+            // Resize during review, then manual Copy: the action reads the
+            // FINAL rect — snapshot pixel-exact vs the resized crop, and the
+            // Repeat-Area rect equals the final global rect.
+            let rect2 = CGRect(x: 30, y: 40, width: 200, height: 150)
+            reviewView.adjustSelectionForTesting(rect: rect2)
+            reviewView.performReviewActionForTesting(.copy)
+            let wantGlobal2 = CGRect(
+                x: 30 + screen.frame.minX, y: 40 + screen.frame.minY,
+                width: 200, height: 150)
+            var finalExact = false
+            if r.copies.count == 2,
+               let want = frozenImage.cropping(toViewRect: rect2) {
+                finalExact = imagesEqual(want.cgImage, r.copies[1].cgImage)
+                    && r.copies[1].cgImage.width == 200
+                    && r.copies[1].cgImage.height == 150
+            }
+            check("overlay2-final-rect-copy",
+                  finalExact && r.areaRects == [wantGlobal2]
+                    && reviewOverlay.session.phase == .completed
+                    && r.completionDone,
+                  "copies \(r.copies.count) rects \(r.areaRects) phase \(reviewOverlay.session.phase)")
+
+            // Save cycle on the production dispatch: .saving blocks competing
+            // intents, double callback resolves once, cancel returns to
+            // review, a later successful save completes exactly once.
+            let s = Spy2()
+            let (saveOverlay, saveView) = makeOverlay(
+                afterShow: true, spy: s)
+            saveView.selectForTesting(rect: rect1)
+            saveView.performReviewActionForTesting(.save)
+            let phaseDuringSave = saveOverlay.session.phase
+            saveView.performReviewActionForTesting(.copy) // must be swallowed
+            let copiesDuringSave = s.copies.count
+            // While saving: Esc, outside click and Close must NOT tear the
+            // overlay down; the canvas stays locked until the typed callback.
+            saveView.handleEscapeForTesting()
+            saveView.handleOutsideClickForTesting()
+            let survivedSaving = saveOverlay.session.phase == .saving
+                && !s.completionDone
+            s.saveAsDone?(.cancelled)
+            let phaseAfterCancel = saveOverlay.session.phase
+            s.saveAsDone?(.cancelled) // double callback: ignored
+            saveView.performReviewActionForTesting(.save)
+            s.saveAsDone?(.saved(URL(fileURLWithPath: "/tmp/ov.png")))
+            check("overlay2-save-cycle",
+                  phaseDuringSave == .saving && copiesDuringSave == 0
+                    && survivedSaving
+                    && phaseAfterCancel == .reviewing
+                    && s.saveAsCalls == 2
+                    && saveOverlay.session.phase == .completed
+                    && s.completionDone
+                    && s.areaRects.count == 1,
+                  "during \(phaseDuringSave) afterCancel \(phaseAfterCancel) calls \(s.saveAsCalls) rects \(s.areaRects.count)")
+
+            // Terminal order: openEditor presents only AFTER teardown — the
+            // dependency observes phase completed and completion already run.
+            let t = Spy2()
+            let (terminalOverlay, terminalView) = makeOverlay(afterShow: true, spy: t)
+            _ = terminalOverlay // keep the weakly-owned overlay alive
+            terminalView.selectForTesting(rect: rect1)
+            terminalView.performReviewActionForTesting(.openEditor)
+            check("overlay2-teardown-before-present",
+                  t.editors.count == 1
+                    && t.editors[0].phase == .completed
+                    && t.editors[0].completionDone,
+                  "editors \(t.editors)")
+        }
+
         print(failures == 0 ? "ALL TESTS PASSED" : "\(failures) TEST(S) FAILED")
         print("Artifacts: \(outputDir)")
         return failures == 0 ? 0 : 1

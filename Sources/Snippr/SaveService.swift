@@ -230,8 +230,11 @@ final class SaveService {
                 }
                 let succeeded = ok
                 await MainActor.run {
-                    Self.endBackgroundWrite()
+                    // reducer/cleanup state must land BEFORE the write-guard
+                    // releases (a quit racing endBackgroundWrite would
+                    // otherwise observe completed I/O with stale UI state)
                     completion(succeeded ? .saved(url) : .failed)
+                    Self.endBackgroundWrite()
                 }
             }
         }
