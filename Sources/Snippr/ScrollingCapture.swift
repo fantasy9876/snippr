@@ -98,7 +98,7 @@ final class ScrollingCapture {
         // The setting is a page-length cap in points, so both platforms cap the
         // same logical page length regardless of pixel density.
         let maxHeightPx = CGFloat(Settings.shared.scrollMaxHeight) * scale
-        var stitcher: VerticalStitcher?
+        var stitcher: SegmentedVerticalStitcher?
         var lastHash = 0
         var captureFailures = 0
         var captureBackend = CaptureBackend.sourceRect
@@ -146,6 +146,7 @@ final class ScrollingCapture {
                     // full-display path.
                     captureFailures = 0
                     backendNeedsHandshake = stitcher != nil
+                    stitcher?.prepareForBackendTransition()
                     updateProgress("Đang dùng chế độ tương thích — cuộn tiếp, xong \(stopHint)")
                     NSLog("Snippr: sourceRect capture failed repeatedly — switching to full-display crop")
                 } else if captureFailures > 10 {
@@ -156,14 +157,36 @@ final class ScrollingCapture {
             }
             captureFailures = 0
             if backendNeedsHandshake {
-                guard Self.validateBackendTransition(stitcher: stitcher, frame: frame.cgImage) else {
-                    // Same pixel dimensions are not enough: scaled-display
-                    // backends can rasterize a different region. Keep all
-                    // accumulated content, but do not mix an unverified frame.
-                    updateProgress("Đang đồng bộ chế độ tương thích — giữ nguyên trang đã ghép")
-                    try? await Task.sleep(nanoseconds: 80_000_000)
+                if let segmented = stitcher,
+                   !Self.validateBackendTransition(
+                    stitcher: segmented.currentSegment, frame: frame.cgImage
+                   ) {
+                    // A backend switch can coincide with a fast flick. Waiting
+                    // forever for an overlap against the old backend would
+                    // recreate the session lock-out. Build a pending strip only
+                    // from fallback frames; promote it after it proves one
+                    // internal transition, with the same visible gap marker.
+                    lastHash = Self.quickHash(frame.cgImage)
+                    switch segmented.appendBackendTransitionFrame(frame.cgImage) {
+                    case let .startedSegment(segmentImage):
+                        if let separator = segmented.segmentSeparator() {
+                            startPreview(with: separator)
+                        }
+                        appendPreview(segmentImage)
+                        updateProgress(
+                            "Đã đổi chế độ chụp và bắt đầu đoạn "
+                            + "\(segmented.segmentCount); vạch sáng đánh dấu chỗ thiếu")
+                        backendNeedsHandshake = false
+                    case .appended, .rejected:
+                        updateProgress(
+                            "Đang đồng bộ chế độ tương thích — cuộn chậm để nối tiếp")
+                    }
+                    if backendNeedsHandshake {
+                        try? await Task.sleep(nanoseconds: 80_000_000)
+                    }
                     continue
                 }
+                stitcher?.discardPendingSegment()
                 backendNeedsHandshake = false
             }
             let hash = Self.quickHash(frame.cgImage)
@@ -171,15 +194,27 @@ final class ScrollingCapture {
             if changed {
                 lastHash = hash
                 if let s = stitcher {
-                    if s.append(frame.cgImage) > 0 {
+                    switch s.append(frame.cgImage) {
+                    case .appended:
                         appendPreview(s.lastSlice)
-                        updateProgress("Đã ghép \(Int(CGFloat(s.totalHeight) / scale)) pt — cuộn tiếp, xong \(stopHint)")
-                    } else {
+                        updateProgress(
+                            "Đã ghép \(Int(CGFloat(s.totalHeight) / scale)) pt "
+                            + "— cuộn tiếp, xong \(stopHint)")
+                    case let .startedSegment(segmentImage):
+                        if let separator = s.segmentSeparator() {
+                            startPreview(with: separator)
+                        }
+                        appendPreview(segmentImage)
+                        updateProgress(
+                            "Mất một đoạn do cuộn quá nhanh — đang ghi đoạn "
+                            + "\(s.segmentCount); vạch sáng đánh dấu chỗ thiếu")
+                    case .rejected:
                         updateProgress("Chưa khớp được — cuộn chậm lại một chút")
                     }
                     if CGFloat(s.totalHeight) >= maxHeightPx { break }
                 } else {
-                    stitcher = VerticalStitcher(first: frame.cgImage, scale: scale)
+                    stitcher = SegmentedVerticalStitcher(
+                        first: frame.cgImage, scale: scale)
                     startPreview(with: frame.cgImage)
                     updateProgress("Cuộn từ từ — ảnh ghép hiện bên cạnh · \(stopHint)")
                 }
@@ -376,6 +411,7 @@ final class ScrollingCapture {
         border.backgroundColor = .clear
         border.hasShadow = false
         border.ignoresMouseEvents = true
+        border.sharingType = .none
         border.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         let borderView = NSView()
         borderView.wantsLayer = true
@@ -414,6 +450,7 @@ final class ScrollingCapture {
         panel.isOpaque = false
         panel.backgroundColor = .clear
         panel.hasShadow = true
+        panel.sharingType = .none
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
 
         let container = NSView()
@@ -469,6 +506,228 @@ final class ScrollingCapture {
         borderWindow = nil
         controlPanel?.orderOut(nil)
         controlPanel = nil
+    }
+}
+
+/// Owns a sequence of independently verified vertical strips. A long flick can
+/// leave no shared pixels at all; after several changed-but-unmatchable frames,
+/// keeping the old reference would dead-lock the rest of the session. Starting
+/// a new segment restores progress without claiming an overlap that cannot be
+/// proven. The final image contains a conspicuous striped separator at every
+/// such boundary, so a discontinuity is never disguised as a valid seam.
+final class SegmentedVerticalStitcher {
+    enum AppendOutcome {
+        case appended(Int)
+        case rejected(consecutive: Int)
+        case startedSegment(CGImage)
+    }
+
+    static let reanchorAfterRejects = 4
+
+    private(set) var currentSegment: VerticalStitcher
+    private var pendingSegment: VerticalStitcher?
+    private var completedSegments: [CGImage] = []
+    private var canonicalHeader: CGImage?
+    private var canonicalHeaderRows = 0
+    private var currentOmittedHeaderRows = 0
+    private(set) var consecutiveRejects = 0
+    private(set) var segmentCount = 1
+    let width: Int
+    let viewportHeight: Int
+    let scale: CGFloat
+
+    init(first: CGImage, scale: CGFloat = 1) {
+        let initial = VerticalStitcher(first: first, scale: scale)
+        currentSegment = initial
+        width = first.width
+        viewportHeight = first.height
+        self.scale = max(1, scale)
+    }
+
+    var lastSlice: CGImage? { currentSegment.lastSlice }
+
+    var totalHeight: Int {
+        let completedHeight = completedSegments.reduce(0) { $0 + $1.height }
+        let currentHeight = currentSegment.totalHeight
+            - currentOmittedHeaderRows
+        return completedHeight + currentHeight
+            + max(0, segmentCount - 1) * separatorRows
+    }
+
+    @discardableResult
+    func append(_ frame: CGImage) -> AppendOutcome {
+        // A geometry change is a backend/configuration error, not evidence of
+        // scrolling. Never let repeated wrong-sized frames trigger re-anchor.
+        guard frame.width == width, frame.height == viewportHeight else {
+            return .rejected(consecutive: consecutiveRejects)
+        }
+
+        let rows = currentSegment.append(frame)
+        if rows > 0 {
+            if currentOmittedHeaderRows > 0,
+               currentSegment.headerRows != currentOmittedHeaderRows {
+                currentOmittedHeaderRows = 0
+            }
+            consecutiveRejects = 0
+            pendingSegment = nil
+            return .appended(rows)
+        }
+
+        consecutiveRejects += 1
+        if let pending = pendingSegment {
+            if pending.append(frame) == 0 {
+                // This candidate did not form a contiguous strip either.
+                // Replace it instead of accumulating unrelated screenshots.
+                pendingSegment = VerticalStitcher(first: frame, scale: scale)
+            }
+        } else {
+            pendingSegment = VerticalStitcher(first: frame, scale: scale)
+        }
+
+        // Four failures alone are not enough evidence: a single animation or
+        // unrelated frame must never enter the output. Promote only after the
+        // pending segment has independently verified at least one transition.
+        guard consecutiveRejects >= Self.reanchorAfterRejects,
+              let outcome = promotePendingSegment() else {
+            return .rejected(consecutive: consecutiveRejects)
+        }
+        return outcome
+    }
+
+    func canAccept(_ frame: CGImage) -> Bool {
+        currentSegment.canAccept(frame)
+    }
+
+    /// Consumes frames from a newly selected capture backend when its first
+    /// image cannot overlap the old backend baseline. Only frames from this
+    /// method enter the pending strip, so no coordinate systems are mixed.
+    @discardableResult
+    func appendBackendTransitionFrame(_ frame: CGImage) -> AppendOutcome {
+        guard frame.width == width, frame.height == viewportHeight else {
+            return .rejected(consecutive: 0)
+        }
+        if let pending = pendingSegment {
+            if pending.append(frame) == 0 {
+                pendingSegment = VerticalStitcher(first: frame, scale: scale)
+            }
+        } else {
+            pendingSegment = VerticalStitcher(first: frame, scale: scale)
+        }
+        return promotePendingSegment()
+            ?? .rejected(consecutive: 0)
+    }
+
+    func discardPendingSegment() {
+        pendingSegment = nil
+        consecutiveRejects = 0
+    }
+
+    /// Pending evidence is backend-specific. Call exactly when capture changes
+    /// coordinate/rasterization backend so sourceRect and full-crop frames can
+    /// never form one pending segment.
+    func prepareForBackendTransition() {
+        discardPendingSegment()
+    }
+
+    private func promotePendingSegment() -> AppendOutcome? {
+        guard let pending = pendingSegment,
+              pending.totalHeight > viewportHeight else { return nil }
+        if segmentCount == 1 {
+            canonicalHeaderRows = currentSegment.headerRows
+            canonicalHeader = currentSegment.topRowsImage(
+                rows: canonicalHeaderRows)
+        }
+        let pendingOmittedHeaderRows = omittedHeaderRows(from: pending)
+        guard let completed = currentSegment.compose(
+                includeHeader: currentOmittedHeaderRows == 0,
+                includeFooter: false,
+                inferredFooterRows: currentSegment.slices.count == 1
+                    && currentSegment.footerRows == 0
+                    && pending.footerRows > 0
+                    && currentSegment.bottomRowsMatch(
+                        pending, rows: pending.footerRows)
+                    ? pending.footerRows : 0),
+              // Preview keeps the raw first viewport of the new segment. Header
+              // de-duplication is a final-compose optimization and can be
+              // revoked if later frames disprove that the chrome is stable.
+              let pendingImage = pending.compose() else { return nil }
+        completedSegments.append(completed)
+        currentSegment = pending
+        currentOmittedHeaderRows = pendingOmittedHeaderRows
+        pendingSegment = nil
+        consecutiveRejects = 0
+        segmentCount += 1
+        return .startedSegment(pendingImage)
+    }
+
+    /// A locally fixed top band can be a different section header or a banner
+    /// introduced later in the page. Omit it only when it is the same raster
+    /// chrome (and height) as the header retained in segment one. Ambiguity is
+    /// fail-safe: keep the later band rather than delete unique page content.
+    private func omittedHeaderRows(from segment: VerticalStitcher) -> Int {
+        guard canonicalHeaderRows > 0,
+              segment.headerRows == canonicalHeaderRows,
+              let canonicalHeader else {
+            return 0
+        }
+        return segment.topRowsMatch(
+            canonicalHeader, rows: canonicalHeaderRows)
+            ? canonicalHeaderRows : 0
+    }
+
+    var separatorRows: Int { max(12, Int(12 * scale)) }
+
+    /// Visible, content-independent boundary used both in the live preview and
+    /// final output. Alternating bands remain obvious on light and dark pages.
+    func segmentSeparator() -> CGImage? {
+        guard let ctx = CGContext(
+            data: nil, width: width, height: separatorRows,
+            bitsPerComponent: 8, bytesPerRow: 0,
+            space: CGColorSpace(name: CGColorSpace.sRGB)!,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else { return nil }
+        ctx.setFillColor(CGColor(
+            srgbRed: 0.96, green: 0.58, blue: 0.08, alpha: 1))
+        ctx.fill(CGRect(x: 0, y: 0, width: width, height: separatorRows))
+        ctx.setFillColor(CGColor(gray: 0.12, alpha: 1))
+        let dashWidth = max(8, Int(8 * scale))
+        var x = 0
+        while x < width {
+            ctx.fill(CGRect(
+                x: x, y: separatorRows / 3,
+                width: min(dashWidth, width - x),
+                height: max(2, separatorRows / 3)))
+            x += dashWidth * 2
+        }
+        return ctx.makeImage()
+    }
+
+    func compose() -> CGImage? {
+        guard let current = currentSegment.compose(
+            includeHeader: currentOmittedHeaderRows == 0) else { return nil }
+        let segments = completedSegments + [current]
+        guard segments.count > 1 else { return current }
+        guard let separator = segmentSeparator() else { return nil }
+        let height = segments.reduce(0) { $0 + $1.height }
+            + (segments.count - 1) * separator.height
+        guard let ctx = CGContext(
+            data: nil, width: width, height: height,
+            bitsPerComponent: 8, bytesPerRow: 0,
+            space: CGColorSpace(name: CGColorSpace.sRGB)!,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else { return nil }
+        var y = height
+        for (index, segment) in segments.enumerated() {
+            y -= segment.height
+            ctx.draw(segment, in: CGRect(
+                x: 0, y: y, width: width, height: segment.height))
+            if index + 1 < segments.count {
+                y -= separator.height
+                ctx.draw(separator, in: CGRect(
+                    x: 0, y: y, width: width, height: separator.height))
+            }
+        }
+        return ctx.makeImage()
     }
 }
 
@@ -537,6 +796,11 @@ final class VerticalStitcher {
     /// at the very end.
     private(set) var footerRows = 0
     private var footerLatched = false
+    /// Fixed top chrome is kept on the first page segment only. Later segments
+    /// can prove it from their first accepted transition, then omit that
+    /// duplicate header when composing across a visible gap marker.
+    private(set) var headerRows = 0
+    private var headerLatched = false
     /// Raster output can only append whole rows, while a 1x trackpad may move
     /// content by half a backing pixel. Carry the rounding remainder forward
     /// so 23.5 + 23.5 appends 24 + 23 rows, not 24 + 24.
@@ -599,6 +863,20 @@ final class VerticalStitcher {
             return 0
         }
         let footer = footerLatched ? footerRows : match.footerRows
+        let nextHeaderRows: Int
+        if !headerLatched {
+            nextHeaderRows = stableHeaderPrefix(
+                candidateRows: match.headerRows, next: nextSig)
+        } else if headerRows > 0 {
+            // Tighten the proven prefix against every accepted frame. The
+            // matcher may bridge a blinking-control gap for alignment, but
+            // composition trims only the continuously stable prefix; it must
+            // never consume the first coincidentally-equal body row.
+            nextHeaderRows = stableHeaderPrefix(
+                candidateRows: headerRows, next: nextSig)
+        } else {
+            nextHeaderRows = headerRows
+        }
 
         // A true sticky footer is identical to the FIRST frame's bottom band
         // for the whole session. Pitch-aligned scrolling content that merely
@@ -620,6 +898,8 @@ final class VerticalStitcher {
         fractionalRowResidual = accumulatedOffset - Double(rows)
         lastFrame = frame.materialized() ?? frame
         lastSig = nextSig
+        headerRows = nextHeaderRows
+        headerLatched = true
         footerRows = footer
         footerLatched = true
         return rows
@@ -643,9 +923,104 @@ final class VerticalStitcher {
         return true
     }
 
+    private func stableHeaderPrefix(
+        candidateRows: Int, next: RowSig
+    ) -> Int {
+        guard candidateRows > 0, let first = firstSig else { return 0 }
+        var stable = 0
+        for y in 0..<candidateRows {
+            let base = y * 4
+            let difference = (
+                abs(first.bands[base] - next.bands[base])
+                + abs(first.bands[base + 1] - next.bands[base + 1])
+                + abs(first.bands[base + 2] - next.bands[base + 2])
+                + abs(first.bands[base + 3] - next.bands[base + 3])
+            ) / 4
+            guard difference < 0.8 else { break }
+            stable += 1
+        }
+        return stable >= Int(6 * scale) ? stable : 0
+    }
+
+    /// Proves that two independently-built segments share the same bottom
+    /// chrome. This is used only when a gap happened immediately after the
+    /// first frame, before the old segment had a second frame from which to
+    /// latch `footerRows`. The new segment must already have detected a stable
+    /// footer; byte-exact full-raster agreement with the old segment prevents
+    /// trimming an unrelated page tail merely because its row means look alike.
+    func bottomRowsMatch(_ other: VerticalStitcher, rows: Int) -> Bool {
+        guard width == other.width,
+              lastFrame.height == other.lastFrame.height,
+              rows > 0,
+              rows <= lastFrame.height / 3,
+              let ours = lastFrame.cropping(to: CGRect(
+                x: 0, y: lastFrame.height - rows,
+                width: width, height: rows)),
+              let theirs = other.lastFrame.cropping(to: CGRect(
+                x: 0, y: other.lastFrame.height - rows,
+                width: width, height: rows)) else {
+            return false
+        }
+        return Self.imagesMatchExactly(ours, theirs)
+    }
+
+    /// Strict cross-segment identity proof for de-duplicating a fixed header.
+    /// Local stability is insufficient: a later section can introduce a new
+    /// sticky title. Compare the original raw header rasters and fail closed on
+    /// even modest content changes; retaining a duplicate near a marked gap is
+    /// safer than removing a unique banner.
+    func topRowsImage(rows: Int) -> CGImage? {
+        guard rows > 0,
+              rows == headerRows,
+              let first = slices.first,
+              first.height >= rows else { return nil }
+        return first.cropping(to: CGRect(
+            x: 0, y: 0, width: width, height: rows))?.materialized()
+    }
+
+    func topRowsMatch(_ reference: CGImage, rows: Int) -> Bool {
+        guard rows > 0,
+              rows == headerRows,
+              reference.width == width,
+              reference.height == rows,
+              let ours = topRowsImage(rows: rows) else {
+            return false
+        }
+
+        return Self.imagesMatchExactly(ours, reference)
+    }
+
+    private static func imagesMatchExactly(
+        _ lhsImage: CGImage, _ rhsImage: CGImage
+    ) -> Bool {
+        guard lhsImage.width == rhsImage.width,
+              lhsImage.height == rhsImage.height else { return false }
+        func rgba(_ image: CGImage) -> [UInt8]? {
+            var bytes = [UInt8](
+                repeating: 0, count: image.width * image.height * 4)
+            guard let context = CGContext(
+                data: &bytes,
+                width: image.width, height: image.height,
+                bitsPerComponent: 8, bytesPerRow: image.width * 4,
+                space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+            ) else { return nil }
+            context.interpolationQuality = .none
+            context.draw(image, in: CGRect(
+                x: 0, y: 0, width: image.width, height: image.height))
+            return bytes
+        }
+        guard let lhs = rgba(lhsImage), let rhs = rgba(rhsImage) else {
+            return false
+        }
+        return lhs == rhs
+    }
+
     struct Match {
         let preciseOffset: Double
+        let headerRows: Int
         let footerRows: Int
+        let confidenceScore: Double
     }
 
     /// How many rows of new content `next` has relative to `previous`;
@@ -723,16 +1098,83 @@ final class VerticalStitcher {
             if footer < minFooter { footer = 0 }
         }
 
+        // Sparse text can leave a same-colour run at the bottom of two frames,
+        // especially when the scroll distance is close to a line-height
+        // multiple. That is not necessarily a fixed footer. Evaluate both the
+        // detected-footer and complete-viewport geometries before latching one.
+        // A real low-detail bar can still produce a confident no-footer match
+        // because body rows dominate the weighted score. Latch the footer only
+        // when excluding it makes the match materially better; ties remain
+        // no-footer because a coincidental blank page tail is indistinguishable
+        // from a fixed bar on this frame pair and must not drop real rows.
+        let withoutFooter: Match? = lockedFooter == nil && footer > 0
+            ? findOverlap(
+                prev: prev, next: next, height: h, scale: scale,
+                lockedFooter: 0)
+            : nil
+        func resolveFooterHypothesis(_ withFooter: Match?) -> Match? {
+            guard let withoutFooter else { return withFooter }
+            guard let withFooter else { return withoutFooter }
+            guard abs(withoutFooter.preciseOffset - withFooter.preciseOffset) <= 1
+            else {
+                Perf.reject(
+                    "footer hypotheses disagree "
+                    + "\(String(format: "%.2f", withoutFooter.preciseOffset))/"
+                    + "\(String(format: "%.2f", withFooter.preciseOffset))")
+                return nil
+            }
+            let footerAdvantage = withoutFooter.confidenceScore
+                - withFooter.confidenceScore
+            if footerAdvantage > 0.05 {
+                return withFooter
+            }
+            return withoutFooter
+        }
+
         let hEff = h - footer
         guard hEff > minHeight else {
             Perf.reject("hEff \(hEff) too small (footer \(footer))")
-            return nil
+            return resolveFooterHypothesis(nil)
         }
+
+        // A fixed top navigation bar stays at the same screen rows while the
+        // body moves underneath it. Primary matching uses a bottom template
+        // and naturally avoids the bar, but whole-overlap recovery must skip
+        // this leading static run when validating the moving body.
+        let header: Int = {
+            let staticEps = 0.8
+            let maxGap = Int(8 * scale)
+            let limit = hEff / 3
+            var rows = 0
+            var index = 0
+            var gapUsed = false
+            while index < limit {
+                if rowDiff[index] < staticEps {
+                    index += 1
+                    rows = index
+                    continue
+                }
+                var gap = 0
+                while index + gap < limit,
+                      gap < maxGap,
+                      rowDiff[index + gap] >= staticEps {
+                    gap += 1
+                }
+                if !gapUsed, gap < maxGap, index + gap < limit,
+                   rowDiff[index + gap] < staticEps {
+                    gapUsed = true
+                    index += gap
+                    continue
+                }
+                break
+            }
+            return rows >= Int(6 * scale) ? rows : 0
+        }()
 
         let k = max(Int(32 * scale), hEff / 4)
         guard hEff - k >= 1 else {
             Perf.reject("k \(k) >= hEff \(hEff)")
-            return nil
+            return resolveFooterHypothesis(nil)
         }
 
         // rows are weighted by their detail (horizontal gradient energy)
@@ -743,34 +1185,44 @@ final class VerticalStitcher {
             weights[i] = w
             weightSum += w
         }
-        guard weightSum > 0 else { return nil }
+        guard weightSum > 0 else { return resolveFooterHypothesis(nil) }
 
         // Pass 1: score every offset. (Storing the scores keeps pass 2 free of
         // the order-dependence the old single-pass second-best tracking had:
         // a chain of small improvements could silently swallow a real alias.)
         let count = hEff - k + 1
-        var scores = [Double](repeating: 0, count: count)
-        var bestOffset = -1
-        var bestScore = Double.greatestFiniteMagnitude
-        for s in 0..<count {
-            let start = hEff - k - s
-            var diff: Double = 0
-            for i in 0..<k {
-                let a = (hEff - k + i) * 4
-                let b = (start + i) * 4
-                let d = (abs(prev.bands[a] - next.bands[b])
-                    + abs(prev.bands[a + 1] - next.bands[b + 1])
-                    + abs(prev.bands[a + 2] - next.bands[b + 2])
-                    + abs(prev.bands[a + 3] - next.bands[b + 3])) / 4
-                diff += weights[i] * d
+        func scoreOffsets(
+            previousBands: [Double], nextBands: [Double]
+        ) -> (scores: [Double], bestOffset: Int, bestScore: Double) {
+            var scores = [Double](repeating: 0, count: count)
+            var bestOffset = -1
+            var bestScore = Double.greatestFiniteMagnitude
+            for s in 0..<count {
+                let start = hEff - k - s
+                var diff = 0.0
+                for i in 0..<k {
+                    let a = (hEff - k + i) * 4
+                    let b = (start + i) * 4
+                    let d = (abs(previousBands[a] - nextBands[b])
+                        + abs(previousBands[a + 1] - nextBands[b + 1])
+                        + abs(previousBands[a + 2] - nextBands[b + 2])
+                        + abs(previousBands[a + 3] - nextBands[b + 3])) / 4
+                    diff += weights[i] * d
+                }
+                diff /= weightSum
+                scores[s] = diff
+                if diff < bestScore {
+                    bestScore = diff
+                    bestOffset = s
+                }
             }
-            diff /= weightSum
-            scores[s] = diff
-            if diff < bestScore {
-                bestScore = diff
-                bestOffset = s
-            }
+            return (scores, bestOffset, bestScore)
         }
+        let rawScores = scoreOffsets(
+            previousBands: prev.bands, nextBands: next.bands)
+        let scores = rawScores.scores
+        let bestOffset = rawScores.bestOffset
+        let bestScore = rawScores.bestScore
 
         // Pass 2: the runner-up must sit OUTSIDE the winner's plateau.
         let exclusion = max(6, Int(6 * scale))
@@ -838,18 +1290,15 @@ final class VerticalStitcher {
         // rasterize the same content; line-pitch aliases score low-but-nonzero
         // (~0.4–2). So uniqueness is a RATIO test with a small epsilon, plus
         // an absolute-gap fallback for noisy pages (animations in overlap).
-        guard bestOffset > 0 else {
-            Perf.reject("gate off=\(bestOffset) best=\(String(format: "%.2f", bestScore))")
-            return nil
-        }
-        // no offsets outside the winner's plateau = zero uniqueness evidence
-        // (tiny effective heights after footer subtraction) — don't guess
-        guard secondScore < Double.greatestFiniteMagnitude else {
-            Perf.reject("vacuous second (count \(count))")
-            return nil
-        }
-        let unique = secondScore > bestScore * 3 + 0.15
-            || secondScore - bestScore > 2.5
+        // Offset zero carries no new rows, and a candidate without a runner-up
+        // has no uniqueness evidence. Keep both as raw rejection conditions,
+        // but continue through the blurred primary path before trying the
+        // short-overlap recovery so fallback order is deterministic.
+        let hasRawCandidate = bestOffset > 0
+            && secondScore < Double.greatestFiniteMagnitude
+        let unique = hasRawCandidate
+            && (secondScore > bestScore * 3 + 0.15
+                || secondScore - bestScore > 2.5)
         // On a 1x display a trackpad can stop at half a backing pixel. Core
         // Animation then re-rasterizes every text edge and raises the absolute
         // difference (3–6 instead of ~0), even though the correct offset remains
@@ -864,13 +1313,436 @@ final class VerticalStitcher {
             && subpixelScore < bestScore * 0.75
             && secondScore > subpixelScore * 4
             && secondScore - subpixelScore > 12
-        guard (bestScore < 2.0 || fractionalButCertain || modeledSubpixel), unique else {
-            Perf.reject("not unique best=\(String(format: "%.2f", bestScore)) second=\(String(format: "%.2f", secondScore)) off=\(bestOffset)")
-            return nil
+        let rawPrimaryAccepted = (bestScore < 2.0
+            || fractionalButCertain || modeledSubpixel) && unique
+        let rawPrimaryWithinMovingBody = header == 0
+            || bestOffset <= hEff - header - k
+        let rawPrimaryGloballyUnique = rawPrimaryAccepted
+            && rawPrimaryWithinMovingBody
+            && primaryCandidateHasUniqueShortEvidence(
+                previousBands: prev.bands, nextBands: next.bands,
+                previousEnergy: prev.energy, effectiveHeight: hEff,
+                scale: scale, primaryTemplateRows: k,
+                headerRows: header, candidateOffset: bestOffset)
+        if rawPrimaryGloballyUnique {
+            return resolveFooterHypothesis(Match(
+                preciseOffset: modeledSubpixel ? subpixelOffset : Double(bestOffset),
+                headerRows: header,
+                footerRows: footer,
+                confidenceScore: modeledSubpixel ? subpixelScore : bestScore))
+        }
+
+        // Thin text captured between backing pixels can re-rasterize every
+        // horizontal edge. The raw matcher still locates the correct offset,
+        // but its absolute score rises above the conservative 2.0 gate. Keep
+        // all proven raw paths untouched; only after they reject, retry the
+        // same candidates with a small vertical box filter applied to the
+        // scoring signal. Static/footer detection and output pixels remain raw.
+        let blurredPrev = verticallyBoxBlurredBands(prev.bands, height: hEff, radius: 2)
+        let blurredNext = verticallyBoxBlurredBands(next.bands, height: hEff, radius: 2)
+        let blurred = scoreOffsets(
+            previousBands: blurredPrev, nextBands: blurredNext)
+        var blurredSecondScore = Double.greatestFiniteMagnitude
+        for s in 0..<count where abs(s - blurred.bestOffset) > exclusion {
+            if blurred.scores[s] < blurredSecondScore {
+                blurredSecondScore = blurred.scores[s]
+            }
+        }
+        let blurredUnique = blurredSecondScore > blurred.bestScore * 3 + 0.15
+            || blurredSecondScore - blurred.bestScore > 2.5
+        let blurredAccepted = unique
+            && blurred.bestOffset > 0
+            && abs(blurred.bestOffset - bestOffset) <= 1
+            && blurred.bestScore < 2.0
+            && blurredSecondScore < Double.greatestFiniteMagnitude
+            && blurredUnique
+        let blurredPrimaryWithinMovingBody = header == 0
+            || blurred.bestOffset <= hEff - header - k
+        let blurredPrimaryGloballyUnique = blurredAccepted
+            && blurredPrimaryWithinMovingBody
+            && primaryCandidateHasUniqueShortEvidence(
+                previousBands: blurredPrev, nextBands: blurredNext,
+                previousEnergy: prev.energy, effectiveHeight: hEff,
+                scale: scale, primaryTemplateRows: k,
+                headerRows: header,
+                candidateOffset: blurred.bestOffset)
+        if blurredPrimaryGloballyUnique {
+            // Refine the integer minimum with the vertex of its local score
+            // parabola. append() carries the fractional remainder between frames,
+            // preventing long captures from drifting by repeated row rounding.
+            var preciseOffset = Double(blurred.bestOffset)
+            if blurred.bestOffset > 0, blurred.bestOffset + 1 < count {
+                let left = blurred.scores[blurred.bestOffset - 1]
+                let middle = blurred.scores[blurred.bestOffset]
+                let right = blurred.scores[blurred.bestOffset + 1]
+                let curvature = left - 2 * middle + right
+                if curvature > 0.0001 {
+                    let delta = max(-0.5, min(0.5, 0.5 * (left - right) / curvature))
+                    preciseOffset += delta
+                }
+            }
+            if Perf.enabled {
+                let line = "blur-match off=\(blurred.bestOffset) precise="
+                    + "\(String(format: "%.3f", preciseOffset)) best="
+                    + "\(String(format: "%.2f", blurred.bestScore)) second="
+                    + "\(String(format: "%.2f", blurredSecondScore))\n"
+                FileHandle.standardError.write(line.data(using: .utf8)!)
+            }
+            return resolveFooterHypothesis(Match(
+                preciseOffset: preciseOffset,
+                headerRows: header, footerRows: footer,
+                confidenceScore: blurred.bestScore))
+        }
+
+        let withoutHeaderRecovery = findShortOverlap(
+            prev: prev, next: next, effectiveHeight: hEff,
+            scale: scale, primaryTemplateRows: k,
+            headerRows: 0, footerRows: footer)
+        let withHeaderRecovery = header > 0
+            ? findShortOverlap(
+                prev: prev, next: next, effectiveHeight: hEff,
+                scale: scale, primaryTemplateRows: k,
+                headerRows: header, footerRows: footer)
+            : nil
+        let recovered: Match?
+        switch (withoutHeaderRecovery, withHeaderRecovery) {
+        case let (withoutHeader?, withHeader?):
+            if abs(withoutHeader.preciseOffset - withHeader.preciseOffset) <= 1 {
+                recovered = withoutHeader.confidenceScore
+                    <= withHeader.confidenceScore ? withoutHeader : withHeader
+            } else {
+                Perf.reject(
+                    "header hypotheses disagree "
+                    + "\(String(format: "%.2f", withoutHeader.preciseOffset))/"
+                    + "\(String(format: "%.2f", withHeader.preciseOffset))")
+                recovered = nil
+            }
+        case let (withoutHeader?, nil):
+            recovered = withoutHeader
+        case let (nil, withHeader?):
+            recovered = withHeader
+        case (nil, nil):
+            recovered = nil
+        }
+        if let recovered {
+            return resolveFooterHypothesis(recovered)
+        }
+        Perf.reject(
+            "confidence raw=\(String(format: "%.2f", bestScore))/"
+            + "\(String(format: "%.2f", secondScore)) blur="
+            + "\(String(format: "%.2f", blurred.bestScore))/"
+            + "\(String(format: "%.2f", blurredSecondScore)) off="
+            + "\(bestOffset)/\(blurred.bestOffset)")
+        return resolveFooterHypothesis(nil)
+    }
+
+    /// Vertical box filter for fallback scoring only. Edge samples are
+    /// replicated so the signal stays the same length and coordinate system.
+    /// Prefix sums keep the retry O(height), rather than multiplying the
+    /// already expensive offset search by the five-tap kernel width.
+    private static func verticallyBoxBlurredBands(
+        _ bands: [Double], height: Int, radius: Int
+    ) -> [Double] {
+        guard height > 0, radius > 0, bands.count >= height * 4 else { return bands }
+        let kernelWidth = radius * 2 + 1
+        var result = [Double](repeating: 0, count: height * 4)
+        for band in 0..<4 {
+            var prefix = [Double](repeating: 0, count: height + 1)
+            for y in 0..<height {
+                prefix[y + 1] = prefix[y] + bands[y * 4 + band]
+            }
+            let first = bands[band]
+            let last = bands[(height - 1) * 4 + band]
+            for y in 0..<height {
+                let low = max(0, y - radius)
+                let high = min(height - 1, y + radius)
+                var sum = prefix[high + 1] - prefix[low]
+                if y < radius { sum += Double(radius - y) * first }
+                let overflow = y + radius - (height - 1)
+                if overflow > 0 { sum += Double(overflow) * last }
+                result[y * 4 + band] = sum / Double(kernelWidth)
+            }
+        }
+        return result
+    }
+
+    /// A long primary template can match one duplicated card while a shorter
+    /// true overlap exists just outside the primary range. Compare the primary
+    /// basin's short score only with candidates in that recovery-only range;
+    /// aliases already inside the primary range were disambiguated by the
+    /// longer template. This avoids whole-overlap checks, which would compare
+    /// a fixed top header with moving body, and keeps the safety scan small.
+    private static func primaryCandidateHasUniqueShortEvidence(
+        previousBands: [Double], nextBands: [Double],
+        previousEnergy: [Double], effectiveHeight hEff: Int,
+        scale: CGFloat, primaryTemplateRows primaryK: Int,
+        headerRows: Int, candidateOffset: Int
+    ) -> Bool {
+        let movingHeight = hEff - headerRows
+        let shortK = max(Int(64 * scale), movingHeight / 5 - 1)
+        let recoveryStart = max(1, movingHeight - primaryK + 1)
+        let searchMax = movingHeight - shortK
+        guard shortK > 0, shortK < primaryK,
+              candidateOffset > 0, candidateOffset <= searchMax else {
+            return shortK >= primaryK
+        }
+        guard recoveryStart <= searchMax else { return true }
+
+        var weights = [Double](repeating: 0, count: shortK)
+        var weightSum = 0.0
+        for index in 0..<shortK {
+            let weight = max(previousEnergy[hEff - shortK + index], 0.5)
+            weights[index] = weight
+            weightSum += weight
+        }
+        guard weightSum > 0 else { return false }
+
+        func score(at offset: Int) -> Double {
+            let nextStart = hEff - shortK - offset
+            var value = 0.0
+            for index in 0..<shortK {
+                let a = (hEff - shortK + index) * 4
+                let b = (nextStart + index) * 4
+                let difference = (abs(previousBands[a] - nextBands[b])
+                    + abs(previousBands[a + 1] - nextBands[b + 1])
+                    + abs(previousBands[a + 2] - nextBands[b + 2])
+                    + abs(previousBands[a + 3] - nextBands[b + 3])) / 4
+                value += weights[index] * difference
+            }
+            return value / weightSum
+        }
+
+        let candidateScore = score(at: candidateOffset)
+        let exclusion = max(6, Int(6 * scale))
+        var recoveryScore = Double.greatestFiniteMagnitude
+        for offset in recoveryStart...searchMax
+            where abs(offset - candidateOffset) > exclusion {
+            recoveryScore = min(recoveryScore, score(at: offset))
+        }
+        guard recoveryScore < Double.greatestFiniteMagnitude else { return true }
+        return recoveryScore > candidateScore * 3 + 0.15
+            || recoveryScore - candidateScore > 2.5
+    }
+
+    /// Conservative second pass for a fast scroll that leaves less than the
+    /// primary matcher's ~25% template, but still has real overlapping pixels.
+    /// The short strip may only propose an offset outside the primary range;
+    /// the entire overlap and both halves must then independently verify it.
+    /// A jump of one viewport or more remains rejected because missing pixels
+    /// cannot be reconstructed safely.
+    private static func findShortOverlap(
+        prev: RowSig, next: RowSig, effectiveHeight hEff: Int,
+        scale: CGFloat, primaryTemplateRows primaryK: Int,
+        headerRows: Int, footerRows: Int
+    ) -> Match? {
+        let movingHeight = hEff - headerRows
+        // Keep roughly 20% moving-body evidence. One row below the exact
+        // fifth leaves a right-hand score sample at the 80% boundary, which
+        // is required to recover the fractional trackpad phase without
+        // materially weakening the overlap gate.
+        let recoveryK = max(Int(64 * scale), movingHeight / 5 - 1)
+        let searchMin = max(1, movingHeight - primaryK + 1)
+        let searchMax = movingHeight - recoveryK
+        guard recoveryK < primaryK, searchMin <= searchMax else { return nil }
+
+        func weights(start: Int, count: Int) -> (values: [Double], sum: Double) {
+            var values = [Double](repeating: 0, count: count)
+            var sum = 0.0
+            for i in 0..<count {
+                let value = max(prev.energy[start + i], 0.5)
+                values[i] = value
+                sum += value
+            }
+            return (values, sum)
+        }
+
+        func alignedScore(
+            previousBands: [Double], nextBands: [Double],
+            prevStart: Int, nextStart: Int, count: Int,
+            weights: [Double], weightSum: Double
+        ) -> Double {
+            guard count > 0, weightSum > 0 else { return .greatestFiniteMagnitude }
+            var score = 0.0
+            for i in 0..<count {
+                let a = (prevStart + i) * 4
+                let b = (nextStart + i) * 4
+                let d = (abs(previousBands[a] - nextBands[b])
+                    + abs(previousBands[a + 1] - nextBands[b + 1])
+                    + abs(previousBands[a + 2] - nextBands[b + 2])
+                    + abs(previousBands[a + 3] - nextBands[b + 3])) / 4
+                score += weights[i] * d
+            }
+            return score / weightSum
+        }
+
+        let templateWeights = weights(start: hEff - recoveryK, count: recoveryK)
+        guard templateWeights.sum > 0 else { return nil }
+
+        let exclusion = max(6, Int(6 * scale))
+        let minHalf = Int(16 * scale)
+
+        typealias Evaluation = (
+            accepted: Bool,
+            bestOffset: Int,
+            bestScore: Double,
+            secondScore: Double,
+            fullScore: Double,
+            firstHalfScore: Double,
+            secondHalfScore: Double,
+            scores: [Double]
+        )
+
+        func evaluate(
+            previousBands: [Double], nextBands: [Double]
+        ) -> Evaluation {
+            // The winner is restricted to the recovery-only range. Runner-up
+            // evidence intentionally includes offsets in the primary range too;
+            // excluding them makes periodic pages look falsely unique.
+            var scores = [Double](
+                repeating: .greatestFiniteMagnitude, count: searchMax + 1)
+            for offset in 0...searchMax {
+                scores[offset] = alignedScore(
+                    previousBands: previousBands, nextBands: nextBands,
+                    prevStart: hEff - recoveryK,
+                    nextStart: hEff - recoveryK - offset,
+                    count: recoveryK,
+                    weights: templateWeights.values,
+                    weightSum: templateWeights.sum)
+            }
+            var bestOffset = -1
+            var bestScore = Double.greatestFiniteMagnitude
+            for offset in searchMin...searchMax where scores[offset] < bestScore {
+                bestOffset = offset
+                bestScore = scores[offset]
+            }
+
+            var secondScore = Double.greatestFiniteMagnitude
+            if bestOffset >= searchMin {
+                for offset in 0...searchMax
+                    where abs(offset - bestOffset) > exclusion {
+                    secondScore = min(secondScore, scores[offset])
+                }
+            }
+            let overlap = movingHeight - max(0, bestOffset)
+            let split = overlap / 2
+
+            func rangeScore(
+                prevStart: Int, nextStart: Int, count: Int
+            ) -> Double {
+                guard count > 0 else { return .greatestFiniteMagnitude }
+                let rangeWeights = weights(start: prevStart, count: count)
+                return alignedScore(
+                    previousBands: previousBands, nextBands: nextBands,
+                    prevStart: prevStart, nextStart: nextStart, count: count,
+                    weights: rangeWeights.values, weightSum: rangeWeights.sum)
+            }
+            let fullScore = bestOffset >= 0
+                ? rangeScore(
+                    prevStart: headerRows + bestOffset,
+                    nextStart: headerRows, count: overlap)
+                : Double.greatestFiniteMagnitude
+            let firstHalfScore = bestOffset >= 0
+                ? rangeScore(
+                    prevStart: headerRows + bestOffset,
+                    nextStart: headerRows, count: split)
+                : Double.greatestFiniteMagnitude
+            let secondHalfScore = bestOffset >= 0
+                ? rangeScore(
+                    prevStart: headerRows + bestOffset + split,
+                    nextStart: headerRows + split,
+                    count: overlap - split)
+                : Double.greatestFiniteMagnitude
+
+            let stronglyUnique = secondScore < Double.greatestFiniteMagnitude
+                && secondScore > bestScore * 4 + 0.15
+                && secondScore - bestScore > 2.5
+            let accepted = bestOffset >= searchMin
+                && bestScore < 2.0
+                && stronglyUnique
+                && split >= minHalf
+                && overlap - split >= minHalf
+                && fullScore < 2.0
+                && firstHalfScore < 2.0
+                && secondHalfScore < 2.0
+            return (
+                accepted, bestOffset, bestScore, secondScore,
+                fullScore, firstHalfScore, secondHalfScore, scores)
+        }
+
+        func refinedOffset(_ evaluation: Evaluation) -> Double {
+            let offset = evaluation.bestOffset
+            var precise = Double(offset)
+            if offset > 0, offset + 1 < evaluation.scores.count {
+                let left = evaluation.scores[offset - 1]
+                let middle = evaluation.scores[offset]
+                let right = evaluation.scores[offset + 1]
+                let curvature = left - 2 * middle + right
+                if curvature > 0.0001 {
+                    let delta = max(
+                        -0.5, min(0.5, 0.5 * (left - right) / curvature))
+                    precise += delta
+                }
+                if Perf.enabled {
+                    let line = "short-refine off=\(offset) left="
+                        + "\(String(format: "%.3f", left)) mid="
+                        + "\(String(format: "%.3f", middle)) right="
+                        + "\(String(format: "%.3f", right)) precise="
+                        + "\(String(format: "%.3f", precise))\n"
+                    FileHandle.standardError.write(line.data(using: .utf8)!)
+                }
+            }
+            return precise
+        }
+
+        let raw = evaluate(previousBands: prev.bands, nextBands: next.bands)
+        if raw.accepted {
+            if Perf.enabled {
+                let line = "short-overlap off=\(raw.bestOffset) k=\(recoveryK) "
+                    + "best=\(String(format: "%.2f", raw.bestScore)) "
+                    + "second=\(String(format: "%.2f", raw.secondScore)) "
+                    + "full=\(String(format: "%.2f", raw.fullScore))\n"
+                FileHandle.standardError.write(line.data(using: .utf8)!)
+            }
+            // An exact raw overlap has a cusp-shaped zero minimum, not a true
+            // parabola. Refining asymmetric neighbouring scores would invent a
+            // fractional displacement. A non-zero but confidently accepted raw
+            // valley can still be a real fractional trackpad phase, though, so
+            // refine only that case and carry its residual across frames.
+            let precise = raw.bestScore < 0.01
+                ? Double(raw.bestOffset)
+                : refinedOffset(raw)
+            return Match(
+                preciseOffset: precise,
+                headerRows: headerRows, footerRows: footerRows,
+                confidenceScore: raw.bestScore)
+        }
+
+        // A fast trackpad flick can be both out of the primary search range
+        // and between backing pixels. Retry the conservative short-overlap
+        // gates on the same scoring-only blur as the primary fallback. The
+        // blurred valley must agree with the raw proposal; output stays raw.
+        let blurredPrev = verticallyBoxBlurredBands(
+            prev.bands, height: hEff, radius: 2)
+        let blurredNext = verticallyBoxBlurredBands(
+            next.bands, height: hEff, radius: 2)
+        let blurred = evaluate(
+            previousBands: blurredPrev, nextBands: blurredNext)
+        guard blurred.accepted,
+              abs(blurred.bestOffset - raw.bestOffset) <= 1 else { return nil }
+
+        let precise = refinedOffset(blurred)
+        if Perf.enabled {
+            let line = "blur-short-overlap off=\(blurred.bestOffset) precise="
+                + "\(String(format: "%.3f", precise)) k=\(recoveryK) "
+                + "best=\(String(format: "%.2f", blurred.bestScore)) "
+                + "second=\(String(format: "%.2f", blurred.secondScore)) "
+                + "full=\(String(format: "%.2f", blurred.fullScore))\n"
+            FileHandle.standardError.write(line.data(using: .utf8)!)
         }
         return Match(
-            preciseOffset: modeledSubpixel ? subpixelOffset : Double(bestOffset),
-            footerRows: footer)
+            preciseOffset: precise,
+            headerRows: headerRows, footerRows: footerRows,
+            confidenceScore: blurred.bestScore)
     }
 
     /// Per-row: mean gray of 4 horizontal bands + gradient energy. A narrow
@@ -927,26 +1799,41 @@ final class VerticalStitcher {
         return RowSig(bands: bands, energy: energy)
     }
 
-    func compose() -> CGImage? {
+    func compose(
+        includeHeader: Bool = true,
+        includeFooter: Bool = true,
+        inferredFooterRows: Int = 0
+    ) -> CGImage? {
         guard !slices.isEmpty else { return nil }
 
-        // A detected sticky footer was excluded from every appended slice, but
-        // the FIRST frame still carries it at its bottom — which would land in
-        // the middle of the page. Move it: trim it off the first slice and
-        // re-attach the footer band (from the last frame) at the very end.
+        // The first slice carries any fixed header/footer chrome. Across a
+        // marked gap, later segments omit their proven duplicate header; a
+        // detected footer is removed from every completed segment and attached
+        // once from the final segment's last frame.
         var parts = slices
-        if footerRows > 0, parts.count > 1,
-           let first = parts.first, first.height > footerRows,
-           lastFrame.height > footerRows {
+        let effectiveFooterRows = footerRows > 0
+            ? footerRows
+            : max(0, min(inferredFooterRows, lastFrame.height / 3))
+        let effectiveHeaderRows = includeHeader ? 0 : headerRows
+        if let first = parts.first,
+           first.height > effectiveHeaderRows + effectiveFooterRows,
+           lastFrame.height > effectiveFooterRows,
+           effectiveHeaderRows > 0 || effectiveFooterRows > 0 {
             let trimmed = first.cropping(to: CGRect(
-                x: 0, y: 0, width: width, height: first.height - footerRows
+                x: 0, y: effectiveHeaderRows,
+                width: width,
+                height: first.height
+                    - effectiveHeaderRows - effectiveFooterRows
             ))?.materialized()
-            let footer = lastFrame.cropping(to: CGRect(
-                x: 0, y: lastFrame.height - footerRows, width: width, height: footerRows
-            ))?.materialized()
-            if let trimmed, let footer {
+            if let trimmed {
                 parts[0] = trimmed
-                parts.append(footer)
+                if includeFooter, effectiveFooterRows > 0,
+                   let footer = lastFrame.cropping(to: CGRect(
+                    x: 0, y: lastFrame.height - effectiveFooterRows,
+                    width: width, height: effectiveFooterRows
+                   ))?.materialized() {
+                    parts.append(footer)
+                }
             }
         }
 
