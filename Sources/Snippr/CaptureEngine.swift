@@ -567,6 +567,12 @@ extension CGRect {
     var area: CGFloat { isNull || isEmpty ? 0 : width * height }
 }
 
+/// Test spy: the live-preview refresh path must never copy pixel buffers.
+/// Self-tests snapshot this counter around preview calls.
+enum MaterializeSpy {
+    nonisolated(unsafe) static var count = 0
+}
+
 extension CGImage {
     /// Redraws this image into its own exactly-sized buffer. Crops made with
     /// `CGImage.cropping(to:)` share the parent's backing store; copying breaks
@@ -575,6 +581,7 @@ extension CGImage {
     /// The copy keeps the source's RGB color space — forcing sRGB here would
     /// clamp Display P3 screenshots and visibly desaturate area shots.
     func materialized() -> CGImage? {
+        MaterializeSpy.count += 1
         let space = (colorSpace?.model == .rgb ? colorSpace : nil)
             ?? CGColorSpace(name: CGColorSpace.sRGB)!
         guard let ctx = CGContext(

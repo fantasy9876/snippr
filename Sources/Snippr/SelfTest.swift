@@ -386,9 +386,9 @@ enum SelfTest {
             if let s {
                 let windowRows = 300
                 let top = s.previewWindowImage(
-                    targetWidth: 400, maxHeight: windowRows, fromTop: true)
+                    targetWidth: 400, maxHeight: windowRows, anchor: .currentTop)
                 let bottom = s.previewWindowImage(
-                    targetWidth: 400, maxHeight: windowRows, fromTop: false)
+                    targetWidth: 400, maxHeight: windowRows, anchor: .bottom)
                 check("stitch-window-no-full-compose", s.fullComposeCount == 0,
                       "window render performed \(s.fullComposeCount) full composes")
                 if let top, let bottom, let full = s.compose(),
@@ -420,10 +420,39 @@ enum SelfTest {
                 let wide = SegmentedVerticalStitcher(first: w0)
                 _ = wide.append(w1)
                 if let window = wide.previewWindowImage(
-                    targetWidth: 400, maxHeight: 1400, fromTop: false) {
+                    targetWidth: 400, maxHeight: 1400, anchor: .bottom) {
                     check("stitch-window-wide-allocation-capped",
                           window.width == 400 && window.height <= 1400,
                           "got \(window.width)x\(window.height)")
+                    // Fractional-scale geometry: 800 source rows at 400/5120
+                    // is 62.5 — cumulative floor must yield exactly 62 (the
+                    // same rule scaledForPreview uses) with no blank seam
+                    // row anywhere in the window.
+                    let expectedRows = Int(CGFloat(800) * 400.0 / 5120.0)
+                    check("stitch-window-wide-floor-height",
+                          window.height == expectedRows,
+                          "got \(window.height), want \(expectedRows)")
+                    var blankRow = -1
+                    var bytes = [UInt8](
+                        repeating: 0, count: window.width * window.height * 4)
+                    if let c = CGContext(
+                        data: &bytes, width: window.width, height: window.height,
+                        bitsPerComponent: 8, bytesPerRow: window.width * 4,
+                        space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) {
+                        c.draw(window, in: CGRect(
+                            x: 0, y: 0,
+                            width: window.width, height: window.height))
+                        for row in 0..<window.height {
+                            var sum = 0
+                            for x in 0..<window.width {
+                                sum += Int(bytes[(row * window.width + x) * 4 + 3])
+                            }
+                            if sum == 0 { blankRow = row; break }
+                        }
+                    }
+                    check("stitch-window-wide-no-blank-seam", blankRow == -1,
+                          "blank seam at scaled row \(blankRow)")
                 } else {
                     check("stitch-window-wide-render", false)
                 }
@@ -463,15 +492,21 @@ enum SelfTest {
                 check("stitch-window-marker-fixture",
                       sawSegment && sawPrepend && segmented.segmentCount == 2,
                       "segment \(sawSegment) prepend \(sawPrepend) count \(segmented.segmentCount)")
+                // segment 1 composes to rows [0, 800); the separator starts
+                // there. currentTop anchors on that separator (clamped so the
+                // window still fills), bottom anchors on the composition end.
                 if let full = segmented.compose() {
-                    for fromTop in [true, false] {
-                        let label = fromTop ? "top" : "bottom"
-                        let windowRows = 1400
+                    let windowRows = 1400
+                    let separatorStart = 800
+                    for (label, anchor, origin) in [
+                        ("top", SegmentedVerticalStitcher.PreviewAnchor.currentTop,
+                         min(separatorStart, full.height - windowRows)),
+                        ("bottom", .bottom, full.height - windowRows),
+                    ] {
                         if let window = segmented.previewWindowImage(
-                            targetWidth: 400, maxHeight: windowRows, fromTop: fromTop),
+                            targetWidth: 400, maxHeight: windowRows, anchor: anchor),
                            let want = full.cropping(to: CGRect(
-                            x: 0, y: fromTop ? 0 : full.height - windowRows,
-                            width: 400, height: windowRows)) {
+                            x: 0, y: origin, width: 400, height: windowRows)) {
                             check("stitch-window-marker-\(label)-exact",
                                   imagesEqual(want, window),
                                   "\(label) window differs from full compose (separator lost?)")
@@ -484,6 +519,167 @@ enum SelfTest {
                 }
             } else {
                 check("stitch-window-marker-crop", false)
+            }
+        }
+
+        // 2b-window-tallseg. Anchor must follow the CURRENT segment ----------------
+        // With a first segment TALLER than the preview window, a global-top
+        // anchor would show only old content and the preview would look
+        // frozen during upward capture. The window must start at the gap
+        // separator and contain the current segment's newest prepends.
+        do {
+            let doc = makeStripePattern(width: 400, height: 4200, seed: 0x7A11_5E91)
+            let vp = 500
+            let path = [0, 300, 600, 900, 1200,
+                        3000, 3200, 3400, 3600,
+                        3450, 3150, 2850]
+            if let first = doc.cropping(to: CGRect(
+                x: 0, y: path[0], width: 400, height: vp)) {
+                let segmented = SegmentedVerticalStitcher(first: first)
+                var sawSegment = false
+                var sawPrepend = false
+                for off in path.dropFirst() {
+                    guard let frame = doc.cropping(to: CGRect(
+                        x: 0, y: off, width: 400, height: vp)) else {
+                        check("stitch-window-tallseg-crop", false); break
+                    }
+                    switch segmented.append(frame) {
+                    case .startedSegment: sawSegment = true
+                    case .prepended: sawPrepend = true
+                    default: break
+                    }
+                }
+                let full = segmented.compose()
+                check("stitch-window-tallseg-fixture",
+                      sawSegment && sawPrepend && full?.height == 2962,
+                      "segment \(sawSegment) prepend \(sawPrepend) height \(full?.height ?? -1)")
+                let windowRows = 1400
+                if let full,
+                   let window = segmented.previewWindowImage(
+                    targetWidth: 400, maxHeight: windowRows, anchor: .currentTop),
+                   let want = full.cropping(to: CGRect(
+                    // separator starts at segment-1 height 1700; window is
+                    // clamped so it still fills: origin 2962-1400 = 1562,
+                    // which keeps the separator AND the prepends in view.
+                    x: 0, y: min(1700, full.height - windowRows),
+                    width: 400, height: windowRows)) {
+                    check("stitch-window-tallseg-anchored",
+                          imagesEqual(want, window),
+                          "tall-segment window not anchored on current segment")
+                } else {
+                    check("stitch-window-tallseg-render", false)
+                }
+            } else {
+                check("stitch-window-tallseg-crop", false)
+            }
+        }
+
+        // 2b-window-materialize. Preview refresh copies no pixel buffers -----------
+        // A 5K source with sticky chrome and prepends used to materialize the
+        // trimmed first viewport (~54 MiB) on every preview rebuild. The
+        // ref-based window render must perform ZERO materializations and no
+        // full composes.
+        do {
+            let wW = 5120, wViewport = 800, wHeader = 100
+            let doc = makeStripePattern(width: wW, height: 2400, seed: 0x3A55_17E0)
+            let chrome = makeStripePattern(width: wW, height: wHeader, seed: 0xC42F_EE00)
+            func chromedWideFrame(offset: Int) -> CGImage? {
+                guard let body = doc.cropping(to: CGRect(
+                    x: 0, y: offset + wHeader, width: wW,
+                    height: wViewport - wHeader)) else { return nil }
+                let c = ctx(wW, wViewport)
+                c.draw(chrome, in: CGRect(
+                    x: 0, y: CGFloat(wViewport - wHeader),
+                    width: CGFloat(wW), height: CGFloat(wHeader)))
+                c.draw(body, in: CGRect(
+                    x: 0, y: 0, width: CGFloat(wW),
+                    height: CGFloat(wViewport - wHeader)))
+                return c.makeImage()
+            }
+            let path = [1000, 700, 400]
+            if let first = chromedWideFrame(offset: path[0]) {
+                let segmented = SegmentedVerticalStitcher(first: first)
+                var prepends = 0
+                for off in path.dropFirst() {
+                    guard let frame = chromedWideFrame(offset: off) else {
+                        check("stitch-window-materialize-crop", false); break
+                    }
+                    if case .prepended = segmented.append(frame) { prepends += 1 }
+                }
+                let composesBefore = segmented.fullComposeCount
+                let materializesBefore = MaterializeSpy.count
+                let window = segmented.previewWindowImage(
+                    targetWidth: 400, maxHeight: 1400, anchor: .currentTop)
+                let materializeDelta = MaterializeSpy.count - materializesBefore
+                let composeDelta = segmented.fullComposeCount - composesBefore
+                check("stitch-window-materialize-free",
+                      prepends == 2 && window != nil
+                        && materializeDelta == 0 && composeDelta == 0
+                        && (window?.width ?? 0) == 400
+                        && (window?.height ?? 9999) <= 1400,
+                      "prepends \(prepends), materialize \(materializeDelta), "
+                      + "compose \(composeDelta), "
+                      + "size \(window?.width ?? -1)x\(window?.height ?? -1)")
+            } else {
+                check("stitch-window-materialize-crop", false)
+            }
+        }
+
+        // 2b-flip-production. Direction flips through the PRODUCTION dispatch ------
+        // Drives applyStitchOutcome — the exact function the capture loop
+        // calls — through down→up→down flips: every preview refresh must do
+        // zero full composes and zero pixel materializations, and the
+        // rebuilt preview must be the anchored bounded window.
+        do {
+            let doc = makeStripePattern(width: 400, height: 2000, seed: 0xF11B_0D0D)
+            let vp = 500
+            let path = [600, 900, 1200, 900, 600, 300, 600, 900, 1200, 1500]
+            MainActor.assumeIsolated {
+                guard let first = doc.cropping(to: CGRect(
+                    x: 0, y: path[0], width: 400, height: vp)) else {
+                    check("stitch-flip-production-crop", false)
+                    return
+                }
+                let session = ScrollingCapture(onFinish: { _ in })
+                let segmented = SegmentedVerticalStitcher(first: first)
+                var prepends = 0
+                var appends = 0
+                var previewSpyClean = true
+                for off in path.dropFirst() {
+                    guard let frame = doc.cropping(to: CGRect(
+                        x: 0, y: off, width: 400, height: vp)) else {
+                        check("stitch-flip-production-crop", false)
+                        return
+                    }
+                    let outcome = segmented.append(frame)
+                    switch outcome {
+                    case .prepended: prepends += 1
+                    case .appended: appends += 1
+                    default: break
+                    }
+                    let composesBefore = segmented.fullComposeCount
+                    let materializesBefore = MaterializeSpy.count
+                    session.applyStitchOutcome(
+                        outcome, stitcher: segmented, stopHint: "test")
+                    if segmented.fullComposeCount != composesBefore
+                        || MaterializeSpy.count != materializesBefore {
+                        previewSpyClean = false
+                    }
+                }
+                check("stitch-flip-production-outcomes",
+                      prepends == 1 && appends == 3,
+                      "prepends \(prepends), appends \(appends)")
+                check("stitch-flip-production-spy-clean", previewSpyClean,
+                      "preview dispatch performed a full compose or materialize")
+                if let preview = session.previewImageForTesting,
+                   let want = segmented.previewWindowImage(
+                    targetWidth: 400, maxHeight: 1400, anchor: .bottom) {
+                    check("stitch-flip-production-anchored",
+                          imagesEqual(want, preview),
+                          "preview after down-flip is not the bottom-anchored window")
+                } else {
+                    check("stitch-flip-production-preview", false)
+                }
             }
         }
 
@@ -565,6 +761,109 @@ enum SelfTest {
             } else {
                 check("stitch-sparse-card-frames", false)
             }
+
+            // Same geometry but the differing content blocks are SOLID fills
+            // (zero energy, zero interior contrast). Flat-but-DIFFERENT rows
+            // must vote against the offset — skipping them as neutral let the
+            // repeated card become nearly the entire electorate.
+            let solidA = makeSolidImage(
+                width: sW, height: 100, color: CGColor(gray: 0.3, alpha: 1))
+            let solidB = makeSolidImage(
+                width: sW, height: 100, color: CGColor(gray: 0.6, alpha: 1))
+            if let a = sparseFrame(card: 375, content: solidA, contentTop: 100),
+               let b = sparseFrame(card: 275, content: solidB, contentTop: 0) {
+                let down = VerticalStitcher(first: a)
+                let downResult = down.append(b)
+                check("stitch-sparse-solid-card-rejected", downResult == .rejected,
+                      "solid-panel repeated-card page got \(downResult) (a→b)")
+                let up = VerticalStitcher(first: b)
+                let upResult = up.append(a)
+                check("stitch-sparse-solid-card-reversed-rejected",
+                      upResult == .rejected,
+                      "solid-panel repeated-card page got \(upResult) (b→a)")
+            } else {
+                check("stitch-sparse-solid-card-frames", false)
+            }
+
+            // Liveness: a TRUE sparse overlap with a modest animated band
+            // (video/ad ~60 of 400 overlap rows) must still stitch — tier 2
+            // of the quorum absorbs it. Frames share the detailed block and
+            // the whitespace; only the animated band differs between shots.
+            func liveFrame(
+                anim: CGImage, extra: CGImage?, offset: Int
+            ) -> CGImage? {
+                // document: detail block at doc[475..600); animated band at
+                // doc[250..310) (inside the 400-row overlap of both shots);
+                // extra content at doc[600..700) (revealed by the scroll);
+                // white elsewhere. Frame shows doc[offset..offset+500).
+                let c = ctx(sW, sViewport)
+                c.setFillColor(CGColor(gray: 1, alpha: 1))
+                c.fill(CGRect(x: 0, y: 0, width: sW, height: sViewport))
+                func place(_ image: CGImage, docTop: Int) {
+                    let top = docTop - offset
+                    guard top + image.height > 0, top < sViewport else { return }
+                    c.draw(image, in: CGRect(
+                        x: 0, y: sViewport - top - image.height,
+                        width: sW, height: image.height))
+                }
+                place(cardSrc, docTop: 475)      // shared detail (125 rows)
+                place(anim, docTop: 250)         // animated band (60 rows)
+                if let extra { place(extra, docTop: 600) }
+                return c.makeImage()
+            }
+            let animFrame1 = makeStripePattern(width: sW, height: 60, seed: 0x0A11_0001)
+            let animFrame2 = makeStripePattern(width: sW, height: 60, seed: 0x0A11_0002)
+            let extraContent = makeStripePattern(width: sW, height: 100, seed: 0x0E17_0000)
+            if let a = liveFrame(anim: animFrame1, extra: nil, offset: 100),
+               let b = liveFrame(anim: animFrame2, extra: extraContent, offset: 200) {
+                let down = VerticalStitcher(first: a)
+                let downResult = down.append(b)
+                check("stitch-sparse-animated-band-appends",
+                      downResult == .appended(rows: 100),
+                      "sparse page with animated band got \(downResult) (down)")
+                let up = VerticalStitcher(first: b)
+                let upResult = up.append(a)
+                check("stitch-sparse-animated-band-prepends",
+                      upResult == .prepended(rows: 100),
+                      "sparse page with animated band got \(upResult) (up)")
+            } else {
+                check("stitch-sparse-animated-frames", false)
+            }
+        }
+
+        // 2b-alternating. A raster that is NOT one translation must reject ---------
+        // Even rows copied from offset k, odd rows from k+1: every single
+        // phase explains only half the rows, so no globally-consistent
+        // translation exists. Both directions must reject.
+        do {
+            let rows = 80
+            var baseBands = [Double](repeating: 0, count: rows * 4)
+            var seed: UInt64 = 0xA17E_44A7
+            for i in 0..<baseBands.count {
+                seed = seed &* 6364136223846793005 &+ 1442695040888963407
+                baseBands[i] = Double((seed >> 33) & 0xFF)
+            }
+            let k = 10
+            var mixedBands = [Double](repeating: 0, count: rows * 4)
+            for y in 0..<rows {
+                let source = min(rows - 1, y + k + (y % 2))
+                for band in 0..<4 {
+                    mixedBands[y * 4 + band] = baseBands[source * 4 + band]
+                }
+            }
+            let energy = [Double](repeating: 4.0, count: rows)
+            let baseSig = VerticalStitcher.RowSig(bands: baseBands, energy: energy)
+            let mixedSig = VerticalStitcher.RowSig(bands: mixedBands, energy: energy)
+            check("stitch-alternating-raster-rejected",
+                  !VerticalStitcher.wholeOverlapAgrees(
+                    base: baseSig, shifted: mixedSig, offset: Double(k) + 0.5,
+                    headerRows: 0, effectiveHeight: rows),
+                  "alternating floor/ceil raster passed (base→mixed)")
+            check("stitch-alternating-raster-reversed-rejected",
+                  !VerticalStitcher.wholeOverlapAgrees(
+                    base: mixedSig, shifted: baseSig, offset: Double(k) + 0.5,
+                    headerRows: 0, effectiveHeight: rows),
+                  "alternating floor/ceil raster passed (mixed→base)")
         }
 
         // 2b-anchor. Prepend anchor must not drift with the header estimate --------
