@@ -168,11 +168,10 @@ final class ScrollingCapture {
                     // internal transition, with the same visible gap marker.
                     lastHash = Self.quickHash(frame.cgImage)
                     switch segmented.appendBackendTransitionFrame(frame.cgImage) {
-                    case let .startedSegment(segmentImage):
-                        if let separator = segmented.segmentSeparator() {
-                            startPreview(with: separator)
-                        }
-                        appendPreview(segmentImage)
+                    case .startedSegment:
+                        // Same cumulative-basis rule as the main loop: the
+                        // bounded window keeps preview geometry global.
+                        rebuildPreview(from: segmented, pinToTop: false)
                         updateProgress(
                             "Đã đổi chế độ chụp và bắt đầu đoạn "
                             + "\(segmented.segmentCount); vạch sáng đánh dấu chỗ thiếu")
@@ -348,11 +347,14 @@ final class ScrollingCapture {
             updateProgress(
                 "Đang cuộn qua vùng đã chụp — "
                 + "\(Int(CGFloat(s.totalHeight) / s.scale)) pt")
-        case let .startedSegment(segmentImage):
-            if let separator = s.segmentSeparator() {
-                startPreview(with: separator)
-            }
-            appendPreview(segmentImage)
+        case .startedSegment:
+            // Rebuild the bounded bottom window instead of seeding an
+            // incremental preview from separator + segment image: that local
+            // seed reset the cumulative-floor basis to a per-segment value
+            // while flip rebuilds use the global total, so at fractional
+            // scales the preview jumped a pixel after every re-anchor. The
+            // window naturally shows the marker and the new segment.
+            rebuildPreview(from: s, pinToTop: false)
             updateProgress(
                 "Mất một đoạn do cuộn quá nhanh — đang ghi đoạn "
                 + "\(s.segmentCount); vạch sáng đánh dấu chỗ thiếu")

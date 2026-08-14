@@ -752,6 +752,55 @@ enum SelfTest {
             }
         }
 
+        // 2b-preview-parity-reanchor. Re-anchor keeps the global floor basis -------
+        // startedSegment used to seed the incremental preview from separator
+        // + segment image, resetting the cumulative-floor basis to a local
+        // value while flip rebuilds used the global total — a 1px jump after
+        // every re-anchor at fractional scales. The re-anchor now rebuilds
+        // the bounded window, so incremental and rebuilt geometry stay equal
+        // through gap + append.
+        do {
+            let doc = makeStripePattern(width: 5120, height: 4200, seed: 0x9EA9_C40A)
+            let vp = 800
+            let path = [0, 600, 2400, 2600, 2800, 3000, 3200]
+            MainActor.assumeIsolated {
+                guard let first = doc.cropping(to: CGRect(
+                    x: 0, y: path[0], width: 5120, height: vp)) else {
+                    check("stitch-preview-reanchor-crop", false)
+                    return
+                }
+                let session = ScrollingCapture(onFinish: { _ in })
+                session.startPreviewForTesting(with: first)
+                let segmented = SegmentedVerticalStitcher(first: first)
+                var sawSegment = false
+                var appendsAfterSegment = 0
+                for off in path.dropFirst() {
+                    guard let frame = doc.cropping(to: CGRect(
+                        x: 0, y: off, width: 5120, height: vp)) else {
+                        check("stitch-preview-reanchor-crop", false)
+                        return
+                    }
+                    let outcome = segmented.append(frame)
+                    switch outcome {
+                    case .startedSegment: sawSegment = true
+                    case .appended: if sawSegment { appendsAfterSegment += 1 }
+                    default: break
+                    }
+                    session.applyStitchOutcome(
+                        outcome, stitcher: segmented, stopHint: "test")
+                }
+                let incremental = session.previewImageForTesting?.height ?? -1
+                let rebuilt = segmented.previewWindowImage(
+                    targetWidth: 400, maxHeight: 1400, anchor: .bottom)?
+                    .height ?? -2
+                check("stitch-preview-reanchor-parity",
+                      sawSegment && appendsAfterSegment >= 1
+                        && incremental == rebuilt,
+                      "segment \(sawSegment), appends \(appendsAfterSegment), "
+                      + "incremental \(incremental), rebuilt \(rebuilt)")
+            }
+        }
+
         // 2b-window-gap-marker-wide. 5K + gap + prepend: marker survives, no
         // source-width canvas after the cache warms, no materialize/compose.
         do {
