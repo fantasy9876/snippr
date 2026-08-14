@@ -320,14 +320,16 @@ final class ScrollingCapture {
         stopHint: String
     ) {
         switch outcome {
-        case .appended:
-            // After a direction change the rolling preview window clipped
-            // away the middle rows; pasting the new slice onto it would seam
-            // non-adjacent content. Rebuild from the bounded window instead
-            // (flips are rare). The direction lives in explicit state, NOT in
-            // the optional preview view — a nil view must not silently skip
-            // the rebuild branch.
-            if previewPinnedTop {
+        case let .appended(rows):
+            // Incremental append is valid ONLY while the preview's cumulative
+            // basis equals the stitcher's global total. Any geometry revision
+            // outside the outcome's row count — a direction flip, or a
+            // header-omit revocation raising totalHeight by the restored
+            // header — must rebuild the bounded window instead: the restored
+            // rows live in the first slice, not in lastSlice. The direction
+            // lives in explicit state, NOT in the optional preview view — a
+            // nil view must not silently skip the rebuild branch.
+            if previewPinnedTop || previewSourceRows != s.totalHeight - rows {
                 rebuildPreview(from: s, pinToTop: false)
             } else {
                 appendPreview(s.lastSlice)
@@ -344,6 +346,12 @@ final class ScrollingCapture {
                 "Đã ghép \(Int(CGFloat(s.totalHeight) / s.scale)) pt "
                 + "(nối lên trên) — cuộn tiếp, xong \(stopHint)")
         case .moved:
+            // A retrace adds no rows, but an accepted frame can still revoke
+            // a header omit and raise totalHeight — resync the preview at the
+            // current anchor when the basis disagrees.
+            if previewSourceRows != s.totalHeight {
+                rebuildPreview(from: s, pinToTop: previewPinnedTop)
+            }
             updateProgress(
                 "Đang cuộn qua vùng đã chụp — "
                 + "\(Int(CGFloat(s.totalHeight) / s.scale)) pt")
@@ -364,6 +372,7 @@ final class ScrollingCapture {
     }
 
     var previewImageForTesting: CGImage? { previewImage }
+    var previewSourceRowsForTesting: Int { previewSourceRows }
     /// Self-tests seed the preview exactly the way run() does on its first
     /// frame, so the incremental path under test is the production one.
     func startPreviewForTesting(with frame: CGImage) {

@@ -631,9 +631,14 @@ enum SelfTest {
         // zero full composes and zero pixel materializations, and the
         // rebuilt preview must be the anchored bounded window.
         do {
-            let doc = makeStripePattern(width: 400, height: 2000, seed: 0xF11B_0D0D)
+            let doc = makeStripePattern(width: 400, height: 2700, seed: 0xF11B_0D0D)
             let vp = 500
-            let path = [600, 900, 1200, 900, 600, 300, 600, 900, 1200, 1500]
+            // The down phase captures 1700 rows (> the 1400-px preview
+            // window) BEFORE the flip, so a buggy incremental append after
+            // the up phase cannot coincidentally equal the bottom window.
+            let path = [600, 900, 1200, 1500, 1800,
+                        1500, 1200, 900, 600, 300,
+                        600, 900, 1200, 1500, 1800, 2100]
             MainActor.assumeIsolated {
                 guard let first = doc.cropping(to: CGRect(
                     x: 0, y: path[0], width: 400, height: vp)) else {
@@ -688,7 +693,7 @@ enum SelfTest {
                     }
                 }
                 check("stitch-flip-production-outcomes",
-                      prepends == 1 && appends == 3,
+                      prepends == 1 && appends == 5,
                       "prepends \(prepends), appends \(appends)")
                 check("stitch-flip-production-spy-clean", previewSpyClean,
                       "preview dispatch performed a full compose or materialize")
@@ -749,6 +754,99 @@ enum SelfTest {
                         && rebuilt == wantRows,
                       "appends \(appends), incremental \(incremental), "
                       + "rebuilt \(rebuilt), want \(wantRows)")
+            }
+        }
+
+        // 2b-preview-omit-revocation. Header-omit revocation resyncs preview ------
+        // Segment 2 initially omits its proven duplicate header; a later
+        // accepted frame with changed chrome revokes the omit, raising
+        // totalHeight by the restored header WITHOUT any rows in the outcome
+        // (the restored band lives in the first slice, not lastSlice). The
+        // preview must resync to the bounded window immediately — on the
+        // appended outcome AND on a moved outcome.
+        do {
+            let rW = 400, rViewport = 500, rHeader = 40
+            let content = makeStripePattern(width: rW, height: 3000, seed: 0x4EAD_0117)
+            let band = makeStripePattern(width: rW, height: rHeader, seed: 0xBAA0_0001)
+            let changedBand = makeStripePattern(width: rW, height: rHeader, seed: 0xBAA0_0002)
+            func revFrame(offset: Int, band: CGImage) -> CGImage? {
+                guard let body = content.cropping(to: CGRect(
+                    x: 0, y: offset, width: rW,
+                    height: rViewport - rHeader)) else { return nil }
+                let c = ctx(rW, rViewport)
+                c.draw(body, in: CGRect(
+                    x: 0, y: 0, width: rW, height: rViewport - rHeader))
+                c.draw(band, in: CGRect(
+                    x: 0, y: rViewport - rHeader, width: rW, height: rHeader))
+                return c.makeImage()
+            }
+            // variant true = revocation lands on an APPENDED frame,
+            // false = revocation lands on a MOVED (retrace) frame.
+            for revokeOnAppend in [true, false] {
+                let label = revokeOnAppend ? "appended" : "moved"
+                let basePath = [0, 200, 2000, 2041, 2083, 2126]
+                let revokeOffset = revokeOnAppend ? 2170 : 2085
+                MainActor.assumeIsolated {
+                    guard let first = revFrame(offset: basePath[0], band: band) else {
+                        check("stitch-omit-revocation-\(label)-crop", false)
+                        return
+                    }
+                    let session = ScrollingCapture(onFinish: { _ in })
+                    session.startPreviewForTesting(with: first)
+                    let segmented = SegmentedVerticalStitcher(first: first)
+                    var sawSegment = false
+                    for off in basePath.dropFirst() {
+                        guard let frame = revFrame(offset: off, band: band) else {
+                            check("stitch-omit-revocation-\(label)-crop", false)
+                            return
+                        }
+                        let outcome = segmented.append(frame)
+                        if case .startedSegment = outcome { sawSegment = true }
+                        session.applyStitchOutcome(
+                            outcome, stitcher: segmented, stopHint: "test")
+                    }
+                    let omitBefore = segmented.totalHeight
+                    guard sawSegment,
+                          let revoker = revFrame(
+                            offset: revokeOffset, band: changedBand) else {
+                        check("stitch-omit-revocation-\(label)-fixture", false)
+                        return
+                    }
+                    let outcome = segmented.append(revoker)
+                    let expectedOutcome: Bool
+                    var outcomeRows = 0
+                    switch outcome {
+                    case let .appended(rows):
+                        expectedOutcome = revokeOnAppend
+                        outcomeRows = rows
+                    case .moved:
+                        expectedOutcome = !revokeOnAppend
+                    default:
+                        expectedOutcome = false
+                    }
+                    session.applyStitchOutcome(
+                        outcome, stitcher: segmented, stopHint: "test")
+                    // totalHeight must have grown by the outcome's rows PLUS
+                    // the restored header — that surplus is the revocation.
+                    let revoked = segmented.totalHeight - omitBefore
+                        == outcomeRows + rHeader
+                    check("stitch-omit-revocation-\(label)-fixture",
+                          expectedOutcome && revoked,
+                          "outcome \(outcome), Δtotal \(segmented.totalHeight - omitBefore), rows \(outcomeRows)")
+                    let basisSynced = session.previewSourceRowsForTesting
+                        == segmented.totalHeight
+                    if let preview = session.previewImageForTesting,
+                       let want = segmented.previewWindowImage(
+                        targetWidth: 400, maxHeight: 1400, anchor: .bottom) {
+                        check("stitch-omit-revocation-\(label)-resync",
+                              basisSynced && imagesEqual(want, preview),
+                              "basis synced \(basisSynced) "
+                              + "(\(session.previewSourceRowsForTesting) vs "
+                              + "\(segmented.totalHeight))")
+                    } else {
+                        check("stitch-omit-revocation-\(label)-preview", false)
+                    }
+                }
             }
         }
 
@@ -868,7 +966,10 @@ enum SelfTest {
                 return c.makeImage()!
             }
             let doc = blueStripes(width: gW, height: 4000, seed: 0x5EA9_A9B1)
-            let path = [0, 600, 2400, 2600, 2800, 3000, 2500, 2000]
+            // Completed segment = 1024 rows: at 400/5120 the separator's 12
+            // source rows floor to ZERO destination pixels, so the 1-px
+            // marker floor branch is genuinely exercised (asserted below).
+            let path = [0, 224, 2400, 2600, 2800, 3000, 2500, 2000]
             if let first = doc.cropping(to: CGRect(
                 x: 0, y: path[0], width: gW, height: gViewport)) {
                 let segmented = SegmentedVerticalStitcher(first: first)
@@ -888,6 +989,13 @@ enum SelfTest {
                 check("stitch-window-gap-wide-fixture",
                       sawSegment && sawPrepend && segmented.segmentCount == 2,
                       "segment \(sawSegment) prepend \(sawPrepend) count \(segmented.segmentCount)")
+                // Lock the fixture's intent: without the floor, the separator
+                // occupies zero scaled pixels at this geometry.
+                let sepStart = 1024
+                let sepScaled = Int(CGFloat(sepStart + 12) * 400.0 / 5120.0)
+                    - Int(CGFloat(sepStart) * 400.0 / 5120.0)
+                check("stitch-window-gap-wide-floor-branch", sepScaled == 0,
+                      "separator naturally scales to \(sepScaled)px — fixture no longer exercises the floor")
                 // Warm call may build the cached separator once; afterwards
                 // repeated refreshes must allocate NOTHING at source width.
                 let warm = segmented.previewWindowImage(
