@@ -775,14 +775,16 @@ final class EditorCanvasView: NSView {
             drafting = blur
         case .crop:
             selected = nil
-            if event.clickCount >= 2, let crop = cropRect, crop.contains(vp) {
-                applyCropSelection()
-            } else if let crop = cropRect,
-                      let handle = EditableSelectionGeometry.handle(
-                        at: vp, in: crop, tolerance: 9 * cropChromeScale
-                      ) {
+            // Handles win over double-click confirm: the second press of a
+            // rapid corner adjustment must resize, not commit the rough crop.
+            if let crop = cropRect,
+               let handle = EditableSelectionGeometry.handle(
+                 at: vp, in: crop, tolerance: 9 * cropChromeScale
+               ) {
                 cropDrag = .resizing(handle: handle, original: crop)
                 handle.cursor.set()
+            } else if event.clickCount >= 2, let crop = cropRect, crop.contains(vp) {
+                applyCropSelection()
             } else if let crop = cropRect, crop.contains(vp) {
                 cropDrag = .moving(start: vp, original: crop)
                 NSCursor.closedHand.set()

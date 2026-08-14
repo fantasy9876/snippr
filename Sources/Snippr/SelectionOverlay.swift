@@ -368,18 +368,20 @@ final class SelectionOverlayView: NSView {
         let p = convert(event.locationInWindow, from: nil)
         guard mode == .area else { return }
 
-        if event.clickCount >= 2, let selection = areaSelection, selection.contains(p) {
-            confirmAreaSelection()
-            return
-        }
         if let button = captureButtonRect, button.contains(p) {
             areaDrag = .captureButton
             return
         }
+        // Handles win over double-click confirm: the second press of a rapid
+        // corner adjustment must resize, not commit the still-rough region.
         if let selection = areaSelection,
            let handle = EditableSelectionGeometry.handle(at: p, in: selection) {
             areaDrag = .resizing(handle: handle, original: selection)
             handle.cursor.set()
+            return
+        }
+        if event.clickCount >= 2, let selection = areaSelection, selection.contains(p) {
+            confirmAreaSelection()
             return
         }
         if let selection = areaSelection, selection.contains(p) {
@@ -452,7 +454,15 @@ final class SelectionOverlayView: NSView {
             confirmAreaSelection()
             return
         }
-        super.keyDown(with: event)
+        // Swallow everything else: super would forward up the responder chain
+        // and beep on every keypress while the overlay is up.
+    }
+
+    /// Mouse-only cancel, mirroring Windows (OverlayForm right-click). Esc
+    /// alone is not enough: key events need the app to be active, which a
+    /// menu-bar app cannot always obtain (see AppActivation).
+    override func rightMouseDown(with event: NSEvent) {
+        owner?.finish(.cancelled)
     }
 
     override func resetCursorRects() {
