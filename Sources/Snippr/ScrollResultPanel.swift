@@ -78,9 +78,12 @@ final class ScrollResultPanel: NSPanel {
             1,
             maxSize.width / max(1, pointSize.width),
             (maxSize.height - toolbarHeight) / max(1, pointSize.height))
+        // EXACT aspect fit — no per-axis min clamps: a distorted or
+        // letterboxed image view would break the single pixels-per-point
+        // factor the annotation host relies on.
         let imageSize = CGSize(
-            width: max(120, pointSize.width * fit),
-            height: max(80, pointSize.height * fit))
+            width: max(1, pointSize.width * fit),
+            height: max(1, pointSize.height * fit))
         // The toolbar needs room for every button INCLUDING Close — a tall,
         // narrow stitch must widen the panel, not overflow the buttons.
         let toolbarMinWidth = ScrollResultPanel.requiredToolbarWidth
@@ -142,11 +145,22 @@ final class ScrollResultPanel: NSPanel {
         ("macwindow", "Open in editor window", .openEditor),
     ]
 
+    /// Annotation tools mirror the area review: tags 100+ tools, 200 color,
+    /// 201 undo.
+    private static let toolItems: [OverlayAnnotationTool] = [
+        .select, .pen, .arrow, .rect, .text,
+    ]
+    private static let colorPresets: [NSColor] = [
+        .systemRed, .systemOrange, .systemYellow, .systemGreen,
+        .systemBlue, .black, .white,
+    ]
+    private var colorIndex = 0
+
     /// Width every button (plus Close and paddings) needs without overlap.
     static var requiredToolbarWidth: CGFloat {
         let buttonWidth: CGFloat = 34, spacing: CGFloat = 2
-        let count = CGFloat(items.count)
-        // leading 8 + action buttons + gap 12 + close + trailing 8
+        let count = CGFloat(items.count + toolItems.count + 2) // + color, undo
+        // leading 8 + buttons + gap 12 + close + trailing 8
         return 8 + count * buttonWidth + (count - 1) * spacing + 12
             + buttonWidth + 8
     }
@@ -160,25 +174,47 @@ final class ScrollResultPanel: NSPanel {
         var buttons: [NSButton] = []
         let size = CGSize(width: 34, height: 30)
         let spacing: CGFloat = 2
-        for (index, item) in Self.items.enumerated() {
+        var x: CGFloat = 8
+        @MainActor func makeButton(
+            symbol: String, tooltip: String, tag: Int, tint: NSColor
+        ) -> NSButton {
             let button = NSButton(frame: CGRect(
-                x: 8 + CGFloat(index) * (size.width + spacing),
-                y: (height - size.height) / 2,
+                x: x, y: (height - size.height) / 2,
                 width: size.width, height: size.height))
             button.bezelStyle = .regularSquare
             button.isBordered = false
             button.image = NSImage(
-                systemSymbolName: item.symbol,
-                accessibilityDescription: item.tooltip)
-            button.toolTip = item.tooltip
-            button.tag = index
+                systemSymbolName: symbol, accessibilityDescription: tooltip)
+            button.contentTintColor = tint
+            button.toolTip = tooltip
+            button.tag = tag
             button.target = self
             button.action = #selector(toolbarPressed(_:))
             bar.addSubview(button)
             buttons.append(button)
+            x += size.width + spacing
+            return button
+        }
+        for (index, tool) in Self.toolItems.enumerated() {
+            _ = makeButton(
+                symbol: tool.symbol, tooltip: tool.tooltip,
+                tag: 100 + index,
+                tint: tool == .select ? .controlAccentColor : .labelColor)
+        }
+        _ = makeButton(
+            symbol: "circle.fill", tooltip: "Color", tag: 200,
+            tint: Self.colorPresets[colorIndex])
+        _ = makeButton(
+            symbol: "arrow.uturn.backward", tooltip: "Undo (⌘Z)",
+            tag: 201, tint: .labelColor)
+        for (index, item) in Self.items.enumerated() {
+            _ = makeButton(
+                symbol: item.symbol, tooltip: item.tooltip,
+                tag: index, tint: .labelColor)
         }
         let close = NSButton(frame: CGRect(
-            x: width - size.width - 8, y: (height - size.height) / 2,
+            x: max(x + 12, width - size.width - 8),
+            y: (height - size.height) / 2,
             width: size.width, height: size.height))
         close.bezelStyle = .regularSquare
         close.isBordered = false
@@ -200,6 +236,26 @@ final class ScrollResultPanel: NSPanel {
             dismiss()
             return
         }
+        if sender.tag >= 100, sender.tag < 100 + Self.toolItems.count {
+            let tool = Self.toolItems[sender.tag - 100]
+            annotationSurface.tool = tool
+            for button in toolbarButtons where button.tag >= 100
+                && button.tag < 100 + Self.toolItems.count {
+                button.contentTintColor =
+                    button.tag == sender.tag ? .controlAccentColor : .labelColor
+            }
+            return
+        }
+        if sender.tag == 200 {
+            colorIndex = (colorIndex + 1) % Self.colorPresets.count
+            annotationSurface.color = Self.colorPresets[colorIndex]
+            sender.contentTintColor = Self.colorPresets[colorIndex]
+            return
+        }
+        if sender.tag == 201 {
+            if annotationSurface.undo() { annotationHost?.needsDisplay = true }
+            return
+        }
         guard sender.tag >= 0, sender.tag < Self.items.count else { return }
         perform(intent: Self.items[sender.tag].intent)
     }
@@ -209,6 +265,10 @@ final class ScrollResultPanel: NSPanel {
     }
 
     override func keyDown(with event: NSEvent) {
+        if annotationHost?.textEditingActive == true {
+            super.keyDown(with: event)
+            return
+        }
         if event.keyCode == 53 { // Esc
             if saving { return }
             dismiss()
@@ -222,12 +282,38 @@ final class ScrollResultPanel: NSPanel {
     }
 
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        if annotationHost?.textEditingActive == true {
+            return super.performKeyEquivalent(with: event)
+        }
         if event.modifierFlags.contains(.command),
            event.charactersIgnoringModifiers?.lowercased() == "c" {
             perform(intent: .copy)
             return true
         }
+        if event.modifierFlags.contains(.command),
+           event.charactersIgnoringModifiers?.lowercased() == "z" {
+            if annotationSurface.undo() { annotationHost?.needsDisplay = true }
+            return true
+        }
         return super.performKeyEquivalent(with: event)
+    }
+
+    var annotationHostForTesting: AnnotationHostView? { annotationHost }
+
+    /// Drives the REAL mouse handlers with constructed events — the gate
+    /// draws through production input, not the surface API.
+    func drawWithRealEventsForTesting(fromView a: CGPoint, toView b: CGPoint) {
+        guard let host = annotationHost, let content = contentView else { return }
+        func event(_ type: NSEvent.EventType, _ p: CGPoint) -> NSEvent? {
+            let inWindow = content.convert(p, from: host)
+            return NSEvent.mouseEvent(
+                with: type, location: inWindow, modifierFlags: [],
+                timestamp: 0, windowNumber: windowNumber, context: nil,
+                eventNumber: 0, clickCount: 1, pressure: 1)
+        }
+        if let down = event(.leftMouseDown, a) { host.mouseDown(with: down) }
+        if let drag = event(.leftMouseDragged, b) { host.mouseDragged(with: drag) }
+        if let up = event(.leftMouseUp, b) { host.mouseUp(with: up) }
     }
 
     private func dismiss() {

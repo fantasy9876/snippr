@@ -3610,9 +3610,9 @@ enum SelfTest {
 
         // 9. Overlay slice 2: in-place area review (production paths, headless) ----
         MainActor.assumeIsolated {
-            guard let screen = NSScreen.main else {
-                check("overlay2-environment", true) // headless display: reducer
-                return                              // paths covered in section 8
+            guard let screen = NSScreen.main ?? NSScreen.screens.first else {
+                check("overlay2-environment", true, "SKIPPED — no display attached; MUST re-run on an unlocked session")
+                return
             }
             let frozenImage = CapturedImage(
                 cgImage: makeStripePattern(width: 800, height: 600, seed: 0x0F0E_0D0C),
@@ -3902,8 +3902,8 @@ enum SelfTest {
 
         // 11. Overlay slice 4: annotations (shared surface, both paths) -----------
         MainActor.assumeIsolated {
-            guard let screen = NSScreen.main else {
-                check("overlay4-environment", true)
+            guard let screen = NSScreen.main ?? NSScreen.screens.first else {
+                check("overlay4-environment", true, "SKIPPED — no display attached; MUST re-run on an unlocked session")
                 return
             }
             let base = makeStripePattern(width: 800, height: 600, seed: 0x4A4A_4A4A)
@@ -4011,6 +4011,175 @@ enum SelfTest {
                   afterText == before + 1
                     && surfaceB.annotations.count == before,
                   "before \(before) afterText \(afterText) final \(surfaceB.annotations.count)")
+        }
+
+        // 12. Overlay slice 5: final layout/matrix gates ---------------------------
+        MainActor.assumeIsolated {
+            guard let screen = NSScreen.main ?? NSScreen.screens.first else {
+                check("overlay5-environment", true, "SKIPPED — no display attached; MUST re-run on an unlocked session")
+                return
+            }
+            // frozen must cover the whole screen: edge selections crop from
+            // it through the pixel authority
+            let frozenImage = CapturedImage(
+                cgImage: makeStripePattern(
+                    width: max(8, Int(screen.frame.width)),
+                    height: max(8, Int(screen.frame.height)),
+                    seed: 0x5555_AAAA),
+                scale: 1)
+            @MainActor func noopDeps() -> CaptureActionRouter.Dependencies {
+                CaptureActionRouter.Dependencies(
+                    copyToClipboard: { _ in }, autoSave: { _, _ in },
+                    saveAs: { _, _ in }, pin: { _ in }, ocr: { _ in },
+                    openEditor: { _ in }, toast: { _ in },
+                    setLastCapture: { _ in }, setLastAreaRect: { _ in },
+                    logEvent: { _ in })
+            }
+            @MainActor func reviewView() -> (SelectionOverlay, SelectionOverlayView) {
+                let overlay = SelectionOverlay(
+                    purpose: .areaReview,
+                    inputs: OverlaySessionInputs(
+                        afterShow: true, afterCopy: false, afterSave: false),
+                    completion: { _ in })
+                overlay.routerDependenciesOverride = noopDeps()
+                let view = SelectionOverlayView(
+                    mode: .area, screen: screen, frozen: frozenImage,
+                    windowList: [], owner: overlay)
+                return (overlay, view)
+            }
+
+            // Toolbar at the edges: bottom-left, bottom-right, top edge,
+            // full-frame — always inside bounds, never over a handle hit rect.
+            let b = screen.frame.size
+            let edgeRects = [
+                CGRect(x: 4, y: 4, width: 200, height: 120),
+                CGRect(x: b.width - 210, y: 4, width: 200, height: 120),
+                CGRect(x: b.width / 2 - 100, y: b.height - 130, width: 200, height: 120),
+                CGRect(x: 4, y: 4, width: b.width - 8, height: b.height - 8),
+            ]
+            var edgeFailures: [String] = []
+            for (index, rect) in edgeRects.enumerated() {
+                let (overlay, view) = reviewView()
+                _ = overlay
+                view.selectForTesting(rect: rect)
+                guard let bar = view.reviewToolbarFrameForTesting else {
+                    edgeFailures.append("#\(index) no toolbar"); continue
+                }
+                if !view.bounds.contains(bar) {
+                    edgeFailures.append("#\(index) out of bounds \(bar)")
+                }
+                if let sel = view.hasAreaSelectionForTesting
+                    ? rect.intersection(view.bounds) : nil {
+                    for (handle, handleRect) in EditableSelectionGeometry.handleRects(
+                        for: sel, size: 18) where bar.intersects(handleRect) {
+                        edgeFailures.append("#\(index) overlaps \(handle) \(handleRect) bar \(bar)")
+                    }
+                }
+            }
+            check("overlay5-toolbar-edges", edgeFailures.isEmpty,
+                  edgeFailures.joined(separator: "; "))
+
+            // Retina 2x + shrink→re-expand: the SAME edges give the SAME
+            // integral pixelRect — no 1px drift through a resize round trip.
+            let retinaFrozen = CapturedImage(
+                cgImage: makeStripePattern(width: 1600, height: 1200, seed: 0x2E71_4A00),
+                scale: 2)
+            let retinaOverlay = SelectionOverlay(
+                purpose: .areaReview,
+                inputs: OverlaySessionInputs(
+                    afterShow: true, afterCopy: false, afterSave: false),
+                completion: { _ in })
+            retinaOverlay.routerDependenciesOverride = noopDeps()
+            let retinaView = SelectionOverlayView(
+                mode: .area, screen: screen, frozen: retinaFrozen,
+                windowList: [], owner: retinaOverlay)
+            let fractional = CGRect(x: 33.4, y: 47.6, width: 211.3, height: 148.7)
+            retinaView.selectForTesting(rect: fractional)
+            let px1 = retinaOverlay.session.pixelRect
+            retinaView.adjustSelectionForTesting(rect: CGRect(
+                x: 60, y: 60, width: 80, height: 60))
+            retinaView.adjustSelectionForTesting(rect: fractional)
+            let px2 = retinaOverlay.session.pixelRect
+            check("overlay5-retina-reexpand",
+                  px1 == px2 && px1 == px1.integral,
+                  "px1 \(px1) px2 \(px2)")
+
+            // Full setting matrix for the two initial intents: effect counts
+            // follow the snapshot exactly.
+            let tiny = CapturedImage(
+                cgImage: makeSolidImage(
+                    width: 6, height: 6, color: NSColor.systemPink.cgColor),
+                scale: 1)
+            var matrixOK = true
+            for intent in [CaptureIntent.initialCapture, .scrollFinished] {
+                let source: CaptureSource =
+                    intent == .initialCapture ? .areaReview : .scrollResult
+                for show in [false, true] {
+                    for copy in [false, true] {
+                        for save in [false, true] {
+                            var copies = 0, saves = 0, toasts = 0, rects = 0
+                            var deps = noopDeps()
+                            deps.copyToClipboard = { _ in copies += 1 }
+                            deps.autoSave = { _, done in
+                                saves += 1; done(URL(fileURLWithPath: "/tmp/m.png")) }
+                            deps.toast = { _ in toasts += 1 }
+                            deps.setLastAreaRect = { _ in rects += 1 }
+                            _ = CaptureActionRouter.commit(
+                                tiny, source: source, intent: intent,
+                                inputs: OverlaySessionInputs(
+                                    afterShow: show, afterCopy: copy,
+                                    afterSave: save),
+                                finalGlobalRect: CGRect(
+                                    x: 1, y: 2, width: 3, height: 4),
+                                dependencies: deps)
+                            let wantCopies = copy
+                                ? 1 : ((show || save) ? 0 : 1) // rescue only
+                            let wantSaves = save ? 1 : 0
+                            let wantToasts = show ? 0 : 1
+                            let wantRects = (intent == .initialCapture && !show)
+                                ? 1 : 0
+                            if copies != wantCopies || saves != wantSaves
+                                || toasts != wantToasts || rects != wantRects {
+                                matrixOK = false
+                                print("  matrix mismatch: \(intent) show=\(show) copy=\(copy) save=\(save) → c\(copies)/\(wantCopies) s\(saves)/\(wantSaves) t\(toasts)/\(wantToasts) r\(rects)/\(wantRects)")
+                            }
+                        }
+                    }
+                }
+            }
+            check("overlay5-setting-matrix", matrixOK, "see mismatches above")
+
+            // Purpose isolation: scroll region and instant OCR hand over the
+            // rect exactly once at mouse-up — no review, no initialCapture
+            // side effects, no second completion.
+            for purpose in [OverlayPurpose.scrollRegion, .instantOCRRegion] {
+                var completions = 0
+                var gotArea = false
+                let overlay = SelectionOverlay(
+                    purpose: purpose,
+                    inputs: OverlaySessionInputs(
+                        afterShow: true, afterCopy: true, afterSave: true),
+                    completion: { result in
+                        completions += 1
+                        if case .area = result { gotArea = true }
+                    })
+                var copies = 0
+                var deps = noopDeps()
+                deps.copyToClipboard = { _ in copies += 1 }
+                overlay.routerDependenciesOverride = deps
+                let view = SelectionOverlayView(
+                    mode: .area, screen: screen, frozen: frozenImage,
+                    windowList: [], owner: overlay)
+                view.selectForTesting(rect: CGRect(
+                    x: 50, y: 60, width: 200, height: 150))
+                view.selectForTesting(rect: CGRect(
+                    x: 50, y: 60, width: 200, height: 150)) // late/double
+                check("overlay5-purpose-isolation-\(purpose)",
+                      completions == 1 && gotArea && copies == 0
+                        && overlay.session.phase == .completed
+                        && view.reviewToolbarFrameForTesting == nil,
+                      "completions \(completions) area \(gotArea) copies \(copies)")
+            }
         }
 
         print(failures == 0 ? "ALL TESTS PASSED" : "\(failures) TEST(S) FAILED")
@@ -4123,6 +4292,42 @@ enum SelfTest {
 
     static func imagesEqualForTesting(_ a: CGImage, _ b: CGImage) -> Bool {
         imagesEqual(a, b)
+    }
+
+    /// Returns non-nil when EVERY probe point (bottom-left pixel coords) has
+    /// reddish ink within `pixelRadius`; nil when any probe area is clean.
+    static func redInkNearForTesting(
+        _ image: CGImage, points: [CGPoint], pixelRadius: Int
+    ) -> Bool? {
+        var bytes = [UInt8](repeating: 0, count: image.width * image.height * 4)
+        guard let ctx = CGContext(
+            data: &bytes, width: image.width, height: image.height,
+            bitsPerComponent: 8, bytesPerRow: image.width * 4,
+            space: CGColorSpace(name: CGColorSpace.sRGB)!,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else { return nil }
+        ctx.interpolationQuality = .none
+        ctx.draw(image, in: CGRect(
+            x: 0, y: 0, width: image.width, height: image.height))
+        for p in points {
+            // convert bottom-left pixel coords to buffer rows (top-down)
+            let cx = Int(p.x), cyBL = Int(p.y)
+            let cy = image.height - 1 - cyBL
+            var found = false
+            for dy in -pixelRadius...pixelRadius where !found {
+                for dx in -pixelRadius...pixelRadius {
+                    let x = cx + dx, y = cy + dy
+                    guard x >= 0, x < image.width, y >= 0, y < image.height
+                    else { continue }
+                    let i = (y * image.width + x) * 4
+                    let r = Int(bytes[i]), g = Int(bytes[i + 1])
+                    let b = Int(bytes[i + 2])
+                    if r > 150, g < 110, b < 110 { found = true; break }
+                }
+            }
+            if !found { return nil }
+        }
+        return true
     }
 
     private static func imagesEqual(_ a: CGImage, _ b: CGImage) -> Bool {

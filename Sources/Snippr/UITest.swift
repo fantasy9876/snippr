@@ -186,19 +186,48 @@ enum UITest {
                     }
                 }
             }
-            // annotate the stitched result: flatten must change while
-            // dimensions stay the stitched image's
+            // Annotate through REAL mouse events at the four corners and
+            // the center of the fitted strip: each stroke must land at the
+            // matching pixel in the export (uniform X/Y mapping), and the
+            // export keeps the stitched dimensions.
             panel.annotationSurface.tool = .pen
-            _ = panel.annotationSurface.beginDrag(atPixel: CGPoint(x: 60, y: 400))
-            panel.annotationSurface.continueDrag(toPixel: CGPoint(x: 260, y: 700))
-            panel.annotationSurface.continueDrag(toPixel: CGPoint(x: 340, y: 1100))
-            panel.annotationSurface.endDrag()
-            let export = panel.exportSnapshotForTesting
-            let panelAnnotated =
-                export.cgImage.width == tallStitch.cgImage.width
-                && export.cgImage.height == tallStitch.cgImage.height
-                && !SelfTest.imagesEqualForTesting(
-                    export.cgImage, tallStitch.cgImage)
+            panel.annotationSurface.color = .systemRed
+            var panelAnnotated = true
+            if let host = panel.annotationHostForTesting {
+                // uniform mapping: pixels-per-point equal on both axes
+                let ppx = CGFloat(tallStitch.cgImage.width) / host.frame.width
+                let ppy = CGFloat(tallStitch.cgImage.height) / host.frame.height
+                if abs(ppx - ppy) > 0.02 * max(ppx, ppy) { panelAnnotated = false }
+                let w = host.bounds.width, h = host.bounds.height
+                let probes: [CGPoint] = [
+                    CGPoint(x: 2, y: 2), CGPoint(x: w - 2, y: 2),
+                    CGPoint(x: 2, y: h - 2), CGPoint(x: w - 2, y: h - 2),
+                    CGPoint(x: w / 2, y: h / 2),
+                ]
+                for p in probes {
+                    panel.drawWithRealEventsForTesting(
+                        fromView: p,
+                        toView: CGPoint(x: min(w - 1, p.x + 1), y: p.y))
+                }
+                let export = panel.exportSnapshotForTesting
+                if export.cgImage.width != tallStitch.cgImage.width
+                    || export.cgImage.height != tallStitch.cgImage.height
+                    || SelfTest.imagesEqualForTesting(
+                        export.cgImage, tallStitch.cgImage) {
+                    panelAnnotated = false
+                }
+                // every probe pixel neighborhood must contain red ink
+                if let probe = SelfTest.redInkNearForTesting(
+                    export.cgImage,
+                    points: probes.map { CGPoint(x: $0.x * ppx, y: $0.y * ppy) },
+                    pixelRadius: Int(8 * max(ppx, 1))) {
+                    _ = probe
+                } else {
+                    panelAnnotated = false
+                }
+            } else {
+                panelAnnotated = false
+            }
             panel.performActionForTesting(.openEditor)
             let editorsAfter = NSApp.windows
                 .filter { $0.windowController is EditorWindowController }.count
