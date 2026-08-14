@@ -209,11 +209,11 @@ final class ScrollingCapture {
                             "Đã ghép \(Int(CGFloat(s.totalHeight) / scale)) pt "
                             + "— cuộn tiếp, xong \(stopHint)")
                     case .prepended:
-                        if previewView?.pinToTop == true {
-                            prependPreview(s.lastSlice)
-                        } else {
-                            rebuildPreview(from: s, pinToTop: true)
-                        }
+                        // Always rebuild: the incremental paste-on-top path
+                        // cannot represent separators or completed segments
+                        // above the current one, and the bounded window
+                        // render is cheap.
+                        rebuildPreview(from: s, pinToTop: true)
                         updateProgress(
                             "Đã ghép \(Int(CGFloat(s.totalHeight) / scale)) pt "
                             + "(nối lên trên) — cuộn tiếp, xong \(stopHint)")
@@ -327,44 +327,19 @@ final class ScrollingCapture {
     private func rebuildPreview(
         from segmented: SegmentedVerticalStitcher, pinToTop: Bool
     ) {
-        // Bounded render only — a full compose() here would materialize the
-        // whole strip (hundreds of MB on long sessions) on the capture loop.
-        let maxSourceRows = max(1, Int(
-            CGFloat(previewMaxHeight)
-                * CGFloat(segmented.width) / CGFloat(previewPixelWidth)))
+        // Bounded render only — the target canvas is at most
+        // previewPixelWidth × previewMaxHeight regardless of source width or
+        // session length; a full compose() here would materialize the whole
+        // strip (hundreds of MB) on the capture loop.
         guard let visible = segmented.previewWindowImage(
-            rows: maxSourceRows, fromTop: pinToTop) else { return }
-        previewImage = scaledForPreview(visible)
+            targetWidth: previewPixelWidth,
+            maxHeight: previewMaxHeight,
+            fromTop: pinToTop) else { return }
+        previewImage = visible
         previewView?.pinToTop = pinToTop
         pushPreview()
     }
 
-    /// Mirror of appendPreview for content captured while scrolling up: the
-    /// newest strip goes on TOP, the oldest content is clipped at the bottom,
-    /// and the panel pins to the top edge so the user watches growth happen.
-    private func prependPreview(_ slice: CGImage?) {
-        guard let slice, let scaled = scaledForPreview(slice) else { return }
-        let prevH = previewImage?.height ?? 0
-        let newH = min(previewMaxHeight, prevH + scaled.height)
-        guard let ctx = CGContext(
-            data: nil, width: previewPixelWidth, height: newH, bitsPerComponent: 8, bytesPerRow: 0,
-            space: CGColorSpace(name: CGColorSpace.sRGB)!,
-            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-        ) else { return }
-        if let prev = previewImage {
-            ctx.draw(prev, in: CGRect(
-                x: 0,
-                y: CGFloat(newH) - CGFloat(scaled.height) - CGFloat(prev.height),
-                width: CGFloat(previewPixelWidth), height: CGFloat(prev.height)
-            ))
-        }
-        ctx.draw(scaled, in: CGRect(
-            x: 0, y: CGFloat(newH) - CGFloat(scaled.height),
-            width: CGFloat(previewPixelWidth), height: CGFloat(scaled.height)))
-        previewImage = ctx.makeImage()
-        previewView?.pinToTop = true
-        pushPreview()
-    }
 
     private func pushPreview() {
         previewView?.image = previewImage
@@ -780,11 +755,64 @@ final class SegmentedVerticalStitcher {
         return ctx.makeImage()
     }
 
-    /// Bounded window over the CURRENT segment for the live preview — the
-    /// rolling preview always tracks current progress, and this never
-    /// materializes the full strip (see VerticalStitcher.composeWindow).
-    func previewWindowImage(rows: Int, fromTop: Bool) -> CGImage? {
-        currentSegment.composeWindow(rows: rows, fromTop: fromTop)
+    /// Bounded preview window over the FULL composition — completed segments
+    /// and their gap separators included, so a marked discontinuity never
+    /// silently disappears from the preview. Parts are drawn scaled directly
+    /// into the target-sized canvas: the only allocation is
+    /// `targetWidth × min(maxHeight, total)` regardless of how wide the
+    /// source frames are or how long the session ran. At `targetWidth ==
+    /// width` this is pixel-identical to cropping `compose()`.
+    func previewWindowImage(
+        targetWidth: Int, maxHeight: Int, fromTop: Bool
+    ) -> CGImage? {
+        guard targetWidth > 0, maxHeight > 0, width > 0 else { return nil }
+        var parts: [CGImage] = []
+        if !completedSegments.isEmpty {
+            guard let separator = segmentSeparator() else { return nil }
+            for segment in completedSegments {
+                parts.append(segment)
+                parts.append(separator)
+            }
+        }
+        guard let currentParts = currentSegment.composedParts(
+            includeHeader: currentOmittedHeaderRows == 0,
+            includeFooter: true, inferredFooterRows: 0) else { return nil }
+        parts += currentParts
+        let scale = CGFloat(targetWidth) / CGFloat(width)
+        let scaledHeights = parts.map { CGFloat($0.height) * scale }
+        let totalScaled = scaledHeights.reduce(0, +)
+        let windowHeight = Int(min(CGFloat(maxHeight), totalScaled.rounded()))
+        guard windowHeight > 0, let ctx = CGContext(
+            data: nil, width: targetWidth, height: windowHeight,
+            bitsPerComponent: 8, bytesPerRow: 0,
+            space: CGColorSpace(name: CGColorSpace.sRGB)!,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else { return nil }
+        ctx.interpolationQuality = .medium
+        // Parts overlapping the window edge are clipped by the context.
+        if fromTop {
+            var consumed: CGFloat = 0
+            for (index, part) in parts.enumerated() {
+                guard consumed < CGFloat(windowHeight) else { break }
+                ctx.draw(part, in: CGRect(
+                    x: 0,
+                    y: CGFloat(windowHeight) - consumed - scaledHeights[index],
+                    width: CGFloat(targetWidth),
+                    height: scaledHeights[index]))
+                consumed += scaledHeights[index]
+            }
+        } else {
+            var consumed: CGFloat = 0
+            for (index, part) in parts.enumerated().reversed() {
+                guard consumed < CGFloat(windowHeight) else { break }
+                ctx.draw(part, in: CGRect(
+                    x: 0, y: consumed,
+                    width: CGFloat(targetWidth),
+                    height: scaledHeights[index]))
+                consumed += scaledHeights[index]
+            }
+        }
+        return ctx.makeImage()
     }
 
     /// Full composes performed across all segments — the preview path must
@@ -1056,48 +1084,123 @@ final class VerticalStitcher {
         let floorOffset = Int(offset.rounded(.down))
         let fraction = offset - Double(floorOffset)
         let interpolate = fraction > 0.25 && fraction < 0.75
-        let intOffset = max(1, interpolate ? floorOffset : Int(offset.rounded()))
+        // A half-row displacement can legitimately have floor 0 (offset 0.5,
+        // the smallest value the subpixel matcher emits); only INTEGER
+        // zero-motion stays banned.
+        let intOffset = interpolate
+            ? max(0, floorOffset) : max(1, Int(offset.rounded()))
         let start = max(0, headerRows)
         let end = effectiveHeight - intOffset - (interpolate ? 1 : 0)
         // A tiny remaining overlap was already covered by the template itself.
         guard end - start >= 8 else { return true }
-        var agree = 0
-        var total = 0
+        // A fractional offset is ONE translation of the whole frame, so the
+        // subpixel phase (crisp floor/ceil, blur on the base side, blur on
+        // the shifted side) must be chosen ONCE for the entire overlap —
+        // per-row phase picking would bless rasters that correspond to no
+        // single translation. FLAT rows — no horizontal detail AND
+        // indistinguishable from their vertical neighbours (blank background,
+        // long solid runs) — agree under any hypothesis, so they do not vote;
+        // the remaining content rows vote equally. (Deliberately NOT
+        // energy-weighted voting: a duplicated card more detailed than the
+        // genuinely differing content would outvote it — the exact
+        // sparse-page trap this guards against. And deliberately not
+        // energy-only: a solid-colour stripe row has zero horizontal energy
+        // yet is fully distinguishable row-to-row.) An overlap with no
+        // content rows proves nothing and fails closed.
+        func verticalContrast(_ sig: RowSig, _ y: Int, height: Int) -> Double {
+            let index = y * 4
+            var neighbourDelta = 0.0
+            if y > 0 {
+                for band in 0..<4 {
+                    neighbourDelta = max(neighbourDelta, abs(
+                        sig.bands[index + band] - sig.bands[index - 4 + band]))
+                }
+            }
+            if y + 1 < height {
+                for band in 0..<4 {
+                    neighbourDelta = max(neighbourDelta, abs(
+                        sig.bands[index + band] - sig.bands[index + 4 + band]))
+                }
+            }
+            return neighbourDelta
+        }
+        // Phase models for a fractional offset k+f: one side is typically the
+        // re-rasterized frame, approximated by a linear two-tap blend with the
+        // ACTUAL fraction weights (a 50/50-only model misses 0.3/0.7-style
+        // trackpad stops). Crisp floor/ceil cover near-integer pairs. The
+        // interpolated tolerance is slightly wider than the crisp one because
+        // CoreAnimation's resampler is not an exact linear blend; duplicate
+        // blocks and mismatched content sit an order of magnitude above both.
+        // Precompute the voting rows once. Crisp rows must sit near zero.
+        // Interpolated rows carry real resampler residue that SCALES with the
+        // row's vertical contrast (CoreAnimation is not an exact two-tap
+        // blend): on known-genuine pairs the best-phase residue measures
+        // ≈0.10–0.15 × contrast, while genuinely different content measures
+        // ≈0.3–0.6 × contrast, so a contrast-normalized tolerance separates
+        // the populations where any flat threshold cannot (razor-thin strokes
+        // reach residue ~27 while low-contrast mismatches sit near 30).
+        var voterA: [Int] = []
+        var voterB: [Int] = []
+        var voterTolerance: [Double] = []
         for y in start..<end {
-            let a = (y + intOffset) * 4
-            let b = y * 4
-            var d = 0.0
-            if interpolate {
-                // Either frame may be the re-rasterized one at a half-row
-                // position, so score every phase the subpixel matcher models
-                // (crisp floor/ceil, blur on the base side, blur on the
-                // shifted side) and keep the best. Rows of genuinely
-                // different content stay far above tolerance under EVERY
-                // phase, so this does not weaken the duplicate-block veto.
-                var dFloor = 0.0, dCeil = 0.0
-                var dBlendBase = 0.0, dBlendUpper = 0.0, dBlendLower = 0.0
+            let contrastBase = verticalContrast(
+                base, y + intOffset, height: effectiveHeight)
+            let contrastShifted = verticalContrast(
+                shifted, y, height: effectiveHeight)
+            let flatBase = base.energy[y + intOffset] < 0.5 && contrastBase < 1.5
+            let flatShifted = shifted.energy[y] < 0.5 && contrastShifted < 1.5
+            guard !flatBase || !flatShifted else { continue }
+            voterA.append((y + intOffset) * 4)
+            voterB.append(y * 4)
+            voterTolerance.append(interpolate
+                ? min(40, max(15, 0.18 * max(contrastBase, contrastShifted)))
+                : 8.0)
+        }
+        guard !voterA.isEmpty else { return false }
+        let phaseCount = interpolate ? 5 : 1
+        let weightHigh = interpolate ? fraction : 0
+        let weightLow = 1 - weightHigh
+        for phase in 0..<phaseCount {
+            var agree = 0
+            for row in 0..<voterA.count {
+                let a = voterA[row]
+                let b = voterB[row]
+                var d = 0.0
                 for band in 0..<4 {
                     let baseFloor = base.bands[a + band]
-                    let baseCeil = base.bands[a + 4 + band]
                     let s0 = shifted.bands[b + band]
-                    let s1 = shifted.bands[b + 4 + band]
-                    dFloor += abs(baseFloor - s0)
-                    dCeil += abs(baseCeil - s0)
-                    dBlendBase += abs((baseFloor + baseCeil) * 0.5 - s0)
-                    dBlendUpper += abs(baseCeil - (s0 + s1) * 0.5)
-                    dBlendLower += abs(baseFloor - (s0 + s1) * 0.5)
-                }
-                d = min(dFloor, dCeil, dBlendBase, dBlendUpper, dBlendLower) / 4
-            } else {
-                for band in 0..<4 {
-                    d += abs(base.bands[a + band] - shifted.bands[b + band])
+                    switch phase {
+                    case 0:
+                        d += abs(baseFloor - s0)
+                    // The remaining phases exist only when `interpolate`,
+                    // whose row range leaves one extra neighbour row in
+                    // bounds on both signatures.
+                    case 1:
+                        d += abs(base.bands[a + 4 + band] - s0)
+                    case 2:
+                        d += abs(baseFloor * weightLow
+                            + base.bands[a + 4 + band] * weightHigh - s0)
+                    case 3:
+                        d += abs(s0 * weightLow
+                            + shifted.bands[b + 4 + band] * weightHigh
+                            - baseFloor)
+                    default:
+                        d += abs(s0 * weightHigh
+                            + shifted.bands[b + 4 + band] * weightLow
+                            - base.bands[a + 4 + band])
+                    }
                 }
                 d /= 4
+                if d < voterTolerance[row] { agree += 1 }
             }
-            total += 1
-            if d < 8.0 { agree += 1 }
+            if Perf.enabled {
+                FileHandle.standardError.write(
+                    "coherence phase=\(phase) agree=\(agree)/\(voterA.count) off=\(String(format: "%.2f", offset))\n"
+                        .data(using: .utf8)!)
+            }
+            if agree * 10 >= voterA.count * 7 { return true }
         }
-        return agree * 10 >= total * 7
+        return false
     }
 
     /// Integrate `frame` into the strip: append new bottom rows, prepend new
@@ -2123,7 +2226,7 @@ final class VerticalStitcher {
     /// The ordered vertical parts of the final image (header lift, prepended
     /// strips, first-frame body, appended strips, re-attached footer) WITHOUT
     /// allocating the full-height canvas.
-    private func composedParts(
+    fileprivate func composedParts(
         includeHeader: Bool,
         includeFooter: Bool,
         inferredFooterRows: Int
@@ -2207,42 +2310,4 @@ final class VerticalStitcher {
         return ctx.makeImage()
     }
 
-    /// Bounded compose for the live preview: renders only the outermost
-    /// `rows` of the strip. The canvas is at most `rows` tall no matter how
-    /// long the session is — a 20k-pt strip must never be materialized just
-    /// to refresh a 1400-px preview after a direction flip.
-    func composeWindow(rows: Int, fromTop: Bool) -> CGImage? {
-        guard rows > 0, let parts = composedParts(
-            includeHeader: true, includeFooter: true,
-            inferredFooterRows: 0) else { return nil }
-        let total = parts.reduce(0) { $0 + $1.height }
-        let windowRows = min(rows, total)
-        guard windowRows > 0, let ctx = CGContext(
-            data: nil, width: width, height: windowRows,
-            bitsPerComponent: 8, bytesPerRow: 0,
-            space: CGColorSpace(name: CGColorSpace.sRGB)!,
-            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-        ) else { return nil }
-        // Parts overlapping the window edge are clipped by the context.
-        if fromTop {
-            var consumed = 0
-            for part in parts {
-                guard consumed < windowRows else { break }
-                ctx.draw(part, in: CGRect(
-                    x: 0, y: CGFloat(windowRows - consumed - part.height),
-                    width: CGFloat(width), height: CGFloat(part.height)))
-                consumed += part.height
-            }
-        } else {
-            var consumed = 0
-            for part in parts.reversed() {
-                guard consumed < windowRows else { break }
-                ctx.draw(part, in: CGRect(
-                    x: 0, y: CGFloat(consumed),
-                    width: CGFloat(width), height: CGFloat(part.height)))
-                consumed += part.height
-            }
-        }
-        return ctx.makeImage()
-    }
 }

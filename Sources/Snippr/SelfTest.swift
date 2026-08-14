@@ -366,28 +366,31 @@ enum SelfTest {
 
         // 2b-window. Bounded preview windows ---------------------------------------
         // The live preview refresh after a direction flip must render only the
-        // outermost window of the strip: byte-identical to cropping the full
-        // compose, with the full-compose spy proving zero full composes.
+        // visible window: at source width it is BYTE-identical to cropping the
+        // full compose, the full-compose spy proves zero full composes, and a
+        // wide-display source still allocates only the target-sized canvas.
         do {
             let doc = makeStripePattern(width: 400, height: 2000, seed: 0x81D0_11E4)
             let vp = 500
             let path = [800, 480, 160, 480, 800, 1120, 1440]
-            var s: VerticalStitcher?
+            var s: SegmentedVerticalStitcher?
             for off in path {
                 guard let frame = doc.cropping(to: CGRect(
                     x: 0, y: off, width: 400, height: vp)) else {
                     check("stitch-window-crop", false); break
                 }
                 if let st = s { _ = st.append(frame) } else {
-                    s = VerticalStitcher(first: frame)
+                    s = SegmentedVerticalStitcher(first: frame)
                 }
             }
             if let s {
                 let windowRows = 300
-                let top = s.composeWindow(rows: windowRows, fromTop: true)
-                let bottom = s.composeWindow(rows: windowRows, fromTop: false)
+                let top = s.previewWindowImage(
+                    targetWidth: 400, maxHeight: windowRows, fromTop: true)
+                let bottom = s.previewWindowImage(
+                    targetWidth: 400, maxHeight: windowRows, fromTop: false)
                 check("stitch-window-no-full-compose", s.fullComposeCount == 0,
-                      "composeWindow performed \(s.fullComposeCount) full composes")
+                      "window render performed \(s.fullComposeCount) full composes")
                 if let top, let bottom, let full = s.compose(),
                    let wantTop = full.cropping(to: CGRect(
                     x: 0, y: 0, width: 400, height: windowRows)),
@@ -395,14 +398,172 @@ enum SelfTest {
                     x: 0, y: full.height - windowRows,
                     width: 400, height: windowRows)) {
                     check("stitch-window-top-content",
-                          imagesRoughlyEqual(wantTop, top),
+                          imagesEqual(wantTop, top),
                           "top window differs from full-compose crop")
                     check("stitch-window-bottom-content",
-                          imagesRoughlyEqual(wantBottom, bottom),
+                          imagesEqual(wantBottom, bottom),
                           "bottom window differs from full-compose crop")
                 } else {
                     check("stitch-window-compose", false)
                 }
+            }
+
+            // Wide display: the returned canvas must be target-sized no
+            // matter the source width (the old path allocated
+            // width × (1400·width/400) — ~350 MiB at width 5120).
+            let wideDoc = makeStripePattern(
+                width: 5120, height: 1400, seed: 0x81D0_57DE)
+            if let w0 = wideDoc.cropping(to: CGRect(
+                x: 0, y: 0, width: 5120, height: 500)),
+               let w1 = wideDoc.cropping(to: CGRect(
+                x: 0, y: 300, width: 5120, height: 500)) {
+                let wide = SegmentedVerticalStitcher(first: w0)
+                _ = wide.append(w1)
+                if let window = wide.previewWindowImage(
+                    targetWidth: 400, maxHeight: 1400, fromTop: false) {
+                    check("stitch-window-wide-allocation-capped",
+                          window.width == 400 && window.height <= 1400,
+                          "got \(window.width)x\(window.height)")
+                } else {
+                    check("stitch-window-wide-render", false)
+                }
+            } else {
+                check("stitch-window-wide-frames", false)
+            }
+        }
+
+        // 2b-window-marker. Gap separator must survive a direction flip ------------
+        // After a re-anchor the composed strip contains segment + separator +
+        // segment; the flip preview window over that region must be
+        // pixel-EXACT against the full compose, separator included.
+        do {
+            let doc = makeStripePattern(width: 400, height: 3000, seed: 0x5E9A_9A99)
+            let vp = 500
+            // 0→300: appends; flick to 1200 (no overlap) rejects and builds
+            // the pending segment at 1200/1400/1600/1800; promote inserts the
+            // marked gap. Then scroll back up inside segment 2 until a real
+            // prepend happens.
+            let path = [0, 300, 1200, 1400, 1600, 1800, 1650, 1350, 1050]
+            if let first = doc.cropping(to: CGRect(
+                x: 0, y: path[0], width: 400, height: vp)) {
+                let segmented = SegmentedVerticalStitcher(first: first)
+                var sawSegment = false
+                var sawPrepend = false
+                for off in path.dropFirst() {
+                    guard let frame = doc.cropping(to: CGRect(
+                        x: 0, y: off, width: 400, height: vp)) else {
+                        check("stitch-window-marker-crop", false); break
+                    }
+                    switch segmented.append(frame) {
+                    case .startedSegment: sawSegment = true
+                    case .prepended: sawPrepend = true
+                    default: break
+                    }
+                }
+                check("stitch-window-marker-fixture",
+                      sawSegment && sawPrepend && segmented.segmentCount == 2,
+                      "segment \(sawSegment) prepend \(sawPrepend) count \(segmented.segmentCount)")
+                if let full = segmented.compose() {
+                    for fromTop in [true, false] {
+                        let label = fromTop ? "top" : "bottom"
+                        let windowRows = 1400
+                        if let window = segmented.previewWindowImage(
+                            targetWidth: 400, maxHeight: windowRows, fromTop: fromTop),
+                           let want = full.cropping(to: CGRect(
+                            x: 0, y: fromTop ? 0 : full.height - windowRows,
+                            width: 400, height: windowRows)) {
+                            check("stitch-window-marker-\(label)-exact",
+                                  imagesEqual(want, window),
+                                  "\(label) window differs from full compose (separator lost?)")
+                        } else {
+                            check("stitch-window-marker-\(label)-render", false)
+                        }
+                    }
+                } else {
+                    check("stitch-window-marker-compose", false)
+                }
+            } else {
+                check("stitch-window-marker-crop", false)
+            }
+        }
+
+        // 2b-halfrow. Coherence at an exact half-row offset ------------------------
+        // The subpixel matcher's smallest emission is offset 0.5 (floor 0).
+        // Coherence must compare rows 0/1 blends, not shift everything by a
+        // whole row — a synthetic half-row blend must pass in BOTH directions.
+        do {
+            let rows = 64
+            var baseBands = [Double](repeating: 0, count: rows * 4)
+            var seed: UInt64 = 0x4A1F_0BEE
+            for i in 0..<baseBands.count {
+                seed = seed &* 6364136223846793005 &+ 1442695040888963407
+                baseBands[i] = Double((seed >> 33) & 0xFF)
+            }
+            var shiftedBands = [Double](repeating: 0, count: rows * 4)
+            for y in 0..<(rows - 1) {
+                for band in 0..<4 {
+                    shiftedBands[y * 4 + band] =
+                        (baseBands[y * 4 + band] + baseBands[(y + 1) * 4 + band]) * 0.5
+                }
+            }
+            for band in 0..<4 {
+                shiftedBands[(rows - 1) * 4 + band] = baseBands[(rows - 1) * 4 + band]
+            }
+            let energy = [Double](repeating: 4.0, count: rows)
+            let baseSig = VerticalStitcher.RowSig(bands: baseBands, energy: energy)
+            let shiftedSig = VerticalStitcher.RowSig(bands: shiftedBands, energy: energy)
+            check("stitch-halfrow-coherence-forward",
+                  VerticalStitcher.wholeOverlapAgrees(
+                    base: baseSig, shifted: shiftedSig, offset: 0.5,
+                    headerRows: 0, effectiveHeight: rows),
+                  "half-row blend rejected (base→shifted)")
+            check("stitch-halfrow-coherence-reverse",
+                  VerticalStitcher.wholeOverlapAgrees(
+                    base: shiftedSig, shifted: baseSig, offset: 0.5,
+                    headerRows: 0, effectiveHeight: rows),
+                  "half-row blend rejected (shifted→base)")
+        }
+
+        // 2b-sparse. Sparse white page + repeated detailed card --------------------
+        // Blank rows agree under any offset, so an unweighted quorum let a
+        // duplicated card carry a fake match on a mostly-white page (75% of
+        // rows "agreed" while every real content row differed). Blank rows
+        // must not vote — with them excluded, the card cannot outvote the
+        // differing content, in either direction.
+        do {
+            let sW = 400, sViewport = 500
+            let cardSrc = makeStripePattern(width: sW, height: 125, seed: 0x0CA9_D0CA)
+            let contentA = makeStripePattern(width: sW, height: 100, seed: 0x0C0A_AAAA)
+            let contentB = makeStripePattern(width: sW, height: 100, seed: 0x0C0B_BBBB)
+            func sparseFrame(
+                card cardTop: Int, content: CGImage, contentTop: Int
+            ) -> CGImage? {
+                let c = ctx(sW, sViewport)
+                c.setFillColor(CGColor(gray: 1, alpha: 1))
+                c.fill(CGRect(x: 0, y: 0, width: sW, height: sViewport))
+                c.draw(cardSrc, in: CGRect(
+                    x: 0, y: sViewport - cardTop - 125,
+                    width: sW, height: 125))
+                c.draw(content, in: CGRect(
+                    x: 0, y: sViewport - contentTop - 100,
+                    width: sW, height: 100))
+                return c.makeImage()
+            }
+            // Claimed offset 100: cards align (a[375..500) ↔ b[275..400)) and
+            // the whitespace matches too, but the only real content rows
+            // (a[100..200) vs b[0..100)) disagree — no true overlap exists.
+            if let a = sparseFrame(card: 375, content: contentA, contentTop: 100),
+               let b = sparseFrame(card: 275, content: contentB, contentTop: 0) {
+                let down = VerticalStitcher(first: a)
+                let downResult = down.append(b)
+                check("stitch-sparse-card-rejected", downResult == .rejected,
+                      "sparse repeated-card page got \(downResult) (a→b)")
+                let up = VerticalStitcher(first: b)
+                let upResult = up.append(a)
+                check("stitch-sparse-card-reversed-rejected", upResult == .rejected,
+                      "sparse repeated-card page got \(upResult) (b→a)")
+            } else {
+                check("stitch-sparse-card-frames", false)
             }
         }
 
