@@ -198,14 +198,21 @@ final class SelectionOverlay {
     /// Factory entry for UI-harness tests: builds the overlay around an
     /// injected frozen image instead of capturing displays, driving the same
     /// production windows/views/session.
+    /// Factory tests MUST inject inputs and dependencies: the harness can
+    /// run on a user machine, and reading live Settings or the live router
+    /// could copy to the real clipboard or write real files.
     static func beginForTesting(
         purpose: OverlayPurpose,
+        inputs: OverlaySessionInputs,
         frozen: CapturedImage,
         screen: NSScreen,
+        dependencies: CaptureActionRouter.Dependencies,
         completion: @escaping @MainActor (OverlayResult) -> Void
     ) -> SelectionOverlay? {
         guard current == nil else { return nil }
-        let overlay = SelectionOverlay(purpose: purpose, completion: completion)
+        let overlay = SelectionOverlay(
+            purpose: purpose, inputs: inputs, completion: completion)
+        overlay.routerDependenciesOverride = dependencies
         current = overlay
         overlay.addOverlay(
             for: screen, frozen: frozen, windowList: [], makeKey: false)
@@ -253,6 +260,8 @@ final class SelectionOverlayView: NSView {
     private var mousePos: CGPoint = .zero
     private var hoverWindow: WindowInfo?
 
+    nonisolated(unsafe) static var frozenBlitCountForTesting = 0
+
     init(mode: OverlayMode, screen: NSScreen, frozen: CapturedImage?, windowList: [WindowInfo], owner: SelectionOverlay) {
         self.mode = mode
         self.screen = screen
@@ -261,6 +270,21 @@ final class SelectionOverlayView: NSView {
         self.owner = owner
         super.init(frame: CGRect(origin: .zero, size: screen.frame.size))
         wantsLayer = true
+        setupFrozenBackground()
+    }
+
+    /// The frozen display is committed to a background layer exactly ONCE;
+    /// resize/drag redraws must not re-blit the full-resolution source
+    /// (plan product rule #5). The spy counter proves it.
+    private func setupFrozenBackground() {
+        guard let frozen else { return }
+        let background = CALayer()
+        background.contents = frozen.cgImage
+        background.contentsGravity = .resize
+        background.frame = CGRect(origin: .zero, size: frame.size)
+        background.zPosition = -1
+        layer?.addSublayer(background)
+        Self.frozenBlitCountForTesting += 1
     }
 
     required init?(coder: NSCoder) { fatalError() }
@@ -446,10 +470,10 @@ final class SelectionOverlayView: NSView {
         guard let owner, owner.session.acceptsCommits,
               let selection = areaSelection?.intersection(bounds),
               selection.width >= 4, selection.height >= 4,
-              let frozen,
-              let snapshot = frozen.cropping(toViewRect: selection)
+              frozen != nil
         else { return }
         syncSessionPixelRect()
+        guard let snapshot = snapshotFromSessionPixelRect() else { return }
         let global = globalRect(for: selection)
         let inputs = owner.session.inputs
 
@@ -513,9 +537,9 @@ final class SelectionOverlayView: NSView {
     override func draw(_ dirtyRect: NSRect) {
         guard let ctx = NSGraphicsContext.current?.cgContext else { return }
 
-        if let frozen {
-            ctx.draw(frozen.cgImage, in: bounds)
-        }
+        // The frozen screen lives in the cached background layer set up
+        // once in setupFrozenBackground() — redraws here only paint the
+        // dim/frame/handles, never the 5K source again.
 
         // dim everything except selection
         ctx.setFillColor(NSColor.black.withAlphaComponent(mode == .area ? 0.4 : 0.25).cgColor)
@@ -787,7 +811,7 @@ final class SelectionOverlayView: NSView {
         case .areaReview:
             guard owner.session.commitInitialCapture() else { return }
             syncSessionPixelRect()
-            guard let snapshot = frozen.cropping(toViewRect: selection) else {
+            guard let snapshot = snapshotFromSessionPixelRect() else {
                 owner.finish(.cancelled)
                 return
             }
@@ -813,6 +837,19 @@ final class SelectionOverlayView: NSView {
             x: selection.minX + screen.frame.minX,
             y: selection.minY + screen.frame.minY,
             width: selection.width, height: selection.height)
+    }
+
+    /// THE single pixel-crop authority: every snapshot (initial, manual
+    /// action, and slice-4 annotation flatten) crops the frozen image by the
+    /// session's integral pixelRect — the view rect is quantized exactly
+    /// once, in syncSessionPixelRect.
+    fileprivate func snapshotFromSessionPixelRect() -> CapturedImage? {
+        guard let owner, let frozen else { return nil }
+        let px = owner.session.pixelRect
+        guard px.width >= 1, px.height >= 1,
+              let cropped = frozen.cgImage.cropping(to: px)?.materialized()
+        else { return nil }
+        return CapturedImage(cgImage: cropped, scale: frozen.scale)
     }
 
     /// Pixel contract: the session always holds the image-local INTEGRAL

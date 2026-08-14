@@ -3766,6 +3766,55 @@ enum SelfTest {
                     && s.areaRects.count == 1,
                   "during \(phaseDuringSave) afterCancel \(phaseAfterCancel) calls \(s.saveAsCalls) rects \(s.areaRects.count)")
 
+            // Synchronous save callback: a dependency that resolves INSIDE
+            // commit must behave identically — the session entered .saving
+            // before the effect, so the sync resolution lands on the right
+            // phase and completes exactly once.
+            let sync = Spy2()
+            let (syncOverlay, syncView) = makeOverlay(afterShow: true, spy: sync)
+            syncView.selectForTesting(rect: rect1)
+            syncOverlay.routerDependenciesOverride?.saveAs = { _, done in
+                sync.saveAsCalls += 1
+                done(.saved(URL(fileURLWithPath: "/tmp/sync.png")))
+                done(.saved(URL(fileURLWithPath: "/tmp/sync2.png"))) // double
+            }
+            syncView.performReviewActionForTesting(.save)
+            check("overlay2-save-sync-callback",
+                  sync.saveAsCalls == 1
+                    && syncOverlay.session.phase == .completed
+                    && sync.completionDone
+                    && sync.areaRects.count == 1,
+                  "calls \(sync.saveAsCalls) phase \(syncOverlay.session.phase) rects \(sync.areaRects.count)")
+
+            // Frozen-blit spy: N redraws must not re-blit the 5K source —
+            // the background layer was committed exactly once per view.
+            let blitBefore = SelectionOverlayView.frozenBlitCountForTesting
+            let b = Spy2()
+            let (blitOverlay, blitView) = makeOverlay(afterShow: true, spy: b)
+            _ = blitOverlay
+            blitView.selectForTesting(rect: rect1)
+            let afterSetup = SelectionOverlayView.frozenBlitCountForTesting
+            for step in 0..<5 {
+                blitView.adjustSelectionForTesting(rect: CGRect(
+                    x: 40, y: 50, width: 120 + CGFloat(step) * 10, height: 90))
+                var buffer = [UInt8](repeating: 0, count: 64 * 64 * 4)
+                if let ctx = CGContext(
+                    data: &buffer, width: 64, height: 64,
+                    bitsPerComponent: 8, bytesPerRow: 64 * 4,
+                    space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                    bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) {
+                    let ns = NSGraphicsContext(cgContext: ctx, flipped: false)
+                    NSGraphicsContext.saveGraphicsState()
+                    NSGraphicsContext.current = ns
+                    blitView.draw(blitView.bounds)
+                    NSGraphicsContext.restoreGraphicsState()
+                }
+            }
+            check("overlay2-frozen-blit-once",
+                  afterSetup == blitBefore + 1
+                    && SelectionOverlayView.frozenBlitCountForTesting == afterSetup,
+                  "setup Δ\(afterSetup - blitBefore), after draws Δ\(SelectionOverlayView.frozenBlitCountForTesting - afterSetup)")
+
             // Terminal order: openEditor presents only AFTER teardown — the
             // dependency observes phase completed and completion already run.
             let t = Spy2()

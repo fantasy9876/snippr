@@ -62,9 +62,28 @@ enum UITest {
             let frozen = CapturedImage(
                 cgImage: SelfTest.makeTestImage(width: 1200, height: 800), scale: 1)
             let editorsBefore = NSApp.windows.filter { $0.windowController is EditorWindowController }.count
+            // no-op dependencies: the harness must never touch the user's
+            // clipboard, files or settings
+            var editorPresents = 0
+            let noopDeps = CaptureActionRouter.Dependencies(
+                copyToClipboard: { _ in },
+                autoSave: { _, _ in },
+                saveAs: { _, _ in },
+                pin: { _ in }, ocr: { _ in },
+                openEditor: { image in
+                    editorPresents += 1
+                    EditorWindowController.open(with: image)
+                },
+                toast: { _ in },
+                setLastCapture: { _ in },
+                setLastAreaRect: { _ in },
+                logEvent: { _ in })
             let overlay = SelectionOverlay.beginForTesting(
                 purpose: .areaReview,
-                frozen: frozen, screen: screen, completion: { _ in })
+                inputs: OverlaySessionInputs(
+                    afterShow: true, afterCopy: false, afterSave: false),
+                frozen: frozen, screen: screen,
+                dependencies: noopDeps, completion: { _ in })
             if let overlay,
                let view = overlay.activeReviewViewForTesting {
                 view.selectForTesting(rect: CGRect(x: 120, y: 140, width: 360, height: 240))
@@ -78,6 +97,7 @@ enum UITest {
                 overlayReviewOK = reviewing && toolbarInside
                     && SelectionOverlay.current == nil
                     && editorsAfter == editorsBefore + 1
+                    && editorPresents == 1
             }
         }
 
@@ -90,11 +110,26 @@ enum UITest {
                 cgImage: SelfTest.makeTestImage(width: 400, height: 24_000), scale: 2)
             let editorsBefore = NSApp.windows
                 .filter { $0.windowController is EditorWindowController }.count
+            var panelEditorPresents = 0
+            let panelDeps = CaptureActionRouter.Dependencies(
+                copyToClipboard: { _ in },
+                autoSave: { _, _ in },
+                saveAs: { _, _ in },
+                pin: { _ in }, ocr: { _ in },
+                openEditor: { image in
+                    panelEditorPresents += 1
+                    EditorWindowController.open(with: image)
+                },
+                toast: { _ in },
+                setLastCapture: { _ in },
+                setLastAreaRect: { _ in },
+                logEvent: { _ in })
             let panel = ScrollResultPanel.show(
                 image: tallStitch,
                 inputs: OverlaySessionInputs(
                     afterShow: true, afterCopy: false, afterSave: false),
-                screen: screen)
+                screen: screen,
+                dependencies: panelDeps)
             let visible = screen.visibleFrame
             let fits = panel.frame.width <= visible.width * 0.9 + 1
                 && panel.frame.height <= visible.height * 0.9 + 1
@@ -105,6 +140,7 @@ enum UITest {
             scrollPanelOK = fits && toolbarVisible
                 && ScrollResultPanel.current == nil
                 && editorsAfter == editorsBefore + 1
+                && panelEditorPresents == 1
         }
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
