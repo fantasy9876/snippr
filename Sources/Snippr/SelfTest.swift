@@ -3885,6 +3885,44 @@ enum SelfTest {
                     && ScrollResultPanel.current == nil),
                   "copies \(copies) toasts \(toasts) rects \(rects) panel \(String(describing: ScrollResultPanel.current))")
 
+            // screen-nil with afterShow=true: the shot must still be
+            // secured through the headless auto path — all 4 copy/save
+            // combos, exactly one action set, zero panels.
+            var screenNilOK = true
+            for copyOn in [false, true] {
+                for saveOn in [false, true] {
+                    var copies2 = 0, saves2 = 0, toasts2 = 0
+                    var deps2 = CaptureActionRouter.Dependencies(
+                        copyToClipboard: { _ in copies2 += 1 },
+                        autoSave: { _, done in
+                            saves2 += 1
+                            done(URL(fileURLWithPath: "/tmp/n.png")) },
+                        saveAs: { _, _ in },
+                        pin: { _ in }, ocr: { _ in }, openEditor: { _ in },
+                        toast: { _ in toasts2 += 1 },
+                        setLastCapture: { _ in },
+                        setLastAreaRect: { _ in }, logEvent: { _ in })
+                    _ = deps2
+                    ScrollResultPresenter.present(
+                        ScrollFinish(
+                            image: img,
+                            inputs: OverlaySessionInputs(
+                                afterShow: true, afterCopy: copyOn,
+                                afterSave: saveOn),
+                            screen: nil),
+                        dependencies: deps2)
+                    let wantCopies2 = copyOn ? 1 : (saveOn ? 0 : 1)
+                    let wantSaves2 = saveOn ? 1 : 0
+                    if copies2 != wantCopies2 || saves2 != wantSaves2
+                        || toasts2 != 1
+                        || ScrollResultPanel.current != nil {
+                        screenNilOK = false
+                        print("  screen-nil mismatch copy=\(copyOn) save=\(saveOn): c\(copies2)/\(wantCopies2) s\(saves2)/\(wantSaves2) t\(toasts2)")
+                    }
+                }
+            }
+            check("overlay6-screen-nil-secured", screenNilOK, "see above")
+
             // nil image: nothing runs, nothing presents.
             if let screen {
                 ScrollResultPresenter.present(
@@ -4015,6 +4053,57 @@ enum SelfTest {
 
         // 12. Overlay slice 5: final layout/matrix gates ---------------------------
         MainActor.assumeIsolated {
+            // The setting matrix is PURE router logic — it must run even on
+            // a headless runner, so it lives before the screen guard.
+            let tinyHeadless = CapturedImage(
+                cgImage: makeSolidImage(
+                    width: 6, height: 6, color: NSColor.systemPink.cgColor),
+                scale: 1)
+            var matrixHeadlessOK = true
+            for intent in [CaptureIntent.initialCapture, .scrollFinished] {
+                let source: CaptureSource =
+                    intent == .initialCapture ? .areaReview : .scrollResult
+                for show in [false, true] {
+                    for copy in [false, true] {
+                        for save in [false, true] {
+                            var copies = 0, saves = 0, toasts = 0, rects = 0
+                            let deps = CaptureActionRouter.Dependencies(
+                                copyToClipboard: { _ in copies += 1 },
+                                autoSave: { _, done in
+                                    saves += 1
+                                    done(URL(fileURLWithPath: "/tmp/m.png")) },
+                                saveAs: { _, _ in },
+                                pin: { _ in }, ocr: { _ in },
+                                openEditor: { _ in },
+                                toast: { _ in toasts += 1 },
+                                setLastCapture: { _ in },
+                                setLastAreaRect: { _ in rects += 1 },
+                                logEvent: { _ in })
+                            _ = CaptureActionRouter.commit(
+                                tinyHeadless, source: source, intent: intent,
+                                inputs: OverlaySessionInputs(
+                                    afterShow: show, afterCopy: copy,
+                                    afterSave: save),
+                                finalGlobalRect: CGRect(
+                                    x: 1, y: 2, width: 3, height: 4),
+                                dependencies: deps)
+                            let wantCopies = copy
+                                ? 1 : ((show || save) ? 0 : 1)
+                            let wantSaves = save ? 1 : 0
+                            let wantToasts = show ? 0 : 1
+                            let wantRects = (intent == .initialCapture && !show)
+                                ? 1 : 0
+                            if copies != wantCopies || saves != wantSaves
+                                || toasts != wantToasts || rects != wantRects {
+                                matrixHeadlessOK = false
+                                print("  matrix mismatch: \(intent) show=\(show) copy=\(copy) save=\(save) → c\(copies)/\(wantCopies) s\(saves)/\(wantSaves) t\(toasts)/\(wantToasts) r\(rects)/\(wantRects)")
+                            }
+                        }
+                    }
+                }
+            }
+            check("overlay5-setting-matrix", matrixHeadlessOK, "see mismatches above")
+
             guard let screen = NSScreen.main ?? NSScreen.screens.first else {
                 print("SKIP overlay5-environment — no display attached; MUST re-run on an unlocked session")
                 return
@@ -4104,50 +4193,6 @@ enum SelfTest {
                   px1 == px2 && px1 == px1.integral,
                   "px1 \(px1) px2 \(px2)")
 
-            // Full setting matrix for the two initial intents: effect counts
-            // follow the snapshot exactly.
-            let tiny = CapturedImage(
-                cgImage: makeSolidImage(
-                    width: 6, height: 6, color: NSColor.systemPink.cgColor),
-                scale: 1)
-            var matrixOK = true
-            for intent in [CaptureIntent.initialCapture, .scrollFinished] {
-                let source: CaptureSource =
-                    intent == .initialCapture ? .areaReview : .scrollResult
-                for show in [false, true] {
-                    for copy in [false, true] {
-                        for save in [false, true] {
-                            var copies = 0, saves = 0, toasts = 0, rects = 0
-                            var deps = noopDeps()
-                            deps.copyToClipboard = { _ in copies += 1 }
-                            deps.autoSave = { _, done in
-                                saves += 1; done(URL(fileURLWithPath: "/tmp/m.png")) }
-                            deps.toast = { _ in toasts += 1 }
-                            deps.setLastAreaRect = { _ in rects += 1 }
-                            _ = CaptureActionRouter.commit(
-                                tiny, source: source, intent: intent,
-                                inputs: OverlaySessionInputs(
-                                    afterShow: show, afterCopy: copy,
-                                    afterSave: save),
-                                finalGlobalRect: CGRect(
-                                    x: 1, y: 2, width: 3, height: 4),
-                                dependencies: deps)
-                            let wantCopies = copy
-                                ? 1 : ((show || save) ? 0 : 1) // rescue only
-                            let wantSaves = save ? 1 : 0
-                            let wantToasts = show ? 0 : 1
-                            let wantRects = (intent == .initialCapture && !show)
-                                ? 1 : 0
-                            if copies != wantCopies || saves != wantSaves
-                                || toasts != wantToasts || rects != wantRects {
-                                matrixOK = false
-                                print("  matrix mismatch: \(intent) show=\(show) copy=\(copy) save=\(save) → c\(copies)/\(wantCopies) s\(saves)/\(wantSaves) t\(toasts)/\(wantToasts) r\(rects)/\(wantRects)")
-                            }
-                        }
-                    }
-                }
-            }
-            check("overlay5-setting-matrix", matrixOK, "see mismatches above")
 
             // Purpose isolation: scroll region and instant OCR hand over the
             // rect exactly once at mouse-up — no review, no initialCapture

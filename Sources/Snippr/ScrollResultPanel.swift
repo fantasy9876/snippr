@@ -12,13 +12,19 @@ enum ScrollResultPresenter {
         dependencies: CaptureActionRouter.Dependencies? = nil
     ) {
         guard let image = finish.image else { return }
+        // No screen = no presentation possible. The router must then treat
+        // the commit as HEADLESS (effective afterShow=false, same
+        // copy/save snapshot): with afterShow=true it would suppress the
+        // rescue-copy/announce believing a panel will show, and the shot
+        // would be lost entirely. ONE commit either way — no double actions.
+        let canPresent = finish.screen != nil
+        var effectiveInputs = finish.inputs
+        if !canPresent { effectiveInputs.afterShow = false }
         CaptureActionRouter.commit(
             image, source: .scrollResult, intent: .scrollFinished,
-            inputs: finish.inputs, finalGlobalRect: nil,
+            inputs: effectiveInputs, finalGlobalRect: nil,
             dependencies: dependencies)
-        // A screenless environment has nowhere to present — the auto actions
-        // above already secured the shot.
-        if finish.inputs.afterShow, let screen = finish.screen {
+        if effectiveInputs.afterShow, let screen = finish.screen {
             ScrollResultPanel.show(
                 image: image, inputs: finish.inputs, screen: screen,
                 dependencies: dependencies)
