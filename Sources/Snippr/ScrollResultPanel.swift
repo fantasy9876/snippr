@@ -16,9 +16,11 @@ enum ScrollResultPresenter {
             image, source: .scrollResult, intent: .scrollFinished,
             inputs: finish.inputs, finalGlobalRect: nil,
             dependencies: dependencies)
-        if finish.inputs.afterShow {
+        // A screenless environment has nowhere to present — the auto actions
+        // above already secured the shot.
+        if finish.inputs.afterShow, let screen = finish.screen {
             ScrollResultPanel.show(
-                image: image, inputs: finish.inputs, screen: finish.screen,
+                image: image, inputs: finish.inputs, screen: screen,
                 dependencies: dependencies)
         }
     }
@@ -79,8 +81,11 @@ final class ScrollResultPanel: NSPanel {
         let imageSize = CGSize(
             width: max(120, pointSize.width * fit),
             height: max(80, pointSize.height * fit))
+        // The toolbar needs room for every button INCLUDING Close — a tall,
+        // narrow stitch must widen the panel, not overflow the buttons.
+        let toolbarMinWidth = ScrollResultPanel.requiredToolbarWidth
         let contentSize = CGSize(
-            width: imageSize.width,
+            width: max(imageSize.width, toolbarMinWidth),
             height: imageSize.height + toolbarHeight)
         let origin = CGPoint(
             x: visible.midX - contentSize.width / 2,
@@ -104,7 +109,7 @@ final class ScrollResultPanel: NSPanel {
         content.layer?.cornerRadius = 10
 
         let imageView = NSImageView(frame: CGRect(
-            x: 0, y: toolbarHeight,
+            x: (contentSize.width - imageSize.width) / 2, y: toolbarHeight,
             width: imageSize.width, height: imageSize.height))
         imageView.image = image.nsImage
         imageView.imageScaling = .scaleProportionallyDown
@@ -136,6 +141,19 @@ final class ScrollResultPanel: NSPanel {
         ("text.viewfinder", "Copy text (OCR)", .ocr),
         ("macwindow", "Open in editor window", .openEditor),
     ]
+
+    /// Width every button (plus Close and paddings) needs without overlap.
+    static var requiredToolbarWidth: CGFloat {
+        let buttonWidth: CGFloat = 34, spacing: CGFloat = 2
+        let count = CGFloat(items.count)
+        // leading 8 + action buttons + gap 12 + close + trailing 8
+        return 8 + count * buttonWidth + (count - 1) * spacing + 12
+            + buttonWidth + 8
+    }
+
+    var toolbarButtonFramesForTesting: [CGRect] {
+        toolbarButtons.map { $0.frame }
+    }
 
     private func buildToolbar(width: CGFloat, height: CGFloat) -> NSView {
         let bar = NSView(frame: CGRect(x: 0, y: 0, width: width, height: height))

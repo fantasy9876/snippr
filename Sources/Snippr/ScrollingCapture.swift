@@ -70,7 +70,7 @@ final class ScrollingCapture {
             guard case let .area(screen, _, rect) = result else {
                 onFinish(ScrollFinish(
                     image: nil, inputs: inputs,
-                    screen: NSScreen.main ?? NSScreen.screens[0]))
+                    screen: NSScreen.main ?? NSScreen.screens.first))
                 return
             }
             // Too-short selections can never stitch (the matcher needs enough
@@ -102,7 +102,7 @@ final class ScrollingCapture {
         if ScrollingCapture.active === self { ScrollingCapture.active = nil }
         onFinish(ScrollFinish(
             image: image, inputs: sessionInputs,
-            screen: originScreen ?? NSScreen.main ?? NSScreen.screens[0]))
+            screen: originScreen ?? NSScreen.main ?? NSScreen.screens.first))
     }
 
     func finalizeForTesting(image: CapturedImage?) {

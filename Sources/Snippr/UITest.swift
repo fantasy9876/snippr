@@ -163,7 +163,29 @@ enum UITest {
             let visible = screen.visibleFrame
             let fits = panel.frame.width <= visible.width * 0.9 + 1
                 && panel.frame.height <= visible.height * 0.9 + 1
-            let toolbarVisible = panel.toolbarFrameForTesting != nil
+            // toolbar layout is REAL: every button (Close included) inside
+            // the bar, no pairwise overlap, and each hit-tests to itself
+            var toolbarVisible = panel.toolbarFrameForTesting != nil
+            if let bar = panel.toolbarFrameForTesting {
+                let frames = panel.toolbarButtonFramesForTesting
+                let barBounds = CGRect(origin: .zero, size: bar.size)
+                for (i, f) in frames.enumerated() {
+                    if !barBounds.contains(f) { toolbarVisible = false }
+                    for j in (i + 1)..<frames.count
+                        where f.intersects(frames[j]) {
+                        toolbarVisible = false
+                    }
+                }
+                if let content = panel.contentView {
+                    for f in frames {
+                        let centerInContent = CGPoint(
+                            x: bar.minX + f.midX, y: bar.minY + f.midY)
+                        if !(content.hitTest(centerInContent) is NSButton) {
+                            toolbarVisible = false
+                        }
+                    }
+                }
+            }
             // annotate the stitched result: flatten must change while
             // dimensions stay the stitched image's
             panel.annotationSurface.tool = .pen

@@ -127,7 +127,9 @@ final class OverlaySession {
 struct ScrollFinish {
     var image: CapturedImage?
     var inputs: OverlaySessionInputs
-    var screen: NSScreen
+    /// nil only in screenless/headless environments — presentation is
+    /// skipped there, but the payload must never crash constructing itself.
+    var screen: NSScreen?
 }
 
 // MARK: - Action router
