@@ -196,12 +196,24 @@ final class ScrollingCapture {
                 if let s = stitcher {
                     switch s.append(frame.cgImage) {
                     case .appended:
-                        appendPreview(s.lastSlice)
+                        // After a direction change the rolling preview window
+                        // clipped away the middle rows; pasting the new slice
+                        // onto it would seam non-adjacent content. Rebuild
+                        // from the composed strip instead (flips are rare).
+                        if previewView?.pinToTop == true {
+                            rebuildPreview(from: s, pinToTop: false)
+                        } else {
+                            appendPreview(s.lastSlice)
+                        }
                         updateProgress(
                             "Đã ghép \(Int(CGFloat(s.totalHeight) / scale)) pt "
                             + "— cuộn tiếp, xong \(stopHint)")
                     case .prepended:
-                        prependPreview(s.lastSlice)
+                        if previewView?.pinToTop == true {
+                            prependPreview(s.lastSlice)
+                        } else {
+                            rebuildPreview(from: s, pinToTop: true)
+                        }
                         updateProgress(
                             "Đã ghép \(Int(CGFloat(s.totalHeight) / scale)) pt "
                             + "(nối lên trên) — cuộn tiếp, xong \(stopHint)")
@@ -304,6 +316,30 @@ final class ScrollingCapture {
         }
         previewImage = ctx.makeImage()
         previewView?.pinToTop = false
+        pushPreview()
+    }
+
+    /// Rebuilds the rolling preview from the composed strip after a scroll
+    /// direction change. The incremental preview is a clipped window, so on a
+    /// flip the newest slice would otherwise be pasted against content it is
+    /// not adjacent to. Crop before scaling: the composed strip can be far
+    /// taller than the preview window.
+    private func rebuildPreview(
+        from segmented: SegmentedVerticalStitcher, pinToTop: Bool
+    ) {
+        guard let composed = segmented.compose() else { return }
+        let maxSourceRows = max(1, Int(
+            CGFloat(previewMaxHeight)
+                * CGFloat(composed.width) / CGFloat(previewPixelWidth)))
+        var visible = composed
+        if composed.height > maxSourceRows {
+            let y = pinToTop ? 0 : composed.height - maxSourceRows
+            visible = composed.cropping(to: CGRect(
+                x: 0, y: y, width: composed.width, height: maxSourceRows
+            )) ?? composed
+        }
+        previewImage = scaledForPreview(visible)
+        previewView?.pinToTop = pinToTop
         pushPreview()
     }
 
@@ -863,6 +899,14 @@ final class VerticalStitcher {
     /// Content captured upward (scroll-up) is stored separately and composed
     /// above the first frame's body, newest strip first.
     private(set) var topSlices: [CGImage] = []
+    /// Header rows skipped when cutting the FIRST prepended slice. Latched for
+    /// the whole session like the footer: if later frames were cut at a
+    /// different (tightened) header estimate, the top strips would no longer
+    /// tile against each other. A frame whose stable top prefix shrinks below
+    /// this anchor is rejected instead — the anchor band was proven not to be
+    /// real chrome, and fail-closed beats silently dropping rows.
+    private(set) var topSliceAnchorRows = 0
+    private var topSliceAnchorLatched = false
     /// Captured rows outside the current viewport. Retracing over an already
     /// captured region must move these cursors instead of duplicating rows —
     /// or, worse, rejecting every frame until the session dead-locks.
@@ -927,8 +971,15 @@ final class VerticalStitcher {
     }
 
     /// Runs the matcher in both scroll directions. Real motion has exactly one
-    /// direction; two confident matches mean the page is periodic enough to
-    /// alias, and guessing a direction would corrupt a seam — fail closed.
+    /// direction. The template matcher can be fooled by a single content block
+    /// that appears twice on the page (an image posted twice, repeated cards):
+    /// the duplicate is a near-perfect, unique template hit in the WRONG
+    /// direction. A claimed offset from real motion makes the ENTIRE overlap
+    /// region agree, while a duplicate-block hit only explains the block
+    /// itself — so whole-overlap coherence both vets a lone up match (the down
+    /// path keeps its field-proven gates unchanged) and arbitrates when the
+    /// two directions disagree. Only a page incoherent under both directions
+    /// is rejected as periodic.
     static func findDirectedOverlap(
         prev: RowSig, next: RowSig, height: Int, scale: CGFloat,
         lockedFooter: Int?
@@ -939,14 +990,70 @@ final class VerticalStitcher {
         let up = findOverlap(
             prev: next, next: prev, height: height, scale: scale,
             lockedFooter: lockedFooter)
-        switch (down, up) {
-        case let (down?, nil): return (down, false)
-        case let (nil, up?): return (up, true)
-        case (.some, .some):
-            Perf.reject("directional ambiguity — both scroll directions match")
-            return nil
-        case (nil, nil): return nil
+        // down: next[y] = prev[y + s] — up (swapped roles): prev[y] = next[y + u]
+        func downCoherent(_ m: Match) -> Bool {
+            wholeOverlapAgrees(
+                base: prev, shifted: next,
+                offset: max(1, Int(m.preciseOffset.rounded())),
+                headerRows: m.headerRows,
+                effectiveHeight: height - m.footerRows)
         }
+        func upCoherent(_ m: Match) -> Bool {
+            wholeOverlapAgrees(
+                base: next, shifted: prev,
+                offset: max(1, Int(m.preciseOffset.rounded())),
+                headerRows: m.headerRows,
+                effectiveHeight: height - m.footerRows)
+        }
+        switch (down, up) {
+        case let (down?, nil):
+            return (down, false)
+        case let (nil, up?):
+            guard upCoherent(up) else {
+                Perf.reject("up match fails whole-overlap coherence")
+                return nil
+            }
+            return (up, true)
+        case let (down?, up?):
+            switch (downCoherent(down), upCoherent(up)) {
+            case (true, false): return (down, false)
+            case (false, true): return (up, true)
+            default:
+                Perf.reject("directional ambiguity — both scroll directions match")
+                return nil
+            }
+        case (nil, nil):
+            return nil
+        }
+    }
+
+    /// True when `shifted[y] ≈ base[y + offset]` holds across (most of) the
+    /// full overlap region, not just the matcher's template. The tolerance
+    /// absorbs subpixel re-rasterization (per-row band deltas of 3–8 on
+    /// fractional trackpad offsets) and the 70% quorum absorbs an animating
+    /// band inside the overlap; content that is actually different scores far
+    /// above the tolerance on most rows.
+    static func wholeOverlapAgrees(
+        base: RowSig, shifted: RowSig, offset: Int,
+        headerRows: Int, effectiveHeight: Int
+    ) -> Bool {
+        let start = max(0, headerRows)
+        let end = effectiveHeight - offset
+        // A tiny remaining overlap was already covered by the template itself.
+        guard end - start >= 8 else { return true }
+        var agree = 0
+        var total = 0
+        for y in start..<end {
+            let a = (y + offset) * 4
+            let b = y * 4
+            let d = (abs(base.bands[a] - shifted.bands[b])
+                + abs(base.bands[a + 1] - shifted.bands[b + 1])
+                + abs(base.bands[a + 2] - shifted.bands[b + 2])
+                + abs(base.bands[a + 3] - shifted.bands[b + 3])) / 4
+            total += 1
+            if d < 8.0 { agree += 1 }
+        }
+        return agree * 10 >= total * 7
     }
 
     /// Integrate `frame` into the strip: append new bottom rows, prepend new
@@ -1006,12 +1113,23 @@ final class VerticalStitcher {
         let coveredRows = scrolledUp ? rowsAboveViewport : rowsBelowViewport
         var newRows = max(0, moved - coveredRows)
         var slice: CGImage?
+        if newRows > 0, scrolledUp {
+            // Every prepend must be cut at the same header anchor or the top
+            // strips stop tiling. A stable prefix that shrank below the anchor
+            // disproves the latched chrome — reject rather than misalign.
+            let anchor = topSliceAnchorLatched ? topSliceAnchorRows : nextHeaderRows
+            guard nextHeaderRows >= anchor else {
+                Perf.reject("top anchor lost \(nextHeaderRows) < \(anchor)")
+                return .rejected
+            }
+        }
         if newRows > 0 {
             if scrolledUp {
                 // new content sits just below the (possibly empty) fixed header
-                newRows = min(newRows, max(0, contentHeight - nextHeaderRows))
+                let anchor = topSliceAnchorLatched ? topSliceAnchorRows : nextHeaderRows
+                newRows = min(newRows, max(0, contentHeight - anchor))
                 slice = newRows > 0 ? frame.cropping(to: CGRect(
-                    x: 0, y: nextHeaderRows, width: width, height: newRows
+                    x: 0, y: anchor, width: width, height: newRows
                 ))?.materialized() : nil
             } else {
                 // new content sits just above the (possibly empty) footer band
@@ -1024,10 +1142,14 @@ final class VerticalStitcher {
 
         if scrolledUp {
             topFractionalRowResidual = accumulatedOffset - Double(moved)
+            // Both seams observe the same physical subpixel phase; carrying a
+            // stale remainder across a direction change double-counts it.
+            fractionalRowResidual = 0
             rowsAboveViewport = max(0, rowsAboveViewport - moved)
             rowsBelowViewport += moved
         } else {
             fractionalRowResidual = accumulatedOffset - Double(moved)
+            topFractionalRowResidual = 0
             rowsBelowViewport = max(0, rowsBelowViewport - moved)
             rowsAboveViewport += moved
         }
@@ -1040,6 +1162,10 @@ final class VerticalStitcher {
 
         guard let slice else { return .moved }
         if scrolledUp {
+            if !topSliceAnchorLatched {
+                topSliceAnchorRows = nextHeaderRows // the anchor the crop used
+                topSliceAnchorLatched = true
+            }
             topSlices.append(slice)
         } else {
             slices.append(slice)
@@ -1963,8 +2089,11 @@ final class VerticalStitcher {
         let effectiveFooterRows = footerRows > 0
             ? footerRows
             : max(0, min(inferredFooterRows, lastFrame.height / 3))
-        let effectiveHeaderRows = includeHeader && topSlices.isEmpty
-            ? 0 : headerRows
+        // With prepends, geometry must follow the anchor the top strips were
+        // cut at — the session header estimate may have tightened since.
+        let effectiveHeaderRows = topSlices.isEmpty
+            ? (includeHeader ? 0 : headerRows)
+            : topSliceAnchorRows
         var headerTrimmedOffFirstFrame = false
         if let first = parts.first,
            first.height > effectiveHeaderRows + effectiveFooterRows,
@@ -1992,7 +2121,10 @@ final class VerticalStitcher {
             // newest prepend is the topmost content
             parts.insert(contentsOf: topSlices.reversed(), at: 0)
             if includeHeader, headerTrimmedOffFirstFrame,
-               let header = topRowsImage(rows: headerRows) {
+               let first = slices.first,
+               let header = first.cropping(to: CGRect(
+                x: 0, y: 0, width: width, height: topSliceAnchorRows
+               ))?.materialized() {
                 parts.insert(header, at: 0)
             }
         }

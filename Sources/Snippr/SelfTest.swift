@@ -294,6 +294,94 @@ enum SelfTest {
             }
         }
 
+        // 2b-dup. Duplicated content blocks vs the reverse matcher -----------------
+        // A block appearing twice on the page (an image posted twice, repeated
+        // cards) is a near-perfect unique template hit in the WRONG direction.
+        // Whole-overlap coherence must veto it — without regressing correct
+        // same-direction matches on the same page.
+        func withDuplicatedBlock(
+            _ src: CGImage, from: Int, to: Int, rows: Int
+        ) -> CGImage? {
+            guard let block = src.cropping(to: CGRect(
+                x: 0, y: from, width: src.width, height: rows)) else { return nil }
+            let c = ctx(src.width, src.height)
+            c.draw(src, in: CGRect(
+                x: 0, y: 0, width: src.width, height: src.height))
+            c.draw(block, in: CGRect(
+                x: 0, y: src.height - to - rows,
+                width: src.width, height: rows))
+            return c.makeImage()
+        }
+        do {
+            // No genuine overlap (fast down flick) + duplicated block: the up
+            // direction "finds" the duplicate. Must reject, never prepend.
+            if let doc = withDuplicatedBlock(
+                makeStripePattern(width: 400, height: 1200, seed: 0xD0B1_0C05),
+                from: 100, to: 975, rows: 125),
+               let a = doc.cropping(to: CGRect(x: 0, y: 0, width: 400, height: 500)),
+               let b = doc.cropping(to: CGRect(x: 0, y: 600, width: 400, height: 500)) {
+                let s = VerticalStitcher(first: a)
+                let result = s.append(b)
+                check("stitch-dup-block-flick-rejected", result == .rejected,
+                      "no-overlap flick over duplicated block got \(result)")
+            } else {
+                check("stitch-dup-block-flick-frames", false)
+            }
+
+            // Healthy down overlap on a page with one duplicated block: the up
+            // direction also matches (on the duplicate), but the down match is
+            // whole-overlap coherent and must win — not be rejected as
+            // ambiguous. (This was the old field failure mode resurfacing.)
+            if let doc = withDuplicatedBlock(
+                makeStripePattern(width: 400, height: 2000, seed: 0xD0B2_0C05),
+                from: 625, to: 925, rows: 150),
+               let a = doc.cropping(to: CGRect(x: 0, y: 300, width: 400, height: 500)),
+               let b = doc.cropping(to: CGRect(x: 0, y: 550, width: 400, height: 500)) {
+                let s = VerticalStitcher(first: a)
+                let result = s.append(b)
+                check("stitch-dup-block-down-still-appends",
+                      result == .appended(rows: 250),
+                      "healthy down overlap got \(result), want appended(250)")
+            } else {
+                check("stitch-dup-block-down-frames", false)
+            }
+        }
+
+        // 2b-anchor. Prepend anchor must not drift with the header estimate --------
+        // Two identical bands 30 rows apart fake a 20-row "header" on the first
+        // up pair; the next pair disproves it. Cutting the second prepend at
+        // the tightened header would drop and duplicate rows. The anchor is
+        // latched instead and the disproving frame is rejected fail-closed;
+        // everything accepted must still compose to the exact page raster.
+        do {
+            if let doc = withDuplicatedBlock(
+                makeStripePattern(width: 400, height: 2000, seed: 0x0A2C_4042),
+                from: 1010, to: 1040, rows: 20),
+               let f0 = doc.cropping(to: CGRect(x: 0, y: 1040, width: 400, height: 500)),
+               let f1 = doc.cropping(to: CGRect(x: 0, y: 1010, width: 400, height: 500)),
+               let f2 = doc.cropping(to: CGRect(x: 0, y: 980, width: 400, height: 500)) {
+                let s = VerticalStitcher(first: f0)
+                let r1 = s.append(f1)
+                let r2 = s.append(f2)
+                check("stitch-anchor-first-prepend", r1 == .prepended(rows: 30),
+                      "got \(r1), want prepended(30)")
+                check("stitch-anchor-disproven-rejected", r2 == .rejected,
+                      "header-estimate collapse got \(r2), want rejected")
+                let composed = s.compose()
+                check("stitch-anchor-height", composed?.height == 530,
+                      "got \(composed?.height ?? -1), want 530")
+                if let composed,
+                   let want = doc.cropping(to: CGRect(
+                    x: 0, y: 1010, width: 400, height: 530)) {
+                    check("stitch-anchor-content",
+                          imagesRoughlyEqual(want, composed),
+                          "anchored prepend composed wrong rows")
+                }
+            } else {
+                check("stitch-anchor-frames", false)
+            }
+        }
+
         // 2c. Sticky footer inside the viewport ------------------------------------
         // A fixed bottom bar (chat input, cookie banner…) used to either stall
         // matching entirely or get baked into every seam. The stitcher must
