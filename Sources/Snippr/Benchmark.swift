@@ -171,7 +171,7 @@ enum Benchmark {
                     print("crop fail"); exit(1)
                 }
                 if let s = stitcher {
-                    let rows = s.append(frame)
+                    let rows = s.append(frame).newRows
                     // Rejected frames never replace the stitcher's reference
                     // frame. Compare against the last ACCEPTED offset; using
                     // the immediately previous probe mislabeled a later
@@ -331,7 +331,7 @@ enum Benchmark {
                 try? await Task.sleep(nanoseconds: 400_000_000)
                 guard let frame = await captureThroughProductionPipeline()
                 else { check("capture-step-\(step)", false); continue }
-                let rows = stitcher.append(frame.cgImage)
+                let rows = stitcher.append(frame.cgImage).newRows
                 let want = Int(stepPt * scale)
                 if rows == want { accepted += 1 }
                 print("  step \(step): +\(want)px → appended \(rows)\(rows == want ? " ✓" : " ✗")")
@@ -390,7 +390,7 @@ enum Benchmark {
                 await Task.yield()
                 guard let frame = await captureThroughProductionPipeline()
                 else { check("phaseB-capture-\(i)", false); continue }
-                let rows = s2.append(frame.cgImage)
+                let rows = s2.append(frame.cgImage).newRows
                 let want = Int(round(step * scale))
                 if rows == want { accepted2 += 1 }
                 print("  chat step \(i + 1) (+\(want)px): appended \(rows)\(rows == want ? " ✓" : " ✗")")

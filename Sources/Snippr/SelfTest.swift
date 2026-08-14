@@ -110,11 +110,188 @@ enum SelfTest {
         if let f0 = periodic.cropping(to: CGRect(x: 0, y: 0, width: 400, height: 500)),
            let f1 = periodic.cropping(to: CGRect(x: 0, y: 100, width: 400, height: 500)) {
             let s2 = VerticalStitcher(first: f0)
-            let appended = s2.append(f1)
+            let appended = s2.append(f1).newRows
             check("stitch-ambiguous-rejected", appended == 0,
                   "appended \(appended) rows from ambiguous content")
         } else {
             check("stitch-ambiguous-crop", false)
+        }
+
+        // 2b-up. Bottom-to-top capture ---------------------------------------------
+        // Scrolling upward reveals new content at the TOP of the viewport. The
+        // matcher finds the reversed overlap and the stitcher prepends, so a
+        // session that starts at the end of a page still produces the full page.
+        do {
+            let doc = makeStripePattern(width: 400, height: 2000, seed: 0xB1D1_5EED)
+            let vp = 500
+            var upOffsets: [Int] = []
+            var position = 2000 - vp
+            while position > 0 {
+                upOffsets.append(position)
+                position -= 320
+            }
+            upOffsets.append(0)
+            var up: VerticalStitcher?
+            var prepends = 0
+            var rejects = 0
+            for off in upOffsets {
+                guard let frame = doc.cropping(to: CGRect(
+                    x: 0, y: off, width: 400, height: vp)) else {
+                    check("stitch-upscroll-crop", false); break
+                }
+                if let s = up {
+                    switch s.append(frame) {
+                    case .prepended: prepends += 1
+                    case .rejected: rejects += 1
+                    default: break
+                    }
+                } else {
+                    up = VerticalStitcher(first: frame)
+                }
+            }
+            let upComposed = up?.compose()
+            check("stitch-upscroll-height", upComposed?.height == 2000,
+                  "got \(upComposed?.height ?? -1), want 2000")
+            check("stitch-upscroll-all-prepended",
+                  prepends == upOffsets.count - 1 && rejects == 0,
+                  "prepends \(prepends)/\(upOffsets.count - 1), rejects \(rejects)")
+            if let upComposed {
+                check("stitch-upscroll-content", imagesRoughlyEqual(doc, upComposed),
+                      "up-scrolled content mismatch")
+                writePNG(upComposed, to: "\(outputDir)/stitched-upscroll.png")
+            }
+        }
+
+        // 2b-retrace. Reversing over already-captured rows -------------------------
+        // Scrolling back up to re-read (then continuing down) used to reject
+        // every reversed frame until the session dead-locked into a new segment
+        // full of duplicates. A reversal over captured content must be a
+        // confirmed `moved`, never a reject, and must not duplicate rows.
+        do {
+            let doc = makeStripePattern(width: 400, height: 2000, seed: 0x0FF5_E70D)
+            let vp = 500
+            let path = [0, 320, 640, 320, 80, 400, 720, 1040, 1360, 1500]
+            var s: VerticalStitcher?
+            var rejects = 0
+            var moves = 0
+            for off in path {
+                guard let frame = doc.cropping(to: CGRect(
+                    x: 0, y: off, width: 400, height: vp)) else {
+                    check("stitch-retrace-crop", false); break
+                }
+                if let st = s {
+                    switch st.append(frame) {
+                    case .rejected: rejects += 1
+                    case .moved: moves += 1
+                    default: break
+                    }
+                } else {
+                    s = VerticalStitcher(first: frame)
+                }
+            }
+            let composed = s?.compose()
+            check("stitch-retrace-height", composed?.height == 2000,
+                  "got \(composed?.height ?? -1), want 2000")
+            check("stitch-retrace-no-rejects", rejects == 0 && moves == 3,
+                  "rejects \(rejects), moves \(moves) (want 0 and 3)")
+            if let composed {
+                check("stitch-retrace-content", imagesRoughlyEqual(doc, composed),
+                      "retraced content mismatch")
+            }
+        }
+
+        // 2b-mixed. Start mid-page, scroll up first, then down past the start ------
+        do {
+            let doc = makeStripePattern(width: 400, height: 2000, seed: 0x001A_ED00)
+            let vp = 500
+            let path = [800, 480, 160, 480, 800, 1120, 1440]
+            var s: VerticalStitcher?
+            var rejects = 0
+            var prepends = 0
+            var appends = 0
+            for off in path {
+                guard let frame = doc.cropping(to: CGRect(
+                    x: 0, y: off, width: 400, height: vp)) else {
+                    check("stitch-mixed-crop", false); break
+                }
+                if let st = s {
+                    switch st.append(frame) {
+                    case .rejected: rejects += 1
+                    case .prepended: prepends += 1
+                    case .appended: appends += 1
+                    default: break
+                    }
+                } else {
+                    s = VerticalStitcher(first: frame)
+                }
+            }
+            let composed = s?.compose()
+            let wantHeight = (1440 + vp) - 160
+            check("stitch-mixed-height", composed?.height == wantHeight,
+                  "got \(composed?.height ?? -1), want \(wantHeight)")
+            check("stitch-mixed-outcomes",
+                  rejects == 0 && prepends == 2 && appends == 2,
+                  "rejects \(rejects), prepends \(prepends), appends \(appends)")
+            if let composed,
+               let wantImage = doc.cropping(to: CGRect(
+                x: 0, y: 160, width: 400, height: wantHeight)) {
+                check("stitch-mixed-content", imagesRoughlyEqual(wantImage, composed),
+                      "mixed-direction content mismatch")
+            }
+        }
+
+        // 2b-header-up. Up-scroll under fixed top chrome ---------------------------
+        // Prepended strips must slide UNDER the header: the composed page keeps
+        // the chrome on top exactly once, never repeated mid-page.
+        do {
+            let hW = 400, hViewport = 500, hHeader = 40
+            let doc = makeStripePattern(width: hW, height: 2000, seed: 0x4EAD_F00D)
+            let chrome = makeStripePattern(width: hW, height: hHeader, seed: 0xC0FF_EE00)
+            func chromedFrame(offset: Int) -> CGImage? {
+                guard let body = doc.cropping(to: CGRect(
+                    x: 0, y: offset + hHeader, width: hW,
+                    height: hViewport - hHeader)) else { return nil }
+                let c = ctx(hW, hViewport)
+                c.draw(chrome, in: CGRect(
+                    x: 0, y: CGFloat(hViewport - hHeader),
+                    width: CGFloat(hW), height: CGFloat(hHeader)))
+                c.draw(body, in: CGRect(
+                    x: 0, y: 0, width: CGFloat(hW),
+                    height: CGFloat(hViewport - hHeader)))
+                return c.makeImage()
+            }
+            let path = [1000, 700, 400, 100]
+            var s: VerticalStitcher?
+            var prepends = 0
+            var rejects = 0
+            for off in path {
+                guard let frame = chromedFrame(offset: off) else {
+                    check("stitch-header-up-crop", false); break
+                }
+                if let st = s {
+                    switch st.append(frame) {
+                    case .prepended: prepends += 1
+                    case .rejected: rejects += 1
+                    default: break
+                    }
+                } else {
+                    s = VerticalStitcher(first: frame)
+                }
+            }
+            let composed = s?.compose()
+            // chrome once + doc body from (100 + hHeader) to (1000 + hViewport)
+            let wantHeight = hHeader + (1000 + hViewport) - (100 + hHeader)
+            check("stitch-header-up-height", composed?.height == wantHeight,
+                  "got \(composed?.height ?? -1), want \(wantHeight)")
+            check("stitch-header-up-outcomes", prepends == 3 && rejects == 0,
+                  "prepends \(prepends), rejects \(rejects)")
+            if let composed,
+               let composedTop = composed.cropping(to: CGRect(
+                x: 0, y: 0, width: hW, height: hHeader)) {
+                check("stitch-header-up-chrome-on-top",
+                      imagesRoughlyEqual(chrome, composedTop),
+                      "top of composed image is not the fixed chrome")
+            }
         }
 
         // 2c. Sticky footer inside the viewport ------------------------------------
@@ -143,7 +320,7 @@ enum SelfTest {
             for (i, off) in offsets.enumerated() {
                 guard let frame = footerFrame(offset: off) else { appendsOK = false; break }
                 if let s = s3 {
-                    let rows = s.append(frame)
+                    let rows = s.append(frame).newRows
                     let want = off - offsets[i - 1]
                     if rows != want {
                         appendsOK = false
@@ -181,7 +358,7 @@ enum SelfTest {
             for off in recoveryOffsets {
                 guard let frame = footerFrame(offset: off) else { break }
                 if let footerRecovery {
-                    recoveryRows.append(footerRecovery.append(frame))
+                    recoveryRows.append(footerRecovery.append(frame).newRows)
                 } else {
                     footerRecovery = VerticalStitcher(first: frame)
                 }
@@ -241,7 +418,7 @@ enum SelfTest {
             for position in positions {
                 guard let frame = lowDetailFooterFrame(offset: position) else { break }
                 if let lowDetail {
-                    rows.append(lowDetail.append(frame))
+                    rows.append(lowDetail.append(frame).newRows)
                 } else {
                     lowDetail = VerticalStitcher(first: frame)
                 }
@@ -386,7 +563,7 @@ enum SelfTest {
             for (i, off) in offsets.enumerated() {
                 guard let frame = blinkFrame(offset: off, phase: i) else { blinkOK = false; break }
                 if let s = s4 {
-                    let rows = s.append(frame)
+                    let rows = s.append(frame).newRows
                     let want = off - offsets[i - 1]
                     if rows != want {
                         blinkOK = false
@@ -470,7 +647,7 @@ enum SelfTest {
                 guard let frame = scrollerFrame(offset: off, thumbY: thumbPositions[i])
                 else { scrollerOK = false; break }
                 if let s = s5 {
-                    let rows = s.append(frame)
+                    let rows = s.append(frame).newRows
                     let want = off - offsets[i - 1]
                     if rows != want {
                         scrollerOK = false
@@ -517,7 +694,7 @@ enum SelfTest {
                 var rows: [Int] = []
                 for position in positions.dropFirst() {
                     guard let next = frame(offset: position) else { break }
-                    rows.append(fractional.append(next))
+                    rows.append(fractional.append(next).newRows)
                 }
                 check("stitch-fractional-trackpad-sequence", rows == expectedRows,
                       "got \(rows), want \(expectedRows)")
@@ -580,7 +757,7 @@ enum SelfTest {
                 var rows: [Int] = []
                 for position in positions.dropFirst() {
                     guard let next = fineTextFrame(offset: position) else { break }
-                    rows.append(fineText.append(next))
+                    rows.append(fineText.append(next).newRows)
                 }
                 check("stitch-fine-text-fractional-accepts-all",
                       rows.count == positions.count - 1 && rows.allSatisfy { $0 > 0 },
@@ -589,6 +766,28 @@ enum SelfTest {
                 check("stitch-fine-text-fractional-no-drift",
                       abs(fineText.totalHeight - expectedHeight) <= 1,
                       "got \(fineText.totalHeight), want \(expectedHeight)±1")
+
+                // Same fractional trackpad positions, scrolled bottom-to-top.
+                // The macOS failure mode (odd backing-pixel offsets from
+                // momentum scrolling) must not resurface in the up direction.
+                if let upFirst = fineTextFrame(offset: positions.last!) {
+                    let fineTextUp = VerticalStitcher(first: upFirst, scale: 2)
+                    var upRows: [Int] = []
+                    var upRejects = 0
+                    for position in positions.dropLast().reversed() {
+                        guard let next = fineTextFrame(offset: position) else { break }
+                        let result = fineTextUp.append(next)
+                        upRows.append(result.newRows)
+                        if !result.isAccepted { upRejects += 1 }
+                    }
+                    check("stitch-fine-text-fractional-upscroll-accepts-all",
+                          upRows.count == positions.count - 1 && upRejects == 0
+                            && upRows.allSatisfy { $0 > 0 },
+                          "prepended \(upRows), rejects \(upRejects)")
+                    check("stitch-fine-text-fractional-upscroll-no-drift",
+                          abs(fineTextUp.totalHeight - expectedHeight) <= 1,
+                          "got \(fineTextUp.totalHeight), want \(expectedHeight)±1")
+                }
 
                 // A real flick combines both failure modes: fractional
                 // re-rasterization and less overlap than the primary 25%
@@ -612,7 +811,7 @@ enum SelfTest {
                     var recoveryRows: [Int] = []
                     for position in recoveryPositions.dropFirst() {
                         guard let next = recoveryFrame(offset: position) else { break }
-                        recoveryRows.append(fractionalRecovery.append(next))
+                        recoveryRows.append(fractionalRecovery.append(next).newRows)
                     }
                     check("stitch-fine-text-fractional-short-overlap-recovers",
                           recoveryRows.count == recoveryPositions.count - 1
@@ -656,7 +855,7 @@ enum SelfTest {
                             guard let next = recoveryFrame(offset: position) else {
                                 break
                             }
-                            driftRows.append(driftRecovery.append(next))
+                            driftRows.append(driftRecovery.append(next).newRows)
                         }
                         let expectedDriftHeight = recoveryViewport
                             + Int(driftPositions.last!.rounded())
@@ -756,7 +955,7 @@ enum SelfTest {
                     x: 0, y: position, width: fW, height: fViewport))
                 else { break }
                 if let recovery {
-                    rows.append(recovery.append(frame))
+                    rows.append(recovery.append(frame).newRows)
                 } else {
                     recovery = VerticalStitcher(first: frame)
                 }
@@ -783,7 +982,7 @@ enum SelfTest {
                    x: 0, y: 400, width: fW, height: fViewport)) {
                 let alias = VerticalStitcher(first: a0)
                 check("stitch-short-overlap-ambiguous-rejected",
-                      alias.append(a400) == 0)
+                      alias.append(a400).newRows == 0)
             } else {
                 check("stitch-short-overlap-ambiguous-frame", false)
             }
@@ -793,7 +992,7 @@ enum SelfTest {
                let n500 = content.cropping(to: CGRect(
                    x: 0, y: 500, width: fW, height: fViewport)) {
                 let noOverlap = VerticalStitcher(first: n0)
-                check("stitch-no-overlap-rejected", noOverlap.append(n500) == 0)
+                check("stitch-no-overlap-rejected", noOverlap.append(n500).newRows == 0)
             } else {
                 check("stitch-no-overlap-frame", false)
             }
@@ -835,7 +1034,7 @@ enum SelfTest {
                    from: a, sourceStart: fViewport - 64, count: 64) {
                 let decoyRecovery = VerticalStitcher(first: a)
                 check("stitch-short-overlap-64-row-decoy-rejected",
-                      decoyRecovery.append(decoy) == 0)
+                      decoyRecovery.append(decoy).newRows == 0)
             } else {
                 check("stitch-short-overlap-64-row-decoy-frame", false)
             }
@@ -852,7 +1051,7 @@ enum SelfTest {
                    from: a, sourceStart: 375, count: 125) {
                 let primaryDecoy = VerticalStitcher(first: a)
                 check("stitch-primary-alias-with-short-overlap-rejected",
-                      primaryDecoy.append(decoy) == 0,
+                      primaryDecoy.append(decoy).newRows == 0,
                       "ambiguous 100/400-row basins must not be guessed")
             } else {
                 check("stitch-primary-alias-with-short-overlap-frame", false)
@@ -918,7 +1117,7 @@ enum SelfTest {
                    x: 0, y: 800, width: fW, height: 1000)) {
                 let retina = VerticalStitcher(first: r0, scale: 2)
                 check("stitch-short-overlap-retina-recovers",
-                      retina.append(r800) == 800)
+                      retina.append(r800).newRows == 800)
             } else {
                 check("stitch-short-overlap-retina-frame", false)
             }
@@ -949,7 +1148,7 @@ enum SelfTest {
             for position in headerPositions {
                 guard let frame = headerFrame(offset: position) else { break }
                 if let headerRecovery {
-                    headerRows.append(headerRecovery.append(frame))
+                    headerRows.append(headerRecovery.append(frame).newRows)
                 } else {
                     headerRecovery = VerticalStitcher(first: frame)
                 }
@@ -1013,7 +1212,7 @@ enum SelfTest {
                     switch segmented.append(frame) {
                     case let .appended(rows):
                         lastRows = rows
-                    case .rejected:
+                    case .prepended, .moved, .rejected:
                         break
                     case .startedSegment:
                         promotedAt = position
@@ -1081,7 +1280,7 @@ enum SelfTest {
                     case .startedSegment:
                         successfulFrames += 1
                         promotedAt = position
-                    case .rejected:
+                    case .prepended, .moved, .rejected:
                         break
                     }
                 }
@@ -1776,7 +1975,7 @@ enum SelfTest {
                       retained.totalHeight == 640, "got \(retained.totalHeight), want 640")
                 if let f3 = content.cropping(to: CGRect(
                     x: 0, y: 360, width: 200, height: 400)) {
-                    let continued = retained.append(f3)
+                    let continued = retained.append(f3).newRows
                     check("scroll-fallback-continues-after-switch", continued == 120,
                           "appended \(continued), want 120")
                     check("scroll-fallback-continued-height", retained.totalHeight == 760,

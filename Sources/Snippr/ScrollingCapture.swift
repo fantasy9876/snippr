@@ -177,7 +177,7 @@ final class ScrollingCapture {
                             "Đã đổi chế độ chụp và bắt đầu đoạn "
                             + "\(segmented.segmentCount); vạch sáng đánh dấu chỗ thiếu")
                         backendNeedsHandshake = false
-                    case .appended, .rejected:
+                    case .appended, .prepended, .moved, .rejected:
                         updateProgress(
                             "Đang đồng bộ chế độ tương thích — cuộn chậm để nối tiếp")
                     }
@@ -200,6 +200,15 @@ final class ScrollingCapture {
                         updateProgress(
                             "Đã ghép \(Int(CGFloat(s.totalHeight) / scale)) pt "
                             + "— cuộn tiếp, xong \(stopHint)")
+                    case .prepended:
+                        prependPreview(s.lastSlice)
+                        updateProgress(
+                            "Đã ghép \(Int(CGFloat(s.totalHeight) / scale)) pt "
+                            + "(nối lên trên) — cuộn tiếp, xong \(stopHint)")
+                    case .moved:
+                        updateProgress(
+                            "Đang cuộn qua vùng đã chụp — "
+                            + "\(Int(CGFloat(s.totalHeight) / scale)) pt")
                     case let .startedSegment(segmentImage):
                         if let separator = s.segmentSeparator() {
                             startPreview(with: separator)
@@ -272,6 +281,7 @@ final class ScrollingCapture {
 
     private func startPreview(with frame: CGImage) {
         previewImage = scaledForPreview(frame)
+        previewView?.pinToTop = false
         pushPreview()
     }
 
@@ -293,6 +303,34 @@ final class ScrollingCapture {
             ))
         }
         previewImage = ctx.makeImage()
+        previewView?.pinToTop = false
+        pushPreview()
+    }
+
+    /// Mirror of appendPreview for content captured while scrolling up: the
+    /// newest strip goes on TOP, the oldest content is clipped at the bottom,
+    /// and the panel pins to the top edge so the user watches growth happen.
+    private func prependPreview(_ slice: CGImage?) {
+        guard let slice, let scaled = scaledForPreview(slice) else { return }
+        let prevH = previewImage?.height ?? 0
+        let newH = min(previewMaxHeight, prevH + scaled.height)
+        guard let ctx = CGContext(
+            data: nil, width: previewPixelWidth, height: newH, bitsPerComponent: 8, bytesPerRow: 0,
+            space: CGColorSpace(name: CGColorSpace.sRGB)!,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else { return }
+        if let prev = previewImage {
+            ctx.draw(prev, in: CGRect(
+                x: 0,
+                y: CGFloat(newH) - CGFloat(scaled.height) - CGFloat(prev.height),
+                width: CGFloat(previewPixelWidth), height: CGFloat(prev.height)
+            ))
+        }
+        ctx.draw(scaled, in: CGRect(
+            x: 0, y: CGFloat(newH) - CGFloat(scaled.height),
+            width: CGFloat(previewPixelWidth), height: CGFloat(scaled.height)))
+        previewImage = ctx.makeImage()
+        previewView?.pinToTop = true
         pushPreview()
     }
 
@@ -518,6 +556,10 @@ final class ScrollingCapture {
 final class SegmentedVerticalStitcher {
     enum AppendOutcome {
         case appended(Int)
+        case prepended(Int)
+        /// Confirmed retrace over already-captured rows — no new content, but
+        /// the evidence chain is intact and the reject counter resets.
+        case moved
         case rejected(consecutive: Int)
         case startedSegment(CGImage)
     }
@@ -562,20 +604,24 @@ final class SegmentedVerticalStitcher {
             return .rejected(consecutive: consecutiveRejects)
         }
 
-        let rows = currentSegment.append(frame)
-        if rows > 0 {
+        let result = currentSegment.append(frame)
+        if result.isAccepted {
             if currentOmittedHeaderRows > 0,
                currentSegment.headerRows != currentOmittedHeaderRows {
                 currentOmittedHeaderRows = 0
             }
             consecutiveRejects = 0
             pendingSegment = nil
-            return .appended(rows)
+            switch result {
+            case let .appended(rows): return .appended(rows)
+            case let .prepended(rows): return .prepended(rows)
+            case .moved, .rejected: return .moved
+            }
         }
 
         consecutiveRejects += 1
         if let pending = pendingSegment {
-            if pending.append(frame) == 0 {
+            if !pending.append(frame).isAccepted {
                 // This candidate did not form a contiguous strip either.
                 // Replace it instead of accumulating unrelated screenshots.
                 pendingSegment = VerticalStitcher(first: frame, scale: scale)
@@ -607,7 +653,7 @@ final class SegmentedVerticalStitcher {
             return .rejected(consecutive: 0)
         }
         if let pending = pendingSegment {
-            if pending.append(frame) == 0 {
+            if !pending.append(frame).isAccepted {
                 pendingSegment = VerticalStitcher(first: frame, scale: scale)
             }
         } else {
@@ -735,6 +781,9 @@ final class SegmentedVerticalStitcher {
 /// bottom so the newest content is always what the user sees.
 final class ScrollPreviewView: NSView {
     var image: CGImage?
+    /// When capturing upward the newest content is at the top; pin there so
+    /// the user always sees the strip growing.
+    var pinToTop = false
 
     override func draw(_ dirtyRect: NSRect) {
         guard let ctx = NSGraphicsContext.current?.cgContext else { return }
@@ -755,13 +804,17 @@ final class ScrollPreviewView: NSView {
         let drawH = CGFloat(image.height) * scale
         ctx.saveGState()
         ctx.clip(to: area)
-        // bottom-aligned: image bottom (= newest slice) sits at the view bottom
+        // bottom-aligned: image bottom (= newest slice) sits at the view
+        // bottom; top-aligned while capturing upward
         ctx.interpolationQuality = .medium
-        ctx.draw(image, in: CGRect(x: area.minX, y: area.minY, width: area.width, height: drawH))
+        let originY = pinToTop ? area.maxY - drawH : area.minY
+        ctx.draw(image, in: CGRect(x: area.minX, y: originY, width: area.width, height: drawH))
         ctx.restoreGState()
         ctx.setStrokeColor(NSColor.white.withAlphaComponent(0.25).cgColor)
-        ctx.stroke(CGRect(x: area.minX, y: area.minY,
-                          width: area.width, height: min(drawH, area.height)), width: 1)
+        let strokeH = min(drawH, area.height)
+        ctx.stroke(CGRect(x: area.minX,
+                          y: pinToTop ? area.maxY - strokeH : area.minY,
+                          width: area.width, height: strokeH), width: 1)
     }
 }
 
@@ -803,8 +856,40 @@ final class VerticalStitcher {
     private var headerLatched = false
     /// Raster output can only append whole rows, while a 1x trackpad may move
     /// content by half a backing pixel. Carry the rounding remainder forward
-    /// so 23.5 + 23.5 appends 24 + 23 rows, not 24 + 24.
+    /// so 23.5 + 23.5 appends 24 + 23 rows, not 24 + 24. The top seam scrolls
+    /// independently of the bottom seam, so each keeps its own remainder.
     private var fractionalRowResidual = 0.0
+    private var topFractionalRowResidual = 0.0
+    /// Content captured upward (scroll-up) is stored separately and composed
+    /// above the first frame's body, newest strip first.
+    private(set) var topSlices: [CGImage] = []
+    /// Captured rows outside the current viewport. Retracing over an already
+    /// captured region must move these cursors instead of duplicating rows —
+    /// or, worse, rejecting every frame until the session dead-locks.
+    private var rowsAboveViewport = 0
+    private var rowsBelowViewport = 0
+
+    /// Every accepted frame is either new content appended below, new content
+    /// prepended above, or a confirmed retrace over already-captured rows
+    /// (`moved`). Only `rejected` means the matcher had no confident overlap.
+    enum AppendResult: Equatable {
+        case appended(rows: Int)
+        case prepended(rows: Int)
+        case moved
+        case rejected
+
+        var newRows: Int {
+            switch self {
+            case let .appended(rows), let .prepended(rows): return rows
+            case .moved, .rejected: return 0
+            }
+        }
+
+        var isAccepted: Bool {
+            if case .rejected = self { return false }
+            return true
+        }
+    }
 
     struct RowSig {
         let bands: [Double]   // h * 4 mean-gray band values
@@ -832,35 +917,59 @@ final class VerticalStitcher {
         guard frame.width == width, frame.height == lastFrame.height,
               let nextSig = Self.rowSignatures(frame),
               let prevSig = lastSig ?? Self.rowSignatures(lastFrame),
-              let match = Self.findOverlap(
-                prev: prevSig, next: nextSig, height: frame.height, scale: scale,
-                lockedFooter: footerLatched ? footerRows : nil)
+              let match = Self.findDirectedOverlap(
+                prev: prevSig, next: nextSig, height: frame.height,
+                scale: scale, lockedFooter: footerLatched ? footerRows : nil)?
+                .match
         else { return false }
         let footer = footerLatched ? footerRows : match.footerRows
         return footerIsStable(footer, next: nextSig)
     }
 
-    /// Append new content from `frame`. Returns the number of new rows
-    /// (0 when nothing new or the frame couldn't be matched).
+    /// Runs the matcher in both scroll directions. Real motion has exactly one
+    /// direction; two confident matches mean the page is periodic enough to
+    /// alias, and guessing a direction would corrupt a seam — fail closed.
+    static func findDirectedOverlap(
+        prev: RowSig, next: RowSig, height: Int, scale: CGFloat,
+        lockedFooter: Int?
+    ) -> (match: Match, scrolledUp: Bool)? {
+        let down = findOverlap(
+            prev: prev, next: next, height: height, scale: scale,
+            lockedFooter: lockedFooter)
+        let up = findOverlap(
+            prev: next, next: prev, height: height, scale: scale,
+            lockedFooter: lockedFooter)
+        switch (down, up) {
+        case let (down?, nil): return (down, false)
+        case let (nil, up?): return (up, true)
+        case (.some, .some):
+            Perf.reject("directional ambiguity — both scroll directions match")
+            return nil
+        case (nil, nil): return nil
+        }
+    }
+
+    /// Integrate `frame` into the strip: append new bottom rows, prepend new
+    /// top rows, or record a confirmed retrace over already-captured content.
     @discardableResult
-    func append(_ frame: CGImage) -> Int {
-        guard frame.width == width, frame.height == lastFrame.height else { return 0 }
-        guard let nextSig = Self.rowSignatures(frame) else { return 0 }
+    func append(_ frame: CGImage) -> AppendResult {
+        guard frame.width == width, frame.height == lastFrame.height else { return .rejected }
+        guard let nextSig = Self.rowSignatures(frame) else { return .rejected }
         let prevSig: RowSig
         if let cached = lastSig {
             prevSig = cached
         } else {
-            guard let computed = Self.rowSignatures(lastFrame) else { return 0 }
+            guard let computed = Self.rowSignatures(lastFrame) else { return .rejected }
             prevSig = computed
             lastSig = computed // rejected ticks must not recompute this
         }
         if firstSig == nil { firstSig = prevSig } // prev of the 1st append IS frame #1
 
-        guard let match = Self.findOverlap(
+        guard let (match, scrolledUp) = Self.findDirectedOverlap(
             prev: prevSig, next: nextSig, height: frame.height, scale: scale,
             lockedFooter: footerLatched ? footerRows : nil
         ) else {
-            return 0
+            return .rejected
         }
         let footer = footerLatched ? footerRows : match.footerRows
         let nextHeaderRows: Int
@@ -882,27 +991,64 @@ final class VerticalStitcher {
         // for the whole session. Pitch-aligned scrolling content that merely
         // matched the previous frame drifts away from it — reject the frame
         // instead of silently dropping/duplicating page rows.
-        guard footerIsStable(footer, next: nextSig) else { return 0 }
+        guard footerIsStable(footer, next: nextSig) else { return .rejected }
 
         let contentHeight = frame.height - footer
-        let accumulatedOffset = match.preciseOffset + fractionalRowResidual
-        let rows = min(Int(accumulatedOffset.rounded()), contentHeight)
-        guard rows > 0 else { return 0 }
-        // new content sits just above the (possibly empty) footer band
-        guard let slice = frame.cropping(to: CGRect(
-            x: 0, y: contentHeight - rows, width: width, height: rows
-        ))?.materialized() else { return 0 }
-        slices.append(slice)
-        lastSlice = slice
-        totalHeight += rows
-        fractionalRowResidual = accumulatedOffset - Double(rows)
+        let accumulatedOffset = match.preciseOffset
+            + (scrolledUp ? topFractionalRowResidual : fractionalRowResidual)
+        let moved = min(Int(accumulatedOffset.rounded()), contentHeight)
+        guard moved > 0 else { return .rejected }
+
+        // The viewport slid by `moved` rows. Rows that re-enter an already
+        // captured region only advance the cursors; rows past the captured
+        // range are genuinely new content. Cut the slice BEFORE committing any
+        // state so a failed crop leaves the bookkeeping untouched.
+        let coveredRows = scrolledUp ? rowsAboveViewport : rowsBelowViewport
+        var newRows = max(0, moved - coveredRows)
+        var slice: CGImage?
+        if newRows > 0 {
+            if scrolledUp {
+                // new content sits just below the (possibly empty) fixed header
+                newRows = min(newRows, max(0, contentHeight - nextHeaderRows))
+                slice = newRows > 0 ? frame.cropping(to: CGRect(
+                    x: 0, y: nextHeaderRows, width: width, height: newRows
+                ))?.materialized() : nil
+            } else {
+                // new content sits just above the (possibly empty) footer band
+                slice = frame.cropping(to: CGRect(
+                    x: 0, y: contentHeight - newRows, width: width, height: newRows
+                ))?.materialized()
+            }
+            guard slice != nil else { return .rejected }
+        }
+
+        if scrolledUp {
+            topFractionalRowResidual = accumulatedOffset - Double(moved)
+            rowsAboveViewport = max(0, rowsAboveViewport - moved)
+            rowsBelowViewport += moved
+        } else {
+            fractionalRowResidual = accumulatedOffset - Double(moved)
+            rowsBelowViewport = max(0, rowsBelowViewport - moved)
+            rowsAboveViewport += moved
+        }
         lastFrame = frame.materialized() ?? frame
         lastSig = nextSig
         headerRows = nextHeaderRows
         headerLatched = true
         footerRows = footer
         footerLatched = true
-        return rows
+
+        guard let slice else { return .moved }
+        if scrolledUp {
+            topSlices.append(slice)
+        } else {
+            slices.append(slice)
+        }
+        lastSlice = slice
+        totalHeight += slice.height
+        return scrolledUp
+            ? .prepended(rows: slice.height)
+            : .appended(rows: slice.height)
     }
 
     private func footerIsStable(_ footer: Int, next: RowSig) -> Bool {
@@ -1809,12 +1955,17 @@ final class VerticalStitcher {
         // The first slice carries any fixed header/footer chrome. Across a
         // marked gap, later segments omit their proven duplicate header; a
         // detected footer is removed from every completed segment and attached
-        // once from the final segment's last frame.
+        // once from the final segment's last frame. Content captured upward
+        // stacks between the header chrome and the first frame's body, so a
+        // retained header must be lifted off the first frame and re-attached
+        // above the prepended strips.
         var parts = slices
         let effectiveFooterRows = footerRows > 0
             ? footerRows
             : max(0, min(inferredFooterRows, lastFrame.height / 3))
-        let effectiveHeaderRows = includeHeader ? 0 : headerRows
+        let effectiveHeaderRows = includeHeader && topSlices.isEmpty
+            ? 0 : headerRows
+        var headerTrimmedOffFirstFrame = false
         if let first = parts.first,
            first.height > effectiveHeaderRows + effectiveFooterRows,
            lastFrame.height > effectiveFooterRows,
@@ -1827,6 +1978,7 @@ final class VerticalStitcher {
             ))?.materialized()
             if let trimmed {
                 parts[0] = trimmed
+                headerTrimmedOffFirstFrame = effectiveHeaderRows > 0
                 if includeFooter, effectiveFooterRows > 0,
                    let footer = lastFrame.cropping(to: CGRect(
                     x: 0, y: lastFrame.height - effectiveFooterRows,
@@ -1834,6 +1986,14 @@ final class VerticalStitcher {
                    ))?.materialized() {
                     parts.append(footer)
                 }
+            }
+        }
+        if !topSlices.isEmpty {
+            // newest prepend is the topmost content
+            parts.insert(contentsOf: topSlices.reversed(), at: 0)
+            if includeHeader, headerTrimmedOffFirstFrame,
+               let header = topRowsImage(rows: headerRows) {
+                parts.insert(header, at: 0)
             }
         }
 
