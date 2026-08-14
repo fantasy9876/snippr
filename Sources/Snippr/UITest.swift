@@ -267,9 +267,11 @@ enum UITest {
             var failCopies = 0
             panelDepsToastCounter = { failToasts += 1 }
             panelDepsCopyCounter = { failCopies += 1 }
+            let annBeforeFail = panel.annotationSurface.annotations.count
             panel.performActionForTesting(.copy)
             panelFailOK = failCopies == 0 && failToasts == 1
                 && ScrollResultPanel.current === panel
+                && panel.annotationSurface.annotations.count == annBeforeFail
             panel.annotationSurface.forceRenderFailureForTesting = false
 
             // Panel save-lock with REAL events: drags + Cmd-Z during an
@@ -279,24 +281,37 @@ enum UITest {
             let annBefore = panel.annotationSurface.annotations.count
             panelDepsSaveHold = true
             panel.performActionForTesting(.save)
+            // step-wise: assert after the drag AND after Cmd-Z separately —
+            // +1/−1 cancellation must not hide two missing guards
             panel.drawWithRealEventsForTesting(
                 fromView: CGPoint(x: 10, y: 10),
                 toView: CGPoint(x: 30, y: 30))
-            if let cmdZ = NSEvent.keyEvent(
-                with: .keyDown, location: .zero, modifierFlags: [.command],
-                timestamp: 0, windowNumber: panel.windowNumber, context: nil,
-                characters: "z", charactersIgnoringModifiers: "z",
-                isARepeat: false, keyCode: 6) {
-                _ = panel.performKeyEquivalent(with: cmdZ)
+            let panelInvariantAfterDrag =
+                panel.annotationSurface.annotations.count == annBefore
+            func panelCmdZ() {
+                if let cmdZ = NSEvent.keyEvent(
+                    with: .keyDown, location: .zero, modifierFlags: [.command],
+                    timestamp: 0, windowNumber: panel.windowNumber, context: nil,
+                    characters: "z", charactersIgnoringModifiers: "z",
+                    isARepeat: false, keyCode: 6) {
+                    _ = panel.performKeyEquivalent(with: cmdZ)
+                }
             }
-            let lockedInvariant =
+            panelCmdZ()
+            let panelInvariantAfterUndo =
                 panel.annotationSurface.annotations.count == annBefore
             panelHeldSaveResolution?(.cancelled)
             panel.drawWithRealEventsForTesting(
                 fromView: CGPoint(x: 12, y: 40),
                 toView: CGPoint(x: 40, y: 60))
-            panelSaveLockOK = lockedInvariant
-                && panel.annotationSurface.annotations.count == annBefore + 1
+            let panelDrawsAfterCancel =
+                panel.annotationSurface.annotations.count == annBefore + 1
+            panelCmdZ()
+            let panelUndoAfterCancel =
+                panel.annotationSurface.annotations.count == annBefore
+            panelSaveLockOK = panelInvariantAfterDrag
+                && panelInvariantAfterUndo
+                && panelDrawsAfterCancel && panelUndoAfterCancel
 
             panel.performActionForTesting(.openEditor)
             let editorsAfter = NSApp.windows

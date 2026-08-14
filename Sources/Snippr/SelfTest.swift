@@ -4344,38 +4344,44 @@ enum SelfTest {
                     eventNumber: 0, clickCount: clicks, pressure: 1)
             }
             let inside = CGPoint(x: 120, y: 120)
-            if let down = mouse(.leftMouseDown, inside) { view.mouseDown(with: down) }
-            if let drag = mouse(.leftMouseDragged, CGPoint(x: 160, y: 160)) {
-                view.mouseDragged(with: drag)
+            @MainActor func sendDrag(to end: CGPoint) {
+                if let down = mouse(.leftMouseDown, inside) { view.mouseDown(with: down) }
+                if let drag = mouse(.leftMouseDragged, end) { view.mouseDragged(with: drag) }
+                if let up = mouse(.leftMouseUp, end) { view.mouseUp(with: up) }
             }
-            if let up = mouse(.leftMouseUp, CGPoint(x: 160, y: 160)) {
-                view.mouseUp(with: up)
+            @MainActor func sendCmdZ() {
+                if let cmdZ = NSEvent.keyEvent(
+                    with: .keyDown, location: .zero, modifierFlags: [.command],
+                    timestamp: 0, windowNumber: 0, context: nil,
+                    characters: "z", charactersIgnoringModifiers: "z",
+                    isARepeat: false, keyCode: 6) {
+                    _ = view.performKeyEquivalent(with: cmdZ)
+                }
             }
-            if let cmdZ = NSEvent.keyEvent(
-                with: .keyDown, location: .zero, modifierFlags: [.command],
-                timestamp: 0, windowNumber: 0, context: nil,
-                characters: "z", charactersIgnoringModifiers: "z",
-                isARepeat: false, keyCode: 6) {
-                _ = view.performKeyEquivalent(with: cmdZ)
-            }
-            let undoDuringSave = overlay.session.phase == .saving
-                && view.annotationSurface?.annotations.count == annotationsBeforeSave
+            // STEP-WISE asserts: a drag(+1) cancelled by an undo(−1) must not
+            // be able to hide two missing guards behind an unchanged total.
+            sendDrag(to: CGPoint(x: 160, y: 160))
+            let invariantAfterDrag =
+                surface6.annotations.count == annotationsBeforeSave
+            sendCmdZ()
+            let invariantAfterUndo =
+                surface6.annotations.count == annotationsBeforeSave
+            let stillSaving = overlay.session.phase == .saving
             spy.saveDone?(.cancelled)
             let backToReview = overlay.session.phase == .reviewing
                 && surface6.annotations.count == annotationsBeforeSave
-            // and after cancel, drawing works again through the same events
-            if let down = mouse(.leftMouseDown, inside) { view.mouseDown(with: down) }
-            if let drag = mouse(.leftMouseDragged, CGPoint(x: 170, y: 150)) {
-                view.mouseDragged(with: drag)
-            }
-            if let up = mouse(.leftMouseUp, CGPoint(x: 170, y: 150)) {
-                view.mouseUp(with: up)
-            }
+            // after cancel: the SAME drag draws (+1)…
+            sendDrag(to: CGPoint(x: 170, y: 150))
             let drawsAfterCancel =
                 surface6.annotations.count == annotationsBeforeSave + 1
+            // …and the SAME Cmd-Z undoes back to the exact old snapshot
+            sendCmdZ()
+            let undoAfterCancel =
+                surface6.annotations.count == annotationsBeforeSave
             check("overlay6-save-lock-annotations",
-                  undoDuringSave && backToReview && drawsAfterCancel,
-                  "during \(undoDuringSave) after \(backToReview) redraw \(drawsAfterCancel) count \(surface6.annotations.count)")
+                  invariantAfterDrag && invariantAfterUndo && stillSaving
+                    && backToReview && drawsAfterCancel && undoAfterCancel,
+                  "drag \(invariantAfterDrag) undo \(invariantAfterUndo) saving \(stillSaving) back \(backToReview) redraw \(drawsAfterCancel) reundo \(undoAfterCancel)")
 
             // Area flatten failure: 0 actions, 1 toast, review + drawings
             // intact (fail-closed parity with the panel).
