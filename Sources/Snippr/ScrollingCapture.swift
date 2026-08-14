@@ -242,6 +242,13 @@ final class ScrollingCapture {
     /// instead of recompositing the whole page every frame.
     private let previewMaxHeight = 1400
     private var previewImage: CGImage?
+    /// Which way the rolling preview is currently pinned. Explicit state:
+    /// the production flip branch must not depend on whether a preview view
+    /// happens to be attached (self-tests run without one).
+    private(set) var previewPinnedTop = false
+    /// Source rows represented by the incremental preview — the cumulative
+    /// basis for floor-consistent strip heights.
+    private var previewSourceRows = 0
 
     private func scaledForPreview(_ image: CGImage) -> CGImage? {
         let scale = CGFloat(previewPixelWidth) / CGFloat(image.width)
@@ -258,28 +265,43 @@ final class ScrollingCapture {
 
     private func startPreview(with frame: CGImage) {
         previewImage = scaledForPreview(frame)
+        previewSourceRows = frame.height
+        previewPinnedTop = false
         previewView?.pinToTop = false
         pushPreview()
     }
 
     private func appendPreview(_ slice: CGImage?) {
-        guard let slice, let scaled = scaledForPreview(slice) else { return }
+        guard let slice, slice.width > 0 else { return }
+        // Cumulative floor: the strip's displayed height is the DIFFERENCE of
+        // cumulative floors — the same geometry rule the rebuilt window uses —
+        // so the incremental total never drifts from scaledY(total) by a
+        // per-slice rounding remainder.
+        let scale = CGFloat(previewPixelWidth) / CGFloat(slice.width)
+        let scaledHeight = Int(CGFloat(previewSourceRows + slice.height) * scale)
+            - Int(CGFloat(previewSourceRows) * scale)
+        previewSourceRows += slice.height
+        guard scaledHeight > 0 else { return }
         let prevH = previewImage?.height ?? 0
-        let newH = min(previewMaxHeight, prevH + scaled.height)
+        let newH = min(previewMaxHeight, prevH + scaledHeight)
         guard let ctx = CGContext(
             data: nil, width: previewPixelWidth, height: newH, bitsPerComponent: 8, bytesPerRow: 0,
             space: CGColorSpace(name: CGColorSpace.sRGB)!,
             bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
         ) else { return }
+        ctx.interpolationQuality = .medium
         // newest slice at the bottom; older content above, clipped at the top
-        ctx.draw(scaled, in: CGRect(x: 0, y: 0, width: previewPixelWidth, height: scaled.height))
+        ctx.draw(slice, in: CGRect(
+            x: 0, y: 0,
+            width: previewPixelWidth, height: scaledHeight))
         if let prev = previewImage {
             ctx.draw(prev, in: CGRect(
-                x: 0, y: CGFloat(scaled.height),
+                x: 0, y: CGFloat(scaledHeight),
                 width: CGFloat(previewPixelWidth), height: CGFloat(prev.height)
             ))
         }
         previewImage = ctx.makeImage()
+        previewPinnedTop = false
         previewView?.pinToTop = false
         pushPreview()
     }
@@ -303,8 +325,10 @@ final class ScrollingCapture {
             // After a direction change the rolling preview window clipped
             // away the middle rows; pasting the new slice onto it would seam
             // non-adjacent content. Rebuild from the bounded window instead
-            // (flips are rare).
-            if previewView?.pinToTop == true {
+            // (flips are rare). The direction lives in explicit state, NOT in
+            // the optional preview view — a nil view must not silently skip
+            // the rebuild branch.
+            if previewPinnedTop {
                 rebuildPreview(from: s, pinToTop: false)
             } else {
                 appendPreview(s.lastSlice)
@@ -338,6 +362,11 @@ final class ScrollingCapture {
     }
 
     var previewImageForTesting: CGImage? { previewImage }
+    /// Self-tests seed the preview exactly the way run() does on its first
+    /// frame, so the incremental path under test is the production one.
+    func startPreviewForTesting(with frame: CGImage) {
+        startPreview(with: frame)
+    }
 
     private func rebuildPreview(
         from segmented: SegmentedVerticalStitcher, pinToTop: Bool
@@ -351,6 +380,8 @@ final class ScrollingCapture {
             maxHeight: previewMaxHeight,
             anchor: pinToTop ? .currentTop : .bottom) else { return }
         previewImage = visible
+        previewSourceRows = segmented.totalHeight
+        previewPinnedTop = pinToTop
         previewView?.pinToTop = pinToTop
         pushPreview()
     }
@@ -748,6 +779,7 @@ final class SegmentedVerticalStitcher {
     /// Visible, content-independent boundary used both in the live preview and
     /// final output. Alternating bands remain obvious on light and dark pages.
     func segmentSeparator() -> CGImage? {
+        SourceCanvasSpy.increment()
         guard let ctx = CGContext(
             data: nil, width: width, height: separatorRows,
             bitsPerComponent: 8, bytesPerRow: 0,
@@ -793,38 +825,34 @@ final class SegmentedVerticalStitcher {
     /// cumulative floor scaling (`scaledY`) — the same rounding rule as
     /// `scaledForPreview` — so incremental and rebuilt previews agree on
     /// size with no blank seams.
+    /// The gap separator raster, built ONCE per session. The preview refresh
+    /// must never re-allocate the source-width canvas that
+    /// `segmentSeparator()` creates (~0.5 MiB per call on a 5K display).
+    private var cachedSeparator: CGImage?
+    private func cachedSeparatorImage() -> CGImage? {
+        if cachedSeparator == nil { cachedSeparator = segmentSeparator() }
+        return cachedSeparator
+    }
+
     func previewWindowImage(
         targetWidth: Int, maxHeight: Int, anchor: PreviewAnchor
     ) -> CGImage? {
         guard targetWidth > 0, maxHeight > 0, width > 0 else { return nil }
-        var refs: [VerticalStitcher.ComposedPartRef] = []
+        // Totals first — O(#segments), no slice scans.
         var currentStartRows = 0
-        if !completedSegments.isEmpty {
-            guard let separator = segmentSeparator() else { return nil }
-            for segment in completedSegments {
-                refs.append(.init(
-                    image: segment, sourceTop: 0, sourceHeight: segment.height))
-                refs.append(.init(
-                    image: separator, sourceTop: 0,
-                    sourceHeight: separator.height))
-                currentStartRows += segment.height + separator.height
-            }
+        for segment in completedSegments {
+            currentStartRows += segment.height + separatorRows
         }
-        refs += currentSegment.composedPartRefs(
-            includeHeader: currentOmittedHeaderRows == 0)
-        let totalRows = refs.reduce(0) { $0 + $1.sourceHeight }
+        let includeHeader = currentOmittedHeaderRows == 0
+        let currentRows = currentSegment
+            .previewGeometry(includeHeader: includeHeader).totalRows
+        let totalRows = currentStartRows + currentRows
         guard totalRows > 0 else { return nil }
         let scale = CGFloat(targetWidth) / CGFloat(width)
         func scaledY(_ rows: Int) -> Int { Int(CGFloat(rows) * scale) }
         let totalScaled = max(1, scaledY(totalRows))
         let windowHeight = min(maxHeight, totalScaled)
-        guard windowHeight > 0, let ctx = CGContext(
-            data: nil, width: targetWidth, height: windowHeight,
-            bitsPerComponent: 8, bytesPerRow: 0,
-            space: CGColorSpace(name: CGColorSpace.sRGB)!,
-            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-        ) else { return nil }
-        ctx.interpolationQuality = .medium
+        guard windowHeight > 0 else { return nil }
         let windowStart: Int
         switch anchor {
         case .bottom:
@@ -835,15 +863,58 @@ final class SegmentedVerticalStitcher {
             windowStart = max(0, min(
                 scaledY(separatorStartRows), totalScaled - windowHeight))
         }
-        var consumedRows = 0
-        for ref in refs {
-            let y0 = scaledY(consumedRows) - windowStart
-            let y1 = scaledY(consumedRows + ref.sourceHeight) - windowStart
-            consumedRows += ref.sourceHeight
-            if y1 <= 0 { continue }
-            if y0 >= windowHeight { break }
+        // Source range the window can touch (with rounding slack).
+        let sourceStart = max(0, Int(
+            (CGFloat(windowStart) / scale).rounded(.down)) - 1)
+        let sourceEnd = min(totalRows, Int(
+            (CGFloat(windowStart + windowHeight) / scale)
+                .rounded(.up)) + 1)
+        guard sourceStart < sourceEnd else { return nil }
+
+        // Collect only the intersecting parts.
+        var items: [(start: Int, ref: VerticalStitcher.ComposedPartRef)] = []
+        var offset = 0
+        for segment in completedSegments {
+            // Completed segments and separators are single parts — O(1) skip
+            // when outside the range.
+            if offset < sourceEnd, offset + segment.height > sourceStart {
+                items.append((offset, .init(
+                    image: segment, sourceTop: 0,
+                    sourceHeight: segment.height)))
+            }
+            offset += segment.height
+            if offset < sourceEnd, offset + separatorRows > sourceStart,
+               let separator = cachedSeparatorImage() {
+                items.append((offset, .init(
+                    image: separator, sourceTop: 0,
+                    sourceHeight: separatorRows, isMarker: true)))
+            }
+            offset += separatorRows
+        }
+        for (start, ref) in currentSegment.previewPartRefs(
+            includeHeader: includeHeader,
+            intersecting: (sourceStart - currentStartRows)
+                ..< (sourceEnd - currentStartRows)) {
+            items.append((start + currentStartRows, ref))
+        }
+
+        guard let ctx = CGContext(
+            data: nil, width: targetWidth, height: windowHeight,
+            bitsPerComponent: 8, bytesPerRow: 0,
+            space: CGColorSpace(name: CGColorSpace.sRGB)!,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else { return nil }
+        ctx.interpolationQuality = .medium
+        func draw(start: Int, ref: VerticalStitcher.ComposedPartRef,
+                  floorTo1px: Bool) {
+            let y0 = scaledY(start) - windowStart
+            var y1 = scaledY(start + ref.sourceHeight) - windowStart
+            // A gap marker must never round away: without at least one
+            // destination pixel the user loses the discontinuity warning.
+            if floorTo1px, y1 - y0 < 1 { y1 = y0 + 1 }
+            guard y1 > 0, y0 < windowHeight else { return }
             let destHeight = y1 - y0
-            guard destHeight > 0, ref.sourceHeight > 0 else { continue }
+            guard destHeight > 0, ref.sourceHeight > 0 else { return }
             // Draw the FULL image positioned so the ref's source region lands
             // exactly on [y0, y1), clipped to that band — cropping without
             // copying any pixels.
@@ -858,6 +929,15 @@ final class SegmentedVerticalStitcher {
                 x: 0, y: CGFloat(windowHeight) - fullTop - fullHeight,
                 width: CGFloat(targetWidth), height: fullHeight))
             ctx.restoreGState()
+        }
+        // Content first, markers LAST: a floored 1-px marker shares its
+        // boundary pixel with the next content part, and whichever draws
+        // later wins — the discontinuity warning must never lose that race.
+        for (start, ref) in items where !ref.isMarker {
+            draw(start: start, ref: ref, floorTo1px: false)
+        }
+        for (start, ref) in items where ref.isMarker {
+            draw(start: start, ref: ref, floorTo1px: true)
         }
         return ctx.makeImage()
     }
@@ -984,6 +1064,11 @@ final class VerticalStitcher {
     /// Content captured upward (scroll-up) is stored separately and composed
     /// above the first frame's body, newest strip first.
     private(set) var topSlices: [CGImage] = []
+    /// Cumulative heights of `topSlices` / `slices[1...]` in chronological
+    /// order, maintained O(1) per accept. The preview window walks these with
+    /// a binary search so its work is bounded by the WINDOW, not the session.
+    private(set) var topSlicePrefixRows: [Int] = []
+    private(set) var tailSlicePrefixRows: [Int] = []
     /// Header rows skipped when cutting the FIRST prepended slice. Latched for
     /// the whole session like the footer: if later frames were cut at a
     /// different (tightened) header estimate, the top strips would no longer
@@ -1209,19 +1294,21 @@ final class VerticalStitcher {
         let weightHigh = interpolate ? fraction : 0
         let weightLow = 1 - weightHigh
         for phase in 0..<phaseCount {
-            // Two-tier quorum. A flat row pair (blank background, solid fill
-            // on BOTH sides) that MATCHES under this phase is neutral — it
-            // agrees under any offset and must not inflate the majority. But
-            // a flat pair that DIFFERS (a gray panel facing a white one) is
-            // hard evidence against the offset and votes with the content.
+            // Quorum. A flat row pair (blank background, solid fill on BOTH
+            // sides) that MATCHES under this phase is neutral — it agrees
+            // under any offset and must not inflate the majority. But a flat
+            // pair that DIFFERS (a gray panel facing a white one) is hard
+            // evidence against the offset and votes with the content.
             //   matched  : content rows that agree            → M
             //   disagreed: any row that differs               → D
-            //   tier 1   : M ≥ 70% of (M + D)
-            //   tier 2   : M > D AND D ≤ 20% of the FULL overlap — absorbs a
-            //              modest animated band (video, ad) inside an
-            //              otherwise-sparse true overlap without letting a
-            //              duplicated card carry a fake seam.
-            // No voting rows at all proves nothing and fails closed.
+            //   pass     : M ≥ 70% of (M + D)
+            // There is deliberately NO disagreement-fraction escape hatch:
+            // from two frames alone an "animated band" is indistinguishable
+            // from genuinely different content next to a duplicated card, and
+            // silently losing those rows is worse than a marked gap. A page
+            // with a large animation may re-anchor; that is the fail-closed
+            // tradeoff this project chose. No voting rows proves nothing and
+            // also fails closed.
             var matched = 0
             var disagreed = 0
             for row in 0..<rowA.count {
@@ -1267,7 +1354,6 @@ final class VerticalStitcher {
             let counted = matched + disagreed
             guard counted > 0 else { continue }
             if matched * 10 >= counted * 7 { return true }
-            if matched > disagreed, disagreed * 5 <= totalRows { return true }
         }
         return false
     }
@@ -1383,8 +1469,12 @@ final class VerticalStitcher {
                 topSliceAnchorLatched = true
             }
             topSlices.append(slice)
+            topSlicePrefixRows.append(
+                (topSlicePrefixRows.last ?? 0) + slice.height)
         } else {
             slices.append(slice)
+            tailSlicePrefixRows.append(
+                (tailSlicePrefixRows.last ?? 0) + slice.height)
         }
         lastSlice = slice
         totalHeight += slice.height
@@ -2302,13 +2392,30 @@ final class VerticalStitcher {
         let image: CGImage
         let sourceTop: Int
         let sourceHeight: Int
+        var isMarker = false
     }
 
-    /// Same geometry as `composedParts`, as zero-copy region refs. The
-    /// preview path MUST use this: `composedParts` materializes the trimmed
-    /// first viewport (54 MiB on a 5K display) on every call.
-    fileprivate func composedPartRefs(includeHeader: Bool) -> [ComposedPartRef] {
-        guard let first = slices.first else { return [] }
+    /// O(1) layout of the current composition for the preview path — every
+    /// field derives from cached totals, never from scanning the slices.
+    fileprivate struct PreviewGeometry {
+        let liftedHeaderRows: Int
+        let topRows: Int
+        let bodySourceTop: Int
+        let bodyRows: Int
+        let tailRows: Int
+        let footerSourceTop: Int
+        let footerRows: Int
+        var totalRows: Int {
+            liftedHeaderRows + topRows + bodyRows + tailRows + footerRows
+        }
+    }
+
+    fileprivate func previewGeometry(includeHeader: Bool) -> PreviewGeometry {
+        guard let first = slices.first else {
+            return PreviewGeometry(
+                liftedHeaderRows: 0, topRows: 0, bodySourceTop: 0,
+                bodyRows: 0, tailRows: 0, footerSourceTop: 0, footerRows: 0)
+        }
         let effectiveFooterRows = footerRows
         let effectiveHeaderRows = topSlices.isEmpty
             ? (includeHeader ? 0 : headerRows)
@@ -2316,38 +2423,112 @@ final class VerticalStitcher {
         let trimApplies = first.height > effectiveHeaderRows + effectiveFooterRows
             && lastFrame.height > effectiveFooterRows
             && (effectiveHeaderRows > 0 || effectiveFooterRows > 0)
-        var refs: [ComposedPartRef] = []
-        if !topSlices.isEmpty {
-            if includeHeader, trimApplies, effectiveHeaderRows > 0 {
-                refs.append(.init(
-                    image: first, sourceTop: 0,
-                    sourceHeight: effectiveHeaderRows))
+        let lifted = (!topSlices.isEmpty && includeHeader && trimApplies
+            && effectiveHeaderRows > 0) ? effectiveHeaderRows : 0
+        return PreviewGeometry(
+            liftedHeaderRows: lifted,
+            topRows: topSlices.isEmpty ? 0 : (topSlicePrefixRows.last ?? 0),
+            bodySourceTop: trimApplies ? effectiveHeaderRows : 0,
+            bodyRows: trimApplies
+                ? first.height - effectiveHeaderRows - effectiveFooterRows
+                : first.height,
+            tailRows: tailSlicePrefixRows.last ?? 0,
+            footerSourceTop: lastFrame.height - effectiveFooterRows,
+            footerRows: trimApplies && effectiveFooterRows > 0
+                ? effectiveFooterRows : 0)
+    }
+
+    /// Zero-copy region refs for the parts of this segment intersecting
+    /// `range` (segment-local source rows), with their start offsets. Work is
+    /// bounded by the intersecting parts: the two variable-length regions are
+    /// entered via binary search on the cached prefix arrays, never scanned.
+    fileprivate func previewPartRefs(
+        includeHeader: Bool, intersecting range: Range<Int>
+    ) -> [(start: Int, ref: ComposedPartRef)] {
+        guard let first = slices.first, !range.isEmpty else { return [] }
+        let geometry = previewGeometry(includeHeader: includeHeader)
+        var out: [(Int, ComposedPartRef)] = []
+        func maybe(_ start: Int, _ height: Int,
+                   _ make: () -> ComposedPartRef) {
+            guard height > 0, start < range.upperBound,
+                  start + height > range.lowerBound else { return }
+            out.append((start, make()))
+        }
+        maybe(0, geometry.liftedHeaderRows) {
+            .init(image: first, sourceTop: 0,
+                  sourceHeight: geometry.liftedHeaderRows)
+        }
+        // Prepends render newest-first: display item j is topSlices[n-1-j],
+        // whose start is lifted + (T - prefix[n-1-j]).
+        let sliceCount = topSlices.count
+        let topTotal = geometry.topRows
+        let topRegionStart = geometry.liftedHeaderRows
+        if sliceCount > 0, topRegionStart < range.upperBound,
+           topRegionStart + topTotal > range.lowerBound {
+            let localStart = max(0, range.lowerBound - topRegionStart)
+            // smallest k with prefix[k] >= T - localStart
+            var lo = 0, hi = sliceCount - 1, k = sliceCount - 1
+            while lo <= hi {
+                let mid = (lo + hi) / 2
+                if topSlicePrefixRows[mid] >= topTotal - localStart {
+                    k = mid; hi = mid - 1
+                } else {
+                    lo = mid + 1
+                }
             }
-            for slice in topSlices.reversed() {
-                refs.append(.init(
-                    image: slice, sourceTop: 0, sourceHeight: slice.height))
+            var index = k
+            while index >= 0 {
+                let height = topSlicePrefixRows[index]
+                    - (index > 0 ? topSlicePrefixRows[index - 1] : 0)
+                let start = topRegionStart
+                    + (topTotal - topSlicePrefixRows[index])
+                if start >= range.upperBound { break }
+                maybe(start, height) {
+                    .init(image: self.topSlices[index], sourceTop: 0,
+                          sourceHeight: height)
+                }
+                index -= 1
             }
         }
-        if trimApplies {
-            refs.append(.init(
-                image: first, sourceTop: effectiveHeaderRows,
-                sourceHeight: first.height
-                    - effectiveHeaderRows - effectiveFooterRows))
-        } else {
-            refs.append(.init(
-                image: first, sourceTop: 0, sourceHeight: first.height))
+        let bodyStart = topRegionStart + topTotal
+        maybe(bodyStart, geometry.bodyRows) {
+            .init(image: first, sourceTop: geometry.bodySourceTop,
+                  sourceHeight: geometry.bodyRows)
         }
-        for slice in slices.dropFirst() {
-            refs.append(.init(
-                image: slice, sourceTop: 0, sourceHeight: slice.height))
+        let tailStart = bodyStart + geometry.bodyRows
+        let tailCount = slices.count - 1
+        if tailCount > 0, tailStart < range.upperBound,
+           tailStart + geometry.tailRows > range.lowerBound {
+            let localStart = max(0, range.lowerBound - tailStart)
+            // smallest i with prefix[i] > localStart
+            var lo = 0, hi = tailCount - 1, i = tailCount - 1
+            while lo <= hi {
+                let mid = (lo + hi) / 2
+                if tailSlicePrefixRows[mid] > localStart {
+                    i = mid; hi = mid - 1
+                } else {
+                    lo = mid + 1
+                }
+            }
+            while i < tailCount {
+                let height = tailSlicePrefixRows[i]
+                    - (i > 0 ? tailSlicePrefixRows[i - 1] : 0)
+                let start = tailStart
+                    + (i > 0 ? tailSlicePrefixRows[i - 1] : 0)
+                if start >= range.upperBound { break }
+                maybe(start, height) {
+                    .init(image: self.slices[i + 1], sourceTop: 0,
+                          sourceHeight: height)
+                }
+                i += 1
+            }
         }
-        if trimApplies, effectiveFooterRows > 0 {
-            refs.append(.init(
-                image: lastFrame,
-                sourceTop: lastFrame.height - effectiveFooterRows,
-                sourceHeight: effectiveFooterRows))
+        maybe(tailStart + geometry.tailRows, geometry.footerRows) {
+            .init(image: self.lastFrame,
+                  sourceTop: geometry.footerSourceTop,
+                  sourceHeight: geometry.footerRows)
         }
-        return refs
+        return out
     }
 
     fileprivate func composedParts(

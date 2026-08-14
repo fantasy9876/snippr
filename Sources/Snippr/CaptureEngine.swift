@@ -2,6 +2,7 @@ import AppKit
 import CoreImage
 import CoreMedia
 import ScreenCaptureKit
+import os
 
 enum CaptureError: Error {
     case noDisplay
@@ -568,9 +569,23 @@ extension CGRect {
 }
 
 /// Test spy: the live-preview refresh path must never copy pixel buffers.
-/// Self-tests snapshot this counter around preview calls.
+/// Self-tests snapshot these counters around preview calls. Lock-protected:
+/// `materialized()` also runs off the main actor in production, and an
+/// unsynchronized read-modify-write would be a data race (the lock costs
+/// nothing next to the pixel copy it counts).
 enum MaterializeSpy {
-    nonisolated(unsafe) static var count = 0
+    private static let state = OSAllocatedUnfairLock(initialState: 0)
+    static var count: Int { state.withLock { $0 } }
+    static func increment() { state.withLock { $0 += 1 } }
+}
+
+/// Test spy counting SOURCE-width canvas allocations (the separator raster).
+/// After the per-session cache is warm, a preview refresh must not create
+/// another one.
+enum SourceCanvasSpy {
+    private static let state = OSAllocatedUnfairLock(initialState: 0)
+    static var count: Int { state.withLock { $0 } }
+    static func increment() { state.withLock { $0 += 1 } }
 }
 
 extension CGImage {
@@ -581,7 +596,7 @@ extension CGImage {
     /// The copy keeps the source's RGB color space — forcing sRGB here would
     /// clamp Display P3 screenshots and visibly desaturate area shots.
     func materialized() -> CGImage? {
-        MaterializeSpy.count += 1
+        MaterializeSpy.increment()
         let space = (colorSpace?.model == .rgb ? colorSpace : nil)
             ?? CGColorSpace(name: CGColorSpace.sRGB)!
         guard let ctx = CGContext(

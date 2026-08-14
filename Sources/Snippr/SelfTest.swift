@@ -641,10 +641,14 @@ enum SelfTest {
                     return
                 }
                 let session = ScrollingCapture(onFinish: { _ in })
+                session.startPreviewForTesting(with: first)
                 let segmented = SegmentedVerticalStitcher(first: first)
                 var prepends = 0
                 var appends = 0
                 var previewSpyClean = true
+                var pinnedAfterPrepend = false
+                var firstAppendAfterFlipRebuilt = false
+                var awaitingFlipBack = false
                 for off in path.dropFirst() {
                     guard let frame = doc.cropping(to: CGRect(
                         x: 0, y: off, width: 400, height: vp)) else {
@@ -665,12 +669,34 @@ enum SelfTest {
                         || MaterializeSpy.count != materializesBefore {
                         previewSpyClean = false
                     }
+                    if case .prepended = outcome {
+                        pinnedAfterPrepend = session.previewPinnedTop
+                        awaitingFlipBack = true
+                    } else if case .appended = outcome, awaitingFlipBack {
+                        // The FIRST appended frame after an upward phase must
+                        // rebuild the bottom-anchored window immediately —
+                        // this is the branch a nil preview view used to skip.
+                        awaitingFlipBack = false
+                        if let preview = session.previewImageForTesting,
+                           let want = segmented.previewWindowImage(
+                            targetWidth: 400, maxHeight: 1400,
+                            anchor: .bottom) {
+                            firstAppendAfterFlipRebuilt =
+                                !session.previewPinnedTop
+                                && imagesEqual(want, preview)
+                        }
+                    }
                 }
                 check("stitch-flip-production-outcomes",
                       prepends == 1 && appends == 3,
                       "prepends \(prepends), appends \(appends)")
                 check("stitch-flip-production-spy-clean", previewSpyClean,
                       "preview dispatch performed a full compose or materialize")
+                check("stitch-flip-production-pinned-state", pinnedAfterPrepend,
+                      "previewPinnedTop not set by the prepend rebuild")
+                check("stitch-flip-production-first-append-rebuilds",
+                      firstAppendAfterFlipRebuilt,
+                      "first append after up-phase did not rebuild bottom window")
                 if let preview = session.previewImageForTesting,
                    let want = segmented.previewWindowImage(
                     targetWidth: 400, maxHeight: 1400, anchor: .bottom) {
@@ -680,6 +706,141 @@ enum SelfTest {
                 } else {
                     check("stitch-flip-production-preview", false)
                 }
+            }
+        }
+
+        // 2b-preview-parity. Incremental and rebuilt previews agree ----------------
+        // Incremental strip heights use the same cumulative floor as the
+        // rebuilt window. At 5120→400 with 500 + 4×30 source rows, per-slice
+        // floors summed to 47 while the rebuild showed 48 — a visible jump on
+        // every flip.
+        do {
+            let doc = makeStripePattern(width: 5120, height: 700, seed: 0x0F10_0AA1)
+            let vp = 500
+            let path = [0, 30, 60, 90, 120]
+            MainActor.assumeIsolated {
+                guard let first = doc.cropping(to: CGRect(
+                    x: 0, y: path[0], width: 5120, height: vp)) else {
+                    check("stitch-preview-parity-crop", false)
+                    return
+                }
+                let session = ScrollingCapture(onFinish: { _ in })
+                session.startPreviewForTesting(with: first)
+                let segmented = SegmentedVerticalStitcher(first: first)
+                var appends = 0
+                for off in path.dropFirst() {
+                    guard let frame = doc.cropping(to: CGRect(
+                        x: 0, y: off, width: 5120, height: vp)) else {
+                        check("stitch-preview-parity-crop", false)
+                        return
+                    }
+                    let outcome = segmented.append(frame)
+                    if case .appended = outcome { appends += 1 }
+                    session.applyStitchOutcome(
+                        outcome, stitcher: segmented, stopHint: "test")
+                }
+                let wantRows = Int(CGFloat(620) * 400.0 / 5120.0)
+                let incremental = session.previewImageForTesting?.height ?? -1
+                let rebuilt = segmented.previewWindowImage(
+                    targetWidth: 400, maxHeight: 1400, anchor: .bottom)?
+                    .height ?? -2
+                check("stitch-preview-parity",
+                      appends == 4 && incremental == wantRows
+                        && rebuilt == wantRows,
+                      "appends \(appends), incremental \(incremental), "
+                      + "rebuilt \(rebuilt), want \(wantRows)")
+            }
+        }
+
+        // 2b-window-gap-marker-wide. 5K + gap + prepend: marker survives, no
+        // source-width canvas after the cache warms, no materialize/compose.
+        do {
+            let gW = 5120, gViewport = 800
+            // Blue-only stripes so the ORANGE gap marker is unmistakable in
+            // the scaled output — the gate detects real marker pixels, not
+            // just a nonzero destination height.
+            func blueStripes(width: Int, height: Int, seed: UInt64) -> CGImage {
+                let c = ctx(width, height)
+                var seed = seed
+                for y in 0..<height {
+                    seed = seed &* 6364136223846793005 &+ 1442695040888963407
+                    let b = 0.25 + 0.75 * CGFloat((seed >> 33) & 0xFF) / 255
+                    c.setFillColor(CGColor(
+                        srgbRed: 0.05, green: 0.08, blue: b, alpha: 1))
+                    c.fill(CGRect(x: 0, y: y, width: width, height: 1))
+                }
+                return c.makeImage()!
+            }
+            let doc = blueStripes(width: gW, height: 4000, seed: 0x5EA9_A9B1)
+            let path = [0, 600, 2400, 2600, 2800, 3000, 2500, 2000]
+            if let first = doc.cropping(to: CGRect(
+                x: 0, y: path[0], width: gW, height: gViewport)) {
+                let segmented = SegmentedVerticalStitcher(first: first)
+                var sawSegment = false
+                var sawPrepend = false
+                for off in path.dropFirst() {
+                    guard let frame = doc.cropping(to: CGRect(
+                        x: 0, y: off, width: gW, height: gViewport)) else {
+                        check("stitch-window-gap-wide-crop", false); break
+                    }
+                    switch segmented.append(frame) {
+                    case .startedSegment: sawSegment = true
+                    case .prepended: sawPrepend = true
+                    default: break
+                    }
+                }
+                check("stitch-window-gap-wide-fixture",
+                      sawSegment && sawPrepend && segmented.segmentCount == 2,
+                      "segment \(sawSegment) prepend \(sawPrepend) count \(segmented.segmentCount)")
+                // Warm call may build the cached separator once; afterwards
+                // repeated refreshes must allocate NOTHING at source width.
+                let warm = segmented.previewWindowImage(
+                    targetWidth: 400, maxHeight: 1400, anchor: .currentTop)
+                let canvasesAfterWarm = SourceCanvasSpy.count
+                let materializesAfterWarm = MaterializeSpy.count
+                let composesAfterWarm = segmented.fullComposeCount
+                let window = segmented.previewWindowImage(
+                    targetWidth: 400, maxHeight: 1400, anchor: .currentTop)
+                _ = segmented.previewWindowImage(
+                    targetWidth: 400, maxHeight: 1400, anchor: .bottom)
+                check("stitch-window-gap-wide-no-source-canvas",
+                      warm != nil
+                        && SourceCanvasSpy.count == canvasesAfterWarm
+                        && MaterializeSpy.count == materializesAfterWarm
+                        && segmented.fullComposeCount == composesAfterWarm,
+                      "canvases +\(SourceCanvasSpy.count - canvasesAfterWarm), "
+                      + "materializes +\(MaterializeSpy.count - materializesAfterWarm), "
+                      + "composes +\(segmented.fullComposeCount - composesAfterWarm)")
+                if let window {
+                    var markerFound = false
+                    var bytes = [UInt8](
+                        repeating: 0, count: window.width * window.height * 4)
+                    if let c = CGContext(
+                        data: &bytes, width: window.width, height: window.height,
+                        bitsPerComponent: 8, bytesPerRow: window.width * 4,
+                        space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) {
+                        c.interpolationQuality = .none
+                        c.draw(window, in: CGRect(
+                            x: 0, y: 0,
+                            width: window.width, height: window.height))
+                        for i in stride(from: 0, to: bytes.count, by: 4) {
+                            let r = Int(bytes[i]), g = Int(bytes[i + 1])
+                            let b = Int(bytes[i + 2])
+                            // orange marker: strong red, moderate green, low blue
+                            if r > 120, g > 40, b < 80, r > b * 2 {
+                                markerFound = true
+                                break
+                            }
+                        }
+                    }
+                    check("stitch-window-gap-wide-marker-visible", markerFound,
+                          "gap marker pixels absent from scaled 5K window")
+                } else {
+                    check("stitch-window-gap-wide-render", false)
+                }
+            } else {
+                check("stitch-window-gap-wide-crop", false)
             }
         }
 
@@ -741,8 +902,8 @@ enum SelfTest {
                     x: 0, y: sViewport - cardTop - 125,
                     width: sW, height: 125))
                 c.draw(content, in: CGRect(
-                    x: 0, y: sViewport - contentTop - 100,
-                    width: sW, height: 100))
+                    x: 0, y: sViewport - contentTop - content.height,
+                    width: sW, height: content.height))
                 return c.makeImage()
             }
             // Claimed offset 100: cards align (a[375..500) ↔ b[275..400)) and
@@ -785,15 +946,20 @@ enum SelfTest {
                 check("stitch-sparse-solid-card-frames", false)
             }
 
-            // Liveness: a TRUE sparse overlap with a modest animated band
-            // (video/ad ~60 of 400 overlap rows) must still stitch — tier 2
-            // of the quorum absorbs it. Frames share the detailed block and
-            // the whitespace; only the animated band differs between shots.
+            // Fail-closed liveness decision (team-locked): from two frames an
+            // animated band is indistinguishable from genuinely different
+            // content next to a duplicated card, so a TRUE sparse overlap
+            // with an 80-row animated band REJECTS rather than risking
+            // silent row loss. (80 rows, not 60: anti-aliased block edges
+            // contribute a handful of extra matching votes, and 60 sat at a
+            // brittle 71% — the fixture must sit clearly below the 70%
+            // quorum.) A page with a large animation re-anchors with a
+            // visible marker instead.
             func liveFrame(
                 anim: CGImage, extra: CGImage?, offset: Int
             ) -> CGImage? {
                 // document: detail block at doc[475..600); animated band at
-                // doc[250..310) (inside the 400-row overlap of both shots);
+                // doc[250..330) (inside the 400-row overlap of both shots);
                 // extra content at doc[600..700) (revealed by the scroll);
                 // white elsewhere. Frame shows doc[offset..offset+500).
                 let c = ctx(sW, sViewport)
@@ -807,27 +973,48 @@ enum SelfTest {
                         width: sW, height: image.height))
                 }
                 place(cardSrc, docTop: 475)      // shared detail (125 rows)
-                place(anim, docTop: 250)         // animated band (60 rows)
+                place(anim, docTop: 250)         // animated band (80 rows)
                 if let extra { place(extra, docTop: 600) }
                 return c.makeImage()
             }
-            let animFrame1 = makeStripePattern(width: sW, height: 60, seed: 0x0A11_0001)
-            let animFrame2 = makeStripePattern(width: sW, height: 60, seed: 0x0A11_0002)
+            let animFrame1 = makeStripePattern(width: sW, height: 80, seed: 0x0A11_0001)
+            let animFrame2 = makeStripePattern(width: sW, height: 80, seed: 0x0A11_0002)
             let extraContent = makeStripePattern(width: sW, height: 100, seed: 0x0E17_0000)
             if let a = liveFrame(anim: animFrame1, extra: nil, offset: 100),
                let b = liveFrame(anim: animFrame2, extra: extraContent, offset: 200) {
                 let down = VerticalStitcher(first: a)
                 let downResult = down.append(b)
-                check("stitch-sparse-animated-band-appends",
-                      downResult == .appended(rows: 100),
+                check("stitch-sparse-animated-band-rejected",
+                      downResult == .rejected,
                       "sparse page with animated band got \(downResult) (down)")
                 let up = VerticalStitcher(first: b)
                 let upResult = up.append(a)
-                check("stitch-sparse-animated-band-prepends",
-                      upResult == .prepended(rows: 100),
+                check("stitch-sparse-animated-band-reversed-rejected",
+                      upResult == .rejected,
                       "sparse page with animated band got \(upResult) (up)")
             } else {
                 check("stitch-sparse-animated-frames", false)
+            }
+
+            // The case that killed the escape hatch: an 80-row block of REAL
+            // differing content next to the repeated 125-row card satisfied
+            // "majority match + disagreement ≤ 20% of overlap" and was
+            // silently swallowed. Must reject in both directions.
+            let content80A = makeStripePattern(width: sW, height: 80, seed: 0x0C8A_0001)
+            let content80B = makeStripePattern(width: sW, height: 80, seed: 0x0C8B_0002)
+            if let a = sparseFrame(card: 375, content: content80A, contentTop: 120),
+               let b = sparseFrame(card: 275, content: content80B, contentTop: 20) {
+                let down = VerticalStitcher(first: a)
+                let downResult = down.append(b)
+                check("stitch-sparse-card-d80-rejected", downResult == .rejected,
+                      "80-row real-content page got \(downResult) (a→b)")
+                let up = VerticalStitcher(first: b)
+                let upResult = up.append(a)
+                check("stitch-sparse-card-d80-reversed-rejected",
+                      upResult == .rejected,
+                      "80-row real-content page got \(upResult) (b→a)")
+            } else {
+                check("stitch-sparse-card-d80-frames", false)
             }
         }
 
