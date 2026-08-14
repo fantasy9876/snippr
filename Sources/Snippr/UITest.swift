@@ -141,16 +141,26 @@ enum UITest {
             let editorsBefore = NSApp.windows
                 .filter { $0.windowController is EditorWindowController }.count
             var panelEditorPresents = 0
+            var panelDepsToastCounter: () -> Void = {}
+            var panelDepsCopyCounter: () -> Void = {}
+            var panelDepsSaveHold = false
+            var panelHeldSaveResolution: (@MainActor (SaveAsOutcome) -> Void)?
             let panelDeps = CaptureActionRouter.Dependencies(
-                copyToClipboard: { _ in },
+                copyToClipboard: { _ in panelDepsCopyCounter() },
                 autoSave: { _, _ in },
-                saveAs: { _, _ in },
+                saveAs: { _, done in
+                    if panelDepsSaveHold {
+                        panelHeldSaveResolution = done
+                    } else {
+                        done(.cancelled)
+                    }
+                },
                 pin: { _ in }, ocr: { _ in },
                 openEditor: { image in
                     panelEditorPresents += 1
                     EditorWindowController.open(with: image)
                 },
-                toast: { _ in },
+                toast: { _ in panelDepsToastCounter() },
                 setLastCapture: { _ in },
                 setLastAreaRect: { _ in },
                 logEvent: { _ in })
@@ -234,6 +244,44 @@ enum UITest {
             } else {
                 panelAnnotated = false
             }
+            // Panel force-fail export: 0 actions, panel STAYS, one toast.
+            var panelFailOK = false
+            panel.annotationSurface.forceRenderFailureForTesting = true
+            var failToasts = 0
+            var failCopies = 0
+            panelDepsToastCounter = { failToasts += 1 }
+            panelDepsCopyCounter = { failCopies += 1 }
+            panel.performActionForTesting(.copy)
+            panelFailOK = failCopies == 0 && failToasts == 1
+                && ScrollResultPanel.current === panel
+            panel.annotationSurface.forceRenderFailureForTesting = false
+
+            // Panel save-lock with REAL events: drags + Cmd-Z during an
+            // in-flight save leave the annotation count unchanged; drawing
+            // resumes after cancel.
+            var panelSaveLockOK = false
+            let annBefore = panel.annotationSurface.annotations.count
+            panelDepsSaveHold = true
+            panel.performActionForTesting(.save)
+            panel.drawWithRealEventsForTesting(
+                fromView: CGPoint(x: 10, y: 10),
+                toView: CGPoint(x: 30, y: 30))
+            if let cmdZ = NSEvent.keyEvent(
+                with: .keyDown, location: .zero, modifierFlags: [.command],
+                timestamp: 0, windowNumber: panel.windowNumber, context: nil,
+                characters: "z", charactersIgnoringModifiers: "z",
+                isARepeat: false, keyCode: 6) {
+                _ = panel.performKeyEquivalent(with: cmdZ)
+            }
+            let lockedInvariant =
+                panel.annotationSurface.annotations.count == annBefore
+            panelHeldSaveResolution?(.cancelled)
+            panel.drawWithRealEventsForTesting(
+                fromView: CGPoint(x: 12, y: 40),
+                toView: CGPoint(x: 40, y: 60))
+            panelSaveLockOK = lockedInvariant
+                && panel.annotationSurface.annotations.count == annBefore + 1
+
             panel.performActionForTesting(.openEditor)
             let editorsAfter = NSApp.windows
                 .filter { $0.windowController is EditorWindowController }.count
@@ -241,7 +289,7 @@ enum UITest {
                 && ScrollResultPanel.current == nil
                 && editorsAfter == editorsBefore + 1
                 && panelEditorPresents == 1
-                && panelAnnotated
+                && panelAnnotated && panelFailOK && panelSaveLockOK
         }
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {

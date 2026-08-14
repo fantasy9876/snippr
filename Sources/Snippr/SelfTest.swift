@@ -4331,20 +4331,85 @@ enum SelfTest {
             let annotationsBeforeSave = surface6.annotations.count
             surface6.tool = .select
             view.performReviewActionForTesting(.save)
-            // save in flight: undo (via the guarded path) and new drags must
-            // leave the annotation set untouched
+            // Save in flight: REAL mouse drags with a drawing tool and a
+            // REAL Cmd-Z must leave the annotation set untouched. (Removing
+            // either production guard turns this gate red.)
             surface6.tool = .pen
-            _ = surface6.beginDrag // (not called: production input is gated
-                                   //  by isSaving in mouseDown — verified in
-                                   //  slice-2 gates; here we check undo)
+            @MainActor func mouse(
+                _ type: NSEvent.EventType, _ p: CGPoint, clicks: Int = 1
+            ) -> NSEvent? {
+                NSEvent.mouseEvent(
+                    with: type, location: p, modifierFlags: [],
+                    timestamp: 0, windowNumber: 0, context: nil,
+                    eventNumber: 0, clickCount: clicks, pressure: 1)
+            }
+            let inside = CGPoint(x: 120, y: 120)
+            if let down = mouse(.leftMouseDown, inside) { view.mouseDown(with: down) }
+            if let drag = mouse(.leftMouseDragged, CGPoint(x: 160, y: 160)) {
+                view.mouseDragged(with: drag)
+            }
+            if let up = mouse(.leftMouseUp, CGPoint(x: 160, y: 160)) {
+                view.mouseUp(with: up)
+            }
+            if let cmdZ = NSEvent.keyEvent(
+                with: .keyDown, location: .zero, modifierFlags: [.command],
+                timestamp: 0, windowNumber: 0, context: nil,
+                characters: "z", charactersIgnoringModifiers: "z",
+                isARepeat: false, keyCode: 6) {
+                _ = view.performKeyEquivalent(with: cmdZ)
+            }
             let undoDuringSave = overlay.session.phase == .saving
                 && view.annotationSurface?.annotations.count == annotationsBeforeSave
             spy.saveDone?(.cancelled)
             let backToReview = overlay.session.phase == .reviewing
                 && surface6.annotations.count == annotationsBeforeSave
+            // and after cancel, drawing works again through the same events
+            if let down = mouse(.leftMouseDown, inside) { view.mouseDown(with: down) }
+            if let drag = mouse(.leftMouseDragged, CGPoint(x: 170, y: 150)) {
+                view.mouseDragged(with: drag)
+            }
+            if let up = mouse(.leftMouseUp, CGPoint(x: 170, y: 150)) {
+                view.mouseUp(with: up)
+            }
+            let drawsAfterCancel =
+                surface6.annotations.count == annotationsBeforeSave + 1
             check("overlay6-save-lock-annotations",
-                  undoDuringSave && backToReview,
-                  "during \(undoDuringSave) after \(backToReview) count \(surface6.annotations.count)")
+                  undoDuringSave && backToReview && drawsAfterCancel,
+                  "during \(undoDuringSave) after \(backToReview) redraw \(drawsAfterCancel) count \(surface6.annotations.count)")
+
+            // Area flatten failure: 0 actions, 1 toast, review + drawings
+            // intact (fail-closed parity with the panel).
+            let spyF = Spy6()
+            var failToasts = 0
+            let overlayF = SelectionOverlay(
+                purpose: .areaReview,
+                inputs: OverlaySessionInputs(
+                    afterShow: true, afterCopy: false, afterSave: false),
+                completion: { _ in spyF.completions += 1 })
+            overlayF.routerDependenciesOverride = CaptureActionRouter.Dependencies(
+                copyToClipboard: { _ in spyF.copies += 1 },
+                autoSave: { _, _ in }, saveAs: { _, _ in },
+                pin: { _ in }, ocr: { _ in }, openEditor: { _ in },
+                toast: { _ in failToasts += 1 },
+                setLastCapture: { _ in },
+                setLastAreaRect: { _ in }, logEvent: { _ in })
+            let viewF = SelectionOverlayView(
+                mode: .area, screen: screen, frozen: frozenImage,
+                windowList: [], owner: overlayF)
+            viewF.selectForTesting(rect: CGRect(x: 60, y: 60, width: 240, height: 180))
+            viewF.annotationSurface?.tool = .rect
+            _ = viewF.annotationSurface?.beginDrag(atPixel: CGPoint(x: 100, y: 100))
+            viewF.annotationSurface?.continueDrag(toPixel: CGPoint(x: 180, y: 160))
+            viewF.annotationSurface?.endDrag()
+            viewF.annotationSurface?.tool = .select
+            viewF.annotationSurface?.forceRenderFailureForTesting = true
+            let annotationsBeforeFail = viewF.annotationSurface?.annotations.count ?? -1
+            viewF.performReviewActionForTesting(.copy)
+            check("overlay6-area-flatten-fail-closed",
+                  spyF.copies == 0 && spyF.completions == 0 && failToasts == 1
+                    && overlayF.session.phase == .reviewing
+                    && viewF.annotationSurface?.annotations.count == annotationsBeforeFail,
+                  "copies \(spyF.copies) toasts \(failToasts) phase \(overlayF.session.phase)")
 
             // double-click terminal wins over EVERY drawing tool
             var toolsOK = true

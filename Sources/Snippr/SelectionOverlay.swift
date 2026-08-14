@@ -555,7 +555,16 @@ final class SelectionOverlayView: NSView {
               frozen != nil
         else { return }
         syncSessionPixelRect()
-        guard let snapshot = snapshotFromSessionPixelRect() else { return }
+        guard let snapshot = snapshotFromSessionPixelRect() else {
+            // fail-closed like the panel: keep review + drawings, tell the
+            // user, run NO action
+            if let toast = owner.routerDependenciesOverride?.toast {
+                toast("Không xuất được ảnh có nét vẽ — thử lại")
+            } else {
+                ToastHUD.show("Không xuất được ảnh có nét vẽ — thử lại")
+            }
+            return
+        }
         let global = globalRect(for: selection)
         let inputs = owner.session.inputs
 
