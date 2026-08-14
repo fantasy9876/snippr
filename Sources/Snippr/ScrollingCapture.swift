@@ -11,7 +11,12 @@ final class ScrollingCapture {
 
     static let escHotkeyID: UInt32 = 999
 
-    private let onFinish: @MainActor (CapturedImage?) -> Void
+    private let onFinish: @MainActor (ScrollFinish) -> Void
+    /// Snapshotted at begin(): a Settings change while the user scrolls must
+    /// not change the finish-time auto actions or the panel's display.
+    private let sessionInputs: OverlaySessionInputs
+    private var originScreen: NSScreen?
+    private var finalized = false
     nonisolated(unsafe) private var finished = false
     private var borderWindow: NSWindow?
     private var controlPanel: NSPanel?
@@ -48,15 +53,24 @@ final class ScrollingCapture {
     /// "✓ / Esc để xong" khi Esc đăng ký được, nếu không thì chỉ còn nút ✓.
     private var stopHint: String { escRegistered ? "✓ / Esc để xong" : "bấm ✓ để xong" }
 
-    init(onFinish: @escaping @MainActor (CapturedImage?) -> Void) {
+    init(
+        inputs: OverlaySessionInputs? = nil,
+        onFinish: @escaping @MainActor (ScrollFinish) -> Void
+    ) {
+        self.sessionInputs = inputs ?? .snapshot()
         self.onFinish = onFinish
     }
 
-    static func begin(onFinish: @escaping @MainActor (CapturedImage?) -> Void) {
+    static func begin(onFinish: @escaping @MainActor (ScrollFinish) -> Void) {
         guard active == nil else { return }
+        // Snapshot BEFORE the picker: the whole session (picker, scrolling,
+        // finish routing) behaves per the settings at invocation time.
+        let inputs = OverlaySessionInputs.snapshot()
         SelectionOverlay.begin(purpose: .scrollRegion) { result in
             guard case let .area(screen, _, rect) = result else {
-                onFinish(nil)
+                onFinish(ScrollFinish(
+                    image: nil, inputs: inputs,
+                    screen: NSScreen.main ?? NSScreen.screens[0]))
                 return
             }
             // Too-short selections can never stitch (the matcher needs enough
@@ -64,10 +78,10 @@ final class ScrollingCapture {
             guard rect.width >= 40, rect.height >= 60 else {
                 ToastHUD.show("Vùng quá nhỏ cho chụp cuộn — chọn vùng cao hơn 60 pt",
                               symbol: "rectangle.dashed")
-                onFinish(nil)
+                onFinish(ScrollFinish(image: nil, inputs: inputs, screen: screen))
                 return
             }
-            let session = ScrollingCapture(onFinish: onFinish)
+            let session = ScrollingCapture(inputs: inputs, onFinish: onFinish)
             active = session
             Task { @MainActor in
                 await session.run(screen: screen, rect: rect)
@@ -75,13 +89,36 @@ final class ScrollingCapture {
         }
     }
 
+    /// Cleanup FIRST, then the callback, exactly once: the result panel must
+    /// present only after the chrome/stop handler are gone and `active` is
+    /// cleared — the .screenSaver-level chrome would otherwise cover it, and
+    /// a callback observing a live session could re-enter it.
+    @MainActor
+    private func finalizeSession(image: CapturedImage?) {
+        guard !finalized else { return }
+        finalized = true
+        removeStop()
+        hideChrome()
+        if ScrollingCapture.active === self { ScrollingCapture.active = nil }
+        onFinish(ScrollFinish(
+            image: image, inputs: sessionInputs,
+            screen: originScreen ?? NSScreen.main ?? NSScreen.screens[0]))
+    }
+
+    func finalizeForTesting(image: CapturedImage?) {
+        finalizeSession(image: image)
+    }
+
     func run(screen: NSScreen, rect: CGRect) async {
+        originScreen = screen
         showChrome(screen: screen, rect: rect)
         installStop()
         defer {
+            // safety net only — finalizeSession is the real teardown and has
+            // already run on every exit path; these are idempotent
             removeStop()
             hideChrome()
-            ScrollingCapture.active = nil
+            if ScrollingCapture.active === self { ScrollingCapture.active = nil }
         }
 
         // our chrome windows just appeared — refresh the window list once so
@@ -92,7 +129,7 @@ final class ScrollingCapture {
         guard let captureRegion = CanonicalCaptureRegion(
             screenSize: screen.frame.size, viewRect: rect, scale: scale)
         else {
-            onFinish(nil)
+            finalizeSession(image: nil)
             return
         }
         // The setting is a page-length cap in points, so both platforms cap the
@@ -219,7 +256,7 @@ final class ScrollingCapture {
         }
 
         let result = stitcher?.compose().map { CapturedImage(cgImage: $0, scale: scale) }
-        onFinish(result)
+        finalizeSession(image: result)
     }
 
     /// Captures ONLY the selected rect (SCStreamConfiguration.sourceRect), so a

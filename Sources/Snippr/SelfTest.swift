@@ -3780,6 +3780,77 @@ enum SelfTest {
                   "editors \(t.editors)")
         }
 
+        // 10. Overlay slice 3: scroll finish payload + teardown order --------------
+        MainActor.assumeIsolated {
+            // finalize: cleanup BEFORE callback, exactly once, payload
+            // carries the snapshotted inputs + origin screen.
+            let inputs = OverlaySessionInputs(
+                afterShow: true, afterCopy: true, afterSave: false)
+            var callbacks = 0
+            var activeAtCall: ScrollingCapture?
+            var payloadInputs: OverlaySessionInputs?
+            let session = ScrollingCapture(inputs: inputs, onFinish: { finish in
+                callbacks += 1
+                activeAtCall = ScrollingCapture.active
+                payloadInputs = finish.inputs
+            })
+            ScrollingCapture.active = session
+            session.finalizeForTesting(image: nil)
+            session.finalizeForTesting(image: nil) // double: must be one-shot
+            check("overlay3-finalize-order",
+                  callbacks == 1 && activeAtCall == nil
+                    && payloadInputs == inputs
+                    && ScrollingCapture.active == nil
+                    && session.previewPanelForTesting == nil,
+                  "callbacks \(callbacks), active \(String(describing: activeAtCall)), inputs \(String(describing: payloadInputs))")
+
+            // presenter headless: scrollFinished auto exactly once, no panel.
+            let img = CapturedImage(
+                cgImage: makeSolidImage(
+                    width: 12, height: 12, color: NSColor.systemBlue.cgColor),
+                scale: 1)
+            var copies = 0
+            var toasts = 0
+            var rects = 0
+            let deps = CaptureActionRouter.Dependencies(
+                copyToClipboard: { _ in copies += 1 },
+                autoSave: { _, _ in },
+                saveAs: { _, _ in },
+                pin: { _ in }, ocr: { _ in }, openEditor: { _ in },
+                toast: { _ in toasts += 1 },
+                setLastCapture: { _ in },
+                setLastAreaRect: { _ in rects += 1 },
+                logEvent: { _ in })
+            let screen = NSScreen.main ?? NSScreen.screens.first
+            if let screen {
+                ScrollResultPresenter.present(
+                    ScrollFinish(
+                        image: img,
+                        inputs: OverlaySessionInputs(
+                            afterShow: false, afterCopy: true, afterSave: false),
+                        screen: screen),
+                    dependencies: deps)
+            }
+            check("overlay3-presenter-headless",
+                  screen == nil || (copies == 1 && toasts == 1 && rects == 0
+                    && ScrollResultPanel.current == nil),
+                  "copies \(copies) toasts \(toasts) rects \(rects) panel \(String(describing: ScrollResultPanel.current))")
+
+            // nil image: nothing runs, nothing presents.
+            if let screen {
+                ScrollResultPresenter.present(
+                    ScrollFinish(
+                        image: nil,
+                        inputs: OverlaySessionInputs(
+                            afterShow: true, afterCopy: true, afterSave: false),
+                        screen: screen),
+                    dependencies: deps)
+            }
+            check("overlay3-presenter-nil-image",
+                  copies <= 1 && ScrollResultPanel.current == nil,
+                  "copies \(copies)")
+        }
+
         print(failures == 0 ? "ALL TESTS PASSED" : "\(failures) TEST(S) FAILED")
         print("Artifacts: \(outputDir)")
         return failures == 0 ? 0 : 1

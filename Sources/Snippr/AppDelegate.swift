@@ -441,9 +441,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func startScrolling() {
-        ScrollingCapture.begin { [weak self] image in
-            guard let image else { return }
-            self?.handleResult(image, source: .scrolling)
+        // Scroll-end routes through the in-place result presenter — never
+        // handleResult: the router runs the auto actions exactly once with
+        // the inputs snapshotted at begin, and the borderless panel replaces
+        // the titled editor (QA invariants 13–15).
+        ScrollingCapture.begin { finish in
+            ScrollResultPresenter.present(finish)
         }
     }
 

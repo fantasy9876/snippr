@@ -81,6 +81,32 @@ enum UITest {
             }
         }
 
+        // Scroll-result panel factory case: 24k-pt stitch fits ≤90% of the
+        // visible frame, toolbar visible, escape hatch presents exactly one
+        // editor AFTER the panel dismissed.
+        var scrollPanelOK = false
+        if let screen = NSScreen.main {
+            let tallStitch = CapturedImage(
+                cgImage: SelfTest.makeTestImage(width: 400, height: 24_000), scale: 2)
+            let editorsBefore = NSApp.windows
+                .filter { $0.windowController is EditorWindowController }.count
+            let panel = ScrollResultPanel.show(
+                image: tallStitch,
+                inputs: OverlaySessionInputs(
+                    afterShow: true, afterCopy: false, afterSave: false),
+                screen: screen)
+            let visible = screen.visibleFrame
+            let fits = panel.frame.width <= visible.width * 0.9 + 1
+                && panel.frame.height <= visible.height * 0.9 + 1
+            let toolbarVisible = panel.toolbarFrameForTesting != nil
+            panel.performActionForTesting(.openEditor)
+            let editorsAfter = NSApp.windows
+                .filter { $0.windowController is EditorWindowController }.count
+            scrollPanelOK = fits && toolbarVisible
+                && ScrollResultPanel.current == nil
+                && editorsAfter == editorsBefore + 1
+        }
+
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
             let fitOK = fittedEditor.imageFitsViewportForTesting()
                 && smallEditor.imageFitsViewportForTesting()
@@ -89,6 +115,7 @@ enum UITest {
             print("UITEST editor-fit \(fitOK ? "PASS" : "FAIL")")
             print("UITEST tall-crop-controls \(tallCropControlsOK ? "PASS" : "FAIL")")
             print("UITEST overlay-review \(overlayReviewOK ? "PASS" : "FAIL")")
+            print("UITEST scroll-panel \(scrollPanelOK ? "PASS" : "FAIL")")
             var index = 0
             for window in NSApp.windows where window.isVisible {
                 guard let view = window.contentView, view.bounds.width > 10 else { continue }
@@ -101,7 +128,8 @@ enum UITest {
                 index += 1
             }
             print("UITEST captured \(index) windows → \(outDir)")
-            exit(index >= 3 && fitOK && tallCropControlsOK && overlayReviewOK ? 0 : 1)
+            exit(index >= 3 && fitOK && tallCropControlsOK && overlayReviewOK
+                 && scrollPanelOK ? 0 : 1)
         }
     }
 }

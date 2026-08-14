@@ -120,6 +120,16 @@ final class OverlaySession {
     var acceptsCommits: Bool { phase == .reviewing }
 }
 
+/// Everything the scroll-finish routing needs, snapshotted at begin():
+/// the stitched image, the behavior inputs, and the ORIGIN screen — a
+/// Settings change or display-focus change mid-run must not reroute the
+/// result (locked API, plan §Gợi ý API).
+struct ScrollFinish {
+    var image: CapturedImage?
+    var inputs: OverlaySessionInputs
+    var screen: NSScreen
+}
+
 // MARK: - Action router
 
 enum CaptureIntent: Equatable {

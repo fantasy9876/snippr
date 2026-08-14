@@ -113,8 +113,8 @@ enum Benchmark {
             try? await Task.sleep(nanoseconds: 800_000_000)
             let screen = NSScreen.main ?? NSScreen.screens[0]
             let rect = CGRect(x: 120, y: screen.frame.height - 620, width: 420, height: 340)
-            let session = ScrollingCapture(onFinish: { image in
-                print("scroll session finished, image: \(image.map { "\($0.cgImage.width)x\($0.cgImage.height)" } ?? "nil")")
+            let session = ScrollingCapture(onFinish: { finish in
+                print("scroll session finished, image: \(finish.image.map { "\($0.cgImage.width)x\($0.cgImage.height)" } ?? "nil")")
                 exit(0)
             })
             ScrollingCapture.active = session
@@ -545,8 +545,8 @@ enum Benchmark {
             print("target: \(info.ownerName) rect \(Int(local.width))x\(Int(local.height))pt")
             let viewportPx = Int(local.height * screen.backingScaleFactor)
 
-            let session = ScrollingCapture(onFinish: { image in
-                guard let image else { print("SCROLLAPP FAILED (no image)"); exit(1) }
+            let session = ScrollingCapture(onFinish: { finish in
+                guard let image = finish.image else { print("SCROLLAPP FAILED (no image)"); exit(1) }
                 let h = image.cgImage.height
                 print("stitched \(image.cgImage.width)x\(h)px (viewport \(viewportPx)px)")
                 SelfTest.writePNG(image.cgImage, to: NSTemporaryDirectory() + "/scrollapp.png")
