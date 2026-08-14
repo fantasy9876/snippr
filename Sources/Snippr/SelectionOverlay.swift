@@ -761,6 +761,14 @@ final class SelectionOverlayView: NSView {
         let p = convert(event.locationInWindow, from: nil)
         guard mode == .area else { return }
         if isSaving { return }
+        if textEditingActive {
+            // While the text field is first responder, a click on the canvas
+            // must NOT move/resize the frame or cancel the session — the
+            // field and the responder chain own the interaction until the
+            // entry commits or cancels (plan: click-outside closes the
+            // overlay, but never while a text field is active).
+            return
+        }
 
         if event.clickCount >= 2, isReviewing, !textEditingActive,
            let selection = areaSelection, selection.contains(p) {

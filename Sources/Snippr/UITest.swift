@@ -118,6 +118,22 @@ enum UITest {
                     }
                     precedenceOK = SelectionOverlay.current != nil
                 }
+                // While typing, a real click OUTSIDE the selection must NOT
+                // cancel the session; after the entry commits, the same
+                // click cancels exactly once.
+                var textOutsideClickOK = false
+                if view.isReviewingForTesting,
+                   let outside = NSEvent.mouseEvent(
+                    with: .leftMouseDown,
+                    location: CGPoint(x: 30, y: 30), // outside 120,140,360,240
+                    modifierFlags: [], timestamp: 0,
+                    windowNumber: view.window?.windowNumber ?? 0,
+                    context: nil, eventNumber: 0, clickCount: 1, pressure: 1) {
+                    view.mouseDown(with: outside)
+                    textOutsideClickOK = SelectionOverlay.current != nil
+                        && overlay.session.phase == .reviewing
+                        && view.textFieldForTesting != nil
+                }
                 view.commitTextEntryForTesting(text: "hello")
                 view.annotationSurface?.tool = .select
                 // escape hatch: exactly one editor presented AFTER teardown
@@ -127,7 +143,7 @@ enum UITest {
                     && SelectionOverlay.current == nil
                     && editorsAfter == editorsBefore + 1
                     && editorPresents == 1
-                    && annotated && precedenceOK
+                    && annotated && precedenceOK && textOutsideClickOK
             }
         }
 
