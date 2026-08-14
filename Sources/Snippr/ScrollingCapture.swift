@@ -329,7 +329,13 @@ final class ScrollingCapture {
             // rows live in the first slice, not in lastSlice. The direction
             // lives in explicit state, NOT in the optional preview view — a
             // nil view must not silently skip the rebuild branch.
-            if previewPinnedTop || previewSourceRows != s.totalHeight - rows {
+            // A latched sticky footer also forces the rebuild: the final
+            // compose re-attaches the footer at the very bottom, while an
+            // incremental paste would leave the old footer band mid-image
+            // and the new one missing.
+            if previewPinnedTop
+                || s.currentSegment.footerRows > 0
+                || previewSourceRows != s.totalHeight - rows {
                 rebuildPreview(from: s, pinToTop: false)
             } else {
                 appendPreview(s.lastSlice)
@@ -349,7 +355,8 @@ final class ScrollingCapture {
             // A retrace adds no rows, but an accepted frame can still revoke
             // a header omit and raise totalHeight — resync the preview at the
             // current anchor when the basis disagrees.
-            if previewSourceRows != s.totalHeight {
+            if previewSourceRows != s.totalHeight
+                || s.currentSegment.footerRows > 0 {
                 rebuildPreview(from: s, pinToTop: previewPinnedTop)
             }
             updateProgress(

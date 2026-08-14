@@ -757,6 +757,79 @@ enum SelfTest {
             }
         }
 
+        // 2b-preview-footer-live. Sticky footer stays at the live preview's
+        // bottom. The final compose re-attaches a latched footer at the very
+        // bottom; the incremental paste used to leave the FIRST frame's
+        // footer band mid-image with no footer at the bottom. Every accepted
+        // outcome must leave the production preview byte-equal to the
+        // bounded window.
+        do {
+            let fW = 400, fViewport = 500, fFooter = 60
+            let content = makeStripePattern(width: fW, height: 2000, seed: 0xF007_E210)
+            let footerBand = makeStripePattern(width: fW, height: fFooter, seed: 0xF007_BA9D)
+            func footeredFrame(offset: Int) -> CGImage? {
+                guard let body = content.cropping(to: CGRect(
+                    x: 0, y: offset, width: fW,
+                    height: fViewport - fFooter)) else { return nil }
+                let c = ctx(fW, fViewport)
+                c.draw(footerBand, in: CGRect(
+                    x: 0, y: 0, width: fW, height: fFooter))
+                c.draw(body, in: CGRect(
+                    x: 0, y: fFooter, width: fW,
+                    height: fViewport - fFooter))
+                return c.makeImage()
+            }
+            let path = [0, 320, 640, 320]
+            MainActor.assumeIsolated {
+                guard let first = footeredFrame(offset: path[0]) else {
+                    check("stitch-footer-preview-live-crop", false)
+                    return
+                }
+                let session = ScrollingCapture(onFinish: { _ in })
+                session.startPreviewForTesting(with: first)
+                let segmented = SegmentedVerticalStitcher(first: first)
+                var appended = 0
+                var moved = 0
+                var allExact = true
+                for off in path.dropFirst() {
+                    guard let frame = footeredFrame(offset: off) else {
+                        check("stitch-footer-preview-live-crop", false)
+                        return
+                    }
+                    let outcome = segmented.append(frame)
+                    session.applyStitchOutcome(
+                        outcome, stitcher: segmented, stopHint: "test")
+                    switch outcome {
+                    case .appended, .prepended, .moved:
+                        if case .appended = outcome { appended += 1 }
+                        if case .moved = outcome { moved += 1 }
+                        if session.previewSourceRowsForTesting
+                            != segmented.totalHeight {
+                            allExact = false
+                        }
+                        if let preview = session.previewImageForTesting,
+                           let want = segmented.previewWindowImage(
+                            targetWidth: 400, maxHeight: 1400,
+                            anchor: session.previewPinnedTop
+                                ? .currentTop : .bottom) {
+                            if !imagesEqual(want, preview) { allExact = false }
+                        } else {
+                            allExact = false
+                        }
+                    default: break
+                    }
+                }
+                // Both patched branches must actually run: at least one
+                // appended AND one moved (retrace) accepted outcome.
+                check("stitch-footer-preview-live",
+                      appended >= 1 && moved >= 1
+                        && segmented.currentSegment.footerRows == fFooter
+                        && allExact,
+                      "appended \(appended), moved \(moved), footer "
+                      + "\(segmented.currentSegment.footerRows), exact \(allExact)")
+            }
+        }
+
         // 2b-preview-omit-revocation. Header-omit revocation resyncs preview ------
         // Segment 2 initially omits its proven duplicate header; a later
         // accepted frame with changed chrome revokes the omit, raising
