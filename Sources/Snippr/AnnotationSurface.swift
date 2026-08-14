@@ -122,24 +122,40 @@ final class AnnotationSurface {
         }
     }
 
-    /// Flattened export: crops `base` to `cropPixels` (integral, image-local)
-    /// and renders the annotations translated so their ABSOLUTE positions
-    /// stay put — anything outside the crop is clipped, never dragged along.
+    /// Allocation spy for the export path: exactly ONE full-size destination
+    /// buffer per flatten, never an intermediate materialized crop.
+    nonisolated(unsafe) static var flattenAllocationsForTesting = 0
+    /// Test hook: simulates destination-allocation failure.
+    var forceRenderFailureForTesting = false
+
+    /// Flattened export: ONE destination buffer in the base's own colour
+    /// space (P3 stays P3); the source crop is drawn straight into it and
+    /// the annotations render translated so their ABSOLUTE positions stay
+    /// put — anything outside the crop is clipped, never dragged along.
+    ///
+    /// FAIL-CLOSED: with annotations present, an allocation/render failure
+    /// returns nil. Callers must keep their surface open and tell the user —
+    /// silently exporting the un-annotated image would lose their drawings.
     func flattened(base: CGImage, cropPixels: CGRect) -> CGImage? {
         let crop = cropPixels.integral
-        guard crop.width >= 1, crop.height >= 1,
-              let cropped = base.cropping(to: crop)?.materialized()
-        else { return nil }
-        guard !annotations.isEmpty else { return cropped }
+        guard crop.width >= 1, crop.height >= 1 else { return nil }
+        guard !annotations.isEmpty else {
+            // no drawings: a plain (shared-storage) crop materialized once
+            return base.cropping(to: crop)?.materialized()
+        }
         let width = Int(crop.width)
         let height = Int(crop.height)
-        guard let ctx = CGContext(
-            data: nil, width: width, height: height,
-            bitsPerComponent: 8, bytesPerRow: 0,
-            space: CGColorSpace(name: CGColorSpace.sRGB)!,
-            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-        ) else { return cropped }
-        ctx.draw(cropped, in: CGRect(x: 0, y: 0, width: width, height: height))
+        let space = base.colorSpace ?? CGColorSpace(name: CGColorSpace.sRGB)!
+        Self.flattenAllocationsForTesting += 1
+        guard !forceRenderFailureForTesting,
+              let sourceCrop = base.cropping(to: crop), // descriptor, no copy
+              let ctx = CGContext(
+                data: nil, width: width, height: height,
+                bitsPerComponent: 8, bytesPerRow: 0,
+                space: space,
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        else { return nil }
+        ctx.draw(sourceCrop, in: CGRect(x: 0, y: 0, width: width, height: height))
         // Annotation coords are BOTTOM-left-origin image pixels (the editor
         // renderer draws them into an unflipped CGContext); the crop rect is
         // TOP-left (CGImage.cropping). Shift accordingly.

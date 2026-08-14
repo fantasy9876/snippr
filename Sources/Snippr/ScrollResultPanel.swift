@@ -124,6 +124,7 @@ final class ScrollResultPanel: NSPanel {
             frame: imageView.frame,
             surface: annotationSurface,
             pixelsPerPoint: pixelsPerPoint)
+        host.isLocked = { [weak self] in self?.saving ?? false }
         content.addSubview(host)
         annotationHost = host
 
@@ -292,7 +293,9 @@ final class ScrollResultPanel: NSPanel {
         }
         if event.modifierFlags.contains(.command),
            event.charactersIgnoringModifiers?.lowercased() == "z" {
-            if annotationSurface.undo() { annotationHost?.needsDisplay = true }
+            if !saving, annotationSurface.undo() {
+                annotationHost?.needsDisplay = true
+            }
             return true
         }
         return super.performKeyEquivalent(with: event)
@@ -324,18 +327,20 @@ final class ScrollResultPanel: NSPanel {
     /// The exported snapshot: the stitched image with any annotations
     /// flattened over the FULL image rect (same shared surface/flatten path
     /// as the area review).
-    private var exportSnapshot: CapturedImage {
-        guard !annotationSurface.isEmpty,
-              let flat = annotationSurface.flattened(
-                base: image.cgImage,
-                cropPixels: CGRect(
-                    x: 0, y: 0,
-                    width: image.cgImage.width, height: image.cgImage.height))
-        else { return image }
+    /// nil = annotated export failed. NEVER falls back to the plain image:
+    /// that would report success while silently dropping the drawings.
+    private var exportSnapshot: CapturedImage? {
+        guard !annotationSurface.isEmpty else { return image }
+        guard let flat = annotationSurface.flattened(
+            base: image.cgImage,
+            cropPixels: CGRect(
+                x: 0, y: 0,
+                width: image.cgImage.width, height: image.cgImage.height))
+        else { return nil }
         return CapturedImage(cgImage: flat, scale: image.scale)
     }
 
-    var exportSnapshotForTesting: CapturedImage { exportSnapshot }
+    var exportSnapshotForTesting: CapturedImage? { exportSnapshot }
 
     /// Same exactly-once + terminal-order rules as the area review: Copy
     /// commits then closes; Pin/OCR/editor tear down BEFORE presenting; Save
@@ -344,7 +349,15 @@ final class ScrollResultPanel: NSPanel {
     /// Repeat-Area memory is never touched.
     private func perform(intent: CaptureIntent) {
         guard !saving else { return }
-        let image = exportSnapshot
+        guard let image = exportSnapshot else {
+            // fail-closed: keep the panel (and the drawings) alive
+            if let toast = dependencies?.toast {
+                toast("Không xuất được ảnh có nét vẽ — thử lại")
+            } else {
+                ToastHUD.show("Không xuất được ảnh có nét vẽ — thử lại")
+            }
+            return
+        }
         switch intent {
         case .copy:
             CaptureActionRouter.commit(
@@ -392,6 +405,10 @@ final class AnnotationHostView: NSView {
     private let surface: AnnotationSurface
     private let pixelsPerPoint: CGFloat
     private var dragging = false
+    /// While the owning surface has a save in flight, ALL annotation input
+    /// is frozen — the exported state must be exactly what the user saw when
+    /// they pressed Save.
+    var isLocked: @MainActor () -> Bool = { false }
 
     init(frame: CGRect, surface: AnnotationSurface, pixelsPerPoint: CGFloat) {
         self.surface = surface
@@ -411,6 +428,7 @@ final class AnnotationHostView: NSView {
     }
 
     override func mouseDown(with event: NSEvent) {
+        if isLocked() { return }
         let p = convert(event.locationInWindow, from: nil)
         guard surface.tool != .select else {
             super.mouseDown(with: event)
@@ -428,7 +446,7 @@ final class AnnotationHostView: NSView {
     }
 
     override func mouseDragged(with event: NSEvent) {
-        guard dragging else { return }
+        guard dragging, !isLocked() else { return }
         let p = convert(event.locationInWindow, from: nil)
         surface.continueDrag(toPixel: pixelPoint(p))
         needsDisplay = true

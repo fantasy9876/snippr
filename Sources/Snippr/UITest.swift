@@ -193,6 +193,7 @@ enum UITest {
             panel.annotationSurface.tool = .pen
             panel.annotationSurface.color = .systemRed
             var panelAnnotated = true
+            var exportForProbes: CapturedImage?
             if let host = panel.annotationHostForTesting {
                 // uniform mapping: pixels-per-point equal on both axes
                 let ppx = CGFloat(tallStitch.cgImage.width) / host.frame.width
@@ -209,16 +210,21 @@ enum UITest {
                         fromView: p,
                         toView: CGPoint(x: min(w - 1, p.x + 1), y: p.y))
                 }
-                let export = panel.exportSnapshotForTesting
-                if export.cgImage.width != tallStitch.cgImage.width
-                    || export.cgImage.height != tallStitch.cgImage.height
-                    || SelfTest.imagesEqualForTesting(
-                        export.cgImage, tallStitch.cgImage) {
+                if let export = panel.exportSnapshotForTesting {
+                    if export.cgImage.width != tallStitch.cgImage.width
+                        || export.cgImage.height != tallStitch.cgImage.height
+                        || SelfTest.imagesEqualForTesting(
+                            export.cgImage, tallStitch.cgImage) {
+                        panelAnnotated = false
+                    }
+                    exportForProbes = export
+                } else {
                     panelAnnotated = false
                 }
                 // every probe pixel neighborhood must contain red ink
-                if let probe = SelfTest.redInkNearForTesting(
-                    export.cgImage,
+                if let exportImage = exportForProbes,
+                   let probe = SelfTest.redInkNearForTesting(
+                    exportImage.cgImage,
                     points: probes.map { CGPoint(x: $0.x * ppx, y: $0.y * ppy) },
                     pixelRadius: Int(8 * max(ppx, 1))) {
                     _ = probe

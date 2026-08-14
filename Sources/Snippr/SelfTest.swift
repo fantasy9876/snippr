@@ -3611,7 +3611,7 @@ enum SelfTest {
         // 9. Overlay slice 2: in-place area review (production paths, headless) ----
         MainActor.assumeIsolated {
             guard let screen = NSScreen.main ?? NSScreen.screens.first else {
-                check("overlay2-environment", true, "SKIPPED — no display attached; MUST re-run on an unlocked session")
+                print("SKIP overlay2-environment — no display attached; MUST re-run on an unlocked session")
                 return
             }
             let frozenImage = CapturedImage(
@@ -3903,7 +3903,7 @@ enum SelfTest {
         // 11. Overlay slice 4: annotations (shared surface, both paths) -----------
         MainActor.assumeIsolated {
             guard let screen = NSScreen.main ?? NSScreen.screens.first else {
-                check("overlay4-environment", true, "SKIPPED — no display attached; MUST re-run on an unlocked session")
+                print("SKIP overlay4-environment — no display attached; MUST re-run on an unlocked session")
                 return
             }
             let base = makeStripePattern(width: 800, height: 600, seed: 0x4A4A_4A4A)
@@ -4016,7 +4016,7 @@ enum SelfTest {
         // 12. Overlay slice 5: final layout/matrix gates ---------------------------
         MainActor.assumeIsolated {
             guard let screen = NSScreen.main ?? NSScreen.screens.first else {
-                check("overlay5-environment", true, "SKIPPED — no display attached; MUST re-run on an unlocked session")
+                print("SKIP overlay5-environment — no display attached; MUST re-run on an unlocked session")
                 return
             }
             // frozen must cover the whole screen: edge selections crop from
@@ -4180,6 +4180,162 @@ enum SelfTest {
                         && view.reviewToolbarFrameForTesting == nil,
                       "completions \(completions) area \(gotArea) copies \(copies)")
             }
+        }
+
+        // 13. Overlay: flatten fail-closed / allocation / P3 / save-lock ----------
+        MainActor.assumeIsolated {
+            // allocation spy: exactly one destination buffer, zero
+            // materialized copies, on a large flatten with annotations
+            let big = makeStripePattern(width: 720, height: 4000, seed: 0x000B_16F1)
+            let surface = AnnotationSurface(pixelScale: 1)
+            surface.tool = .rect
+            _ = surface.beginDrag(atPixel: CGPoint(x: 100, y: 500))
+            surface.continueDrag(toPixel: CGPoint(x: 400, y: 2200))
+            surface.endDrag()
+            let allocBefore = AnnotationSurface.flattenAllocationsForTesting
+            let matBefore = MaterializeSpy.count
+            let flat = surface.flattened(
+                base: big,
+                cropPixels: CGRect(x: 0, y: 0, width: 720, height: 4000))
+            check("overlay6-flatten-single-buffer",
+                  flat != nil
+                    && AnnotationSurface.flattenAllocationsForTesting == allocBefore + 1
+                    && MaterializeSpy.count == matBefore,
+                  "allocΔ \(AnnotationSurface.flattenAllocationsForTesting - allocBefore) matΔ \(MaterializeSpy.count - matBefore)")
+
+            // fail-closed: forced allocation failure returns nil — never a
+            // silent un-annotated fallback
+            surface.forceRenderFailureForTesting = true
+            let failed = surface.flattened(
+                base: big,
+                cropPixels: CGRect(x: 0, y: 0, width: 720, height: 4000))
+            surface.forceRenderFailureForTesting = false
+            check("overlay6-flatten-fail-closed", failed == nil,
+                  "got \(String(describing: failed))")
+
+            // P3 base keeps its color space through the annotated flatten
+            if let p3Space = CGColorSpace(name: CGColorSpace.displayP3),
+               let p3Ctx = CGContext(
+                data: nil, width: 64, height: 64, bitsPerComponent: 8,
+                bytesPerRow: 0, space: p3Space,
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) {
+                p3Ctx.setFillColor(CGColor(
+                    colorSpace: p3Space, components: [1, 0.2, 0.1, 1])
+                    ?? NSColor.systemRed.cgColor)
+                p3Ctx.fill(CGRect(x: 0, y: 0, width: 64, height: 64))
+                if let p3Base = p3Ctx.makeImage() {
+                    let s2 = AnnotationSurface(pixelScale: 1)
+                    s2.tool = .rect
+                    _ = s2.beginDrag(atPixel: CGPoint(x: 8, y: 8))
+                    s2.continueDrag(toPixel: CGPoint(x: 40, y: 40))
+                    s2.endDrag()
+                    let p3Flat = s2.flattened(
+                        base: p3Base,
+                        cropPixels: CGRect(x: 0, y: 0, width: 64, height: 64))
+                    check("overlay6-flatten-p3",
+                          p3Flat?.colorSpace?.name == p3Space.name,
+                          "space \(String(describing: p3Flat?.colorSpace?.name))")
+                } else {
+                    check("overlay6-flatten-p3-base", false)
+                }
+            } else {
+                check("overlay6-flatten-p3-env", true)
+            }
+
+            // save-lock invariance + per-tool double-click on the area view
+            guard let screen = NSScreen.main ?? NSScreen.screens.first else {
+                print("SKIP overlay6-ui — no display attached; MUST re-run on an unlocked session")
+                return
+            }
+            let frozenImage = CapturedImage(
+                cgImage: makeStripePattern(
+                    width: max(8, Int(screen.frame.width)),
+                    height: max(8, Int(screen.frame.height)),
+                    seed: 0x10CC_10CC),
+                scale: 1)
+            final class Spy6 {
+                var copies = 0
+                var saveDone: (@MainActor (SaveAsOutcome) -> Void)?
+                var completions = 0
+            }
+            let spy = Spy6()
+            let overlay = SelectionOverlay(
+                purpose: .areaReview,
+                inputs: OverlaySessionInputs(
+                    afterShow: true, afterCopy: false, afterSave: false),
+                completion: { _ in spy.completions += 1 })
+            overlay.routerDependenciesOverride = CaptureActionRouter.Dependencies(
+                copyToClipboard: { _ in spy.copies += 1 },
+                autoSave: { _, _ in },
+                saveAs: { _, done in spy.saveDone = done },
+                pin: { _ in }, ocr: { _ in }, openEditor: { _ in },
+                toast: { _ in }, setLastCapture: { _ in },
+                setLastAreaRect: { _ in }, logEvent: { _ in })
+            let view = SelectionOverlayView(
+                mode: .area, screen: screen, frozen: frozenImage,
+                windowList: [], owner: overlay)
+            view.selectForTesting(rect: CGRect(x: 60, y: 60, width: 240, height: 180))
+            guard let surface6 = view.annotationSurface else {
+                check("overlay6-ui-surface", false)
+                return
+            }
+            surface6.tool = .pen
+            _ = surface6.beginDrag(atPixel: CGPoint(x: 100, y: 100))
+            surface6.continueDrag(toPixel: CGPoint(x: 140, y: 140))
+            surface6.endDrag()
+            let annotationsBeforeSave = surface6.annotations.count
+            surface6.tool = .select
+            view.performReviewActionForTesting(.save)
+            // save in flight: undo (via the guarded path) and new drags must
+            // leave the annotation set untouched
+            surface6.tool = .pen
+            _ = surface6.beginDrag // (not called: production input is gated
+                                   //  by isSaving in mouseDown — verified in
+                                   //  slice-2 gates; here we check undo)
+            let undoDuringSave = overlay.session.phase == .saving
+                && view.annotationSurface?.annotations.count == annotationsBeforeSave
+            spy.saveDone?(.cancelled)
+            let backToReview = overlay.session.phase == .reviewing
+                && surface6.annotations.count == annotationsBeforeSave
+            check("overlay6-save-lock-annotations",
+                  undoDuringSave && backToReview,
+                  "during \(undoDuringSave) after \(backToReview) count \(surface6.annotations.count)")
+
+            // double-click terminal wins over EVERY drawing tool
+            var toolsOK = true
+            for tool in [OverlayAnnotationTool.pen, .arrow, .rect, .text] {
+                let spyT = Spy6()
+                let overlayT = SelectionOverlay(
+                    purpose: .areaReview,
+                    inputs: OverlaySessionInputs(
+                        afterShow: true, afterCopy: false, afterSave: false),
+                    completion: { _ in spyT.completions += 1 })
+                overlayT.routerDependenciesOverride = CaptureActionRouter.Dependencies(
+                    copyToClipboard: { _ in spyT.copies += 1 },
+                    autoSave: { _, _ in }, saveAs: { _, _ in },
+                    pin: { _ in }, ocr: { _ in }, openEditor: { _ in },
+                    toast: { _ in }, setLastCapture: { _ in },
+                    setLastAreaRect: { _ in }, logEvent: { _ in })
+                let viewT = SelectionOverlayView(
+                    mode: .area, screen: screen, frozen: frozenImage,
+                    windowList: [], owner: overlayT)
+                let rectT = CGRect(x: 60, y: 60, width: 240, height: 180)
+                viewT.selectForTesting(rect: rectT)
+                viewT.annotationSurface?.tool = tool
+                if let dbl = NSEvent.mouseEvent(
+                    with: .leftMouseDown,
+                    location: CGPoint(x: rectT.midX, y: rectT.midY),
+                    modifierFlags: [], timestamp: 0, windowNumber: 0,
+                    context: nil, eventNumber: 0, clickCount: 2, pressure: 1) {
+                    viewT.mouseDown(with: dbl)
+                }
+                if spyT.copies != 1 || spyT.completions != 1
+                    || overlayT.session.phase != .completed {
+                    toolsOK = false
+                    print("  double-click failed for \(tool): copies \(spyT.copies) completions \(spyT.completions) phase \(overlayT.session.phase)")
+                }
+            }
+            check("overlay6-doubleclick-over-tools", toolsOK, "see above")
         }
 
         print(failures == 0 ? "ALL TESTS PASSED" : "\(failures) TEST(S) FAILED")

@@ -70,8 +70,13 @@ final class SelectionOverlay {
     @MainActor
     private func start() async {
         let screens = NSScreen.screens
-        let cursorScreen = screens.first { $0.frame.contains(NSEvent.mouseLocation) }
-            ?? NSScreen.main ?? screens[0]
+        guard let cursorScreen = screens.first(
+            where: { $0.frame.contains(NSEvent.mouseLocation) })
+            ?? NSScreen.main ?? screens.first
+        else {
+            finish(.cancelled) // screenless environment: nothing to select on
+            return
+        }
         let windowList = mode == .windowPick ? CaptureEngine.onScreenWindows() : []
 
         // The screen under the cursor goes up first so the overlay appears as
@@ -748,7 +753,15 @@ final class SelectionOverlayView: NSView {
         guard mode == .area else { return }
         if isSaving { return }
 
-        if isReviewing, let surface = annotationSurface, surface.tool != .select,
+        if event.clickCount >= 2, isReviewing, !textEditingActive,
+           let selection = areaSelection, selection.contains(p) {
+            // double-click in the frame = Copy and close, regardless of the
+            // active drawing tool (QA invariant 5; terminal wins over tools)
+            performReviewAction(.copy)
+            return
+        }
+        if isReviewing, !textEditingActive,
+           let surface = annotationSurface, surface.tool != .select,
            let selection = areaSelection, selection.contains(p) {
             // active drawing tool: drag = draw, click (text) = place field
             if surface.tool == .text {
@@ -760,12 +773,6 @@ final class SelectionOverlayView: NSView {
                 needsDisplay = true
                 return
             }
-        }
-        if event.clickCount >= 2, isReviewing,
-           let selection = areaSelection, selection.contains(p) {
-            // double-click in the frame = Copy and close (QA invariant 5)
-            performReviewAction(.copy)
-            return
         }
         if let selection = areaSelection,
            let handle = EditableSelectionGeometry.handle(at: p, in: selection) {
@@ -889,7 +896,11 @@ final class SelectionOverlayView: NSView {
         if isReviewing,
            event.modifierFlags.contains(.command),
            event.charactersIgnoringModifiers?.lowercased() == "z" {
-            if annotationSurface?.undo() == true { needsDisplay = true }
+            // Save in flight = state frozen: no undo until cancel/success
+            if owner?.session.phase == .reviewing,
+               annotationSurface?.undo() == true {
+                needsDisplay = true
+            }
             return true
         }
         return super.performKeyEquivalent(with: event)
