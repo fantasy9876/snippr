@@ -3900,6 +3900,119 @@ enum SelfTest {
                   "copies \(copies)")
         }
 
+        // 11. Overlay slice 4: annotations (shared surface, both paths) -----------
+        MainActor.assumeIsolated {
+            guard let screen = NSScreen.main else {
+                check("overlay4-environment", true)
+                return
+            }
+            let base = makeStripePattern(width: 800, height: 600, seed: 0x4A4A_4A4A)
+            let frozenImage = CapturedImage(cgImage: base, scale: 1)
+
+            final class Spy4 {
+                var copies: [CapturedImage] = []
+            }
+            let spy = Spy4()
+            let overlay = SelectionOverlay(
+                purpose: .areaReview,
+                inputs: OverlaySessionInputs(
+                    afterShow: true, afterCopy: false, afterSave: false),
+                completion: { _ in })
+            overlay.routerDependenciesOverride = CaptureActionRouter.Dependencies(
+                copyToClipboard: { spy.copies.append($0) },
+                autoSave: { _, _ in }, saveAs: { _, _ in },
+                pin: { _ in }, ocr: { _ in }, openEditor: { _ in },
+                toast: { _ in }, setLastCapture: { _ in },
+                setLastAreaRect: { _ in }, logEvent: { _ in })
+            let view = SelectionOverlayView(
+                mode: .area, screen: screen, frozen: frozenImage,
+                windowList: [], owner: overlay)
+            let rect = CGRect(x: 100, y: 100, width: 300, height: 200)
+            view.selectForTesting(rect: rect)
+            guard let surface = view.annotationSurface else {
+                check("overlay4-surface-created", false)
+                return
+            }
+            check("overlay4-surface-created", true)
+
+            // draw a rect annotation inside the crop (pixel coords, BL)
+            surface.tool = .rect
+            _ = surface.beginDrag(atPixel: CGPoint(x: 150, y: 150))
+            surface.continueDrag(toPixel: CGPoint(x: 250, y: 220))
+            surface.endDrag()
+            surface.tool = .select
+            let plainCrop = base.cropping(
+                to: overlay.session.pixelRect)!
+            view.performReviewActionForTesting(.copy)
+            var flattenChanged = false
+            var flattenMatchesSurface = false
+            if let copied = spy.copies.first {
+                flattenChanged = !imagesEqual(plainCrop, copied.cgImage)
+                if let want = surface.flattened(
+                    base: base, cropPixels: overlay.session.pixelRect) {
+                    flattenMatchesSurface = imagesEqual(want, copied.cgImage)
+                }
+            }
+            check("overlay4-flatten-hash",
+                  flattenChanged && flattenMatchesSurface,
+                  "changed \(flattenChanged) matches \(flattenMatchesSurface)")
+
+            // Remap/clip: a fresh session — annotation OUTSIDE a shrunken
+            // crop disappears from flatten (absolute positions, clipped),
+            // and returns when the crop expands again.
+            let spyB = Spy4()
+            let overlayB = SelectionOverlay(
+                purpose: .areaReview,
+                inputs: OverlaySessionInputs(
+                    afterShow: true, afterCopy: false, afterSave: false),
+                completion: { _ in })
+            overlayB.routerDependenciesOverride = CaptureActionRouter.Dependencies(
+                copyToClipboard: { spyB.copies.append($0) },
+                autoSave: { _, _ in }, saveAs: { _, _ in },
+                pin: { _ in }, ocr: { _ in }, openEditor: { _ in },
+                toast: { _ in }, setLastCapture: { _ in },
+                setLastAreaRect: { _ in }, logEvent: { _ in })
+            let viewB = SelectionOverlayView(
+                mode: .area, screen: screen, frozen: frozenImage,
+                windowList: [], owner: overlayB)
+            viewB.selectForTesting(rect: rect)
+            guard let surfaceB = viewB.annotationSurface else {
+                check("overlay4-remap-surface", false)
+                return
+            }
+            surfaceB.tool = .rect
+            _ = surfaceB.beginDrag(atPixel: CGPoint(x: 320, y: 150))
+            surfaceB.continueDrag(toPixel: CGPoint(x: 380, y: 250))
+            surfaceB.endDrag()
+            surfaceB.tool = .select
+            // shrink so the annotation (x 320..380) is fully outside
+            viewB.adjustSelectionForTesting(rect: CGRect(
+                x: 100, y: 100, width: 150, height: 200))
+            let shrunkenPlain = base.cropping(to: overlayB.session.pixelRect)!
+            let shrunkenFlat = surfaceB.flattened(
+                base: base, cropPixels: overlayB.session.pixelRect)
+            let clipped = shrunkenFlat.map { imagesEqual(shrunkenPlain, $0) } ?? false
+            // expand back: the annotation is visible again
+            viewB.adjustSelectionForTesting(rect: rect)
+            let expandedPlain = base.cropping(to: overlayB.session.pixelRect)!
+            let expandedFlat = surfaceB.flattened(
+                base: base, cropPixels: overlayB.session.pixelRect)
+            let restored = expandedFlat.map { !imagesEqual(expandedPlain, $0) } ?? false
+            check("overlay4-remap-clip", clipped && restored,
+                  "clipped \(clipped) restored \(restored)")
+
+            // Undo removes the newest annotation; text adds via the shared
+            // API and changes flatten.
+            let before = surfaceB.annotations.count
+            surfaceB.addText("Snippr", atPixel: CGPoint(x: 150, y: 150))
+            let afterText = surfaceB.annotations.count
+            _ = surfaceB.undo()
+            check("overlay4-text-and-undo",
+                  afterText == before + 1
+                    && surfaceB.annotations.count == before,
+                  "before \(before) afterText \(afterText) final \(surfaceB.annotations.count)")
+        }
+
         print(failures == 0 ? "ALL TESTS PASSED" : "\(failures) TEST(S) FAILED")
         print("Artifacts: \(outputDir)")
         return failures == 0 ? 0 : 1
@@ -4006,6 +4119,10 @@ enum SelfTest {
         )!
         c.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
         return buf
+    }
+
+    static func imagesEqualForTesting(_ a: CGImage, _ b: CGImage) -> Bool {
+        imagesEqual(a, b)
     }
 
     private static func imagesEqual(_ a: CGImage, _ b: CGImage) -> Bool {

@@ -257,6 +257,12 @@ final class SelectionOverlayView: NSView {
 
     private var areaSelection: CGRect?
     private var areaDrag: AreaDrag?
+    /// Slice 4: shared annotation state (pixel space, absolute). Created on
+    /// review begin so scale matches the frozen image.
+    private(set) var annotationSurface: AnnotationSurface?
+    private var annotationDragging = false
+    private var textField: NSTextField?
+    private var textFieldPixelOrigin: CGPoint = .zero
     private var mousePos: CGPoint = .zero
     private var hoverWindow: WindowInfo?
 
@@ -369,6 +375,16 @@ final class SelectionOverlayView: NSView {
         ("macwindow", "Open in editor window", .openEditor),
     ]
 
+    /// Annotation tool buttons occupy tags 100+; color cycler 200; undo 201.
+    private static let toolItems: [OverlayAnnotationTool] = [
+        .select, .pen, .arrow, .rect, .text,
+    ]
+    private static let colorPresets: [NSColor] = [
+        .systemRed, .systemOrange, .systemYellow, .systemGreen,
+        .systemBlue, .black, .white,
+    ]
+    private var colorIndex = 0
+
     private func buildReviewToolbar() -> NSView {
         let container = NSView(frame: .zero)
         container.wantsLayer = true
@@ -376,6 +392,46 @@ final class SelectionOverlayView: NSView {
             NSColor.black.withAlphaComponent(0.82).cgColor
         container.layer?.cornerRadius = 8
         var buttons: [NSButton] = []
+        for (index, tool) in Self.toolItems.enumerated() {
+            let button = NSButton(frame: .zero)
+            button.bezelStyle = .regularSquare
+            button.isBordered = false
+            button.image = NSImage(
+                systemSymbolName: tool.symbol,
+                accessibilityDescription: tool.tooltip)
+            button.contentTintColor = tool == .select ? .controlAccentColor : .white
+            button.toolTip = tool.tooltip
+            button.tag = 100 + index
+            button.target = self
+            button.action = #selector(reviewToolbarButtonPressed(_:))
+            container.addSubview(button)
+            buttons.append(button)
+        }
+        let colorButton = NSButton(frame: .zero)
+        colorButton.bezelStyle = .regularSquare
+        colorButton.isBordered = false
+        colorButton.image = NSImage(
+            systemSymbolName: "circle.fill", accessibilityDescription: "Color")
+        colorButton.contentTintColor = Self.colorPresets[colorIndex]
+        colorButton.toolTip = "Color"
+        colorButton.tag = 200
+        colorButton.target = self
+        colorButton.action = #selector(reviewToolbarButtonPressed(_:))
+        container.addSubview(colorButton)
+        buttons.append(colorButton)
+        let undoButton = NSButton(frame: .zero)
+        undoButton.bezelStyle = .regularSquare
+        undoButton.isBordered = false
+        undoButton.image = NSImage(
+            systemSymbolName: "arrow.uturn.backward",
+            accessibilityDescription: "Undo (⌘Z)")
+        undoButton.contentTintColor = .white
+        undoButton.toolTip = "Undo (⌘Z)"
+        undoButton.tag = 201
+        undoButton.target = self
+        undoButton.action = #selector(reviewToolbarButtonPressed(_:))
+        container.addSubview(undoButton)
+        buttons.append(undoButton)
         for (index, item) in Self.toolbarItems.enumerated() {
             let button = NSButton(frame: .zero)
             button.bezelStyle = .regularSquare
@@ -456,6 +512,27 @@ final class SelectionOverlayView: NSView {
         if isSaving { return }
         if sender.tag == -1 {
             owner?.finish(.cancelled)
+            return
+        }
+        if sender.tag >= 100, sender.tag < 100 + Self.toolItems.count {
+            let tool = Self.toolItems[sender.tag - 100]
+            annotationSurface?.tool = tool
+            for button in toolbarButtons where button.tag >= 100
+                && button.tag < 100 + Self.toolItems.count {
+                button.contentTintColor =
+                    button.tag - 100 == sender.tag - 100 ? .controlAccentColor : .white
+            }
+            if tool != .text { endTextEntry(commit: true) }
+            return
+        }
+        if sender.tag == 200 {
+            colorIndex = (colorIndex + 1) % Self.colorPresets.count
+            annotationSurface?.color = Self.colorPresets[colorIndex]
+            sender.contentTintColor = Self.colorPresets[colorIndex]
+            return
+        }
+        if sender.tag == 201 {
+            if annotationSurface?.undo() == true { needsDisplay = true }
             return
         }
         guard sender.tag >= 0, sender.tag < Self.toolbarItems.count else { return }
@@ -555,6 +632,16 @@ final class SelectionOverlayView: NSView {
             ctx.fillPath(using: .evenOdd)
         } else {
             ctx.fill(bounds)
+        }
+
+        if let surface = annotationSurface, !surface.isEmpty,
+           let sel = areaSelection {
+            let scale = frozen?.scale ?? 1
+            ctx.saveGState()
+            ctx.clip(to: sel)
+            ctx.scaleBy(x: 1 / scale, y: 1 / scale)
+            surface.drawForPreview(in: ctx)
+            ctx.restoreGState()
         }
 
         let accent = NSColor.controlAccentColor
@@ -661,6 +748,19 @@ final class SelectionOverlayView: NSView {
         guard mode == .area else { return }
         if isSaving { return }
 
+        if isReviewing, let surface = annotationSurface, surface.tool != .select,
+           let selection = areaSelection, selection.contains(p) {
+            // active drawing tool: drag = draw, click (text) = place field
+            if surface.tool == .text {
+                beginTextEntry(atView: p)
+                return
+            }
+            if surface.beginDrag(atPixel: pixelPoint(fromView: p)) {
+                annotationDragging = true
+                needsDisplay = true
+                return
+            }
+        }
         if event.clickCount >= 2, isReviewing,
            let selection = areaSelection, selection.contains(p) {
             // double-click in the frame = Copy and close (QA invariant 5)
@@ -694,6 +794,11 @@ final class SelectionOverlayView: NSView {
     override func mouseDragged(with event: NSEvent) {
         guard mode == .area else { return }
         let p = convert(event.locationInWindow, from: nil)
+        if annotationDragging {
+            annotationSurface?.continueDrag(toPixel: pixelPoint(fromView: p))
+            needsDisplay = true
+            return
+        }
         switch areaDrag {
         case .creating(let anchor):
             areaSelection = EditableSelectionGeometry.rect(from: anchor, to: p, within: bounds)
@@ -718,6 +823,12 @@ final class SelectionOverlayView: NSView {
         switch mode {
         case .area:
             let p = convert(event.locationInWindow, from: nil)
+            if annotationDragging {
+                annotationSurface?.endDrag()
+                annotationDragging = false
+                needsDisplay = true
+                return
+            }
             let wasCreating: Bool
             if case .creating = areaDrag { wasCreating = true } else { wasCreating = false }
             let wasAdjusting = areaDrag != nil && !wasCreating
@@ -746,6 +857,10 @@ final class SelectionOverlayView: NSView {
     }
 
     override func keyDown(with event: NSEvent) {
+        if textEditingActive {
+            super.keyDown(with: event)
+            return
+        }
         if event.keyCode == 53 { // Esc
             handleEscape()
             return
@@ -761,14 +876,68 @@ final class SelectionOverlayView: NSView {
     }
 
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        if textEditingActive {
+            // ⌘C/⌘Z/⌘V belong to the active text field
+            return super.performKeyEquivalent(with: event)
+        }
         if isReviewing,
            event.modifierFlags.contains(.command),
            event.charactersIgnoringModifiers?.lowercased() == "c" {
             performReviewAction(.copy)
             return true
         }
+        if isReviewing,
+           event.modifierFlags.contains(.command),
+           event.charactersIgnoringModifiers?.lowercased() == "z" {
+            if annotationSurface?.undo() == true { needsDisplay = true }
+            return true
+        }
         return super.performKeyEquivalent(with: event)
     }
+
+    // MARK: text annotation entry
+
+    fileprivate func beginTextEntry(atView p: CGPoint) {
+        endTextEntry(commit: true)
+        let field = NSTextField(frame: CGRect(
+            x: p.x, y: p.y - 12, width: 220, height: 26))
+        field.font = .boldSystemFont(ofSize: 18)
+        field.textColor = annotationSurface?.color ?? .systemRed
+        field.backgroundColor = NSColor.black.withAlphaComponent(0.35)
+        field.isBordered = true
+        field.focusRingType = .default
+        field.delegate = textFieldDelegate
+        addSubview(field)
+        textField = field
+        textFieldPixelOrigin = pixelPoint(fromView: CGPoint(x: p.x, y: p.y - 12))
+        window?.makeFirstResponder(field)
+    }
+
+    /// Commits (or discards) the in-flight text field. Return in the field
+    /// ends editing via the delegate — never the capture-terminal path.
+    fileprivate func endTextEntry(commit: Bool) {
+        guard let field = textField else { return }
+        let value = field.stringValue
+        field.removeFromSuperview()
+        textField = nil
+        window?.makeFirstResponder(self)
+        if commit, !value.isEmpty {
+            annotationSurface?.addText(value, atPixel: textFieldPixelOrigin)
+            needsDisplay = true
+        }
+    }
+
+    func beginTextEntryForTesting(atView p: CGPoint) {
+        beginTextEntry(atView: p)
+    }
+    func commitTextEntryForTesting(text: String) {
+        textField?.stringValue = text
+        endTextEntry(commit: true)
+    }
+    var textFieldForTesting: NSTextField? { textField }
+
+    private lazy var textFieldDelegate = OverlayTextFieldDelegate(
+        onEnd: { [weak self] in self?.endTextEntry(commit: true) })
 
     override func resetCursorRects() {
         guard mode == .area else {
@@ -821,6 +990,8 @@ final class SelectionOverlayView: NSView {
                 finalGlobalRect: globalRect(for: selection),
                 dependencies: owner.routerDependenciesOverride)
             if owner.session.phase == .reviewing {
+                annotationSurface = AnnotationSurface(
+                    pixelScale: frozen.scale)
                 owner.reviewDidBegin(in: self)
                 layoutReviewToolbar()
                 needsDisplay = true
@@ -839,6 +1010,24 @@ final class SelectionOverlayView: NSView {
             width: selection.width, height: selection.height)
     }
 
+    /// View points (bottom-left) → frozen image pixels (bottom-left): the
+    /// frozen image maps 1:1 onto the view in points.
+    fileprivate func pixelPoint(fromView p: CGPoint) -> CGPoint {
+        let scale = frozen?.scale ?? 1
+        return CGPoint(x: p.x * scale, y: p.y * scale)
+    }
+
+    /// Text-field-first responder precedence (QA invariant: while typing,
+    /// Enter/⌘C/⌘Z/Esc belong to the text editing, never terminal capture).
+    fileprivate var textEditingActive: Bool {
+        guard let field = textField else { return false }
+        if let editor = window?.firstResponder as? NSTextView,
+           editor.delegate === field {
+            return true
+        }
+        return window?.firstResponder === field
+    }
+
     /// THE single pixel-crop authority: every snapshot (initial, manual
     /// action, and slice-4 annotation flatten) crops the frozen image by the
     /// session's integral pixelRect — the view rect is quantized exactly
@@ -846,8 +1035,13 @@ final class SelectionOverlayView: NSView {
     fileprivate func snapshotFromSessionPixelRect() -> CapturedImage? {
         guard let owner, let frozen else { return nil }
         let px = owner.session.pixelRect
-        guard px.width >= 1, px.height >= 1,
-              let cropped = frozen.cgImage.cropping(to: px)?.materialized()
+        guard px.width >= 1, px.height >= 1 else { return nil }
+        if let surface = annotationSurface, !surface.isEmpty {
+            guard let flat = surface.flattened(
+                base: frozen.cgImage, cropPixels: px) else { return nil }
+            return CapturedImage(cgImage: flat, scale: frozen.scale)
+        }
+        guard let cropped = frozen.cgImage.cropping(to: px)?.materialized()
         else { return nil }
         return CapturedImage(cgImage: cropped, scale: frozen.scale)
     }
@@ -865,5 +1059,18 @@ final class SelectionOverlayView: NSView {
             height: selection.height * scale
         ).integral
         owner.session.pixelRect = px
+    }
+}
+
+/// Ends overlay text editing when the field resigns or Return is pressed —
+/// keeping Return inside the text field instead of the capture-terminal path.
+@MainActor
+final class OverlayTextFieldDelegate: NSObject, NSTextFieldDelegate {
+    private let onEnd: @MainActor () -> Void
+    init(onEnd: @escaping @MainActor () -> Void) {
+        self.onEnd = onEnd
+    }
+    func controlTextDidEndEditing(_ obj: Notification) {
+        onEnd()
     }
 }

@@ -38,6 +38,9 @@ final class ScrollResultPanel: NSPanel {
     private var saving = false
     private var toolbarButtons: [NSButton] = []
     private var actionBar: NSView?
+    /// Slice 4: shared annotation surface over the stitched image.
+    let annotationSurface: AnnotationSurface
+    private var annotationHost: AnnotationHostView?
 
     @discardableResult
     static func show(
@@ -60,6 +63,7 @@ final class ScrollResultPanel: NSPanel {
         self.image = image
         self.inputs = inputs
         self.dependencies = dependencies
+        self.annotationSurface = AnnotationSurface(pixelScale: image.scale)
 
         // Fit ≤90% of the ORIGIN screen's visible frame (a 24k-pt stitch must
         // not become a 24k-pt window).
@@ -105,6 +109,15 @@ final class ScrollResultPanel: NSPanel {
         imageView.image = image.nsImage
         imageView.imageScaling = .scaleProportionallyDown
         content.addSubview(imageView)
+
+        // pixels-per-view-point for the fitted image (used by drawing input)
+        let pixelsPerPoint = CGFloat(image.cgImage.width) / imageSize.width
+        let host = AnnotationHostView(
+            frame: imageView.frame,
+            surface: annotationSurface,
+            pixelsPerPoint: pixelsPerPoint)
+        content.addSubview(host)
+        annotationHost = host
 
         let bar = buildToolbar(width: contentSize.width, height: toolbarHeight)
         content.addSubview(bar)
@@ -204,6 +217,22 @@ final class ScrollResultPanel: NSPanel {
         orderOut(nil)
     }
 
+    /// The exported snapshot: the stitched image with any annotations
+    /// flattened over the FULL image rect (same shared surface/flatten path
+    /// as the area review).
+    private var exportSnapshot: CapturedImage {
+        guard !annotationSurface.isEmpty,
+              let flat = annotationSurface.flattened(
+                base: image.cgImage,
+                cropPixels: CGRect(
+                    x: 0, y: 0,
+                    width: image.cgImage.width, height: image.cgImage.height))
+        else { return image }
+        return CapturedImage(cgImage: flat, scale: image.scale)
+    }
+
+    var exportSnapshotForTesting: CapturedImage { exportSnapshot }
+
     /// Same exactly-once + terminal-order rules as the area review: Copy
     /// commits then closes; Pin/OCR/editor tear down BEFORE presenting; Save
     /// locks the panel in-flight and stays open on cancel/failure. All
@@ -211,6 +240,7 @@ final class ScrollResultPanel: NSPanel {
     /// Repeat-Area memory is never touched.
     private func perform(intent: CaptureIntent) {
         guard !saving else { return }
+        let image = exportSnapshot
         switch intent {
         case .copy:
             CaptureActionRouter.commit(
@@ -246,6 +276,127 @@ final class ScrollResultPanel: NSPanel {
                 dependencies: dependencies)
         case .initialCapture, .scrollFinished:
             break
+        }
+    }
+}
+
+/// Transparent input+preview layer for annotations over a FITTED image: view
+/// points map to image pixels through one scale factor; the surface itself
+/// stays in absolute pixel space (shared with the area review).
+@MainActor
+final class AnnotationHostView: NSView {
+    private let surface: AnnotationSurface
+    private let pixelsPerPoint: CGFloat
+    private var dragging = false
+
+    init(frame: CGRect, surface: AnnotationSurface, pixelsPerPoint: CGFloat) {
+        self.surface = surface
+        self.pixelsPerPoint = max(0.01, pixelsPerPoint)
+        super.init(frame: frame)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    private func pixelPoint(_ p: CGPoint) -> CGPoint {
+        CGPoint(x: p.x * pixelsPerPoint, y: p.y * pixelsPerPoint)
+    }
+
+    func addTextForTesting(_ text: String, atView p: CGPoint) {
+        surface.addText(text, atPixel: pixelPoint(p))
+        needsDisplay = true
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        let p = convert(event.locationInWindow, from: nil)
+        guard surface.tool != .select else {
+            super.mouseDown(with: event)
+            return
+        }
+        if surface.tool == .text {
+            // panel V1 text: fixed-position entry via field over the image
+            hostBeginTextEntry(atView: p)
+            return
+        }
+        if surface.beginDrag(atPixel: pixelPoint(p)) {
+            dragging = true
+            needsDisplay = true
+        }
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard dragging else { return }
+        let p = convert(event.locationInWindow, from: nil)
+        surface.continueDrag(toPixel: pixelPoint(p))
+        needsDisplay = true
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        guard dragging else { return }
+        surface.endDrag()
+        dragging = false
+        needsDisplay = true
+    }
+
+    override var acceptsFirstResponder: Bool { true }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        // transparent to clicks while the select tool is active so the panel
+        // keeps its move-by-background behavior
+        let view = super.hitTest(point)
+        if view === self, surface.tool == .select, textField == nil {
+            return nil
+        }
+        return view
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard !surface.isEmpty else { return }
+        guard let ctx = NSGraphicsContext.current?.cgContext else { return }
+        ctx.saveGState()
+        ctx.scaleBy(x: 1 / pixelsPerPoint, y: 1 / pixelsPerPoint)
+        surface.drawForPreview(in: ctx)
+        ctx.restoreGState()
+    }
+
+    // MARK: text entry (same precedence rule as the overlay)
+
+    private var textField: NSTextField?
+    private var textPixelOrigin: CGPoint = .zero
+    private lazy var fieldDelegate = OverlayTextFieldDelegate(
+        onEnd: { [weak self] in self?.hostEndTextEntry(commit: true) })
+
+    var textEditingActive: Bool {
+        guard let field = textField else { return false }
+        if let editor = window?.firstResponder as? NSTextView,
+           editor.delegate === field {
+            return true
+        }
+        return window?.firstResponder === field
+    }
+
+    private func hostBeginTextEntry(atView p: CGPoint) {
+        hostEndTextEntry(commit: true)
+        let field = NSTextField(frame: CGRect(
+            x: p.x, y: p.y - 12, width: 200, height: 24))
+        field.font = .boldSystemFont(ofSize: 14)
+        field.textColor = surface.color
+        field.backgroundColor = NSColor.black.withAlphaComponent(0.35)
+        field.delegate = fieldDelegate
+        addSubview(field)
+        textField = field
+        textPixelOrigin = pixelPoint(CGPoint(x: p.x, y: p.y - 12))
+        window?.makeFirstResponder(field)
+    }
+
+    private func hostEndTextEntry(commit: Bool) {
+        guard let field = textField else { return }
+        let value = field.stringValue
+        field.removeFromSuperview()
+        textField = nil
+        if commit, !value.isEmpty {
+            surface.addText(value, atPixel: textPixelOrigin)
+            needsDisplay = true
         }
     }
 }

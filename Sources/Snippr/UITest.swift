@@ -91,6 +91,35 @@ enum UITest {
                 let reviewing = view.isReviewingForTesting
                     && overlay.session.phase == .reviewing
                 let toolbarInside = toolbarFrame.map { view.bounds.contains($0) } ?? false
+                // annotation + text-responder precedence: while the text
+                // field is first responder, Return must stay in the field —
+                // the overlay survives.
+                view.annotationSurface?.tool = .rect
+                _ = view.annotationSurface?.beginDrag(
+                    atPixel: CGPoint(x: 200, y: 220))
+                view.annotationSurface?.continueDrag(
+                    toPixel: CGPoint(x: 320, y: 300))
+                view.annotationSurface?.endDrag()
+                let annotated = view.annotationSurface?.isEmpty == false
+                view.annotationSurface?.tool = .text
+                view.beginTextEntryForTesting(
+                    atView: CGPoint(x: 200, y: 200))
+                var precedenceOK = false
+                if let field = view.textFieldForTesting,
+                   view.window?.firstResponder === field
+                    || view.window?.firstResponder is NSTextView {
+                    if let returnEvent = NSEvent.keyEvent(
+                        with: .keyDown, location: .zero, modifierFlags: [],
+                        timestamp: 0, windowNumber: view.window?.windowNumber ?? 0,
+                        context: nil, characters: "\r",
+                        charactersIgnoringModifiers: "\r",
+                        isARepeat: false, keyCode: 36) {
+                        view.keyDown(with: returnEvent)
+                    }
+                    precedenceOK = SelectionOverlay.current != nil
+                }
+                view.commitTextEntryForTesting(text: "hello")
+                view.annotationSurface?.tool = .select
                 // escape hatch: exactly one editor presented AFTER teardown
                 view.performReviewActionForTesting(.openEditor)
                 let editorsAfter = NSApp.windows.filter { $0.windowController is EditorWindowController }.count
@@ -98,6 +127,7 @@ enum UITest {
                     && SelectionOverlay.current == nil
                     && editorsAfter == editorsBefore + 1
                     && editorPresents == 1
+                    && annotated && precedenceOK
             }
         }
 
@@ -134,6 +164,19 @@ enum UITest {
             let fits = panel.frame.width <= visible.width * 0.9 + 1
                 && panel.frame.height <= visible.height * 0.9 + 1
             let toolbarVisible = panel.toolbarFrameForTesting != nil
+            // annotate the stitched result: flatten must change while
+            // dimensions stay the stitched image's
+            panel.annotationSurface.tool = .pen
+            _ = panel.annotationSurface.beginDrag(atPixel: CGPoint(x: 60, y: 400))
+            panel.annotationSurface.continueDrag(toPixel: CGPoint(x: 260, y: 700))
+            panel.annotationSurface.continueDrag(toPixel: CGPoint(x: 340, y: 1100))
+            panel.annotationSurface.endDrag()
+            let export = panel.exportSnapshotForTesting
+            let panelAnnotated =
+                export.cgImage.width == tallStitch.cgImage.width
+                && export.cgImage.height == tallStitch.cgImage.height
+                && !SelfTest.imagesEqualForTesting(
+                    export.cgImage, tallStitch.cgImage)
             panel.performActionForTesting(.openEditor)
             let editorsAfter = NSApp.windows
                 .filter { $0.windowController is EditorWindowController }.count
@@ -141,6 +184,7 @@ enum UITest {
                 && ScrollResultPanel.current == nil
                 && editorsAfter == editorsBefore + 1
                 && panelEditorPresents == 1
+                && panelAnnotated
         }
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
