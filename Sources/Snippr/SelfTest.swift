@@ -767,18 +767,29 @@ enum SelfTest {
             let fW = 400, fViewport = 500, fFooter = 60
             let content = makeStripePattern(width: fW, height: 2000, seed: 0xF007_E210)
             let footerBand = makeStripePattern(width: fW, height: fFooter, seed: 0xF007_BA9D)
-            func footeredFrame(offset: Int) -> CGImage? {
+            func footeredFrame(offset: Int, blinkFooter: Bool = false) -> CGImage? {
                 guard let body = content.cropping(to: CGRect(
                     x: 0, y: offset, width: fW,
                     height: fViewport - fFooter)) else { return nil }
                 let c = ctx(fW, fViewport)
                 c.draw(footerBand, in: CGRect(
                     x: 0, y: 0, width: fW, height: fFooter))
+                if blinkFooter {
+                    // one blinking row inside the sticky bar — within the
+                    // footer-stability tolerance, but a real pixel change the
+                    // preview must show after the retrace
+                    c.setFillColor(CGColor(gray: 0.95, alpha: 1))
+                    c.fill(CGRect(x: 0, y: 30, width: fW, height: 1))
+                }
                 c.draw(body, in: CGRect(
                     x: 0, y: fFooter, width: fW,
                     height: fViewport - fFooter))
                 return c.makeImage()
             }
+            // The last frame is a RETRACE whose footer carries the blink: if
+            // the moved branch stopped rebuilding, the preview would keep the
+            // pre-blink footer while the bounded window shows the new one —
+            // the gate is red without the moved-branch rebuild.
             let path = [0, 320, 640, 320]
             MainActor.assumeIsolated {
                 guard let first = footeredFrame(offset: path[0]) else {
@@ -791,14 +802,19 @@ enum SelfTest {
                 var appended = 0
                 var moved = 0
                 var allExact = true
-                for off in path.dropFirst() {
-                    guard let frame = footeredFrame(offset: off) else {
+                for (index, off) in path.dropFirst().enumerated() {
+                    let isLast = index == path.count - 2
+                    guard let frame = footeredFrame(
+                        offset: off, blinkFooter: isLast) else {
                         check("stitch-footer-preview-live-crop", false)
                         return
                     }
                     let outcome = segmented.append(frame)
                     session.applyStitchOutcome(
                         outcome, stitcher: segmented, stopHint: "test")
+                    if isLast, case .moved = outcome {} else if isLast {
+                        allExact = false // blink frame must be a retrace
+                    }
                     switch outcome {
                     case .appended, .prepended, .moved:
                         if case .appended = outcome { appended += 1 }
