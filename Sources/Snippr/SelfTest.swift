@@ -752,6 +752,53 @@ enum SelfTest {
             }
         }
 
+        // 2b-promotion-compose. Promotion composes ONLY the old segment ------------
+        // The startedSegment payload is gone; promoting a pending segment
+        // must compose exactly the outgoing segment (it becomes the completed
+        // raster) and never the new one — the dead pending.compose() used to
+        // allocate a source-resolution canvas on the capture loop per
+        // re-anchor.
+        do {
+            let doc = makeStripePattern(width: 400, height: 3000, seed: 0x9407_C0DE)
+            let vp = 500
+            let path = [0, 300, 1200, 1400, 1600, 1800]
+            if let first = doc.cropping(to: CGRect(
+                x: 0, y: path[0], width: 400, height: vp)) {
+                let segmented = SegmentedVerticalStitcher(first: first)
+                var promoteDelta = -1
+                var nonPromoteDelta = 0
+                var sawSegment = false
+                for off in path.dropFirst() {
+                    guard let frame = doc.cropping(to: CGRect(
+                        x: 0, y: off, width: 400, height: vp)) else {
+                        check("stitch-promotion-compose-crop", false); break
+                    }
+                    let before = FullComposeSpy.count
+                    let outcome = segmented.append(frame)
+                    let delta = FullComposeSpy.count - before
+                    if case .startedSegment = outcome {
+                        sawSegment = true
+                        promoteDelta = delta
+                    } else {
+                        nonPromoteDelta += delta
+                    }
+                }
+                check("stitch-promotion-compose-old-only",
+                      sawSegment && promoteDelta == 1 && nonPromoteDelta == 0
+                        && segmented.fullComposeCount == 0,
+                      "segment \(sawSegment), promoteΔ \(promoteDelta), "
+                      + "otherΔ \(nonPromoteDelta), "
+                      + "current \(segmented.fullComposeCount)")
+                check("stitch-promotion-compose-preview-works",
+                      segmented.previewWindowImage(
+                        targetWidth: 400, maxHeight: 1400,
+                        anchor: .currentTop) != nil,
+                      "bounded preview failed after payloadless promotion")
+            } else {
+                check("stitch-promotion-compose-crop", false)
+            }
+        }
+
         // 2b-preview-parity-reanchor. Re-anchor keeps the global floor basis -------
         // startedSegment used to seed the incremental preview from separator
         // + segment image, resetting the cumulative-floor basis to a local

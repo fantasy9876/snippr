@@ -588,6 +588,16 @@ enum SourceCanvasSpy {
     static func increment() { state.withLock { $0 += 1 } }
 }
 
+/// Test spy counting full-strip composes GLOBALLY (across all stitcher
+/// instances, unlike the per-instance counter that moves away with a
+/// completed segment). A promotion must compose exactly the OLD segment —
+/// never the pending/new one.
+enum FullComposeSpy {
+    private static let state = OSAllocatedUnfairLock(initialState: 0)
+    static var count: Int { state.withLock { $0 } }
+    static func increment() { state.withLock { $0 += 1 } }
+}
+
 extension CGImage {
     /// Redraws this image into its own exactly-sized buffer. Crops made with
     /// `CGImage.cropping(to:)` share the parent's backing store; copying breaks

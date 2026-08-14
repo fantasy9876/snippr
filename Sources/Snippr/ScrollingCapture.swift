@@ -616,7 +616,7 @@ final class SegmentedVerticalStitcher {
         /// the evidence chain is intact and the reject counter resets.
         case moved
         case rejected(consecutive: Int)
-        case startedSegment(CGImage)
+        case startedSegment
     }
 
     static let reanchorAfterRejects = 4
@@ -747,18 +747,19 @@ final class SegmentedVerticalStitcher {
                     && pending.footerRows > 0
                     && currentSegment.bottomRowsMatch(
                         pending, rows: pending.footerRows)
-                    ? pending.footerRows : 0),
-              // Preview keeps the raw first viewport of the new segment. Header
-              // de-duplication is a final-compose optimization and can be
-              // revoked if later frames disprove that the chrome is stable.
-              let pendingImage = pending.compose() else { return nil }
+                    ? pending.footerRows : 0)
+        else { return nil }
+        // Only the OLD segment composes here (it must — it becomes the
+        // completed raster). The new segment is never composed at promotion:
+        // its consumers render bounded preview windows, and a full-resolution
+        // compose on the capture loop would be a dead payload.
         completedSegments.append(completed)
         currentSegment = pending
         currentOmittedHeaderRows = pendingOmittedHeaderRows
         pendingSegment = nil
         consecutiveRejects = 0
         segmentCount += 1
-        return .startedSegment(pendingImage)
+        return .startedSegment
     }
 
     /// A locally fixed top band can be a different section header or a banner
@@ -2603,6 +2604,7 @@ final class VerticalStitcher {
             includeFooter: includeFooter,
             inferredFooterRows: inferredFooterRows) else { return nil }
         fullComposeCount += 1
+        FullComposeSpy.increment()
         let h = parts.reduce(0) { $0 + $1.height }
         guard let ctx = CGContext(
             data: nil, width: width, height: h, bitsPerComponent: 8, bytesPerRow: 0,
