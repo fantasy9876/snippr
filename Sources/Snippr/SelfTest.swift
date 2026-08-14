@@ -3307,6 +3307,13 @@ enum SelfTest {
                     && !review.commitInitialCapture()
                     && review.acceptsCommits,
                   "phase \(review.phase)")
+            // Reviewing is unreachable via transition() even for area-review:
+            // only the atomic latch may enter it.
+            let latchOnly = makeSession(.areaReview, afterShow: true)
+            check("overlay-session-reviewing-latch-only",
+                  !latchOnly.transition(to: .reviewing)
+                    && latchOnly.phase == .selecting,
+                  "phase \(latchOnly.phase)")
             let headless = makeSession(.areaReview, afterShow: false)
             check("overlay-session-headless-completes",
                   headless.commitInitialCapture()

@@ -92,8 +92,10 @@ final class OverlaySession {
             guard purpose == .areaReview else { return false }
         }
         switch (phase, next) {
-        case (.selecting, .reviewing),
-             (.selecting, .completed),
+        // NOTE: (.selecting → .reviewing) is deliberately absent — review is
+        // reachable ONLY through the atomic commitInitialCapture latch, so a
+        // stray transition call can never bypass the exactly-once guarantee.
+        case (.selecting, .completed),
              (.reviewing, .saving),
              (.reviewing, .completed),
              (.saving, .reviewing),
