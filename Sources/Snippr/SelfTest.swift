@@ -1174,6 +1174,48 @@ enum SelfTest {
             }
         }
 
+        // 2h1b. Mid-session reversal must NOT split a segment ----------------------
+        // The field failure behind duplicated blocks: scroll down, scroll back
+        // up to re-read, continue down. Reversed frames used to reject until
+        // the session re-anchored a new segment from the higher viewport and
+        // re-captured everything below it. Now the reversal is a confirmed
+        // move: one segment, no separator, no duplicate rows.
+        do {
+            let doc = makeStripePattern(width: 400, height: 2200, seed: 0x5E63_4EAD)
+            let vp = 500
+            let path = [0, 300, 600, 900, 600, 300, 600, 900, 1200, 1500, 1700]
+            if let first = doc.cropping(to: CGRect(
+                x: 0, y: path[0], width: 400, height: vp)) {
+                let segmented = SegmentedVerticalStitcher(first: first)
+                var splits = 0
+                var rejects = 0
+                for off in path.dropFirst() {
+                    guard let frame = doc.cropping(to: CGRect(
+                        x: 0, y: off, width: 400, height: vp)) else {
+                        check("stitch-segment-reversal-crop", false); break
+                    }
+                    switch segmented.append(frame) {
+                    case .startedSegment: splits += 1
+                    case .rejected: rejects += 1
+                    default: break
+                    }
+                }
+                check("stitch-segment-reversal-single-segment",
+                      splits == 0 && rejects == 0 && segmented.segmentCount == 1,
+                      "splits \(splits), rejects \(rejects), segments \(segmented.segmentCount)")
+                let composed = segmented.compose()
+                check("stitch-segment-reversal-height", composed?.height == 2200,
+                      "got \(composed?.height ?? -1), want 2200")
+                if let composed {
+                    check("stitch-segment-reversal-content",
+                          imagesRoughlyEqual(doc, composed),
+                          "reversal duplicated or dropped rows")
+                }
+            } else {
+                check("stitch-segment-reversal-crop", false)
+            }
+        }
+
         // 2h2. Complete overlap loss re-anchors only to a proven new segment -------
         // A fast flick can move farther than the viewport. There is no honest
         // seam to infer in that case, so the session waits until later frames
