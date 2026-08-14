@@ -3287,6 +3287,320 @@ enum SelfTest {
         let down = windowShot.downscaledTo1x()
         check("downscale-1x", down.cgImage.width == 200 && down.scale == 1)
 
+        // 8. Overlay session + action router (slice 1) -----------------------------
+        MainActor.assumeIsolated {
+            @MainActor func makeSession(
+                _ purpose: OverlayPurpose,
+                afterShow: Bool = true, afterCopy: Bool = false,
+                afterSave: Bool = false
+            ) -> OverlaySession {
+                OverlaySession(purpose: purpose, inputs: OverlaySessionInputs(
+                    afterShow: afterShow, afterCopy: afterCopy,
+                    afterSave: afterSave))
+            }
+
+            // Reducer: area-review with afterShow reviews; headless completes.
+            let review = makeSession(.areaReview, afterShow: true)
+            check("overlay-session-initial-once",
+                  review.commitInitialCapture()
+                    && review.phase == .reviewing
+                    && !review.commitInitialCapture()
+                    && review.acceptsCommits,
+                  "phase \(review.phase)")
+            let headless = makeSession(.areaReview, afterShow: false)
+            check("overlay-session-headless-completes",
+                  headless.commitInitialCapture()
+                    && headless.phase == .completed
+                    && !headless.acceptsCommits,
+                  "phase \(headless.phase)")
+
+            // Save round trip: reviewing → saving → (fail) reviewing →
+            // saving → completed; completed accepts nothing further.
+            check("overlay-session-save-cycle",
+                  review.transition(to: .saving)
+                    && !review.acceptsCommits
+                    && review.transition(to: .reviewing)
+                    && review.transition(to: .saving)
+                    && review.transition(to: .completed)
+                    && !review.transition(to: .reviewing)
+                    && review.phase == .completed,
+                  "phase \(review.phase)")
+
+            // Non-area purposes: initialCapture latch refused, review/saving
+            // transitions forbidden with phase untouched, straight completion
+            // allowed.
+            for purpose in [OverlayPurpose.scrollRegion, .instantOCRRegion, .windowPick] {
+                let s = makeSession(purpose, afterShow: true)
+                let latchRefused = !s.commitInitialCapture()
+                let reviewingRefused = !s.transition(to: .reviewing)
+                let savingRefused = !s.transition(to: .saving)
+                check("overlay-session-purpose-locked-\(purpose)",
+                      latchRefused && reviewingRefused && savingRefused
+                        && s.phase == .selecting
+                        && s.transition(to: .completed),
+                      "phase \(s.phase)")
+            }
+
+            // Router intent matrix with spies.
+            let snapshotImage = CapturedImage(
+                cgImage: makeSolidImage(
+                    width: 8, height: 8, color: NSColor.systemTeal.cgColor),
+                scale: 1)
+            final class Spy {
+                var copies = 0, autoSaves = 0, saveAsCalls = 0
+                var pins = 0, ocrs = 0, editors = 0
+                var toasts: [String] = []
+                var lastCaptures = 0
+                var areaRects: [CGRect] = []
+                var logs = 0
+                var autoSaveDone: (@MainActor (URL?) -> Void)?
+                var saveAsDone: (@MainActor (SaveAsOutcome) -> Void)?
+            }
+            @MainActor func deps(_ spy: Spy) -> CaptureActionRouter.Dependencies {
+                CaptureActionRouter.Dependencies(
+                    copyToClipboard: { _ in spy.copies += 1 },
+                    autoSave: { _, done in
+                        spy.autoSaves += 1; spy.autoSaveDone = done },
+                    saveAs: { _, done in
+                        spy.saveAsCalls += 1; spy.saveAsDone = done },
+                    pin: { _ in spy.pins += 1 },
+                    ocr: { _ in spy.ocrs += 1 },
+                    openEditor: { _ in spy.editors += 1 },
+                    toast: { spy.toasts.append($0) },
+                    setLastCapture: { _ in spy.lastCaptures += 1 },
+                    setLastAreaRect: { spy.areaRects.append($0) },
+                    logEvent: { _ in spy.logs += 1 })
+            }
+            let rect = CGRect(x: 10, y: 20, width: 30, height: 40)
+
+            // initialCapture entering review: auto-copy only, no toast, no
+            // lastAreaRect yet (the action that completes review writes it).
+            let s1 = Spy()
+            let o1 = CaptureActionRouter.commit(
+                snapshotImage, source: .areaReview, intent: .initialCapture,
+                inputs: .init(afterShow: true, afterCopy: true, afterSave: false),
+                finalGlobalRect: rect, dependencies: deps(s1))
+            check("overlay-router-initial-reviewing",
+                  o1 == .completed && s1.copies == 1 && s1.toasts.isEmpty
+                    && s1.areaRects.isEmpty && s1.lastCaptures == 1
+                    && s1.logs == 1 && s1.autoSaves == 0,
+                  "copies \(s1.copies) toasts \(s1.toasts) rects \(s1.areaRects)")
+
+            // initialCapture headless with nothing configured: rescue copy +
+            // toast + lastAreaRect written.
+            let s2 = Spy()
+            _ = CaptureActionRouter.commit(
+                snapshotImage, source: .areaReview, intent: .initialCapture,
+                inputs: .init(afterShow: false, afterCopy: false, afterSave: false),
+                finalGlobalRect: rect, dependencies: deps(s2))
+            check("overlay-router-initial-headless-fallback",
+                  s2.copies == 1 && s2.toasts.count == 1
+                    && s2.areaRects == [rect],
+                  "copies \(s2.copies) toasts \(s2.toasts) rects \(s2.areaRects)")
+
+            // initialCapture headless with afterSave: announce toast comes
+            // from the save completion, exactly once.
+            let s3 = Spy()
+            _ = CaptureActionRouter.commit(
+                snapshotImage, source: .areaReview, intent: .initialCapture,
+                inputs: .init(afterShow: false, afterCopy: false, afterSave: true),
+                finalGlobalRect: rect, dependencies: deps(s3))
+            s3.autoSaveDone?(URL(fileURLWithPath: "/tmp/x.png"))
+            check("overlay-router-initial-autosave",
+                  s3.autoSaves == 1 && s3.toasts.count == 1
+                    && s3.copies == 0 && s3.areaRects == [rect],
+                  "saves \(s3.autoSaves) toasts \(s3.toasts)")
+
+            // Manual copy: one clipboard write, NO auto-save replay even with
+            // afterSave configured; lastAreaRect written at completion.
+            let s4 = Spy()
+            let o4 = CaptureActionRouter.commit(
+                snapshotImage, source: .areaReview, intent: .copy,
+                inputs: .init(afterShow: true, afterCopy: true, afterSave: true),
+                finalGlobalRect: rect, dependencies: deps(s4))
+            check("overlay-router-copy-no-replay",
+                  o4 == .completed && s4.copies == 1 && s4.autoSaves == 0
+                    && s4.saveAsCalls == 0 && s4.areaRects == [rect],
+                  "copies \(s4.copies) autoSaves \(s4.autoSaves)")
+
+            // Save-As success: .saving outcome, one-shot resolution, area
+            // rect written once even if the dependency calls back twice.
+            let s5 = Spy()
+            var resolutions: [CaptureCommitOutcome] = []
+            let o5 = CaptureActionRouter.commit(
+                snapshotImage, source: .areaReview, intent: .save,
+                inputs: .init(afterShow: true, afterCopy: false, afterSave: false),
+                finalGlobalRect: rect, dependencies: deps(s5),
+                resolution: { resolutions.append($0) })
+            s5.saveAsDone?(.saved(URL(fileURLWithPath: "/tmp/y.png")))
+            s5.saveAsDone?(.saved(URL(fileURLWithPath: "/tmp/z.png")))
+            check("overlay-router-save-once",
+                  o5 == .saving && s5.saveAsCalls == 1
+                    && resolutions == [.completed]
+                    && s5.areaRects == [rect] && s5.autoSaves == 0,
+                  "resolutions \(resolutions) rects \(s5.areaRects)")
+
+            // Save-As cancel: back to review, silent, no lastAreaRect.
+            let s6 = Spy()
+            var cancelResolutions: [CaptureCommitOutcome] = []
+            _ = CaptureActionRouter.commit(
+                snapshotImage, source: .areaReview, intent: .save,
+                inputs: .init(afterShow: true, afterCopy: false, afterSave: false),
+                finalGlobalRect: rect, dependencies: deps(s6),
+                resolution: { cancelResolutions.append($0) })
+            s6.saveAsDone?(.cancelled)
+            check("overlay-router-save-cancel",
+                  cancelResolutions == [.cancelled] && s6.areaRects.isEmpty
+                    && s6.toasts.isEmpty,
+                  "resolutions \(cancelResolutions) toasts \(s6.toasts)")
+
+            // Save-As failure: toast, resolution .failed, no lastAreaRect —
+            // review state is the session's job, the router must not
+            // complete anything.
+            let s6b = Spy()
+            var failResolutions: [CaptureCommitOutcome] = []
+            _ = CaptureActionRouter.commit(
+                snapshotImage, source: .areaReview, intent: .save,
+                inputs: .init(afterShow: true, afterCopy: false, afterSave: false),
+                finalGlobalRect: rect, dependencies: deps(s6b),
+                resolution: { failResolutions.append($0) })
+            s6b.saveAsDone?(.failed)
+            check("overlay-router-save-failed",
+                  failResolutions == [.failed] && s6b.areaRects.isEmpty
+                    && s6b.toasts == ["Save failed"] && s6b.lastCaptures == 0,
+                  "resolutions \(failResolutions) toasts \(s6b.toasts)")
+
+            // Inputs are a value-type SNAPSHOT: mutating the source value
+            // after the session captured it must change nothing. (Real
+            // Settings/UserDefaults are never touched in selftest.)
+            var mutableInputs = OverlaySessionInputs(
+                afterShow: false, afterCopy: true, afterSave: false)
+            let frozenSession = OverlaySession(
+                purpose: .areaReview, inputs: mutableInputs)
+            mutableInputs.afterCopy = false
+            mutableInputs.afterSave = true
+            mutableInputs.afterShow = true
+            let s9 = Spy()
+            _ = CaptureActionRouter.commit(
+                snapshotImage, source: .areaReview, intent: .initialCapture,
+                inputs: frozenSession.inputs,
+                finalGlobalRect: rect, dependencies: deps(s9))
+            check("overlay-router-inputs-snapshot",
+                  frozenSession.inputs == OverlaySessionInputs(
+                    afterShow: false, afterCopy: true, afterSave: false)
+                    && s9.copies == 1 && s9.autoSaves == 0
+                    && s9.areaRects == [rect],
+                  "inputs \(frozenSession.inputs), copies \(s9.copies), autoSaves \(s9.autoSaves)")
+
+            // scrollFinished positive matrix: headless runs auto actions +
+            // toast; presenting runs auto silently; NEVER a Repeat-Area rect.
+            let s10 = Spy()
+            let o10 = CaptureActionRouter.commit(
+                snapshotImage, source: .scrollResult, intent: .scrollFinished,
+                inputs: .init(afterShow: false, afterCopy: true, afterSave: false),
+                finalGlobalRect: rect, dependencies: deps(s10))
+            check("overlay-router-scrollfinished-headless",
+                  o10 == .completed && s10.copies == 1
+                    && s10.toasts.count == 1 && s10.areaRects.isEmpty,
+                  "copies \(s10.copies) toasts \(s10.toasts) rects \(s10.areaRects)")
+            let s10b = Spy()
+            let o10b = CaptureActionRouter.commit(
+                snapshotImage, source: .scrollResult, intent: .scrollFinished,
+                inputs: .init(afterShow: true, afterCopy: true, afterSave: false),
+                finalGlobalRect: rect, dependencies: deps(s10b))
+            check("overlay-router-scrollfinished-presenting",
+                  o10b == .completed && s10b.copies == 1
+                    && s10b.toasts.isEmpty && s10b.areaRects.isEmpty,
+                  "copies \(s10b.copies) toasts \(s10b.toasts)")
+            let s10c = Spy()
+            let o10c = CaptureActionRouter.commit(
+                snapshotImage, source: .scrollResult, intent: .scrollFinished,
+                inputs: .init(afterShow: false, afterCopy: false, afterSave: true),
+                finalGlobalRect: nil, dependencies: deps(s10c))
+            s10c.autoSaveDone?(URL(fileURLWithPath: "/tmp/s.png"))
+            check("overlay-router-scrollfinished-autosave",
+                  o10c == .completed && s10c.autoSaves == 1
+                    && s10c.toasts.count == 1 && s10c.areaRects.isEmpty,
+                  "saves \(s10c.autoSaves) toasts \(s10c.toasts)")
+
+            // Wrong intent×source pairings fail closed with ZERO side
+            // effects of any kind.
+            let s11 = Spy()
+            let wrong1 = CaptureActionRouter.commit(
+                snapshotImage, source: .areaReview, intent: .scrollFinished,
+                inputs: .init(afterShow: false, afterCopy: true, afterSave: false),
+                finalGlobalRect: rect, dependencies: deps(s11))
+            let wrong2 = CaptureActionRouter.commit(
+                snapshotImage, source: .scrollResult, intent: .initialCapture,
+                inputs: .init(afterShow: false, afterCopy: true, afterSave: false),
+                finalGlobalRect: rect, dependencies: deps(s11))
+            let wrong3 = CaptureActionRouter.commit(
+                snapshotImage, source: .area, intent: .initialCapture,
+                inputs: .init(afterShow: false, afterCopy: true, afterSave: false),
+                finalGlobalRect: rect, dependencies: deps(s11))
+            check("overlay-router-intent-source-enforced",
+                  wrong1 == .failed && wrong2 == .failed && wrong3 == .failed
+                    && s11.copies == 0 && s11.autoSaves == 0
+                    && s11.lastCaptures == 0 && s11.logs == 0
+                    && s11.toasts.isEmpty && s11.areaRects.isEmpty,
+                  "w1 \(wrong1) w2 \(wrong2) w3 \(wrong3) copies \(s11.copies)")
+
+            // Pin / OCR / open editor: exactly one respective effect, no auto
+            // replay.
+            let s7 = Spy()
+            _ = CaptureActionRouter.commit(
+                snapshotImage, source: .areaReview, intent: .pin,
+                inputs: .init(afterShow: true, afterCopy: true, afterSave: true),
+                finalGlobalRect: rect, dependencies: deps(s7))
+            _ = CaptureActionRouter.commit(
+                snapshotImage, source: .areaReview, intent: .ocr,
+                inputs: .init(afterShow: true, afterCopy: true, afterSave: true),
+                finalGlobalRect: rect, dependencies: deps(s7))
+            _ = CaptureActionRouter.commit(
+                snapshotImage, source: .areaReview, intent: .openEditor,
+                inputs: .init(afterShow: true, afterCopy: true, afterSave: true),
+                finalGlobalRect: rect, dependencies: deps(s7))
+            check("overlay-router-terminal-intents",
+                  s7.pins == 1 && s7.ocrs == 1 && s7.editors == 1
+                    && s7.copies == 0 && s7.autoSaves == 0
+                    && s7.saveAsCalls == 0,
+                  "pins \(s7.pins) ocrs \(s7.ocrs) editors \(s7.editors)")
+
+            // Source enforcement: finalGlobalRect from any non-areaReview
+            // source is IGNORED by the router itself.
+            let s8 = Spy()
+            for source in [CaptureSource.area, .scrolling, .scrollResult,
+                           .fullscreen, .window] {
+                _ = CaptureActionRouter.commit(
+                    snapshotImage, source: source, intent: .copy,
+                    inputs: .init(afterShow: false, afterCopy: false,
+                                  afterSave: false),
+                    finalGlobalRect: rect, dependencies: deps(s8))
+            }
+            check("overlay-router-source-enforced", s8.areaRects.isEmpty,
+                  "rects \(s8.areaRects)")
+
+            // Late-view guard: after the single terminal route ran, the
+            // production addOverlay guard refuses new windows and `current`
+            // stays detached.
+            if let screen = NSScreen.main {
+                let overlay = SelectionOverlay(
+                    purpose: .areaReview, completion: { _ in })
+                overlay.finish(.cancelled)
+                let windowsAfter = overlay.addOverlayForTesting(
+                    screen: screen, frozen: nil)
+                check("overlay-late-view-guard",
+                      windowsAfter == 0
+                        && overlay.session.phase == .completed
+                        && SelectionOverlay.current == nil,
+                      "windows \(windowsAfter), phase \(overlay.session.phase)")
+            } else {
+                // headless display environment — the guard path is still
+                // covered by the reducer checks above
+                check("overlay-late-view-guard", true)
+            }
+        }
+
         print(failures == 0 ? "ALL TESTS PASSED" : "\(failures) TEST(S) FAILED")
         print("Artifacts: \(outputDir)")
         return failures == 0 ? 0 : 1

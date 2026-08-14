@@ -54,7 +54,7 @@ final class ScrollingCapture {
 
     static func begin(onFinish: @escaping @MainActor (CapturedImage?) -> Void) {
         guard active == nil else { return }
-        SelectionOverlay.begin(mode: .area) { result in
+        SelectionOverlay.begin(purpose: .scrollRegion) { result in
             guard case let .area(screen, _, rect) = result else {
                 onFinish(nil)
                 return

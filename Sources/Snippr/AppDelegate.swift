@@ -3,10 +3,21 @@ import ScreenCaptureKit
 
 enum CaptureSource {
     case fullscreen, area, window, scrolling
+    /// Interactive in-place area review (Lightshot flow). Distinct from
+    /// legacy `.area`, which Repeat Area still uses — the router honors
+    /// `finalGlobalRect` only for this source.
+    case areaReview
+    /// Stitched scroll result presented on the in-place panel (not the
+    /// legacy `handleResult` scrolling route).
+    case scrollResult
 }
 
 /// Shared error/result plumbing used by capture flows.
 enum AppServices {
+    /// The most recent capture, shared between the legacy result routing and
+    /// the overlay action router ("open last", Repeat-related features).
+    @MainActor static var lastCapture: CapturedImage?
+
     static func handleCaptureError(_ error: Error) {
         if case CaptureError.permission = error {
             ToastHUD.show("Screen Recording permission needed — enable Snippr in System Settings", symbol: "exclamationmark.shield.fill", duration: 5)
@@ -22,7 +33,6 @@ enum AppServices {
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem?
-    private var lastCapture: CapturedImage?
     private var screenParametersObserver: NSObjectProtocol?
 
     // MARK: lifecycle
@@ -261,7 +271,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: menu actions
 
     @objc private func reopen() {
-        if let last = lastCapture {
+        if let last = AppServices.lastCapture {
             EditorWindowController.open(with: last)
         } else {
             PreferencesWindowController.show()
@@ -322,7 +332,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let cg = nsImage.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return }
         let scale = nsImage.size.width > 0 ? CGFloat(cg.width) / nsImage.size.width : 1
         let captured = CapturedImage(cgImage: cg, scale: max(1, scale))
-        lastCapture = captured
+        AppServices.lastCapture = captured
         logEvent("editor-opened px=\(cg.width)x\(cg.height)")
         EditorWindowController.open(with: captured)
     }
@@ -352,7 +362,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func captureArea() {
-        SelectionOverlay.begin(mode: .area) { [weak self] result in
+        SelectionOverlay.begin(purpose: .areaReview) { [weak self] result in
             guard case let .area(screen, frozen, rect) = result,
                   let cropped = frozen.cropping(toViewRect: rect) else { return }
             // remember for Repeat Area Capture (global AppKit coords)
@@ -410,7 +420,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func captureAnyWindow() {
-        SelectionOverlay.begin(mode: .windowPick) { [weak self] result in
+        SelectionOverlay.begin(purpose: .windowPick) { [weak self] result in
             guard case let .window(info) = result else { return }
             self?.captureWindow(info)
         }
@@ -441,7 +451,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: result routing
 
     private func handleResult(_ image: CapturedImage, source: CaptureSource) {
-        lastCapture = image
+        AppServices.lastCapture = image
         logEvent("capture source=\(source) px=\(image.cgImage.width)x\(image.cgImage.height)")
         let s = Settings.shared
         let copied = s.afterCopy

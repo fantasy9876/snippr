@@ -25,17 +25,33 @@ final class SelectionOverlay {
 
     private var windows: [OverlayWindow] = []
     private let mode: OverlayMode
+    /// One session per begin() — the shared state machine every view on every
+    /// display consults (exactly-once initialCapture, phase, pixel rect).
+    let session: OverlaySession
     private let completion: @MainActor (OverlayResult) -> Void
-    fileprivate var finished = false
+    /// SINGLE source of truth for "this session is over": derived from the
+    /// session phase, never a separate flag — a separate bool and the phase
+    /// could disagree, letting a late secondary-display capture add windows
+    /// to a completed session (or a completed phase leave windows alive).
+    fileprivate var finished: Bool { session.phase == .completed }
 
-    init(mode: OverlayMode, completion: @escaping @MainActor (OverlayResult) -> Void) {
-        self.mode = mode
+    init(purpose: OverlayPurpose, completion: @escaping @MainActor (OverlayResult) -> Void) {
+        self.mode = purpose == .windowPick ? .windowPick : .area
+        self.session = OverlaySession(
+            purpose: purpose, inputs: .snapshot())
         self.completion = completion
     }
 
-    static func begin(mode: OverlayMode, completion: @escaping @MainActor (OverlayResult) -> Void) {
+    /// Every caller states its purpose — there is deliberately no
+    /// mode-based entry point left: a shared `.area` would silently give
+    /// Instant OCR and the scroll picker whatever review chrome the
+    /// area-review purpose grows.
+    static func begin(
+        purpose: OverlayPurpose,
+        completion: @escaping @MainActor (OverlayResult) -> Void
+    ) {
         guard current == nil else { return }
-        let overlay = SelectionOverlay(mode: mode, completion: completion)
+        let overlay = SelectionOverlay(purpose: purpose, completion: completion)
         current = overlay
         Task { @MainActor in
             await overlay.start()
@@ -94,11 +110,23 @@ final class SelectionOverlay {
         NSCursor.crosshair.set()
     }
 
+    /// Test hook: drives the exact production guard a late secondary-display
+    /// capture hits when it resolves after the session completed.
+    func addOverlayForTesting(
+        screen: NSScreen, frozen: CapturedImage?
+    ) -> Int {
+        addOverlay(for: screen, frozen: frozen, windowList: [], makeKey: false)
+        return windows.count
+    }
+
     @MainActor
     private func addOverlay(
         for screen: NSScreen, frozen: CapturedImage?,
         windowList: [WindowInfo], makeKey: Bool
     ) {
+        // Same completed-state guard the async freeze tasks consult — a
+        // window must never attach to a finished session.
+        guard !finished else { return }
         let win = OverlayWindow(
             contentRect: screen.frame,
             styleMask: .borderless,
@@ -128,13 +156,26 @@ final class SelectionOverlay {
         }
     }
 
+    /// Idempotency latch for teardown — separate from the PHASE: a headless
+    /// commitInitialCapture legitimately reaches `.completed` first, and
+    /// finish() must still run its one teardown + completion afterwards.
+    private var tornDown = false
+
+    /// The ONLY terminal route: completes the session and tears down every
+    /// window exactly once. All cancel/confirm paths and (later) review
+    /// actions funnel through here so the session phase and the window
+    /// lifecycle can never disagree. Late-view guards read the session phase;
+    /// this latch only prevents double teardown/completion.
     func finish(_ result: OverlayResult) {
-        guard !finished else { return }
-        finished = true
+        guard !tornDown else { return }
+        tornDown = true
+        session.forceComplete()
         for w in windows { w.orderOut(nil) }
         windows.removeAll()
         NSCursor.arrow.set()
-        SelectionOverlay.current = nil
+        if SelectionOverlay.current === self {
+            SelectionOverlay.current = nil
+        }
         completion(result)
     }
 
