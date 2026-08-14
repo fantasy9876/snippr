@@ -328,6 +328,23 @@ enum SelfTest {
                 check("stitch-dup-block-flick-frames", false)
             }
 
+            // Same duplicated-block page, frames presented in the REVERSED
+            // order: the spurious hit now lands in the DOWN direction. A lone
+            // down match must pass whole-overlap coherence exactly like a lone
+            // up match — neither direction is exempt.
+            if let doc = withDuplicatedBlock(
+                makeStripePattern(width: 400, height: 1200, seed: 0xD0B1_0C05),
+                from: 100, to: 975, rows: 125),
+               let a = doc.cropping(to: CGRect(x: 0, y: 0, width: 400, height: 500)),
+               let b = doc.cropping(to: CGRect(x: 0, y: 600, width: 400, height: 500)) {
+                let s = VerticalStitcher(first: b)
+                let result = s.append(a)
+                check("stitch-dup-block-flick-reversed-rejected", result == .rejected,
+                      "reversed no-overlap flick over duplicated block got \(result)")
+            } else {
+                check("stitch-dup-block-flick-reversed-frames", false)
+            }
+
             // Healthy down overlap on a page with one duplicated block: the up
             // direction also matches (on the duplicate), but the down match is
             // whole-overlap coherent and must win — not be rejected as
@@ -344,6 +361,48 @@ enum SelfTest {
                       "healthy down overlap got \(result), want appended(250)")
             } else {
                 check("stitch-dup-block-down-frames", false)
+            }
+        }
+
+        // 2b-window. Bounded preview windows ---------------------------------------
+        // The live preview refresh after a direction flip must render only the
+        // outermost window of the strip: byte-identical to cropping the full
+        // compose, with the full-compose spy proving zero full composes.
+        do {
+            let doc = makeStripePattern(width: 400, height: 2000, seed: 0x81D0_11E4)
+            let vp = 500
+            let path = [800, 480, 160, 480, 800, 1120, 1440]
+            var s: VerticalStitcher?
+            for off in path {
+                guard let frame = doc.cropping(to: CGRect(
+                    x: 0, y: off, width: 400, height: vp)) else {
+                    check("stitch-window-crop", false); break
+                }
+                if let st = s { _ = st.append(frame) } else {
+                    s = VerticalStitcher(first: frame)
+                }
+            }
+            if let s {
+                let windowRows = 300
+                let top = s.composeWindow(rows: windowRows, fromTop: true)
+                let bottom = s.composeWindow(rows: windowRows, fromTop: false)
+                check("stitch-window-no-full-compose", s.fullComposeCount == 0,
+                      "composeWindow performed \(s.fullComposeCount) full composes")
+                if let top, let bottom, let full = s.compose(),
+                   let wantTop = full.cropping(to: CGRect(
+                    x: 0, y: 0, width: 400, height: windowRows)),
+                   let wantBottom = full.cropping(to: CGRect(
+                    x: 0, y: full.height - windowRows,
+                    width: 400, height: windowRows)) {
+                    check("stitch-window-top-content",
+                          imagesRoughlyEqual(wantTop, top),
+                          "top window differs from full-compose crop")
+                    check("stitch-window-bottom-content",
+                          imagesRoughlyEqual(wantBottom, bottom),
+                          "bottom window differs from full-compose crop")
+                } else {
+                    check("stitch-window-compose", false)
+                }
             }
         }
 
