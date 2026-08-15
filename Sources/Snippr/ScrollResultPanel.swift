@@ -71,7 +71,6 @@ final class ScrollResultPanel: NSPanel {
         self.image = image
         self.inputs = inputs
         self.dependencies = dependencies
-        self.annotationSurface = AnnotationSurface(pixelScale: image.scale)
 
         // Fit ≤90% of the ORIGIN screen's visible frame (a 24k-pt stitch must
         // not become a 24k-pt window).
@@ -90,6 +89,16 @@ final class ScrollResultPanel: NSPanel {
         let imageSize = CGSize(
             width: max(1, pointSize.width * fit),
             height: max(1, pointSize.height * fit))
+        // Authoring scale = pixels per VIEW point of the fitted panel, not
+        // image.scale: this panel is fixed-fit, so a Pen 3pt / Text 18pt must
+        // measure 3pt/18pt on the panel the user draws on — and the export,
+        // viewed at the same fit, shows exactly the same weight (WYSIWYG).
+        // With image.scale on a very tall stitch (fit « 1) the strokes were
+        // ~6px on a 24k image: correct bytes, invisible while drawing.
+        // fit == 1 degenerates to pixelsPerPoint == image.scale — unchanged.
+        // Pixel COORDINATES stay absolute; only pt→px size conversion moves.
+        let pixelsPerPoint = CGFloat(image.cgImage.width) / imageSize.width
+        self.annotationSurface = AnnotationSurface(pixelScale: pixelsPerPoint)
         // The toolbar needs room for every button INCLUDING Close — a tall,
         // narrow stitch must widen the panel, not overflow the buttons.
         let toolbarMinWidth = ScrollResultPanel.requiredToolbarWidth
@@ -124,8 +133,7 @@ final class ScrollResultPanel: NSPanel {
         imageView.imageScaling = .scaleProportionallyDown
         content.addSubview(imageView)
 
-        // pixels-per-view-point for the fitted image (used by drawing input)
-        let pixelsPerPoint = CGFloat(image.cgImage.width) / imageSize.width
+        // same pixels-per-view-point maps drawing input to image pixels
         let host = AnnotationHostView(
             frame: imageView.frame,
             surface: annotationSurface,

@@ -151,6 +151,7 @@ enum UITest {
         // visible frame, toolbar visible, escape hatch presents exactly one
         // editor AFTER the panel dismissed.
         var scrollPanelOK = false
+        var panelPreviewOK = false
         if let screen = NSScreen.main {
             let tallStitch = CapturedImage(
                 cgImage: SelfTest.makeTestImage(width: 400, height: 24_000), scale: 2)
@@ -212,6 +213,59 @@ enum UITest {
                     }
                 }
             }
+            // WYSIWYG preview: on the fixed-fit panel a Pen stroke must be
+            // VISIBLY thick — the authoring scale is pixelsPerPoint, not
+            // image.scale. Cross-section through the midpoint of an
+            // off-center stroke in the RENDERED host: exactly one contiguous
+            // run, ~3 view pt thick, centroid on the stroke line (off-center
+            // endpoints turn an axis flip into a centroid miss). With
+            // image.scale authoring the run measures ≤1 px → gate red.
+            if let host = panel.annotationHostForTesting {
+                panel.annotationSurface.tool = .pen
+                panel.annotationSurface.color = .systemRed
+                let annBeforePreview = panel.annotationSurface.annotations.count
+                let w = host.bounds.width, h = host.bounds.height
+                let a = CGPoint(x: w * 0.15, y: h * 0.4)
+                let b = CGPoint(x: w * 0.8, y: h * 0.4)
+                panel.drawWithRealEventsForTesting(fromView: a, toView: b)
+                if panel.annotationSurface.annotations.count == annBeforePreview + 1,
+                   let rep = host.bitmapImageRepForCachingDisplay(in: host.bounds) {
+                    host.cacheDisplay(in: host.bounds, to: rep)
+                    let repScale = CGFloat(rep.pixelsHigh) / max(1, h)
+                    let col = min(
+                        rep.pixelsWide - 1,
+                        Int((a.x + b.x) / 2 / max(1, w) * CGFloat(rep.pixelsWide)))
+                    var runs: [(count: Int, sumRow: CGFloat)] = []
+                    var run: (count: Int, sumRow: CGFloat)?
+                    for row in 0..<rep.pixelsHigh {
+                        let c = rep.colorAt(x: col, y: row)?
+                            .usingColorSpace(.deviceRGB)
+                        let red = c.map {
+                            $0.alphaComponent > 0.4 && $0.redComponent > 0.6
+                                && $0.redComponent > $0.greenComponent + 0.25
+                                && $0.redComponent > $0.blueComponent + 0.25
+                        } ?? false
+                        if red {
+                            run = ((run?.count ?? 0) + 1,
+                                   (run?.sumRow ?? 0) + CGFloat(row))
+                        } else if let finished = run {
+                            runs.append(finished)
+                            run = nil
+                        }
+                    }
+                    if let finished = run { runs.append(finished) }
+                    if runs.count == 1, let stroke = runs.first {
+                        let thicknessPt = CGFloat(stroke.count) / repScale
+                        // rep rows count from the TOP; view y is bottom-up
+                        let centroidViewY =
+                            h - (stroke.sumRow / CGFloat(stroke.count)) / repScale
+                        panelPreviewOK = thicknessPt >= 2 && thicknessPt <= 4.5
+                            && abs(centroidViewY - a.y) <= 2.5
+                    }
+                }
+                _ = panel.annotationSurface.undo() // clean slate for the probes
+            }
+
             // Annotate through REAL mouse events at the four corners and
             // the center of the fitted strip: each stroke must land at the
             // matching pixel in the export (uniform X/Y mapping), and the
@@ -332,6 +386,7 @@ enum UITest {
             print("UITEST tall-crop-controls \(tallCropControlsOK ? "PASS" : "FAIL")")
             print("UITEST overlay-review \(overlayReviewOK ? "PASS" : "FAIL")")
             print("UITEST scroll-panel \(scrollPanelOK ? "PASS" : "FAIL")")
+            print("UITEST scroll-panel-preview \(panelPreviewOK ? "PASS" : "FAIL")")
             var index = 0
             for window in NSApp.windows where window.isVisible {
                 guard let view = window.contentView, view.bounds.width > 10 else { continue }
@@ -345,7 +400,7 @@ enum UITest {
             }
             print("UITEST captured \(index) windows → \(outDir)")
             exit(index >= 3 && fitOK && tallCropControlsOK && overlayReviewOK
-                 && scrollPanelOK ? 0 : 1)
+                 && scrollPanelOK && panelPreviewOK ? 0 : 1)
         }
     }
 }
