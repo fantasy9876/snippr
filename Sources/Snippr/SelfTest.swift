@@ -4216,15 +4216,17 @@ enum SelfTest {
             }
             let moveBarDuring = moveView.reviewToolbarFrameForTesting
             let movePixelsDuring = moveOverlay.session.pixelRect
-            let moveLive = moveBarBefore != nil
+            let moveToolbarLive = moveBarBefore != nil
                 && moveBarDuring != moveBarBefore
-                && movePixelsDuring == expectedPixels(
-                    for: movedRect, frozen: frozenImage)
+            let movePixelsLive = movePixelsDuring == expectedPixels(
+                for: movedRect, frozen: frozenImage)
             if let up = liveMouse(.leftMouseUp, moveEnd) {
                 moveView.mouseUp(with: up)
             }
-            let moveNoJump = moveView.reviewToolbarFrameForTesting == moveBarDuring
-                && moveOverlay.session.pixelRect == movePixelsDuring
+            let moveToolbarNoJump =
+                moveView.reviewToolbarFrameForTesting == moveBarDuring
+            let movePixelsNoJump =
+                moveOverlay.session.pixelRect == movePixelsDuring
 
             let resizeRect = CGRect(
                 x: max(40, b.width / 2 - 130),
@@ -4247,20 +4249,26 @@ enum SelfTest {
             }
             let resizeBarDuring = resizeView.reviewToolbarFrameForTesting
             let resizePixelsDuring = resizeOverlay.session.pixelRect
-            let resizeLive = resizeBarBefore != nil
+            let resizeToolbarLive = resizeBarBefore != nil
                 && resizeBarDuring != resizeBarBefore
-                && resizePixelsDuring == expectedPixels(
-                    for: resizedRect, frozen: frozenImage)
+            let resizePixelsLive = resizePixelsDuring == expectedPixels(
+                for: resizedRect, frozen: frozenImage)
             if let up = liveMouse(.leftMouseUp, resizeEnd) {
                 resizeView.mouseUp(with: up)
             }
-            let resizeNoJump =
+            let resizeToolbarNoJump =
                 resizeView.reviewToolbarFrameForTesting == resizeBarDuring
-                && resizeOverlay.session.pixelRect == resizePixelsDuring
+            let resizePixelsNoJump =
+                resizeOverlay.session.pixelRect == resizePixelsDuring
 
             check("overlay7-toolbar-live-follow",
-                  moveLive && moveNoJump && resizeLive && resizeNoJump,
-                  "moveLive \(moveLive) moveNoJump \(moveNoJump) resizeLive \(resizeLive) resizeNoJump \(resizeNoJump)")
+                  moveToolbarLive && moveToolbarNoJump
+                    && resizeToolbarLive && resizeToolbarNoJump,
+                  "moveLive \(moveToolbarLive) moveNoJump \(moveToolbarNoJump) resizeLive \(resizeToolbarLive) resizeNoJump \(resizeToolbarNoJump)")
+            check("overlay7-pixelrect-live-follow",
+                  movePixelsLive && movePixelsNoJump
+                    && resizePixelsLive && resizePixelsNoJump,
+                  "moveLive \(movePixelsLive) moveNoJump \(movePixelsNoJump) resizeLive \(resizePixelsLive) resizeNoJump \(resizePixelsNoJump)")
 
             // Retina 2x + shrink→re-expand: the SAME edges give the SAME
             // integral pixelRect — no 1px drift through a resize round trip.

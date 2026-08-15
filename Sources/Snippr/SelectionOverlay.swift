@@ -831,6 +831,7 @@ final class SelectionOverlayView: NSView {
             needsDisplay = true
             return
         }
+        var adjustedReviewCrop = false
         switch areaDrag {
         case .creating(let anchor):
             areaSelection = EditableSelectionGeometry.rect(from: anchor, to: p, within: bounds)
@@ -840,12 +841,21 @@ final class SelectionOverlayView: NSView {
                 by: CGPoint(x: p.x - start.x, y: p.y - start.y),
                 within: bounds
             )
+            adjustedReviewCrop = true
         case .resizing(let handle, let original):
             areaSelection = EditableSelectionGeometry.resized(
                 original, using: handle, to: p, within: bounds
             )
+            adjustedReviewCrop = true
         case .none:
             break
+        }
+        if adjustedReviewCrop, owner?.session.phase == .reviewing {
+            // Keep the visible toolbar and the session's pixel authority on
+            // the same crop during the drag.  Waiting for mouseUp leaves the
+            // toolbar behind and creates a visible jump on release.
+            syncSessionPixelRect()
+            layoutReviewToolbar()
         }
         needsDisplay = true
         window?.invalidateCursorRects(for: self)
