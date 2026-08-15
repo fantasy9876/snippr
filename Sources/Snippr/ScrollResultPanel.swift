@@ -2,8 +2,9 @@ import AppKit
 
 /// Routes a finished scrolling capture: the auto actions run exactly once
 /// through the router (`.scrollFinished`, source `.scrollResult` — never a
-/// Repeat-Area rect), then the borderless result panel presents only when the
-/// snapshotted `afterShow` says so. There is deliberately no `handleResult`
+/// Repeat-Area rect), then — only when the snapshotted `afterShow` says so —
+/// the result is presented in the Editor (default, `AfterScrollShow.editor`)
+/// or the borderless in-place panel. There is deliberately no `handleResult`
 /// path here (QA invariants 13–15).
 @MainActor
 enum ScrollResultPresenter {
@@ -26,9 +27,20 @@ enum ScrollResultPresenter {
             inputs: effectiveInputs, finalGlobalRect: nil,
             dependencies: dependencies)
         if effectiveInputs.afterShow, let screen = finish.screen {
-            ScrollResultPanel.show(
-                image: image, inputs: finish.inputs, screen: screen,
-                dependencies: dependencies)
+            switch afterScrollShow {
+            case .editor:
+                // The editor is the destination the in-place panel's own
+                // "Open in editor" button reaches: the SAME router intent,
+                // so exactly-once/lastCapture semantics are unchanged.
+                CaptureActionRouter.commit(
+                    image, source: .scrollResult, intent: .openEditor,
+                    inputs: finish.inputs, finalGlobalRect: nil,
+                    dependencies: dependencies)
+            case .panel:
+                ScrollResultPanel.show(
+                    image: image, inputs: finish.inputs, screen: screen,
+                    dependencies: dependencies)
+            }
         }
     }
 }

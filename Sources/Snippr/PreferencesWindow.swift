@@ -227,6 +227,7 @@ struct GeneralTab: View {
     @AppStorage(Settings.Keys.afterCopy) private var afterCopy = false
     @AppStorage(Settings.Keys.afterSave) private var afterSave = false
     @AppStorage(Settings.Keys.afterCropShow) private var afterCrop = AfterCropShow.editor.rawValue
+    @AppStorage(Settings.Keys.afterScrollShow) private var afterScroll = AfterScrollShow.editor.rawValue
     @AppStorage(Settings.Keys.hidePreviewMode) private var hidePreview = HidePreviewMode.manual.rawValue
     @State private var folderLabel = Settings.shared.screenshotsFolder.path
     @State private var launchAtStartup = LaunchAtLogin.isEnabled
@@ -313,6 +314,16 @@ struct GeneralTab: View {
             Row(label: "After Area Crop, show") {
                 Picker("", selection: $afterCrop) {
                     ForEach(AfterCropShow.allCases, id: \.rawValue) { c in
+                        Text(c.label).tag(c.rawValue)
+                    }
+                }
+                .pickerStyle(.radioGroup)
+                .horizontalRadioGroupLayout()
+                .labelsHidden()
+            }
+            Row(label: "After Scrolling capture, show") {
+                Picker("", selection: $afterScroll) {
+                    ForEach(AfterScrollShow.allCases, id: \.rawValue) { c in
                         Text(c.label).tag(c.rawValue)
                     }
                 }
