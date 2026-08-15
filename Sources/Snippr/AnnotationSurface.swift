@@ -7,6 +7,10 @@ enum OverlayAnnotationTool: CaseIterable {
     case arrow
     case rect
     case text
+    case line
+    case oval
+    case highlight
+    case counter
 
     var symbol: String {
         switch self {
@@ -15,6 +19,10 @@ enum OverlayAnnotationTool: CaseIterable {
         case .arrow: return "arrow.up.right"
         case .rect: return "rectangle"
         case .text: return "textformat"
+        case .line: return "line.diagonal"
+        case .oval: return "circle"
+        case .highlight: return "highlighter"
+        case .counter: return "1.circle"
         }
     }
 
@@ -25,6 +33,10 @@ enum OverlayAnnotationTool: CaseIterable {
         case .arrow: return "Arrow (A)"
         case .rect: return "Rectangle (R)"
         case .text: return "Text (T)"
+        case .line: return "Line (L)"
+        case .oval: return "Oval (O)"
+        case .highlight: return "Highlighter (H)"
+        case .counter: return "Counter (N)"
         }
     }
 }
@@ -66,13 +78,31 @@ final class AnnotationSurface {
             activePen = pen
             annotations.append(pen)
             return true
-        case .arrow, .rect:
+        case .arrow, .rect, .line, .oval, .highlight:
+            let kind: ShapeAnnotation.Kind
+            switch tool {
+            case .arrow: kind = .arrow
+            case .rect: kind = .rect
+            case .line: kind = .line
+            case .oval: kind = .oval
+            case .highlight: kind = .highlight
+            default: preconditionFailure("unreachable shape tool")
+            }
             let shape = ShapeAnnotation(
-                kind: tool == .arrow ? .arrow : .rect,
+                kind: kind,
                 start: p, end: p, uiScale: pixelScale)
             shape.color = color
             activeShape = shape
             annotations.append(shape)
+            return true
+        case .counter:
+            let counter = CounterAnnotation(uiScale: pixelScale)
+            counter.center = p
+            counter.number = (annotations.compactMap {
+                ($0 as? CounterAnnotation)?.number
+            }.max() ?? 0) + 1
+            counter.color = color
+            annotations.append(counter)
             return true
         case .text:
             // text placement is click-driven; the host creates the field

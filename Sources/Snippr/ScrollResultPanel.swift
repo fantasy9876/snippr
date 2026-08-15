@@ -170,6 +170,7 @@ final class ScrollResultPanel: NSPanel {
     /// 201 undo.
     private static let toolItems: [OverlayAnnotationTool] = [
         .select, .pen, .arrow, .rect, .text,
+        .line, .oval, .highlight, .counter,
     ]
     private static let colorPresets: [NSColor] = [
         .systemRed, .systemOrange, .systemYellow, .systemGreen,

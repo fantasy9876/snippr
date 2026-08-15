@@ -383,6 +383,7 @@ final class SelectionOverlayView: NSView {
     /// Annotation tool buttons occupy tags 100+; color cycler 200; undo 201.
     private static let toolItems: [OverlayAnnotationTool] = [
         .select, .pen, .arrow, .rect, .text,
+        .line, .oval, .highlight, .counter,
     ]
     private static let colorPresets: [NSColor] = [
         .systemRed, .systemOrange, .systemYellow, .systemGreen,
