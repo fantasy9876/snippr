@@ -4168,6 +4168,100 @@ enum SelfTest {
             check("overlay5-toolbar-edges", edgeFailures.isEmpty,
                   edgeFailures.joined(separator: "; "))
 
+            // Regression: the review toolbar and pixel-crop authority must
+            // follow a REAL move/resize drag before mouseUp.  The old edge
+            // gate used adjustSelectionForTesting(), which performs sync +
+            // layout itself and therefore stayed green while production
+            // mouseDragged left both values stale until the button released.
+            @MainActor func liveMouse(
+                _ type: NSEvent.EventType, _ point: CGPoint
+            ) -> NSEvent? {
+                NSEvent.mouseEvent(
+                    with: type, location: point, modifierFlags: [],
+                    timestamp: 0, windowNumber: 0, context: nil,
+                    eventNumber: 0, clickCount: 1, pressure: 1)
+            }
+            @MainActor func expectedPixels(
+                for rect: CGRect, frozen: CapturedImage
+            ) -> CGRect {
+                let scale = frozen.scale
+                return CGRect(
+                    x: rect.minX * scale,
+                    y: (CGFloat(frozen.cgImage.height) / scale - rect.maxY) * scale,
+                    width: rect.width * scale,
+                    height: rect.height * scale
+                ).integral
+            }
+
+            let moveRect = CGRect(
+                x: max(40, b.width / 2 - 130),
+                y: max(100, b.height / 2 - 80),
+                width: 260, height: 160)
+            let moveDelta = CGPoint(x: 37, y: 29)
+            let movedRect = EditableSelectionGeometry.moved(
+                moveRect, by: moveDelta,
+                within: CGRect(origin: .zero, size: b))
+            let (moveOverlay, moveView) = reviewView()
+            moveView.selectForTesting(rect: moveRect)
+            let moveBarBefore = moveView.reviewToolbarFrameForTesting
+            let moveStart = CGPoint(x: moveRect.midX, y: moveRect.midY)
+            let moveEnd = CGPoint(
+                x: moveStart.x + moveDelta.x,
+                y: moveStart.y + moveDelta.y)
+            if let down = liveMouse(.leftMouseDown, moveStart) {
+                moveView.mouseDown(with: down)
+            }
+            if let drag = liveMouse(.leftMouseDragged, moveEnd) {
+                moveView.mouseDragged(with: drag)
+            }
+            let moveBarDuring = moveView.reviewToolbarFrameForTesting
+            let movePixelsDuring = moveOverlay.session.pixelRect
+            let moveLive = moveBarBefore != nil
+                && moveBarDuring != moveBarBefore
+                && movePixelsDuring == expectedPixels(
+                    for: movedRect, frozen: frozenImage)
+            if let up = liveMouse(.leftMouseUp, moveEnd) {
+                moveView.mouseUp(with: up)
+            }
+            let moveNoJump = moveView.reviewToolbarFrameForTesting == moveBarDuring
+                && moveOverlay.session.pixelRect == movePixelsDuring
+
+            let resizeRect = CGRect(
+                x: max(40, b.width / 2 - 130),
+                y: min(max(180, b.height / 3), b.height - 220),
+                width: 260, height: 180)
+            let resizedRect = EditableSelectionGeometry.resized(
+                resizeRect, using: .bottom,
+                to: CGPoint(x: resizeRect.midX, y: 5),
+                within: CGRect(origin: .zero, size: b))
+            let (resizeOverlay, resizeView) = reviewView()
+            resizeView.selectForTesting(rect: resizeRect)
+            let resizeBarBefore = resizeView.reviewToolbarFrameForTesting
+            let resizeStart = SelectionHandle.bottom.point(in: resizeRect)
+            let resizeEnd = CGPoint(x: resizeStart.x, y: 5)
+            if let down = liveMouse(.leftMouseDown, resizeStart) {
+                resizeView.mouseDown(with: down)
+            }
+            if let drag = liveMouse(.leftMouseDragged, resizeEnd) {
+                resizeView.mouseDragged(with: drag)
+            }
+            let resizeBarDuring = resizeView.reviewToolbarFrameForTesting
+            let resizePixelsDuring = resizeOverlay.session.pixelRect
+            let resizeLive = resizeBarBefore != nil
+                && resizeBarDuring != resizeBarBefore
+                && resizePixelsDuring == expectedPixels(
+                    for: resizedRect, frozen: frozenImage)
+            if let up = liveMouse(.leftMouseUp, resizeEnd) {
+                resizeView.mouseUp(with: up)
+            }
+            let resizeNoJump =
+                resizeView.reviewToolbarFrameForTesting == resizeBarDuring
+                && resizeOverlay.session.pixelRect == resizePixelsDuring
+
+            check("overlay7-toolbar-live-follow",
+                  moveLive && moveNoJump && resizeLive && resizeNoJump,
+                  "moveLive \(moveLive) moveNoJump \(moveNoJump) resizeLive \(resizeLive) resizeNoJump \(resizeNoJump)")
+
             // Retina 2x + shrink→re-expand: the SAME edges give the SAME
             // integral pixelRect — no 1px drift through a resize round trip.
             let retinaFrozen = CapturedImage(
