@@ -343,6 +343,12 @@ final class SelectionOverlayView: NSView {
     var reviewToolbarFrameForTesting: CGRect? {
         reviewToolbar?.isHidden == false ? reviewToolbar?.frame : nil
     }
+    var reviewToolbarButtonsForTesting: [(tag: Int, tooltip: String)] {
+        toolbarButtons.map { ($0.tag, $0.toolTip ?? "") }
+    }
+    func clickReviewToolbarButtonForTesting(tag: Int) {
+        toolbarButtons.first { $0.tag == tag }?.performClick(nil)
+    }
 
     /// Test hook: runs the production selection→commit path without raw
     /// mouse plumbing (QA prefers small state hooks over synthesized clicks).

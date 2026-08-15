@@ -190,6 +190,9 @@ final class ScrollResultPanel: NSPanel {
     var toolbarButtonFramesForTesting: [CGRect] {
         toolbarButtons.map { $0.frame }
     }
+    var toolbarButtonsForTesting: [(tag: Int, tooltip: String)] {
+        toolbarButtons.map { ($0.tag, $0.toolTip ?? "") }
+    }
 
     private func buildToolbar(width: CGFloat, height: CGFloat) -> NSView {
         let bar = NSView(frame: CGRect(x: 0, y: 0, width: width, height: height))

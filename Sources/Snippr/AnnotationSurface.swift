@@ -155,8 +155,22 @@ final class AnnotationSurface {
     /// Allocation spy for the export path: exactly ONE full-size destination
     /// buffer per flatten, never an intermediate materialized crop.
     nonisolated(unsafe) static var flattenAllocationsForTesting = 0
+    /// S2 fail-first hooks: production does not write these until regional
+    /// pixelation exists.  Tests use them to reject a hidden full-image cache.
+    nonisolated(unsafe) static var regionalPixelateAllocationsForTesting = 0
+    nonisolated(unsafe) static var lastRegionalPixelateRectForTesting: CGRect?
     /// Test hook: simulates destination-allocation failure.
     var forceRenderFailureForTesting = false
+    /// Test hook: regional pixelation must fail closed during export.
+    var forceRegionalPixelateFailureForTesting = false
+
+    /// Inserts the editor's existing BlurAnnotation model so the S2 RED gate
+    /// can exercise rendering/allocation before the toolbar routes the tool.
+    func addBlurForTesting(rect: CGRect) {
+        let blur = BlurAnnotation(uiScale: pixelScale)
+        blur.rect = rect
+        annotations.append(blur)
+    }
 
     /// Flattened export: ONE destination buffer in the base's own colour
     /// space (P3 stays P3); the source crop is drawn straight into it and

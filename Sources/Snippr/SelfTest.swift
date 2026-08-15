@@ -4364,6 +4364,83 @@ enum SelfTest {
             check("overlay8-full-tools-s1", s1Failures.isEmpty,
                   s1Failures.joined(separator: "; "))
 
+            // S2 production/catalog gate: Pixelate must be the SAME real
+            // toolbar item/tag on area + scroll, and reverse-drag must create
+            // the editor's BlurAnnotation model through live mouse handlers.
+            let s2Tools = OverlayAnnotationTool.allCases.filter {
+                $0.tooltip.hasPrefix("Pixelate")
+            }
+            var s2ToolbarFailures: [String] = []
+            if s2Tools.count != 1 {
+                s2ToolbarFailures.append("catalog \(s2Tools.count)/1")
+            }
+            if let tool = s2Tools.first,
+               let index = OverlayAnnotationTool.allCases.firstIndex(of: tool) {
+                let expectedTag = 100 + index
+                let (_, view) = reviewView()
+                let selection = CGRect(
+                    x: max(40, b.width / 2 - 150),
+                    y: max(100, b.height / 2 - 100),
+                    width: 300, height: 200)
+                view.selectForTesting(rect: selection)
+                let areaPixelate = view.reviewToolbarButtonsForTesting.filter {
+                    $0.tooltip.hasPrefix("Pixelate")
+                }
+                if areaPixelate.map(\.tag) != [expectedTag] {
+                    s2ToolbarFailures.append("area tags \(areaPixelate.map(\.tag))")
+                }
+                view.clickReviewToolbarButtonForTesting(tag: expectedTag)
+                if view.annotationSurface?.tool != tool {
+                    s2ToolbarFailures.append("area click did not select")
+                }
+                let start = CGPoint(
+                    x: selection.minX + 220,
+                    y: selection.minY + 145)
+                let end = CGPoint(
+                    x: selection.minX + 65,
+                    y: selection.minY + 45)
+                if let down = liveMouse(.leftMouseDown, start) {
+                    view.mouseDown(with: down)
+                }
+                if let drag = liveMouse(.leftMouseDragged, end) {
+                    view.mouseDragged(with: drag)
+                }
+                if let up = liveMouse(.leftMouseUp, end) {
+                    view.mouseUp(with: up)
+                }
+                let wantRect = CGRect(
+                    x: end.x, y: end.y,
+                    width: start.x - end.x, height: start.y - end.y)
+                if let blur = view.annotationSurface?.annotations.last
+                    as? BlurAnnotation {
+                    if blur.rect != wantRect {
+                        s2ToolbarFailures.append(
+                            "reverse rect \(blur.rect) want \(wantRect)")
+                    }
+                } else {
+                    s2ToolbarFailures.append("area no BlurAnnotation")
+                }
+
+                let panel = ScrollResultPanel.show(
+                    image: frozenImage,
+                    inputs: OverlaySessionInputs(
+                        afterShow: true, afterCopy: false, afterSave: false),
+                    screen: screen, dependencies: noopDeps())
+                let panelPixelate = panel.toolbarButtonsForTesting.filter {
+                    $0.tooltip.hasPrefix("Pixelate")
+                }
+                if panelPixelate.map(\.tag) != [expectedTag] {
+                    s2ToolbarFailures.append("panel tags \(panelPixelate.map(\.tag))")
+                }
+                panel.clickToolbarButtonForTesting(tag: expectedTag)
+                if panel.annotationSurface.tool != tool {
+                    s2ToolbarFailures.append("panel click did not select")
+                }
+                panel.clickToolbarButtonForTesting(tag: -1)
+            }
+            check("overlay9-pixelate-toolbar-s2", s2ToolbarFailures.isEmpty,
+                  s2ToolbarFailures.joined(separator: "; "))
+
             // Retina 2x + shrink→re-expand: the SAME edges give the SAME
             // integral pixelRect — no 1px drift through a resize round trip.
             let retinaFrozen = CapturedImage(
@@ -4425,6 +4502,57 @@ enum SelfTest {
 
         // 13. Overlay: flatten fail-closed / allocation / P3 / save-lock ----------
         MainActor.assumeIsolated {
+            // S2 regional pixelation must allocate only the requested blur
+            // region, preserve pixels outside it (including the Y-mirrored
+            // wrong region), and fail closed if Core Image cannot render.
+            let pixelBase = makeNoiseImage(width: 320, height: 240)
+            let pixelSurface = AnnotationSurface(pixelScale: 1)
+            let blurRect = CGRect(x: 149, y: 31, width: 53, height: 37)
+            pixelSurface.addBlurForTesting(rect: blurRect)
+            AnnotationSurface.regionalPixelateAllocationsForTesting = 0
+            AnnotationSurface.lastRegionalPixelateRectForTesting = nil
+            let pixelDestBefore = AnnotationSurface.flattenAllocationsForTesting
+            let pixelFlat = pixelSurface.flattened(
+                base: pixelBase,
+                cropPixels: CGRect(x: 0, y: 0, width: 320, height: 240))
+            func equalCrops(_ a: CGImage, _ b: CGImage, _ rect: CGRect) -> Bool {
+                guard let ac = a.cropping(to: rect),
+                      let bc = b.cropping(to: rect) else { return false }
+                return imagesEqual(ac, bc)
+            }
+            let blurTL = CGRect(
+                x: blurRect.minX,
+                y: CGFloat(pixelBase.height) - blurRect.maxY,
+                width: blurRect.width, height: blurRect.height)
+            let mirroredTL = CGRect(
+                x: blurRect.minX, y: blurRect.minY,
+                width: blurRect.width, height: blurRect.height)
+            var regionalPixelsOK = false
+            if let pixelFlat {
+                regionalPixelsOK = !equalCrops(pixelBase, pixelFlat, blurTL)
+                    && equalCrops(
+                        pixelBase, pixelFlat,
+                        CGRect(x: 0, y: 0, width: 24, height: 24))
+                    && equalCrops(pixelBase, pixelFlat, mirroredTL)
+            }
+            let regionalAllocOK =
+                AnnotationSurface.regionalPixelateAllocationsForTesting == 1
+                && AnnotationSurface.lastRegionalPixelateRectForTesting
+                    == blurRect.integral
+                && blurRect.width * blurRect.height
+                    < CGFloat(pixelBase.width * pixelBase.height) / 10
+                && AnnotationSurface.flattenAllocationsForTesting
+                    == pixelDestBefore + 1
+            pixelSurface.forceRegionalPixelateFailureForTesting = true
+            let regionalFailed = pixelSurface.flattened(
+                base: pixelBase,
+                cropPixels: CGRect(x: 0, y: 0, width: 320, height: 240)) == nil
+            pixelSurface.forceRegionalPixelateFailureForTesting = false
+            check("overlay9-pixelate-regional-s2",
+                  regionalPixelsOK && regionalAllocOK && regionalFailed
+                    && pixelSurface.annotations.count == 1,
+                  "pixels \(regionalPixelsOK) alloc \(regionalAllocOK) failClosed \(regionalFailed) count \(pixelSurface.annotations.count) region \(String(describing: AnnotationSurface.lastRegionalPixelateRectForTesting))")
+
             // allocation spy: exactly one destination buffer, zero
             // materialized copies, on a large flatten with annotations
             let big = makeStripePattern(width: 720, height: 4000, seed: 0x000B_16F1)
