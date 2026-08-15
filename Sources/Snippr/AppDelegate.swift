@@ -41,6 +41,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let devToolFlags = [
             "--uitest", "--benchmark", "--test-firstopen", "--test-scrollpreview",
             "--test-scrollstitch", "--test-scrollreal", "--test-scrollapp",
+            "--test-scrollreplay",
         ]
         let isDevTool = devToolFlags.contains { CommandLine.arguments.contains($0) }
         let captureDevToolFlags = [
@@ -95,6 +96,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if Benchmark.firstOpenTestRequested { Benchmark.runFirstOpenTest() }
         if let dir = Benchmark.scrollPreviewOutDir { Benchmark.runScrollPreviewTest(outDir: dir) }
         if Benchmark.scrollStitchTestRequested { Benchmark.runScrollStitchTest() }
+        if let path = Benchmark.scrollReplayPath { Benchmark.runScrollReplayTest(path: path) }
         if let dir = Benchmark.scrollRealOutDir { Benchmark.runScrollRealTest(outDir: dir) }
         if Benchmark.scrollAppRequested { Benchmark.runScrollAppTest() }
         if !isDevTool {

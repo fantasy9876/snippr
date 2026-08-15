@@ -589,6 +589,66 @@ enum SelfTest {
             }
         }
 
+        // 2c-bounce-revisit. Scroll-back-to-top must never re-enter the output ----
+        // The rubber-band / Home-key ending: after a long downward capture the
+        // page jumps back to the top. Those frames fail the edge matcher,
+        // then verify against EACH OTHER — and the pending promotion used to
+        // append the page top AGAIN behind a separator (the duplicated-block
+        // + phantom-stripe capture from the field report). Revisited content
+        // must resolve as a retrace: no growth, no new segment. A real gap
+        // (flick to unseen content) shares no captured rows and still
+        // re-anchors through the pending path — covered by 2b fixtures above.
+        do {
+            // textured rows: real pages carry horizontal detail (text,
+            // borders); the revisit ledger deliberately ignores flat rows,
+            // so a solid-stripe fixture could never exercise it.
+            let doc = makeTexturedStripePattern(width: 400, height: 5200, seed: 0xB0B0_57AF)
+            let vp = 500
+            if let first = doc.cropping(to: CGRect(
+                x: 0, y: 0, width: 400, height: vp)) {
+                let segmented = SegmentedVerticalStitcher(first: first)
+                var walkOK = true
+                var off = 0
+                for step in [300, 250, 300, 250, 300, 250, 300, 250,
+                             300, 250, 300, 250, 300, 250, 300, 250] {
+                    off += step
+                    guard let frame = doc.cropping(to: CGRect(
+                            x: 0, y: off, width: 400, height: vp)),
+                          case .appended = segmented.append(frame) else {
+                        walkOK = false
+                        break
+                    }
+                }
+                let heightBefore = segmented.totalHeight
+                let segmentsBefore = segmented.segmentCount
+                var badOutcome = false
+                // the bounce: settle near the top, then small drifts — enough
+                // ticks to cross the re-anchor threshold twice over
+                for bounceOff in [40, 40, 60, 80, 100, 120, 140, 160] {
+                    guard let frame = doc.cropping(to: CGRect(
+                        x: 0, y: bounceOff, width: 400, height: vp)) else {
+                        badOutcome = true
+                        break
+                    }
+                    switch segmented.append(frame) {
+                    case .appended, .prepended, .startedSegment:
+                        badOutcome = true
+                    case .moved, .rejected:
+                        break
+                    }
+                }
+                check("scroll7-bounce-revisit",
+                      walkOK && !badOutcome
+                        && segmented.totalHeight == heightBefore
+                        && segmented.segmentCount == segmentsBefore,
+                      "walk \(walkOK) bad \(badOutcome) "
+                        + "height \(segmented.totalHeight)/\(heightBefore) "
+                        + "segments \(segmented.segmentCount)/\(segmentsBefore)")
+            } else {
+                check("scroll7-bounce-revisit", false, "crop fail")
+            }
+        }
+
         // 2b-window-materialize. Preview refresh copies no pixel buffers -----------
         // A 5K source with sticky chrome and prepends used to materialize the
         // trimmed first viewport (~54 MiB) on every preview rebuild. The
@@ -6106,6 +6166,35 @@ enum SelfTest {
             c.setFillColor(CGColor(srgbRed: r, green: g, blue: b, alpha: 1))
             c.fill(CGRect(x: 0, y: y, width: width, height: 1))
         }
+        return c.makeImage()!
+    }
+
+    /// Like `makeStripePattern` but every row also carries deterministic
+    /// per-pixel texture (±24 around the row colour), so rows have real
+    /// horizontal-gradient energy like text/UI content while staying unique
+    /// per row.
+    private static func makeTexturedStripePattern(width: Int, height: Int, seed: UInt64) -> CGImage {
+        var buf = [UInt8](repeating: 0, count: width * height * 4)
+        var seed = seed
+        for y in 0..<height {
+            seed = seed &* 6364136223846793005 &+ 1442695040888963407
+            let base = [Int((seed >> 33) & 0xFF), Int((seed >> 41) & 0xFF), Int((seed >> 49) & 0xFF)]
+            var px = seed ^ 0x9E37_79B9_7F4A_7C15
+            for x in 0..<width {
+                px = px &* 6364136223846793005 &+ 1442695040888963407
+                let noise = Int((px >> 40) & 0x3F) - 32   // -32...31
+                let i = (y * width + x) * 4
+                for ch in 0..<3 {
+                    buf[i + ch] = UInt8(min(255, max(0, base[ch] + noise)))
+                }
+                buf[i + 3] = 255
+            }
+        }
+        let c = CGContext(
+            data: &buf, width: width, height: height, bitsPerComponent: 8, bytesPerRow: width * 4,
+            space: CGColorSpace(name: CGColorSpace.sRGB)!,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        )!
         return c.makeImage()!
     }
 

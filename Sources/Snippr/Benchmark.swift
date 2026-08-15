@@ -534,6 +534,77 @@ enum Benchmark {
         }
     }
 
+    /// `--test-scrollreplay <png>`: HEADLESS diagnostic for the
+    /// duplicate-block / phantom-segment reports. Replays a scroll session
+    /// against a supplied tall page image: viewport crops walk down the page
+    /// (exact-pixel frames, like --test-scrollstitch), then the page
+    /// "bounces" back to the top — the rubber-band / Home-key ending users
+    /// actually hit. Top-content frames must NOT enter the output: no
+    /// .appended, no new segment. Prints every outcome for diagnosis.
+    static var scrollReplayPath: String? {
+        guard let i = CommandLine.arguments.firstIndex(of: "--test-scrollreplay"),
+              CommandLine.arguments.count > i + 1 else { return nil }
+        return CommandLine.arguments[i + 1]
+    }
+
+    static func runScrollReplayTest(path: String) {
+        Task { @MainActor in
+            guard let img = NSImage(contentsOfFile: path),
+                  let tall = img.cgImage(forProposedRect: nil, context: nil, hints: nil)
+            else { print("load fail: \(path)"); exit(1) }
+            // Exclude the tail so a replay of a KNOWN-buggy stitched output
+            // (whose last rows duplicate the top) cannot legitimize the
+            // bounce frames by matching its own duplicated tail.
+            let effectiveHeight = tall.height > 2000 ? tall.height - 430 : tall.height
+            let vh = min(760, effectiveHeight / 3)
+            let vw = tall.width
+            func frame(at off: Int) -> CGImage? {
+                tall.cropping(to: CGRect(x: 0, y: off, width: vw, height: vh))
+            }
+            guard let first = frame(at: 0) else { print("crop fail"); exit(1) }
+            let s = SegmentedVerticalStitcher(first: first, scale: 2)
+            var off = 0
+            var flip = false
+            var accepted = 0, rejected = 0
+            while off + (flip ? 233 : 137) + vh <= effectiveHeight {
+                off += flip ? 233 : 137
+                flip.toggle()
+                guard let f = frame(at: off) else { break }
+                switch s.append(f) {
+                case .appended: accepted += 1
+                case .rejected: rejected += 1
+                case .startedSegment:
+                    print("  mid-scroll startedSegment at off \(off) (segments=\(s.segmentCount))")
+                default: break
+                }
+            }
+            print("walk done: accepted \(accepted), rejected \(rejected), "
+                  + "segments \(s.segmentCount), total \(s.totalHeight)px")
+            let heightBefore = s.totalHeight
+            let segmentsBefore = s.segmentCount
+            var failures = 0
+            // the bounce: several near-top frames (settle + tiny scrolls)
+            for bounceOff in [300, 300, 320, 340, 360, 380] {
+                guard let f = frame(at: bounceOff) else { continue }
+                let r = s.append(f)
+                print("BOUNCE off \(bounceOff): \(r) "
+                      + "segments=\(s.segmentCount) total=\(s.totalHeight)")
+                if case .appended = r { failures += 1 }
+            }
+            if s.segmentCount > segmentsBefore {
+                print("BOUNCE opened a new segment (separator in output)")
+                failures += 1
+            }
+            let grew = s.totalHeight - heightBefore
+            print("bounce grew output by \(grew)px "
+                  + "(segments \(segmentsBefore)→\(s.segmentCount))")
+            print(failures == 0
+                  ? "SCROLLREPLAY OK (bounce stayed out of the output)"
+                  : "SCROLLREPLAY FAILED (\(failures))")
+            exit(failures == 0 ? 0 : 1)
+        }
+    }
+
     /// `--test-scrollapp`: drives the REAL ScrollingCapture session against
     /// the frontmost window of ANOTHER app (open a tall page first), scrolling
     /// it with synthesized wheel events — chrome exclusion, overlay
