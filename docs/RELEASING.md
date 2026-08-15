@@ -5,6 +5,16 @@ cài** — release thiếu hash sẽ khiến client từ chối auto-update (fai
 
 ## macOS (vd. 1.2.2)
 
+0. **Danh tính ký phải ổn định.** `./build.sh` tự tạo/dùng chứng chỉ self-signed
+   `Snippr Dev` (`scripts/ensure-dev-cert.sh`, keychain riêng
+   `~/Library/Keychains/snippr-dev.keychain-db` + file mật khẩu cạnh bên).
+   Release build **từ chối** ký ad-hoc: ad-hoc pin designated requirement vào
+   cdhash, mỗi bản build/update mới làm macOS coi là app khác → mất Screen
+   Recording/Accessibility dù toggle vẫn bật (sự cố 1.2.2/1.2.3 trên Mac Studio).
+   Build trên nhiều máy: copy 2 file keychain + password sang máy kia và chạy
+   `scripts/ensure-dev-cert.sh` một lần để mọi máy ký cùng một danh tính; nếu
+   không, người dùng phải cấp lại quyền đúng một lần khi đổi máy build.
+
 1. Bump version: `Support/Info.plist` (`CFBundleShortVersionString` + `CFBundleVersion`),
    `PreferencesWindow.swift` (AboutTab).
 2. `./build.sh release` build app arm64. Build Intel riêng bằng
