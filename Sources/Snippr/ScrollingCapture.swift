@@ -1391,6 +1391,121 @@ final class VerticalStitcher {
         }
     }
 
+    /// Band subsets that may be treated as an "animated region": a sidebar
+    /// ad creative, a carousel, an autoplaying video card. At most HALF the
+    /// width, and only contiguous edge/single bands — the matcher never gets
+    /// to pick and choose scattered evidence.
+    static let animatedBandMasks: [[Int]] = [[3], [0], [2], [1], [2, 3], [0, 1]]
+
+    /// Minimum mean |Δ| (gray) the masked bands must show along the accepted
+    /// alignment for the mask to be JUSTIFIED. A column that did not change
+    /// cannot be the reason the full-width matcher rejected, so a weaker
+    /// witness must not override that rejection.
+    static let animatedBandMinDifference = 4.0
+
+    /// `sig` with the masked bands replaced by their nearest kept band, so
+    /// per-row averages keep their scale (static/footer/header epsilons stay
+    /// meaningful) while the masked bands contribute exactly what the kept
+    /// bands say.
+    static func maskedSignature(
+        _ sig: RowSig, masking mask: [Int], height: Int
+    ) -> RowSig {
+        var bands = sig.bands
+        let kept = (0..<4).filter { !mask.contains($0) }
+        for band in mask {
+            guard let source = kept.min(by: { abs($0 - band) < abs($1 - band) })
+            else { continue }
+            for y in 0..<height {
+                bands[y * 4 + band] = sig.bands[y * 4 + source]
+            }
+        }
+        return RowSig(bands: bands, energy: sig.energy)
+    }
+
+    /// Recovery for a frame pair whose MINORITY of the width changed content
+    /// (an ad creative swapping right after frame #1 — the VnExpress
+    /// duplicated-top report) while the rest of the page scrolled coherently.
+    /// Runs only after the full-width matcher rejected. Each candidate mask
+    /// must pass the complete directed matcher (uniqueness, whole-overlap
+    /// coherence, footer/header hypotheses) on the KEPT bands, AND the masked
+    /// bands must actually differ along that alignment; every mask that
+    /// passes must agree on offset and direction. Three-quarter changes have
+    /// no admissible mask and keep failing closed (re-anchor).
+    static func findDirectedOverlapMaskingAnimatedBands(
+        prev: RowSig, next: RowSig, height h: Int, scale: CGFloat,
+        lockedFooter: Int?
+    ) -> (match: Match, scrolledUp: Bool)? {
+        guard prev.bands.count == h * 4, next.bands.count == h * 4 else { return nil }
+        // A frame that did not change at all is a pause, not an animation.
+        var changedRows = 0
+        for y in 0..<h {
+            let base = y * 4
+            var d = 0.0
+            for band in 0..<4 { d += abs(prev.bands[base + band] - next.bands[base + band]) }
+            if d / 4 > 1.5 { changedRows += 1 }
+        }
+        guard changedRows > h / 20 else { return nil }
+
+        var candidates: [(match: Match, scrolledUp: Bool, mask: [Int])] = []
+        for mask in animatedBandMasks {
+            let maskedPrev = maskedSignature(prev, masking: mask, height: h)
+            let maskedNext = maskedSignature(next, masking: mask, height: h)
+            guard let (match, scrolledUp) = findDirectedOverlap(
+                prev: maskedPrev, next: maskedNext, height: h, scale: scale,
+                lockedFooter: lockedFooter)
+            else { continue }
+            guard maskedBandsDiffer(
+                prev: prev, next: next, mask: mask, match: match,
+                scrolledUp: scrolledUp, height: h)
+            else { continue }
+            candidates.append((match, scrolledUp, mask))
+        }
+        guard let first = candidates.first else { return nil }
+        for candidate in candidates.dropFirst() {
+            guard candidate.scrolledUp == first.scrolledUp,
+                  abs(candidate.match.preciseOffset - first.match.preciseOffset) <= 1
+            else {
+                Perf.reject("animated-band masks disagree")
+                return nil
+            }
+        }
+        let best = candidates.min {
+            ($0.mask.count, $0.match.confidenceScore)
+                < ($1.mask.count, $1.match.confidenceScore)
+        }!
+        if Perf.enabled {
+            FileHandle.standardError.write(
+                "animated-band match mask=\(best.mask) off=\(String(format: "%.2f", best.match.preciseOffset)) up=\(best.scrolledUp)\n"
+                    .data(using: .utf8)!)
+        }
+        return (best.match, best.scrolledUp)
+    }
+
+    /// Mean |Δ| of the masked bands over the overlap implied by `match`.
+    static func maskedBandsDiffer(
+        prev: RowSig, next: RowSig, mask: [Int], match: Match,
+        scrolledUp: Bool, height: Int
+    ) -> Bool {
+        let offset = max(0, Int(match.preciseOffset.rounded()))
+        let effective = height - match.footerRows
+        let start = max(0, match.headerRows)
+        let end = effective - offset
+        guard end - start >= 8 else { return false }
+        var total = 0.0
+        var count = 0
+        for y in start..<end {
+            // down: next[y] = prev[y + offset]; up: prev[y] = next[y + offset]
+            let a = scrolledUp ? y : y + offset
+            let b = scrolledUp ? y + offset : y
+            for band in mask {
+                total += abs(prev.bands[a * 4 + band] - next.bands[b * 4 + band])
+                count += 1
+            }
+        }
+        guard count > 0 else { return false }
+        return total / Double(count) >= animatedBandMinDifference
+    }
+
     /// True when `shifted[y] ≈ base[y + offset]` holds across (most of) the
     /// full overlap region, not just the matcher's template. A half-row
     /// offset (1x trackpad) is compared against the mean of the two
@@ -1564,10 +1679,14 @@ final class VerticalStitcher {
         }
         if firstSig == nil { firstSig = prevSig } // prev of the 1st append IS frame #1
 
+        let lockedFooter = footerLatched ? footerRows : nil
         guard let (match, scrolledUp) = Self.findDirectedOverlap(
             prev: prevSig, next: nextSig, height: frame.height, scale: scale,
-            lockedFooter: footerLatched ? footerRows : nil
-        ) else {
+            lockedFooter: lockedFooter)
+            ?? Self.findDirectedOverlapMaskingAnimatedBands(
+                prev: prevSig, next: nextSig, height: frame.height,
+                scale: scale, lockedFooter: lockedFooter)
+        else {
             return .rejected
         }
         let footer = footerLatched ? footerRows : match.footerRows

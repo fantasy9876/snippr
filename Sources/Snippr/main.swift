@@ -20,7 +20,7 @@ if arguments.contains("--check-permissions") {
 let devToolFlags = [
     "--uitest", "--benchmark", "--test-firstopen", "--test-scrollpreview",
     "--test-scrollstitch", "--test-scrollreal", "--test-scrollapp",
-    "--test-scrollreplay",
+    "--test-scrollreplay", "--test-scrollreplay-split",
 ]
 let isDevTool = devToolFlags.contains { arguments.contains($0) }
 

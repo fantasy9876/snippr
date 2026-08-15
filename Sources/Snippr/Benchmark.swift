@@ -605,6 +605,60 @@ enum Benchmark {
         }
     }
 
+    /// `--test-scrollreplay-split <png> <topRows>`: HEADLESS replay of the
+    /// duplicated-TOP report. `png` is a KNOWN-buggy stitched output whose
+    /// first `topRows` rows are the phantom first segment (frame #1, old ad
+    /// creative), followed by the separator and the page again (new
+    /// creative). Frame #1 = the phantom block; every later frame is cut from
+    /// the page below the separator. The walk must stay ONE segment.
+    static var scrollReplaySplit: (path: String, topRows: Int)? {
+        guard let i = CommandLine.arguments.firstIndex(of: "--test-scrollreplay-split"),
+              CommandLine.arguments.count > i + 2,
+              let rows = Int(CommandLine.arguments[i + 2]) else { return nil }
+        return (CommandLine.arguments[i + 1], rows)
+    }
+
+    static func runScrollReplaySplitTest(path: String, topRows: Int) {
+        Task { @MainActor in
+            guard let img = NSImage(contentsOfFile: path),
+                  let tall = img.cgImage(forProposedRect: nil, context: nil, hints: nil)
+            else { print("load fail: \(path)"); exit(1) }
+            let vw = tall.width, vh = topRows
+            let probe = SegmentedVerticalStitcher(
+                first: tall.cropping(to: CGRect(x: 0, y: 0, width: vw, height: 1))!, scale: 1)
+            let pageStart = topRows + probe.separatorRows
+            guard let first = tall.cropping(to: CGRect(x: 0, y: 0, width: vw, height: vh)),
+                  let page = tall.cropping(to: CGRect(
+                    x: 0, y: pageStart, width: vw, height: tall.height - pageStart))
+            else { print("crop fail"); exit(1) }
+            let s = SegmentedVerticalStitcher(first: first, scale: 1)
+            var off = 0, appended = 0, rejected = 0, started = 0, moved = 0
+            var flip = false
+            while off + (flip ? 90 : 60) + vh <= page.height {
+                off += flip ? 90 : 60
+                flip.toggle()
+                guard let f = page.cropping(to: CGRect(x: 0, y: off, width: vw, height: vh)) else { break }
+                let r = s.append(f)
+                switch r {
+                case .appended: appended += 1
+                case .rejected: rejected += 1
+                case .moved, .prepended: moved += 1
+                case .startedSegment:
+                    started += 1
+                    print("  startedSegment at off \(off) (segments=\(s.segmentCount))")
+                }
+                if off < 400 { print("  off \(off): \(r) total=\(s.totalHeight)") }
+            }
+            let expected = vh + off
+            print("walk done: appended \(appended) rejected \(rejected) moved \(moved) "
+                  + "started \(started) segments \(s.segmentCount) total \(s.totalHeight)px expected \(expected)px")
+            let ok = started == 0 && s.segmentCount == 1 && s.totalHeight == expected
+            print(ok ? "SCROLLREPLAY-SPLIT OK (one segment, no duplicated top)"
+                     : "SCROLLREPLAY-SPLIT FAILED")
+            exit(ok ? 0 : 1)
+        }
+    }
+
     /// `--test-scrollapp`: drives the REAL ScrollingCapture session against
     /// the frontmost window of ANOTHER app (open a tall page first), scrolling
     /// it with synthesized wheel events — chrome exclusion, overlay
