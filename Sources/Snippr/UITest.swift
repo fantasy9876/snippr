@@ -117,12 +117,17 @@ enum UITest {
                 // annotation + text-responder precedence: while the text
                 // field is first responder, Return must stay in the field —
                 // the overlay survives.
+                // blue rect: its right edge (crop x=200) falls inside the
+                // typed-text probe window — red would green the ink probe
+                // without any text
+                view.annotationSurface?.color = .systemBlue
                 view.annotationSurface?.tool = .rect
                 _ = view.annotationSurface?.beginDrag(
                     atPixel: CGPoint(x: 200, y: 220))
                 view.annotationSurface?.continueDrag(
                     toPixel: CGPoint(x: 320, y: 300))
                 view.annotationSurface?.endDrag()
+                view.annotationSurface?.color = .systemRed
                 let annotated = view.annotationSurface?.isEmpty == false
                 view.annotationSurface?.tool = .text
                 view.beginTextEntryForTesting(

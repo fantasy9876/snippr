@@ -554,11 +554,16 @@ final class AnnotationHostView: NSView {
 
     private func hostEndTextEntry(commit: Bool) {
         guard let field = textField else { return }
+        // Reentrancy parity with the area view: removing the field fires
+        // controlTextDidEndEditing → onEnd → hostEndTextEntry AGAIN. Read
+        // the value, then nil the ivar BEFORE removeFromSuperview so the
+        // nested call bails — one entry, one annotation.
         let value = field.stringValue
-        field.removeFromSuperview()
+        let origin = textPixelOrigin
         textField = nil
+        field.removeFromSuperview()
         if commit, !value.isEmpty {
-            surface.addText(value, atPixel: textPixelOrigin)
+            surface.addText(value, atPixel: origin)
             needsDisplay = true
         }
     }

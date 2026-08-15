@@ -953,12 +953,18 @@ final class SelectionOverlayView: NSView {
     /// ends editing via the delegate — never the capture-terminal path.
     fileprivate func endTextEntry(commit: Bool) {
         guard let field = textField else { return }
+        // Reentrancy: removing/resigning the field fires the delegate's
+        // controlTextDidEndEditing → onEnd → endTextEntry AGAIN. Read the
+        // value (validateEditing needs the live editor), then clear the ivar
+        // BEFORE remove/resign so the nested call sees nil — the entry must
+        // commit exactly once, never twice.
         let value = field.stringValue
-        field.removeFromSuperview()
+        let origin = textFieldPixelOrigin
         textField = nil
+        field.removeFromSuperview()
         window?.makeFirstResponder(self)
         if commit, !value.isEmpty {
-            annotationSurface?.addText(value, atPixel: textFieldPixelOrigin)
+            annotationSurface?.addText(value, atPixel: origin)
             needsDisplay = true
         }
     }
