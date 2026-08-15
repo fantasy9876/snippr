@@ -63,12 +63,26 @@ enum Benchmark {
             // 3) AREA capture driven by a synthetic drag — the most used path.
             // (Focus goes to Finder rather than hiding: a hidden app can't
             // receive the synthetic drag, which would only test the harness.)
+            // CGEvent injection silently no-ops without Accessibility — a
+            // permission the HARNESS needs for HID posting but production
+            // Snippr never uses. Without it, drive the SAME production
+            // NSResponder handlers with direct NSEvents instead of failing
+            // the gate on a harness-only permission.
+            let axTrusted = AXIsProcessTrusted()
+            let pathName = axTrusted
+                ? "CGEvent (Accessibility granted)"
+                : "direct NSEvent fallback (Accessibility NOT granted)"
+            print("area input path: \(pathName)")
             for round in 1...2 {
                 let before = editorWindows()
                 delegate.runHotkeyForTesting(.area)
                 try? await Task.sleep(nanoseconds: 2_500_000_000) // overlay up & key
                 let overlayUp = SelectionOverlay.current != nil
-                dragMouse(from: CGPoint(x: 400, y: 400), to: CGPoint(x: 900, y: 720))
+                if axTrusted {
+                    dragMouse(from: CGPoint(x: 400, y: 400), to: CGPoint(x: 900, y: 720))
+                } else {
+                    dragOverlayDirect()
+                }
                 try? await Task.sleep(nanoseconds: 350_000_000)
                 // Mouse-up IS the capture: the overlay must be in in-place
                 // REVIEW (toolbar up, no Capture button). Return = Copy and
@@ -78,7 +92,11 @@ enum Benchmark {
                 let toolbarUp = SelectionOverlay.current?
                     .activeReviewViewForTesting?
                     .reviewToolbarFrameForTesting != nil
-                pressKey(36) // Return → Copy & close
+                if axTrusted {
+                    pressKey(36) // Return → Copy & close
+                } else {
+                    pressReturnDirect() // same production keyDown handler
+                }
                 try? await Task.sleep(nanoseconds: 1_500_000_000)
 
                 let fresh = editorWindows().filter { w in !before.contains { $0 === w } }
@@ -564,6 +582,53 @@ enum Benchmark {
             // which produced a false "nothing scrolled" reproduction earlier
             try? await Task.sleep(nanoseconds: 18_000_000_000)
             session.finishForTesting()
+        }
+    }
+
+    /// No-Accessibility fallback for the area gate: sends NSEvents straight
+    /// into the live overlay's production mouseDown/Dragged/Up handlers.
+    /// Points are view-local (derived from the view's own bounds) and events
+    /// carry window coordinates, exactly what the handlers' `convert` expects.
+    private static func dragOverlayDirect() {
+        guard let view = SelectionOverlay.current?.activeReviewViewForTesting,
+              view.window != nil else {
+            print("  direct drag: no live overlay view")
+            return
+        }
+        let b = view.bounds
+        let dx = min(250, b.width * 0.3), dy = min(160, b.height * 0.3)
+        let start = CGPoint(x: b.midX - dx, y: b.midY - dy)
+        let end = CGPoint(x: b.midX + dx, y: b.midY + dy)
+        func mouse(_ type: NSEvent.EventType, _ p: CGPoint) -> NSEvent? {
+            NSEvent.mouseEvent(
+                with: type, location: view.convert(p, to: nil),
+                modifierFlags: [], timestamp: 0,
+                windowNumber: view.window?.windowNumber ?? 0, context: nil,
+                eventNumber: 0, clickCount: 1, pressure: 1)
+        }
+        if let down = mouse(.leftMouseDown, start) { view.mouseDown(with: down) }
+        for i in 1...6 {
+            let t = CGFloat(i) / 6
+            let p = CGPoint(x: start.x + (end.x - start.x) * t,
+                            y: start.y + (end.y - start.y) * t)
+            if let drag = mouse(.leftMouseDragged, p) { view.mouseDragged(with: drag) }
+        }
+        if let up = mouse(.leftMouseUp, end) { view.mouseUp(with: up) }
+    }
+
+    /// No-Accessibility fallback for Return → Copy & close: same production
+    /// keyDown handler the HID path would reach.
+    private static func pressReturnDirect() {
+        guard let view = SelectionOverlay.current?.activeReviewViewForTesting else {
+            print("  direct return: no live overlay view")
+            return
+        }
+        if let ev = NSEvent.keyEvent(
+            with: .keyDown, location: .zero, modifierFlags: [],
+            timestamp: 0, windowNumber: view.window?.windowNumber ?? 0,
+            context: nil, characters: "\r", charactersIgnoringModifiers: "\r",
+            isARepeat: false, keyCode: 36) {
+            view.keyDown(with: ev)
         }
     }
 
