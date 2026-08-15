@@ -9,7 +9,8 @@ import AppKit
 enum ScrollResultPresenter {
     static func present(
         _ finish: ScrollFinish,
-        dependencies: CaptureActionRouter.Dependencies? = nil
+        dependencies: CaptureActionRouter.Dependencies? = nil,
+        afterScrollShow: AfterScrollShow = Settings.shared.afterScrollShow
     ) {
         guard let image = finish.image else { return }
         // No screen = no presentation possible. The router must then treat

@@ -4611,6 +4611,47 @@ enum SelfTest {
             check("overlay3-presenter-nil-image",
                   copies <= 1 && ScrollResultPanel.current == nil,
                   "copies \(copies)")
+
+            // afterScrollShow = .editor (default): the finished stitch opens
+            // the EDITOR through the router's openEditor effect exactly once
+            // — auto copy still exactly once, no in-place panel. .panel keeps
+            // the borderless panel and never touches the editor.
+            if let screen {
+                var edCopies = 0, edOpens = 0, edToasts = 0
+                let edDeps = CaptureActionRouter.Dependencies(
+                    copyToClipboard: { _ in edCopies += 1 },
+                    autoSave: { _, _ in },
+                    saveAs: { _, _ in },
+                    pin: { _ in }, ocr: { _ in },
+                    openEditor: { _ in edOpens += 1 },
+                    toast: { _ in edToasts += 1 },
+                    setLastCapture: { _ in },
+                    setLastAreaRect: { _ in },
+                    logEvent: { _ in })
+                let showInputs = OverlaySessionInputs(
+                    afterShow: true, afterCopy: true, afterSave: false)
+                ScrollResultPresenter.present(
+                    ScrollFinish(image: img, inputs: showInputs, screen: screen),
+                    dependencies: edDeps, afterScrollShow: .editor)
+                let editorPath = edOpens == 1 && edCopies == 1
+                    && ScrollResultPanel.current == nil
+                let editorDetail = "editor: opens \(edOpens) copies \(edCopies) "
+                    + "panel \(ScrollResultPanel.current != nil)"
+                edOpens = 0; edCopies = 0
+                ScrollResultPresenter.present(
+                    ScrollFinish(image: img, inputs: showInputs, screen: screen),
+                    dependencies: edDeps, afterScrollShow: .panel)
+                let panelPath = edOpens == 0 && edCopies == 1
+                    && ScrollResultPanel.current != nil
+                let panelDetail = "panel: opens \(edOpens) copies \(edCopies) "
+                    + "panel \(ScrollResultPanel.current != nil)"
+                ScrollResultPanel.current?.performActionForTesting(.copy)
+                check("scroll9-result-opens-editor",
+                      editorPath && panelPath
+                        && Settings.shared.afterScrollShow == .editor,
+                      editorDetail + "; " + panelDetail
+                        + "; default \(Settings.shared.afterScrollShow)")
+            }
         }
 
         // 11. Overlay slice 4: annotations (shared surface, both paths) -----------

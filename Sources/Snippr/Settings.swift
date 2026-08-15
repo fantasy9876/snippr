@@ -25,6 +25,14 @@ enum AfterCropShow: String, CaseIterable {
     var label: String { self == .thumbnail ? "Thumbnail" : "Editor" }
 }
 
+/// Where a finished scrolling capture is presented. The editor is the
+/// default: a long page needs ⌘/Ctrl+scroll zoom, crop and the full tool set
+/// (field request 2026-08-15); the borderless in-place panel stays available.
+enum AfterScrollShow: String, CaseIterable {
+    case editor, panel
+    var label: String { self == .editor ? "Editor" : "In-place panel" }
+}
+
 enum HidePreviewMode: String, CaseIterable {
     case manual, after3s, after10s
     var label: String {
@@ -205,6 +213,7 @@ final class Settings {
         static let afterCopy = "afterCopy"
         static let afterSave = "afterSave"
         static let afterCropShow = "afterCropShow"
+        static let afterScrollShow = "afterScrollShow"
         static let hidePreviewMode = "hidePreviewMode"
         static let ocrLanguage = "ocrLanguage"
         static let ocrRemoveLineBreaks = "ocrRemoveLineBreaks"
@@ -258,6 +267,7 @@ final class Settings {
             Keys.afterCopy: false,
             Keys.afterSave: false,
             Keys.afterCropShow: AfterCropShow.editor.rawValue,
+            Keys.afterScrollShow: AfterScrollShow.editor.rawValue,
             Keys.hidePreviewMode: HidePreviewMode.manual.rawValue,
             Keys.ocrLanguage: OCRLanguage.englishPlus.rawValue,
             Keys.ocrRemoveLineBreaks: false,
@@ -335,6 +345,10 @@ final class Settings {
     var afterCropShow: AfterCropShow {
         get { AfterCropShow(rawValue: d.string(forKey: Keys.afterCropShow) ?? "") ?? .editor }
         set { d.set(newValue.rawValue, forKey: Keys.afterCropShow) }
+    }
+    var afterScrollShow: AfterScrollShow {
+        get { AfterScrollShow(rawValue: d.string(forKey: Keys.afterScrollShow) ?? "") ?? .editor }
+        set { d.set(newValue.rawValue, forKey: Keys.afterScrollShow) }
     }
 
     var hidePreviewMode: HidePreviewMode {
