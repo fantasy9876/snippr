@@ -4443,6 +4443,172 @@ enum SelfTest {
             check("overlay9-pixelate-toolbar-s2", s2ToolbarFailures.isEmpty,
                   s2ToolbarFailures.joined(separator: "; "))
 
+            // S3 live-host gate: both real area and scroll-panel responders
+            // must write the same editor keys, show the same HUD, and stamp
+            // the persisted point width onto marks created afterward.
+            do {
+                var widths: [String: CGFloat] = [
+                    EditorTool.arrow.rawValue: 7,
+                    EditorTool.pen.rawValue: 6,
+                ]
+                var writes: [(key: String, value: CGFloat)] = []
+                AnnotationSurface.strokeWidthStoreOverrideForTesting =
+                    OverlayStrokeWidthStore(
+                        read: { widths[$0] ?? 3 },
+                        write: { value, key in
+                            widths[key] = value
+                            writes.append((key, value))
+                        })
+                defer {
+                    AnnotationSurface.strokeWidthStoreOverrideForTesting = nil
+                }
+                func lineScroll(_ delta: Int32) -> NSEvent? {
+                    guard let cg = CGEvent(
+                        scrollWheelEvent2Source: nil, units: .line,
+                        wheelCount: 1, wheel1: delta,
+                        wheel2: 0, wheel3: 0)
+                    else { return nil }
+                    return NSEvent(cgEvent: cg)
+                }
+
+                var hostFailures: [String] = []
+                let (strokeOverlay, strokeView) = reviewView()
+                let strokeSelection = CGRect(
+                    x: max(40, b.width / 2 - 160),
+                    y: max(100, b.height / 2 - 110),
+                    width: 320, height: 220)
+                strokeView.selectForTesting(rect: strokeSelection)
+                strokeView.clickReviewToolbarButtonForTesting(
+                    tag: OverlayAnnotationTool.arrow.toolbarTag)
+                if let up = lineScroll(1) {
+                    strokeView.scrollWheel(with: up)
+                    strokeView.scrollWheel(with: up)
+                }
+                let areaHUD = strokeView.subviews.compactMap {
+                    $0 as? StrokePreviewView
+                }.last
+                if widths[EditorTool.arrow.rawValue] != 8
+                    || areaHUD?.isHidden != false
+                    || areaHUD?.strokeWidth != 8
+                    || areaHUD?.hitTest(CGPoint(
+                        x: areaHUD?.bounds.midX ?? 0,
+                        y: areaHUD?.bounds.midY ?? 0)) != nil
+                    || areaHUD.map({ strokeView.bounds.contains($0.frame) })
+                        != true {
+                    hostFailures.append(
+                        "area width \(String(describing: widths[EditorTool.arrow.rawValue])) hud \(String(describing: areaHUD?.strokeWidth))")
+                }
+                let areaStart = CGPoint(
+                    x: strokeSelection.minX + 40,
+                    y: strokeSelection.minY + 40)
+                let areaEnd = CGPoint(
+                    x: strokeSelection.minX + 150,
+                    y: strokeSelection.minY + 120)
+                if let down = liveMouse(.leftMouseDown, areaStart) {
+                    strokeView.mouseDown(with: down)
+                }
+                if let drag = liveMouse(.leftMouseDragged, areaEnd) {
+                    strokeView.mouseDragged(with: drag)
+                }
+                if let up = liveMouse(.leftMouseUp, areaEnd) {
+                    strokeView.mouseUp(with: up)
+                }
+                if (strokeView.annotationSurface?.annotations.last
+                    as? ShapeAnnotation)?.strokeWidthPt != 8 {
+                    hostFailures.append("area model width")
+                }
+
+                areaHUD?.isHidden = true
+                guard strokeOverlay.session.transition(to: .saving) else {
+                    hostFailures.append("area save transition")
+                    check("overlay10-stroke-width-hosts-s3", false,
+                          hostFailures.joined(separator: "; "))
+                    return
+                }
+                let writesBeforeAreaLock = writes.count
+                if let up = lineScroll(1) {
+                    strokeView.scrollWheel(with: up)
+                }
+                if writes.count != writesBeforeAreaLock
+                    || areaHUD?.isHidden == false {
+                    hostFailures.append("area save-lock")
+                }
+                _ = strokeOverlay.session.transition(to: .reviewing)
+
+                var panelSaveDone: (@MainActor (SaveAsOutcome) -> Void)?
+                let panelDeps = CaptureActionRouter.Dependencies(
+                    copyToClipboard: { _ in }, autoSave: { _, _ in },
+                    saveAs: { _, done in panelSaveDone = done },
+                    pin: { _ in }, ocr: { _ in }, openEditor: { _ in },
+                    toast: { _ in }, setLastCapture: { _ in },
+                    setLastAreaRect: { _ in }, logEvent: { _ in })
+                let narrowPanelImage = CapturedImage(
+                    cgImage: makeNoiseImage(width: 64, height: 800), scale: 1)
+                let panel = ScrollResultPanel.show(
+                    image: narrowPanelImage,
+                    inputs: OverlaySessionInputs(
+                        afterShow: true, afterCopy: false, afterSave: false),
+                    screen: screen, dependencies: panelDeps)
+                panel.clickToolbarButtonForTesting(
+                    tag: OverlayAnnotationTool.pen.toolbarTag)
+                if let host = panel.annotationHostForTesting,
+                   let up = lineScroll(1) {
+                    host.scrollWheel(with: up)
+                    host.scrollWheel(with: up)
+                    let panelHUD = (panel.contentView?.subviews ?? [])
+                        .compactMap { $0 as? StrokePreviewView }.last
+                        ?? host.subviews.compactMap {
+                            $0 as? StrokePreviewView
+                        }.last
+                    let panelHUDFrameOK = panel.contentView.map { content in
+                        guard let panelHUD else { return false }
+                        let frame = panelHUD.convert(panelHUD.bounds, to: content)
+                        return content.bounds.contains(frame)
+                            && panelHUD.superview === content
+                    } == true
+                    if widths[EditorTool.pen.rawValue] != 7
+                        || panelHUD?.isHidden != false
+                        || panelHUD?.strokeWidth != 7
+                        || panelHUD?.hitTest(CGPoint(
+                            x: panelHUD?.bounds.midX ?? 0,
+                            y: panelHUD?.bounds.midY ?? 0)) != nil
+                        || !panelHUDFrameOK {
+                        hostFailures.append(
+                            "panel width \(String(describing: widths[EditorTool.pen.rawValue])) hud \(String(describing: panelHUD?.strokeWidth)) frame \(panelHUDFrameOK)")
+                    }
+                    panel.drawWithRealEventsForTesting(
+                        fromView: CGPoint(x: 10, y: 20),
+                        toView: CGPoint(x: 50, y: 90))
+                    if (panel.annotationSurface.annotations.last
+                        as? PenAnnotation)?.strokeWidthPt != 7 {
+                        hostFailures.append("panel model width")
+                    }
+                    panelHUD?.isHidden = true
+                    panel.performActionForTesting(.save)
+                    let writesBeforePanelLock = writes.count
+                    host.scrollWheel(with: up)
+                    if panelSaveDone == nil
+                        || writes.count != writesBeforePanelLock
+                        || panelHUD?.isHidden == false {
+                        hostFailures.append("panel save-lock")
+                    }
+                    panelSaveDone?(.cancelled)
+                    host.scrollWheel(with: up)
+                    if writes.count != writesBeforePanelLock + 1
+                        || widths[EditorTool.pen.rawValue] != 7.5
+                        || panelHUD?.isHidden != false {
+                        hostFailures.append("panel unlock")
+                    }
+                } else {
+                    hostFailures.append("panel host/event")
+                }
+                panel.clickToolbarButtonForTesting(tag: -1)
+
+                check("overlay10-stroke-width-hosts-s3",
+                      hostFailures.isEmpty,
+                      hostFailures.joined(separator: "; "))
+            }
+
             // Retina 2x + shrink→re-expand: the SAME edges give the SAME
             // integral pixelRect — no 1px drift through a resize round trip.
             let retinaFrozen = CapturedImage(
@@ -4504,6 +4670,191 @@ enum SelfTest {
 
         // 13. Overlay: flatten fail-closed / allocation / P3 / save-lock ----------
         MainActor.assumeIsolated {
+            // S3 headless gate of record: the overlay must read the editor's
+            // exact per-tool keys for new marks, and the real scroll host
+            // must port the editor's precise/non-precise width machine. The
+            // in-memory store keeps selftest away from real UserDefaults.
+            do {
+                var widths: [String: CGFloat] = [
+                    EditorTool.pen.rawValue: 7,
+                    EditorTool.arrow.rawValue: 4,
+                    EditorTool.line.rawValue: 5,
+                    EditorTool.rect.rawValue: 6,
+                    EditorTool.oval.rawValue: 8,
+                    EditorTool.highlight.rawValue: 11,
+                ]
+                var reads: [String] = []
+                var writes: [(key: String, value: CGFloat)] = []
+                AnnotationSurface.strokeWidthStoreOverrideForTesting =
+                    OverlayStrokeWidthStore(
+                        read: { key in
+                            reads.append(key)
+                            return widths[key] ?? 3
+                        },
+                        write: { value, key in
+                            widths[key] = value
+                            writes.append((key, value))
+                        })
+                defer {
+                    AnnotationSurface.strokeWidthStoreOverrideForTesting = nil
+                }
+
+                let creationCases: [(OverlayAnnotationTool, String, CGFloat)] = [
+                    (.pen, EditorTool.pen.rawValue, 7),
+                    (.arrow, EditorTool.arrow.rawValue, 4),
+                    (.line, EditorTool.line.rawValue, 5),
+                    (.rect, EditorTool.rect.rawValue, 6),
+                    (.oval, EditorTool.oval.rawValue, 8),
+                ]
+                var creationOK = true
+                for (tool, key, expected) in creationCases {
+                    let surface = AnnotationSurface(pixelScale: 2)
+                    surface.tool = tool
+                    _ = surface.beginDrag(atPixel: CGPoint(x: 10, y: 10))
+                    surface.continueDrag(toPixel: CGPoint(x: 80, y: 60))
+                    surface.endDrag()
+                    let width: CGFloat?
+                    if let pen = surface.annotations.last as? PenAnnotation {
+                        width = pen.strokeWidthPt
+                    } else if let shape = surface.annotations.last
+                        as? ShapeAnnotation {
+                        width = shape.strokeWidthPt
+                    } else {
+                        width = nil
+                    }
+                    if width != expected || !reads.contains(key) {
+                        creationOK = false
+                    }
+                }
+                widths.removeValue(forKey: EditorTool.line.rawValue)
+                let defaultSurface = AnnotationSurface(pixelScale: 1)
+                defaultSurface.tool = .line
+                _ = defaultSurface.beginDrag(atPixel: CGPoint(x: 2, y: 2))
+                defaultSurface.continueDrag(toPixel: CGPoint(x: 20, y: 20))
+                defaultSurface.endDrag()
+                let defaultOK = (defaultSurface.annotations.last
+                    as? ShapeAnnotation)?.strokeWidthPt == 3
+                func strokeScrollEvent(
+                    units: CGScrollEventUnit, delta: Int32,
+                    flags: CGEventFlags = []
+                ) -> NSEvent? {
+                    guard let cg = CGEvent(
+                        scrollWheelEvent2Source: nil, units: units,
+                        wheelCount: 1, wheel1: delta,
+                        wheel2: 0, wheel3: 0)
+                    else { return nil }
+                    cg.flags = flags
+                    return NSEvent(cgEvent: cg)
+                }
+                let hostSurface = AnnotationSurface(pixelScale: 1)
+                hostSurface.tool = .pen
+                let host = AnnotationHostView(
+                    frame: CGRect(x: 0, y: 0, width: 160, height: 120),
+                    surface: hostSurface,
+                    baseImage: makeNoiseImage(width: 160, height: 120),
+                    pixelsPerPoint: 1)
+                var eligibleScrollOK = true
+                for (tool, key, _) in creationCases {
+                    widths[key] = 10
+                    hostSurface.tool = tool
+                    let writesBefore = writes.count
+                    if let lineUp = strokeScrollEvent(units: .line, delta: 1) {
+                        host.scrollWheel(with: lineUp)
+                    }
+                    if widths[key] != 10.5
+                        || writes.count != writesBefore + 1
+                        || writes.last?.key != key {
+                        eligibleScrollOK = false
+                    }
+                }
+                widths[EditorTool.pen.rawValue] = 7
+                hostSurface.tool = .pen
+                let writesBeforePrecise = writes.count
+                if let precise9 = strokeScrollEvent(units: .pixel, delta: 9) {
+                    host.scrollWheel(with: precise9)
+                    host.scrollWheel(with: precise9)
+                }
+                let preciseOK = widths[EditorTool.pen.rawValue] == 7.5
+                    && writes.count == writesBeforePrecise + 1
+                let hud = host.subviews.compactMap {
+                    $0 as? StrokePreviewView
+                }.last
+                let hudOK = hud?.isHidden == false
+                    && hud?.strokeWidth == 7.5
+                    && hud?.color == hostSurface.color
+
+                _ = hostSurface.beginDrag(atPixel: CGPoint(x: 5, y: 5))
+                hostSurface.continueDrag(toPixel: CGPoint(x: 50, y: 40))
+                hostSurface.endDrag()
+                let persistedModelOK =
+                    (hostSurface.annotations.last as? PenAnnotation)?
+                        .strokeWidthPt == 7.5
+
+                var nonStrokeIgnored = true
+                for tool in [
+                    OverlayAnnotationTool.highlight, .text, .counter, .blur,
+                    .select,
+                ] {
+                    hud?.isHidden = true
+                    hostSurface.tool = tool
+                    let writesBefore = writes.count
+                    if let lineUp = strokeScrollEvent(units: .line, delta: 1) {
+                        host.scrollWheel(with: lineUp)
+                    }
+                    if writes.count != writesBefore || hud?.isHidden == false {
+                        nonStrokeIgnored = false
+                    }
+                }
+
+                hostSurface.tool = .arrow
+                let writesBeforeModified = writes.count
+                for flags in [
+                    CGEventFlags.maskShift, .maskCommand, .maskControl,
+                ] {
+                    if let modified = strokeScrollEvent(
+                        units: .line, delta: 1, flags: flags) {
+                        host.scrollWheel(with: modified)
+                    }
+                }
+                let modifierIgnored = writes.count == writesBeforeModified
+
+                let penBeforeArrow = widths[EditorTool.pen.rawValue]
+                widths[EditorTool.arrow.rawValue] = 10
+                let writesBeforeNegative = writes.count
+                if let lineDown = strokeScrollEvent(units: .line, delta: -1) {
+                    host.scrollWheel(with: lineDown)
+                }
+                let negativeStepOK = widths[EditorTool.arrow.rawValue] == 9.5
+                    && writes.count == writesBeforeNegative + 1
+                    && writes.last?.key == EditorTool.arrow.rawValue
+                    && writes.last?.value == 9.5
+                widths[EditorTool.arrow.rawValue] = 20
+                let writesBeforeUpper = writes.count
+                if let lineUp = strokeScrollEvent(units: .line, delta: 1) {
+                    host.scrollWheel(with: lineUp)
+                }
+                let upperClampOK = widths[EditorTool.arrow.rawValue] == 20
+                    && writes.count == writesBeforeUpper + 1
+                widths[EditorTool.arrow.rawValue] = 1
+                let writesBeforeLower = writes.count
+                if let lineDown = strokeScrollEvent(units: .line, delta: -1) {
+                    host.scrollWheel(with: lineDown)
+                }
+                let lowerClampOK = widths[EditorTool.arrow.rawValue] == 1
+                    && writes.count == writesBeforeLower + 1
+                let perToolIsolationOK =
+                    widths[EditorTool.pen.rawValue] == penBeforeArrow
+
+                check("overlay10-stroke-width-core-s3",
+                      creationOK && defaultOK && eligibleScrollOK
+                        && preciseOK && hudOK && persistedModelOK
+                        && nonStrokeIgnored && modifierIgnored
+                        && negativeStepOK
+                        && upperClampOK && lowerClampOK
+                        && perToolIsolationOK,
+                      "create \(creationOK) default \(defaultOK) eligible \(eligibleScrollOK) precise \(preciseOK) hud \(hudOK) model \(persistedModelOK) nonStroke \(nonStrokeIgnored) modifiers \(modifierIgnored) negative \(negativeStepOK) clamp \(lowerClampOK)/\(upperClampOK) isolated \(perToolIsolationOK) reads \(reads) writes \(writes)")
+            }
+
             // S2 regional pixelation must allocate only the requested blur
             // region, preserve pixels outside it (including the Y-mirrored
             // wrong region), and fail closed if Core Image cannot render.

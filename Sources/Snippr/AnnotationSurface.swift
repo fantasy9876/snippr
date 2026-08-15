@@ -1,5 +1,17 @@
 import AppKit
 
+/// Narrow persistence seam for overlay stroke widths. Production delegates
+/// to the editor's canonical Settings keys; self-tests inject memory-only
+/// closures so they never mutate the user's annotation preferences.
+struct OverlayStrokeWidthStore {
+    let read: (String) -> CGFloat
+    let write: (CGFloat, String) -> Void
+
+    static let live = OverlayStrokeWidthStore(
+        read: { Settings.shared.toolWidth(for: $0) },
+        write: { Settings.shared.setToolWidth($0, for: $1) })
+}
+
 /// V1 in-place annotation tools (plan P1): a deliberate subset of the editor.
 enum OverlayAnnotationTool: String, CaseIterable {
     case select
@@ -66,19 +78,30 @@ enum OverlayAnnotationTool: String, CaseIterable {
 /// the two surfaces cannot drift.
 @MainActor
 final class AnnotationSurface {
+    /// Tests replace this before constructing a surface. Production callers
+    /// leave it nil and therefore share the editor's Settings-backed store.
+    static var strokeWidthStoreOverrideForTesting: OverlayStrokeWidthStore?
+
     private(set) var annotations: [Annotation] = []
     var tool: OverlayAnnotationTool = .select
     var color: NSColor = .systemRed
     /// Converts point-based stroke widths to pixels (the base image's scale).
     let pixelScale: CGFloat
+    let strokeWidthStore: OverlayStrokeWidthStore
 
     private var activeShape: ShapeAnnotation?
     private var activePen: PenAnnotation?
     private var activeBlur: BlurAnnotation?
     private var activeBlurAnchor: CGPoint?
 
-    init(pixelScale: CGFloat) {
+    init(
+        pixelScale: CGFloat,
+        strokeWidthStore: OverlayStrokeWidthStore? = nil
+    ) {
         self.pixelScale = max(1, pixelScale)
+        self.strokeWidthStore = strokeWidthStore
+            ?? Self.strokeWidthStoreOverrideForTesting
+            ?? .live
     }
 
     var isEmpty: Bool { annotations.isEmpty }
