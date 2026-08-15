@@ -335,6 +335,30 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
             && imageSize.height <= visibleDocumentRect.height + tolerance
     }
 
+    /// UI-test hook: ⌘+scroll on the canvas must change the scroll view's
+    /// magnification (zoom in for a positive wheel delta unless the reverse
+    /// preference is on) — the zoom path a scrolling capture relies on now
+    /// that it opens in the Editor. Drives the REAL `scrollWheel(with:)` with
+    /// a synthesized command-modified wheel event.
+    func commandScrollZoomForTesting(deltaY: Double = 40) -> (before: CGFloat, after: CGFloat)? {
+        guard let cg = CGEvent(
+            scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 1,
+            wheel1: Int32(deltaY), wheel2: 0, wheel3: 0)
+        else { return nil }
+        cg.flags = .maskCommand
+        if let window {
+            let center = window.convertPoint(toScreen: NSPoint(
+                x: window.frame.width / 2, y: window.frame.height / 2))
+            // CGEvent locations are top-left based.
+            let screenHeight = NSScreen.screens.first?.frame.height ?? 0
+            cg.location = CGPoint(x: center.x, y: screenHeight - center.y)
+        }
+        guard let event = NSEvent(cgEvent: cg) else { return nil }
+        let before = scrollView.magnification
+        canvas.scrollWheel(with: event)
+        return (before, scrollView.magnification)
+    }
+
     /// UI-test hook for the fixed crop actions used when the fitted image is
     /// too narrow to contain image-relative controls.
     func cropActionControlsReadyForTesting() -> Bool {

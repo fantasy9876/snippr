@@ -550,8 +550,21 @@ enum UITest {
                 && smallEditor.imageFitsViewportForTesting()
                 && tallEditor.imageFitsViewportForTesting()
             let tallCropControlsOK = tallEditor.cropActionControlsReadyForTesting()
+            // ⌘+scroll zoom on the tall (scroll-capture-like) editor: a
+            // positive wheel delta zooms IN (or out with the reverse pref)
+            // and a subsequent opposite delta moves back.
+            var cmdZoomOK = false
+            if let zoomIn = tallEditor.commandScrollZoomForTesting(deltaY: 40),
+               let zoomOut = tallEditor.commandScrollZoomForTesting(deltaY: -40) {
+                let reverse = Settings.shared.zoomReverseScroll
+                let inOK = reverse ? zoomIn.after < zoomIn.before : zoomIn.after > zoomIn.before
+                let outOK = reverse ? zoomOut.after > zoomOut.before : zoomOut.after < zoomOut.before
+                cmdZoomOK = inOK && outOK
+                print("UITEST editor-cmd-scroll-zoom detail in \(zoomIn.before)→\(zoomIn.after) out \(zoomOut.before)→\(zoomOut.after)")
+            }
             print("UITEST editor-fit \(fitOK ? "PASS" : "FAIL")")
             print("UITEST tall-crop-controls \(tallCropControlsOK ? "PASS" : "FAIL")")
+            print("UITEST editor-cmd-scroll-zoom \(cmdZoomOK ? "PASS" : "FAIL")")
             print("UITEST overlay-review \(overlayReviewOK ? "PASS" : "FAIL")")
             print("UITEST scroll-panel \(scrollPanelOK ? "PASS" : "FAIL")")
             print("UITEST scroll-panel-preview \(panelPreviewOK ? "PASS" : "FAIL")")
@@ -571,7 +584,7 @@ enum UITest {
                 index += 1
             }
             print("UITEST captured \(index) windows → \(outDir)")
-            exit(index >= 3 && fitOK && tallCropControlsOK && overlayReviewOK
+            exit(index >= 3 && fitOK && tallCropControlsOK && cmdZoomOK && overlayReviewOK
                  && scrollPanelOK && panelPreviewOK
                  && panelTextTerminalsOK && toastAboveOverlayOK ? 0 : 1)
         }
