@@ -35,6 +35,66 @@ enum SelfTest {
             }
         }
 
+        // 0. Updater detached-shell regression ----------------------------------
+        // Exercise the exact production shell against a real ad-hoc signed app
+        // in a disposable DMG. The RED verifier contains an unsupported
+        // `codesign --quiet`, so the valid candidate aborts and leaves "old".
+        do {
+            let root = URL(fileURLWithPath: outputDir)
+                .appendingPathComponent("updater-valid-\(UUID().uuidString)")
+            defer { try? FileManager.default.removeItem(at: root) }
+            let installed = root.appendingPathComponent("installed/Snippr.app")
+            try makeUpdaterInstalledFixture(at: installed, marker: "old")
+            if let dmg = makeUpdaterDMGFixture(at: root, tamperAfterSigning: false) {
+                let result = runCommand(
+                    "/bin/sh",
+                    ["-c", UpdateChecker.detachedInstallerScript(),
+                     "snippr-updater-selftest", dmg.path, installed.path, "0", "0"])
+                let marker = updaterFixtureMarker(at: installed) ?? "missing"
+                let cleanSwap = !FileManager.default.fileExists(atPath: installed.path + ".new")
+                    && !FileManager.default.fileExists(atPath: installed.path + ".old")
+                    && !FileManager.default.fileExists(atPath: dmg.path)
+                check("updater13-valid-signed-candidate-installs",
+                      result.status == 0 && marker == "new" && cleanSwap,
+                      "status \(result.status) marker \(marker) clean \(cleanSwap) output \(result.output)")
+            } else {
+                check("updater13-valid-signed-candidate-installs", false,
+                      "could not create signed DMG fixture")
+            }
+        } catch {
+            check("updater13-valid-signed-candidate-installs", false,
+                  "fixture error \(error)")
+        }
+
+        // A candidate modified after signing must never replace the old app.
+        do {
+            let root = URL(fileURLWithPath: outputDir)
+                .appendingPathComponent("updater-tampered-\(UUID().uuidString)")
+            defer { try? FileManager.default.removeItem(at: root) }
+            let installed = root.appendingPathComponent("installed/Snippr.app")
+            try makeUpdaterInstalledFixture(at: installed, marker: "old")
+            if let dmg = makeUpdaterDMGFixture(at: root, tamperAfterSigning: true) {
+                let result = runCommand(
+                    "/bin/sh",
+                    ["-c", UpdateChecker.detachedInstallerScript(),
+                     "snippr-updater-selftest", dmg.path, installed.path, "0", "0"])
+                let marker = updaterFixtureMarker(at: installed) ?? "missing"
+                let preserved = result.status != 0 && marker == "old"
+                    && !FileManager.default.fileExists(atPath: installed.path + ".new")
+                    && !FileManager.default.fileExists(atPath: installed.path + ".old")
+                    && !FileManager.default.fileExists(atPath: dmg.path)
+                check("updater13-tampered-candidate-preserves-old",
+                      preserved,
+                      "status \(result.status) marker \(marker) output \(result.output)")
+            } else {
+                check("updater13-tampered-candidate-preserves-old", false,
+                      "could not create tampered DMG fixture")
+            }
+        } catch {
+            check("updater13-tampered-candidate-preserves-old", false,
+                  "fixture error \(error)")
+        }
+
         // 1. Annotation rendering ------------------------------------------------
         let base = makeTestImage(width: 1600, height: 1200)
         let scale: CGFloat = 2
@@ -6131,6 +6191,101 @@ enum SelfTest {
         print(failures == 0 ? "ALL TESTS PASSED" : "\(failures) TEST(S) FAILED")
         print("Artifacts: \(outputDir)")
         return failures == 0 ? 0 : 1
+    }
+
+    // MARK: - Updater fixture helpers
+
+    private struct CommandResult {
+        let status: Int32
+        let output: String
+    }
+
+    private static func runCommand(_ executable: String, _ arguments: [String]) -> CommandResult {
+        let process = Process()
+        let pipe = Pipe()
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = arguments
+        process.standardOutput = pipe
+        process.standardError = pipe
+        do {
+            try process.run()
+            process.waitUntilExit()
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            return CommandResult(
+                status: process.terminationStatus,
+                output: String(data: data, encoding: .utf8) ?? "")
+        } catch {
+            return CommandResult(status: -1, output: "\(error)")
+        }
+    }
+
+    private static func makeUpdaterInstalledFixture(at app: URL, marker: String) throws {
+        let resources = app.appendingPathComponent("Contents/Resources")
+        try FileManager.default.createDirectory(
+            at: resources, withIntermediateDirectories: true)
+        try Data(marker.utf8).write(to: resources.appendingPathComponent("fixture-version"))
+    }
+
+    private static func updaterFixtureMarker(at app: URL) -> String? {
+        let url = app.appendingPathComponent("Contents/Resources/fixture-version")
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
+    private static func makeUpdaterDMGFixture(
+        at root: URL, tamperAfterSigning: Bool
+    ) -> URL? {
+        let source = root.appendingPathComponent("dmg-source")
+        let app = source.appendingPathComponent("Snippr.app")
+        let contents = app.appendingPathComponent("Contents")
+        let macOS = contents.appendingPathComponent("MacOS")
+        let resources = contents.appendingPathComponent("Resources")
+        let fm = FileManager.default
+        do {
+            try fm.createDirectory(at: macOS, withIntermediateDirectories: true)
+            try fm.createDirectory(at: resources, withIntermediateDirectories: true)
+            try fm.copyItem(
+                at: URL(fileURLWithPath: "/usr/bin/true"),
+                to: macOS.appendingPathComponent("Snippr"))
+            let plist: [String: Any] = [
+                "CFBundleExecutable": "Snippr",
+                "CFBundleIdentifier": "com.manhhoang.snippr",
+                "CFBundleName": "Snippr",
+                "CFBundlePackageType": "APPL",
+                "CFBundleShortVersionString": "1.2.3",
+                "CFBundleVersion": "18",
+            ]
+            let plistData = try PropertyListSerialization.data(
+                fromPropertyList: plist, format: .xml, options: 0)
+            try plistData.write(to: contents.appendingPathComponent("Info.plist"))
+            let marker = resources.appendingPathComponent("fixture-version")
+            try Data("new".utf8).write(to: marker)
+            let sign = runCommand(
+                "/usr/bin/codesign",
+                ["--force", "--sign", "-", "--identifier",
+                 "com.manhhoang.snippr", app.path])
+            guard sign.status == 0 else {
+                print("  updater fixture signing failed: \(sign.output)")
+                return nil
+            }
+            if tamperAfterSigning {
+                try Data("tampered".utf8).write(to: marker)
+            }
+            let dmg = root.appendingPathComponent("fixture.dmg")
+            let volumeName = "SnipprFixture-\(UUID().uuidString.prefix(8))"
+            let create = runCommand(
+                "/usr/bin/hdiutil",
+                ["create", "-quiet", "-ov", "-volname", volumeName,
+                 "-srcfolder", source.path, "-format", "UDZO", dmg.path])
+            guard create.status == 0 else {
+                print("  updater fixture DMG failed: \(create.output)")
+                return nil
+            }
+            return dmg
+        } catch {
+            print("  updater fixture error: \(error)")
+            return nil
+        }
     }
 
     // MARK: - Test image factories

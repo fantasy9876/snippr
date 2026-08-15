@@ -23,6 +23,10 @@ enum UpdateChecker {
     /// tampered manifest from pointing the downloader at an arbitrary origin.
     static let allowedDownloadHost = "snippr.pages.dev"
 
+    // Kept in one place so the detached installer and its fail-first fixture
+    // exercise the exact same code-signature verifier arguments.
+    nonisolated static let codeSignatureVerifyArguments = ["--verify", "--deep", "--quiet"]
+
     static var currentVersion: String {
         Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0"
     }
@@ -117,16 +121,40 @@ enum UpdateChecker {
             // new bundle's code signature, and swaps ONLY after the new copy is
             // fully in place — with rollback — so a failed copy never leaves the
             // user without an app. Every failure path re-opens the current app.
-            let script = """
-            sleep 1
-            DMG='\(dmg.path)'
-            APP='/Applications/Snippr.app'
-            fail() { hdiutil detach "$MOUNT" -quiet 2>/dev/null; rm -rf "$APP.new"; rm -f "$DMG"; open "$APP" 2>/dev/null; exit 1; }
+            let script = detachedInstallerScript()
+            let proc = Process()
+            proc.executableURL = URL(fileURLWithPath: "/bin/sh")
+            proc.arguments = [
+                "-c", script, "snippr-updater",
+                dmg.path, "/Applications/Snippr.app", "1", "1",
+            ]
+            try proc.run()
+            NSApp.terminate(nil)
+        } catch {
+            ToastHUD.show("Tải bản cập nhật thất bại", symbol: "exclamationmark.triangle.fill")
+        }
+    }
+
+    /// The detached shell takes paths as positional arguments instead of
+    /// interpolating them into shell source. Arguments are:
+    ///   $1 DMG path, $2 installed app path, $3 delay seconds, $4 relaunch 0/1.
+    /// RED intentionally preserves the current verifier flags; the self-test
+    /// proves that the unsupported flag aborts an otherwise valid update.
+    nonisolated static func detachedInstallerScript() -> String {
+        let verificationFlags = codeSignatureVerifyArguments.joined(separator: " ")
+        return """
+            DELAY="${3:-1}"
+            RELAUNCH="${4:-1}"
+            sleep "$DELAY"
+            DMG="$1"
+            APP="$2"
+            reopen() { [ "$RELAUNCH" = "1" ] && open "$APP" 2>/dev/null; return 0; }
+            fail() { hdiutil detach "$MOUNT" -quiet 2>/dev/null; rm -rf "$APP.new"; rm -f "$DMG"; reopen; exit 1; }
             MOUNT=$(hdiutil attach -nobrowse -readonly "$DMG" | awk -F'\\t' '/\\/Volumes\\//{print $NF}' | tail -1)
-            [ -n "$MOUNT" ] || { rm -f "$DMG"; open "$APP" 2>/dev/null; exit 1; }
+            [ -n "$MOUNT" ] || { rm -f "$DMG"; reopen; exit 1; }
             SRC="$MOUNT/Snippr.app"
             [ -d "$SRC" ] || fail
-            codesign --verify --deep --quiet "$SRC" || fail
+            codesign \(verificationFlags) "$SRC" || fail
             rm -rf "$APP.new"
             cp -R "$SRC" "$APP.new" || fail
             rm -rf "$APP.old"
@@ -139,16 +167,8 @@ enum UpdateChecker {
             fi
             hdiutil detach "$MOUNT" -quiet
             rm -f "$DMG"
-            open "$APP"
+            reopen
             """
-            let proc = Process()
-            proc.executableURL = URL(fileURLWithPath: "/bin/sh")
-            proc.arguments = ["-c", script]
-            try proc.run()
-            NSApp.terminate(nil)
-        } catch {
-            ToastHUD.show("Tải bản cập nhật thất bại", symbol: "exclamationmark.triangle.fill")
-        }
     }
 
     /// Streaming SHA-256 so a large DMG isn't held in memory all at once.
