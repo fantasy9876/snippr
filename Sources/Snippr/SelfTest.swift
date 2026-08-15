@@ -1149,6 +1149,70 @@ enum SelfTest {
             }
         }
 
+        // 2d-animated-band. A side ad that changes must not re-anchor ---------------
+        // Field report (VnExpress, 2026-08-15): the right-column ad creative
+        // changed right after the first frame. Every later frame failed the
+        // full-width matcher against frame #1 (two of four bands differed),
+        // the pending strip verified against itself and was PROMOTED — the
+        // page top entered the output twice behind a separator. A page whose
+        // body scrolls coherently in the untouched bands must keep stitching
+        // as ONE segment; a frame that differs in MORE than half the width
+        // must still fail closed.
+        do {
+            let vp = 500, w = 400
+            let doc = makeTexturedStripePattern(width: w, height: 3000, seed: 0xAD11_5EED)
+            // `bands` = which quarter-width bands carry the "ad" (changes
+            // between frame #1 and every later frame).
+            func animatedRun(bands: Set<Int>) -> (segments: Int, height: Int, appended: Int, started: Int, ok: Bool) {
+                let adA = makeTexturedStripePattern(width: w, height: vp, seed: 0xADA0_0001)
+                let adB = makeTexturedStripePattern(width: w, height: vp, seed: 0xADB0_0002)
+                func page(_ ad: CGImage) -> CGImage {
+                    let c = ctx(w, 3000)
+                    c.draw(doc, in: CGRect(x: 0, y: 0, width: w, height: 3000))
+                    // rows 0..<vp of the page hold the ad in the given bands
+                    for band in bands {
+                        let x = band * (w / 4)
+                        let rect = CGRect(x: x, y: 3000 - vp, width: w / 4, height: vp)
+                        if let piece = ad.cropping(to: CGRect(x: x, y: 0, width: w / 4, height: vp)) {
+                            c.draw(piece, in: rect)
+                        }
+                    }
+                    return c.makeImage()!
+                }
+                let pageA = page(adA), pageB = page(adB)
+                guard let first = pageA.cropping(to: CGRect(x: 0, y: 0, width: w, height: vp)) else {
+                    return (0, 0, 0, 0, false)
+                }
+                let s = SegmentedVerticalStitcher(first: first)
+                var off = 0, appended = 0, started = 0
+                for step in [40, 40, 60, 80, 120, 160, 200, 200, 200] {
+                    off += step
+                    guard let f = pageB.cropping(to: CGRect(x: 0, y: off, width: w, height: vp)) else { break }
+                    switch s.append(f) {
+                    case .appended: appended += 1
+                    case .startedSegment: started += 1
+                    default: break
+                    }
+                }
+                return (s.segmentCount, s.totalHeight, appended, started, true)
+            }
+            let one = animatedRun(bands: [3])
+            let two = animatedRun(bands: [2, 3])
+            let three = animatedRun(bands: [1, 2, 3])
+            let walkHeight = 500 + 40 + 40 + 60 + 80 + 120 + 160 + 200 + 200 + 200
+            check("scroll8-animated-band-stitches",
+                  one.ok && two.ok
+                    && one.segments == 1 && one.appended == 9 && one.height == walkHeight
+                    && two.segments == 1 && two.appended == 9 && two.height == walkHeight,
+                  "one seg \(one.segments) app \(one.appended) h \(one.height)/\(walkHeight); "
+                    + "two seg \(two.segments) app \(two.appended) h \(two.height)")
+            // Three of four bands changed: no band mask may bless that, so the
+            // session re-anchors exactly as before (marked gap, no silent seam).
+            check("scroll8-animated-majority-fails-closed",
+                  three.ok && three.segments == 2 && three.started == 1,
+                  "three-band segments \(three.segments) started \(three.started) appended \(three.appended)")
+        }
+
         // 2b-window-materialize. Preview refresh copies no pixel buffers -----------
         // A 5K source with sticky chrome and prepends used to materialize the
         // trimmed first viewport (~54 MiB) on every preview rebuild. The
