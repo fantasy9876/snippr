@@ -28,6 +28,7 @@ enum OverlayAnnotationTool: String, CaseIterable {
     static let toolbarTagBase = 100
     static let colorToolbarTag = 200
     static let undoToolbarTag = 201
+    static let redoToolbarTag = 202
 
     var toolbarTag: Int {
         Self.toolbarTagBase + Self.allCases.firstIndex(of: self)!
@@ -37,6 +38,20 @@ enum OverlayAnnotationTool: String, CaseIterable {
         let index = tag - toolbarTagBase
         guard allCases.indices.contains(index) else { return nil }
         return allCases[index]
+    }
+
+    /// S4 exposes the tools added by S1/S2 through the SAME mapping on both
+    /// live surfaces. Pre-existing V/P/A/R/T tooltip shortcuts remain outside
+    /// this slice; do not duplicate this switch in either host.
+    static func tool(forShortcutKey key: String) -> Self? {
+        switch key.lowercased() {
+        case "l": return .line
+        case "o": return .oval
+        case "h": return .highlight
+        case "n": return .counter
+        case "b": return .blur
+        default: return nil
+        }
     }
 
     /// The editor's exact persisted raw value. Keep this explicit instead of
@@ -118,6 +133,10 @@ final class AnnotationSurface {
     private var activeBlur: BlurAnnotation?
     private var activeBlurAnchor: CGPoint?
     private var strokeTrackpadAccum: CGFloat = 0
+    private var redoAnnotations: [Annotation] = []
+    /// Hosts install weak-owner callbacks so Undo/Redo enabled state follows
+    /// real mutations regardless of whether they came from mouse or text.
+    var historyDidChange: (() -> Void)?
 
     init(
         pixelScale: CGFloat,
@@ -130,6 +149,8 @@ final class AnnotationSurface {
     }
 
     var isEmpty: Bool { annotations.isEmpty }
+    var canUndo: Bool { !annotations.isEmpty }
+    var canRedo: Bool { !redoAnnotations.isEmpty }
 
     var adjustsStrokeWidth: Bool { tool.adjustsStrokeWidth }
 
@@ -169,6 +190,21 @@ final class AnnotationSurface {
         strokeTrackpadAccum = 0
     }
 
+    private func clearActiveDraft() {
+        activeShape = nil
+        activePen = nil
+        activeBlur = nil
+        activeBlurAnchor = nil
+    }
+
+    /// A real new annotation forks history. Redo itself deliberately does
+    /// not use this helper because it must preserve the remaining redo stack.
+    private func appendNewAnnotation(_ annotation: Annotation) {
+        redoAnnotations.removeAll()
+        annotations.append(annotation)
+        historyDidChange?()
+    }
+
     // MARK: drag lifecycle (image-pixel coordinates)
 
     /// Returns true when the surface consumed the drag start (tool != select).
@@ -182,7 +218,7 @@ final class AnnotationSurface {
             pen.strokeWidthPt = storedStrokeWidth(for: tool)
             pen.points = [p]
             activePen = pen
-            annotations.append(pen)
+            appendNewAnnotation(pen)
             return true
         case .arrow, .rect, .line, .oval, .highlight:
             let kind: ShapeAnnotation.Kind
@@ -200,7 +236,7 @@ final class AnnotationSurface {
             shape.color = color
             shape.strokeWidthPt = storedStrokeWidth(for: tool)
             activeShape = shape
-            annotations.append(shape)
+            appendNewAnnotation(shape)
             return true
         case .counter:
             let counter = CounterAnnotation(uiScale: pixelScale)
@@ -209,14 +245,18 @@ final class AnnotationSurface {
                 ($0 as? CounterAnnotation)?.number
             }.max() ?? 0) + 1
             counter.color = color
-            annotations.append(counter)
+            appendNewAnnotation(counter)
             return true
         case .blur:
             let blur = BlurAnnotation(uiScale: pixelScale)
             blur.rect = CGRect(origin: p, size: .zero)
             activeBlur = blur
             activeBlurAnchor = p
+            // Pixelate needs a live preview while dragging, but a click-only
+            // zero-area draft is not a mutation and must preserve redo. Clear
+            // the redo branch only when endDrag confirms a real region.
             annotations.append(blur)
+            historyDidChange?()
             return true
         case .text:
             // text placement is click-driven; the host creates the field
@@ -237,15 +277,15 @@ final class AnnotationSurface {
     }
 
     func endDrag() {
-        if let blur = activeBlur,
-           (blur.rect.width <= 1 || blur.rect.height <= 1),
-           annotations.last === blur {
-            annotations.removeLast()
+        if let blur = activeBlur, annotations.last === blur {
+            if blur.rect.width <= 1 || blur.rect.height <= 1 {
+                annotations.removeLast()
+            } else {
+                redoAnnotations.removeAll()
+            }
+            historyDidChange?()
         }
-        activeShape = nil
-        activePen = nil
-        activeBlur = nil
-        activeBlurAnchor = nil
+        clearActiveDraft()
     }
 
     func addText(_ string: String, atPixel p: CGPoint) {
@@ -254,18 +294,26 @@ final class AnnotationSurface {
         annotation.text = string
         annotation.origin = p
         annotation.color = color
-        annotations.append(annotation)
+        appendNewAnnotation(annotation)
     }
 
-    /// Undo removes the newest annotation (V1 scope: annotation-only stack).
+    /// Annotation-only two-stack history. The exact model object moves between
+    /// stacks; no clone is needed because overlays do not edit old marks.
     @discardableResult
     func undo() -> Bool {
-        guard !annotations.isEmpty else { return false }
-        annotations.removeLast()
-        activeShape = nil
-        activePen = nil
-        activeBlur = nil
-        activeBlurAnchor = nil
+        guard let annotation = annotations.popLast() else { return false }
+        redoAnnotations.append(annotation)
+        clearActiveDraft()
+        historyDidChange?()
+        return true
+    }
+
+    @discardableResult
+    func redo() -> Bool {
+        guard let annotation = redoAnnotations.popLast() else { return false }
+        annotations.append(annotation)
+        clearActiveDraft()
+        historyDidChange?()
         return true
     }
 
@@ -335,7 +383,7 @@ final class AnnotationSurface {
     func addBlurForTesting(rect: CGRect) {
         let blur = BlurAnnotation(uiScale: pixelScale)
         blur.rect = rect
-        annotations.append(blur)
+        appendNewAnnotation(blur)
     }
 
     /// Flattened export: ONE destination buffer in the base's own colour

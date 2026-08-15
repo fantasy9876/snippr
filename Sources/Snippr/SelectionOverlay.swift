@@ -441,6 +441,19 @@ final class SelectionOverlayView: NSView {
         undoButton.action = #selector(reviewToolbarButtonPressed(_:))
         container.addSubview(undoButton)
         buttons.append(undoButton)
+        let redoButton = NSButton(frame: .zero)
+        redoButton.bezelStyle = .regularSquare
+        redoButton.isBordered = false
+        redoButton.image = NSImage(
+            systemSymbolName: "arrow.uturn.forward",
+            accessibilityDescription: "Redo (⇧⌘Z)")
+        redoButton.contentTintColor = .white
+        redoButton.toolTip = "Redo (⇧⌘Z)"
+        redoButton.tag = OverlayAnnotationTool.redoToolbarTag
+        redoButton.target = self
+        redoButton.action = #selector(reviewToolbarButtonPressed(_:))
+        container.addSubview(redoButton)
+        buttons.append(redoButton)
         for (index, item) in Self.toolbarItems.enumerated() {
             let button = NSButton(frame: .zero)
             button.bezelStyle = .regularSquare
@@ -515,6 +528,38 @@ final class SelectionOverlayView: NSView {
         // ALL buttons (Close included) lock while a save is in flight.
         let enabled = owner?.session.acceptsCommits ?? false
         for button in toolbarButtons { button.isEnabled = enabled }
+        updateHistoryButtons()
+    }
+
+    private func updateHistoryButtons() {
+        let unlocked = owner?.session.phase == .reviewing
+        for button in toolbarButtons {
+            switch button.tag {
+            case OverlayAnnotationTool.undoToolbarTag:
+                button.isEnabled = unlocked && (annotationSurface?.canUndo ?? false)
+            case OverlayAnnotationTool.redoToolbarTag:
+                button.isEnabled = unlocked && (annotationSurface?.canRedo ?? false)
+            default:
+                break
+            }
+        }
+    }
+
+    private func selectAnnotationTool(_ tool: OverlayAnnotationTool) {
+        annotationSurface?.tool = tool
+        for button in toolbarButtons
+            where OverlayAnnotationTool.tool(forToolbarTag: button.tag) != nil {
+            button.contentTintColor =
+                button.tag == tool.toolbarTag ? .controlAccentColor : .white
+        }
+        if tool != .text { endTextEntry(commit: true) }
+    }
+
+    private func performHistoryAction(redo: Bool) {
+        guard owner?.session.phase == .reviewing,
+              let surface = annotationSurface else { return }
+        let changed = redo ? surface.redo() : surface.undo()
+        if changed { needsDisplay = true }
     }
 
     @objc private func reviewToolbarButtonPressed(_ sender: NSButton) {
@@ -524,13 +569,7 @@ final class SelectionOverlayView: NSView {
             return
         }
         if let tool = OverlayAnnotationTool.tool(forToolbarTag: sender.tag) {
-            annotationSurface?.tool = tool
-            for button in toolbarButtons
-                where OverlayAnnotationTool.tool(forToolbarTag: button.tag) != nil {
-                button.contentTintColor =
-                    button.tag == sender.tag ? .controlAccentColor : .white
-            }
-            if tool != .text { endTextEntry(commit: true) }
+            selectAnnotationTool(tool)
             return
         }
         if sender.tag == OverlayAnnotationTool.colorToolbarTag {
@@ -540,7 +579,11 @@ final class SelectionOverlayView: NSView {
             return
         }
         if sender.tag == OverlayAnnotationTool.undoToolbarTag {
-            if annotationSurface?.undo() == true { needsDisplay = true }
+            performHistoryAction(redo: false)
+            return
+        }
+        if sender.tag == OverlayAnnotationTool.redoToolbarTag {
+            performHistoryAction(redo: true)
             return
         }
         guard sender.tag >= 0, sender.tag < Self.toolbarItems.count else { return }
@@ -978,6 +1021,15 @@ final class SelectionOverlayView: NSView {
             performReviewAction(.copy)
             return
         }
+        let flags = event.modifierFlags.intersection(
+            [.command, .shift, .control, .option])
+        if owner?.session.phase == .reviewing,
+           flags.isEmpty,
+           let key = event.charactersIgnoringModifiers,
+           let tool = OverlayAnnotationTool.tool(forShortcutKey: key) {
+            selectAnnotationTool(tool)
+            return
+        }
         super.keyDown(with: event)
     }
 
@@ -992,14 +1044,14 @@ final class SelectionOverlayView: NSView {
             performReviewAction(.copy)
             return true
         }
+        let flags = event.modifierFlags.intersection(
+            [.command, .shift, .control, .option])
         if isReviewing,
-           event.modifierFlags.contains(.command),
-           event.charactersIgnoringModifiers?.lowercased() == "z" {
-            // Save in flight = state frozen: no undo until cancel/success
-            if owner?.session.phase == .reviewing,
-               annotationSurface?.undo() == true {
-                needsDisplay = true
-            }
+           event.charactersIgnoringModifiers?.lowercased() == "z",
+           flags == [.command] || flags == [.command, .shift] {
+            // Save in flight is consumed but frozen. After cancel the same
+            // exact shortcut reaches the preserved history branch.
+            performHistoryAction(redo: flags.contains(.shift))
             return true
         }
         return super.performKeyEquivalent(with: event)
@@ -1116,8 +1168,11 @@ final class SelectionOverlayView: NSView {
                 finalGlobalRect: globalRect(for: selection),
                 dependencies: owner.routerDependenciesOverride)
             if owner.session.phase == .reviewing {
-                annotationSurface = AnnotationSurface(
-                    pixelScale: frozen.scale)
+                let surface = AnnotationSurface(pixelScale: frozen.scale)
+                surface.historyDidChange = { [weak self] in
+                    self?.updateHistoryButtons()
+                }
+                annotationSurface = surface
                 owner.reviewDidBegin(in: self)
                 layoutReviewToolbar()
                 needsDisplay = true

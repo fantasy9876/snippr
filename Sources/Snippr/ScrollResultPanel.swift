@@ -154,6 +154,10 @@ final class ScrollResultPanel: NSPanel {
         content.addSubview(bar)
         actionBar = bar
         contentView = content
+        annotationSurface.historyDidChange = { [weak self] in
+            self?.updateHistoryButtons()
+        }
+        updateHistoryButtons()
     }
 
     var toolbarFrameForTesting: CGRect? { actionBar?.frame }
@@ -178,7 +182,7 @@ final class ScrollResultPanel: NSPanel {
     static var requiredToolbarWidth: CGFloat {
         let buttonWidth: CGFloat = 34, spacing: CGFloat = 2
         let count = CGFloat(
-            items.count + OverlayAnnotationTool.allCases.count + 2)
+            items.count + OverlayAnnotationTool.allCases.count + 3)
         // leading 8 + buttons + gap 12 + close + trailing 8
         return 8 + count * buttonWidth + (count - 1) * spacing + 12
             + buttonWidth + 8
@@ -230,6 +234,9 @@ final class ScrollResultPanel: NSPanel {
         _ = makeButton(
             symbol: "arrow.uturn.backward", tooltip: "Undo (⌘Z)",
             tag: OverlayAnnotationTool.undoToolbarTag, tint: .labelColor)
+        _ = makeButton(
+            symbol: "arrow.uturn.forward", tooltip: "Redo (⇧⌘Z)",
+            tag: OverlayAnnotationTool.redoToolbarTag, tint: .labelColor)
         for (index, item) in Self.items.enumerated() {
             _ = makeButton(
                 symbol: item.symbol, tooltip: item.tooltip,
@@ -253,6 +260,36 @@ final class ScrollResultPanel: NSPanel {
         return bar
     }
 
+    private func updateHistoryButtons() {
+        for button in toolbarButtons {
+            switch button.tag {
+            case OverlayAnnotationTool.undoToolbarTag:
+                button.isEnabled = !saving && annotationSurface.canUndo
+            case OverlayAnnotationTool.redoToolbarTag:
+                button.isEnabled = !saving && annotationSurface.canRedo
+            default:
+                break
+            }
+        }
+    }
+
+    private func selectAnnotationTool(_ tool: OverlayAnnotationTool) {
+        annotationSurface.tool = tool
+        for button in toolbarButtons
+            where OverlayAnnotationTool.tool(forToolbarTag: button.tag) != nil {
+            button.contentTintColor =
+                button.tag == tool.toolbarTag ? .controlAccentColor : .labelColor
+        }
+        if tool != .text { annotationHost?.commitActiveTextEntry() }
+    }
+
+    private func performHistoryAction(redo: Bool) {
+        guard !saving else { return }
+        let changed = redo
+            ? annotationSurface.redo() : annotationSurface.undo()
+        if changed { annotationHost?.needsDisplay = true }
+    }
+
     @objc private func toolbarPressed(_ sender: NSButton) {
         if saving { return }
         if sender.tag == -1 {
@@ -260,14 +297,7 @@ final class ScrollResultPanel: NSPanel {
             return
         }
         if let tool = OverlayAnnotationTool.tool(forToolbarTag: sender.tag) {
-            annotationSurface.tool = tool
-            for button in toolbarButtons
-                where OverlayAnnotationTool.tool(forToolbarTag: button.tag) != nil {
-                button.contentTintColor =
-                    button.tag == sender.tag ? .controlAccentColor : .labelColor
-            }
-            // leaving the Text tool commits the in-flight entry (area parity)
-            if tool != .text { annotationHost?.commitActiveTextEntry() }
+            selectAnnotationTool(tool)
             return
         }
         if sender.tag == OverlayAnnotationTool.colorToolbarTag {
@@ -277,7 +307,11 @@ final class ScrollResultPanel: NSPanel {
             return
         }
         if sender.tag == OverlayAnnotationTool.undoToolbarTag {
-            if annotationSurface.undo() { annotationHost?.needsDisplay = true }
+            performHistoryAction(redo: false)
+            return
+        }
+        if sender.tag == OverlayAnnotationTool.redoToolbarTag {
+            performHistoryAction(redo: true)
             return
         }
         guard sender.tag >= 0, sender.tag < Self.items.count else { return }
@@ -308,6 +342,14 @@ final class ScrollResultPanel: NSPanel {
             perform(intent: .copy)
             return
         }
+        let flags = event.modifierFlags.intersection(
+            [.command, .shift, .control, .option])
+        if !saving, flags.isEmpty,
+           let key = event.charactersIgnoringModifiers,
+           let tool = OverlayAnnotationTool.tool(forShortcutKey: key) {
+            selectAnnotationTool(tool)
+            return
+        }
         super.keyDown(with: event)
     }
 
@@ -320,11 +362,11 @@ final class ScrollResultPanel: NSPanel {
             perform(intent: .copy)
             return true
         }
-        if event.modifierFlags.contains(.command),
-           event.charactersIgnoringModifiers?.lowercased() == "z" {
-            if !saving, annotationSurface.undo() {
-                annotationHost?.needsDisplay = true
-            }
+        let flags = event.modifierFlags.intersection(
+            [.command, .shift, .control, .option])
+        if event.charactersIgnoringModifiers?.lowercased() == "z",
+           flags == [.command] || flags == [.command, .shift] {
+            performHistoryAction(redo: flags.contains(.shift))
             return true
         }
         return super.performKeyEquivalent(with: event)
@@ -416,6 +458,7 @@ final class ScrollResultPanel: NSPanel {
                     guard let self else { return }
                     self.saving = false
                     for button in self.toolbarButtons { button.isEnabled = true }
+                    self.updateHistoryButtons()
                     if outcome == .completed { self.dismiss() }
                 })
         case .pin, .ocr, .openEditor:
