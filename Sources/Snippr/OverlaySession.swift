@@ -147,7 +147,8 @@ enum CaptureIntent: Equatable {
     case save
     case pin
     case ocr
-    /// Structural S5 RED seam. Routing remains fail-closed until GREEN.
+    /// OCR the current flattened snapshot, copy the recognized source text,
+    /// then immediately start translation in the result window.
     case translate
     case openEditor
 }
@@ -186,6 +187,8 @@ struct CaptureActionRouter {
         /// Interactive Save-As panel (the toolbar's Save intent).
         var saveAs: @MainActor (CapturedImage, @escaping @MainActor (SaveAsOutcome) -> Void) -> Void
         var pin: @MainActor (CapturedImage) -> Void
+        /// One recognition effect for both manual intents. `autoTranslate` is
+        /// false for OCR and true only for the explicit Translate action.
         var ocr: @MainActor (CapturedImage, Bool) -> Void
         var openEditor: @MainActor (CapturedImage) -> Void
         var toast: @MainActor (String) -> Void
@@ -193,6 +196,10 @@ struct CaptureActionRouter {
         var setLastAreaRect: @MainActor (CGRect) -> Void
         var logEvent: @MainActor (String) -> Void
 
+        /// Backward-compatible injection seam: existing tests and harnesses
+        /// that do not care which OCR presentation was requested keep their
+        /// one-argument closure. Translate still routes exactly once through
+        /// that same injected effect.
         init(
             copyToClipboard: @escaping @MainActor (CapturedImage) -> Void,
             autoSave: @escaping @MainActor (
@@ -222,6 +229,8 @@ struct CaptureActionRouter {
                 logEvent: logEvent)
         }
 
+        /// Mode-aware seam for S5 and future callers that must distinguish
+        /// offline OCR presentation from explicit OCR + Translate.
         init(
             copyToClipboard: @escaping @MainActor (CapturedImage) -> Void,
             autoSave: @escaping @MainActor (
@@ -400,15 +409,11 @@ struct CaptureActionRouter {
             recordAreaRect()
             return .completed
 
-        case .ocr:
+        case .ocr, .translate:
             deps.setLastCapture(snapshot)
-            deps.ocr(snapshot, false)
+            deps.ocr(snapshot, intent == .translate)
             recordAreaRect()
             return .completed
-
-        case .translate:
-            // S5 RED: the public intent compiles, but no effect is routed.
-            return .failed
 
         case .openEditor:
             deps.setLastCapture(snapshot)

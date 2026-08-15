@@ -448,8 +448,9 @@ enum UITest {
                 scale: 2)
             let inputs = OverlaySessionInputs(
                 afterShow: true, afterCopy: false, afterSave: false)
-            // Self.items order: 0 copy, 1 save, 2 pin, 3 ocr, 4 openEditor
-            for tag in 0...4 {
+            // Drive every terminal descriptor from the shared area/panel
+            // catalog, including explicit OCR + Translate.
+            for tag in OverlayActionCatalog.items.indices {
                 var routed: CapturedImage?
                 let deps = CaptureActionRouter.Dependencies(
                     copyToClipboard: { routed = $0 },

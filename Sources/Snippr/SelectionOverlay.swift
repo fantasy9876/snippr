@@ -343,10 +343,18 @@ final class SelectionOverlayView: NSView {
     var hasAreaSelectionForTesting: Bool { areaSelection != nil }
     var isReviewingForTesting: Bool { isReviewing }
     var reviewToolbarFrameForTesting: CGRect? {
-        reviewToolbar?.isHidden == false ? reviewToolbar?.frame : nil
+        let frames = [reviewToolRail, reviewActionBar].compactMap { view in
+            view?.isHidden == false ? view?.frame : nil
+        }
+        guard var result = frames.first else { return nil }
+        for frame in frames.dropFirst() { result = result.union(frame) }
+        return result
     }
     var reviewToolbarButtonsForTesting: [(tag: Int, tooltip: String)] {
         toolbarButtons.map { ($0.tag, $0.toolTip ?? "") }
+    }
+    var reviewToolbarButtonFramesForTesting: [CGRect] {
+        toolbarButtons.map { $0.convert($0.bounds, to: self) }
     }
     func clickReviewToolbarButtonForTesting(tag: Int) {
         toolbarButtons.first { $0.tag == tag }?.performClick(nil)
@@ -377,16 +385,11 @@ final class SelectionOverlayView: NSView {
 
     // MARK: Review toolbar
 
-    private var reviewToolbar: NSView?
+    private var reviewToolRail: NSView?
+    private var reviewActionBar: NSView?
+    private var toolToolbarButtons: [NSButton] = []
+    private var actionToolbarButtons: [NSButton] = []
     private var toolbarButtons: [NSButton] = []
-
-    private static let toolbarItems: [(symbol: String, tooltip: String, intent: CaptureIntent)] = [
-        ("doc.on.doc", "Copy (Enter, ⌘C)", .copy),
-        ("square.and.arrow.down", "Save…", .save),
-        ("pin", "Pin to screen", .pin),
-        ("text.viewfinder", "Copy text (OCR)", .ocr),
-        ("macwindow", "Open in editor window", .openEditor),
-    ]
 
     private static let colorPresets: [NSColor] = [
         .systemRed, .systemOrange, .systemYellow, .systemGreen,
@@ -394,136 +397,125 @@ final class SelectionOverlayView: NSView {
     ]
     private var colorIndex = 0
 
-    private func buildReviewToolbar() -> NSView {
+    private func makeReviewToolbarContainer() -> NSView {
         let container = NSView(frame: .zero)
         container.wantsLayer = true
         container.layer?.backgroundColor =
             NSColor.black.withAlphaComponent(0.82).cgColor
         container.layer?.cornerRadius = 8
-        var buttons: [NSButton] = []
-        for tool in OverlayAnnotationTool.allCases {
-            let button = NSButton(frame: .zero)
-            button.bezelStyle = .regularSquare
-            button.isBordered = false
-            button.image = NSImage(
-                systemSymbolName: tool.symbol,
-                accessibilityDescription: tool.tooltip)
-            button.contentTintColor = tool == .select ? .controlAccentColor : .white
-            button.toolTip = tool.tooltip
-            button.tag = tool.toolbarTag
-            button.target = self
-            button.action = #selector(reviewToolbarButtonPressed(_:))
-            container.addSubview(button)
-            buttons.append(button)
-        }
-        let colorButton = NSButton(frame: .zero)
-        colorButton.bezelStyle = .regularSquare
-        colorButton.isBordered = false
-        colorButton.image = NSImage(
-            systemSymbolName: "circle.fill", accessibilityDescription: "Color")
-        colorButton.contentTintColor = Self.colorPresets[colorIndex]
-        colorButton.toolTip = "Color"
-        colorButton.tag = OverlayAnnotationTool.colorToolbarTag
-        colorButton.target = self
-        colorButton.action = #selector(reviewToolbarButtonPressed(_:))
-        container.addSubview(colorButton)
-        buttons.append(colorButton)
-        let undoButton = NSButton(frame: .zero)
-        undoButton.bezelStyle = .regularSquare
-        undoButton.isBordered = false
-        undoButton.image = NSImage(
-            systemSymbolName: "arrow.uturn.backward",
-            accessibilityDescription: "Undo (⌘Z)")
-        undoButton.contentTintColor = .white
-        undoButton.toolTip = "Undo (⌘Z)"
-        undoButton.tag = OverlayAnnotationTool.undoToolbarTag
-        undoButton.target = self
-        undoButton.action = #selector(reviewToolbarButtonPressed(_:))
-        container.addSubview(undoButton)
-        buttons.append(undoButton)
-        let redoButton = NSButton(frame: .zero)
-        redoButton.bezelStyle = .regularSquare
-        redoButton.isBordered = false
-        redoButton.image = NSImage(
-            systemSymbolName: "arrow.uturn.forward",
-            accessibilityDescription: "Redo (⇧⌘Z)")
-        redoButton.contentTintColor = .white
-        redoButton.toolTip = "Redo (⇧⌘Z)"
-        redoButton.tag = OverlayAnnotationTool.redoToolbarTag
-        redoButton.target = self
-        redoButton.action = #selector(reviewToolbarButtonPressed(_:))
-        container.addSubview(redoButton)
-        buttons.append(redoButton)
-        for (index, item) in Self.toolbarItems.enumerated() {
-            let button = NSButton(frame: .zero)
-            button.bezelStyle = .regularSquare
-            button.isBordered = false
-            button.image = NSImage(
-                systemSymbolName: item.symbol, accessibilityDescription: item.tooltip)
-            button.contentTintColor = .white
-            button.toolTip = item.tooltip
-            button.tag = index
-            button.target = self
-            button.action = #selector(reviewToolbarButtonPressed(_:))
-            container.addSubview(button)
-            buttons.append(button)
-        }
-        let close = NSButton(frame: .zero)
-        close.bezelStyle = .regularSquare
-        close.isBordered = false
-        close.image = NSImage(
-            systemSymbolName: "xmark", accessibilityDescription: "Close (Esc)")
-        close.contentTintColor = .white
-        close.toolTip = "Close (Esc)"
-        close.tag = -1
-        close.target = self
-        close.action = #selector(reviewToolbarButtonPressed(_:))
-        container.addSubview(close)
-        buttons.append(close)
-        toolbarButtons = buttons
         return container
     }
 
-    /// Attach the toolbar to the selection edge: below the frame when there
-    /// is room, above otherwise, always clamped inside this screen's bounds
-    /// and never overlapping the resize-handle hit rects (QA invariant 3).
+    private func makeReviewToolbarButton(
+        symbol: String, tooltip: String, tag: Int, tint: NSColor
+    ) -> NSButton {
+        let button = NSButton(frame: .zero)
+        button.bezelStyle = .regularSquare
+        button.isBordered = false
+        button.image = NSImage(
+            systemSymbolName: symbol, accessibilityDescription: tooltip)
+        button.contentTintColor = tint
+        button.toolTip = tooltip
+        button.tag = tag
+        button.target = self
+        button.action = #selector(reviewToolbarButtonPressed(_:))
+        return button
+    }
+
+    private func buildReviewToolbars() -> (tool: NSView, action: NSView) {
+        let toolContainer = makeReviewToolbarContainer()
+        let actionContainer = makeReviewToolbarContainer()
+        var toolButtons: [NSButton] = []
+        for tool in OverlayAnnotationTool.allCases {
+            let button = makeReviewToolbarButton(
+                symbol: tool.symbol, tooltip: tool.tooltip,
+                tag: tool.toolbarTag,
+                tint: tool == .select ? .controlAccentColor : .white)
+            toolContainer.addSubview(button)
+            toolButtons.append(button)
+        }
+        let colorButton = makeReviewToolbarButton(
+            symbol: "circle.fill", tooltip: "Color",
+            tag: OverlayAnnotationTool.colorToolbarTag,
+            tint: Self.colorPresets[colorIndex])
+        toolContainer.addSubview(colorButton)
+        toolButtons.append(colorButton)
+        let undoButton = makeReviewToolbarButton(
+            symbol: "arrow.uturn.backward", tooltip: "Undo (⌘Z)",
+            tag: OverlayAnnotationTool.undoToolbarTag, tint: .white)
+        toolContainer.addSubview(undoButton)
+        toolButtons.append(undoButton)
+        let redoButton = makeReviewToolbarButton(
+            symbol: "arrow.uturn.forward", tooltip: "Redo (⇧⌘Z)",
+            tag: OverlayAnnotationTool.redoToolbarTag, tint: .white)
+        toolContainer.addSubview(redoButton)
+        toolButtons.append(redoButton)
+
+        var actionButtons: [NSButton] = []
+        for (index, item) in OverlayActionCatalog.items.enumerated() {
+            let button = makeReviewToolbarButton(
+                symbol: item.symbol, tooltip: item.tooltip,
+                tag: index, tint: .white)
+            actionContainer.addSubview(button)
+            actionButtons.append(button)
+        }
+        let close = makeReviewToolbarButton(
+            symbol: "xmark", tooltip: "Close (Esc)", tag: -1, tint: .white)
+        actionContainer.addSubview(close)
+        actionButtons.append(close)
+
+        toolToolbarButtons = toolButtons
+        actionToolbarButtons = actionButtons
+        toolbarButtons = toolButtons + actionButtons
+        return (toolContainer, actionContainer)
+    }
+
+    /// Annotation controls form a wrapped vertical rail beside the crop;
+    /// terminal actions form a wrapped horizontal strip below it. Each group
+    /// flips independently at an edge and falls inside only when an outside
+    /// placement is impossible. They remain separate siblings so the empty
+    /// space between an L-shaped layout never intercepts canvas input.
     fileprivate func layoutReviewToolbar() {
         guard isReviewing, let selection = areaSelection else {
-            reviewToolbar?.isHidden = true
+            reviewToolRail?.isHidden = true
+            reviewActionBar?.isHidden = true
             return
         }
-        let toolbar: NSView
-        if let existing = reviewToolbar {
-            toolbar = existing
+        let toolRail: NSView
+        let actionBar: NSView
+        if let existingTool = reviewToolRail,
+           let existingAction = reviewActionBar {
+            toolRail = existingTool
+            actionBar = existingAction
         } else {
-            toolbar = buildReviewToolbar()
-            addSubview(toolbar)
-            reviewToolbar = toolbar
+            let built = buildReviewToolbars()
+            toolRail = built.tool
+            actionBar = built.action
+            addSubview(toolRail)
+            addSubview(actionBar)
+            reviewToolRail = toolRail
+            reviewActionBar = actionBar
         }
-        toolbar.isHidden = false
-        let buttonSize = CGSize(width: 34, height: 30)
-        let spacing: CGFloat = 2
-        let padding: CGFloat = 6
-        let count = CGFloat(toolbarButtons.count)
-        let width = count * buttonSize.width + (count - 1) * spacing + padding * 2
-        let height = buttonSize.height + padding * 2
-        let margin: CGFloat = 10 // stays clear of the 18-pt handle hit rects
-        var x = selection.maxX - width
-        x = max(bounds.minX + margin, min(bounds.maxX - width - margin, x))
-        var y = selection.minY - height - margin
-        if y < bounds.minY + margin {
-            y = selection.maxY + margin
+        guard let layout = OverlayToolbarLayout.area(
+            selection: selection, bounds: bounds,
+            toolCount: toolToolbarButtons.count,
+            actionCount: actionToolbarButtons.count)
+        else {
+            toolRail.isHidden = true
+            actionBar.isHidden = true
+            return
         }
-        if y + height > bounds.maxY - margin {
-            // full-height selection: keep the bar inside, near the bottom
-            y = max(bounds.minY + margin, min(
-                bounds.maxY - height - margin, selection.minY + margin))
+        toolRail.isHidden = false
+        actionBar.isHidden = false
+        toolRail.frame = layout.toolFrame
+        actionBar.frame = layout.actionFrame
+        for (button, frame) in zip(
+            toolToolbarButtons, layout.toolButtonFramesLocal) {
+            button.frame = frame
         }
-        toolbar.frame = CGRect(x: x, y: y, width: width, height: height)
-        for (index, button) in toolbarButtons.enumerated() {
-            button.frame = CGRect(
-                x: padding + CGFloat(index) * (buttonSize.width + spacing),
-                y: padding, width: buttonSize.width, height: buttonSize.height)
+        for (button, frame) in zip(
+            actionToolbarButtons, layout.actionButtonFramesLocal) {
+            button.frame = frame
         }
         // ALL buttons (Close included) lock while a save is in flight.
         let enabled = owner?.session.acceptsCommits ?? false
@@ -586,8 +578,9 @@ final class SelectionOverlayView: NSView {
             performHistoryAction(redo: true)
             return
         }
-        guard sender.tag >= 0, sender.tag < Self.toolbarItems.count else { return }
-        performReviewAction(Self.toolbarItems[sender.tag].intent)
+        guard sender.tag >= 0,
+              sender.tag < OverlayActionCatalog.items.count else { return }
+        performReviewAction(OverlayActionCatalog.items[sender.tag].intent)
     }
 
     /// One review intention = one router commit with the CURRENT crop.
@@ -656,7 +649,7 @@ final class SelectionOverlayView: NSView {
                         self?.layoutReviewToolbar()
                     }
                 })
-        case .pin, .ocr, .openEditor:
+        case .pin, .ocr, .translate, .openEditor:
             // teardown BEFORE presenting so the .screenSaver-level overlay
             // can't cover the new surface
             owner.finish(.handled)
@@ -664,7 +657,7 @@ final class SelectionOverlayView: NSView {
                 snapshot, source: .areaReview, intent: intent,
                 inputs: inputs, finalGlobalRect: global,
                 dependencies: baseDependencies)
-        case .translate, .initialCapture, .scrollFinished:
+        case .initialCapture, .scrollFinished:
             break
         }
     }

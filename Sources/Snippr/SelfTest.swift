@@ -4202,17 +4202,23 @@ enum SelfTest {
                 let (overlay, view) = reviewView()
                 _ = overlay
                 view.selectForTesting(rect: rect)
-                guard let bar = view.reviewToolbarFrameForTesting else {
+                let buttonFrames = view.reviewToolbarButtonFramesForTesting
+                guard !buttonFrames.isEmpty else {
                     edgeFailures.append("#\(index) no toolbar"); continue
                 }
-                if !view.bounds.contains(bar) {
-                    edgeFailures.append("#\(index) out of bounds \(bar)")
-                }
-                if let sel = view.hasAreaSelectionForTesting
-                    ? rect.intersection(view.bounds) : nil {
-                    for (handle, handleRect) in EditableSelectionGeometry.handleRects(
-                        for: sel, size: 18) where bar.intersects(handleRect) {
-                        edgeFailures.append("#\(index) overlaps \(handle) \(handleRect) bar \(bar)")
+                for (buttonIndex, buttonFrame) in buttonFrames.enumerated() {
+                    if !view.bounds.contains(buttonFrame) {
+                        edgeFailures.append(
+                            "#\(index) button \(buttonIndex) out of bounds \(buttonFrame)")
+                    }
+                    if let sel = view.hasAreaSelectionForTesting
+                        ? rect.intersection(view.bounds) : nil {
+                        for (handle, handleRect) in EditableSelectionGeometry
+                            .handleRects(for: sel, size: 18)
+                            where buttonFrame.intersects(handleRect) {
+                            edgeFailures.append(
+                                "#\(index) button \(buttonIndex) overlaps \(handle) \(handleRect) frame \(buttonFrame)")
+                        }
                     }
                 }
             }
@@ -4462,6 +4468,11 @@ enum SelfTest {
             @MainActor func distinct12(_ values: [CGFloat]) -> Int {
                 Set(values.map { Int(($0 * 10).rounded()) }).count
             }
+            @MainActor func separation12(_ a: CGRect, _ b: CGRect) -> CGFloat {
+                let dx = max(0, max(a.minX - b.maxX, b.minX - a.maxX))
+                let dy = max(0, max(a.minY - b.maxY, b.minY - a.maxY))
+                return max(dx, dy)
+            }
             @MainActor func inspectAreaLayout12(
                 view: SelectionOverlayView, selection: CGRect,
                 expectToolSide: String?, expectActionSide: String?,
@@ -4472,6 +4483,7 @@ enum SelfTest {
                 let actions = buttons.filter { $0.tag < 100 }
                 let editingFrames = editing.map { buttonFrame12($0, in: view) }
                 let actionFrames = actions.map { buttonFrame12($0, in: view) }
+                let orderedButtons = editing + actions
                 let allFrames = editingFrames + actionFrames
                 var failures: [String] = []
                 if editing.count != OverlayAnnotationTool.allCases.count + 3 {
@@ -4498,6 +4510,10 @@ enum SelfTest {
                     if !view.bounds.contains(frame) {
                         failures.append("button \(i) outside \(frame)")
                     }
+                    let center = CGPoint(x: frame.midX, y: frame.midY)
+                    if view.hitTest(center) !== orderedButtons[i] {
+                        failures.append("button \(i) not hit-testable")
+                    }
                     for j in (i + 1)..<allFrames.count
                         where frame.intersects(allFrames[j]) {
                         failures.append("buttons \(i)/\(j) overlap")
@@ -4514,6 +4530,16 @@ enum SelfTest {
                     }
                     if distinct12(actionFrames.map(\.minY)) <= 1 {
                         failures.append("actions did not wrap rows")
+                    }
+                    if editingFrames.count >= 2,
+                       abs(editingFrames[0].midX - editingFrames[1].midX) > 0.1
+                        || editingFrames[0].minY <= editingFrames[1].minY {
+                        failures.append("tool order is not top-to-bottom")
+                    }
+                    if actionFrames.count >= 2,
+                       abs(actionFrames[0].midY - actionFrames[1].midY) > 0.1
+                        || actionFrames[0].minX >= actionFrames[1].minX {
+                        failures.append("action order is not left-to-right")
                     }
                 }
                 return failures
@@ -4554,15 +4580,60 @@ enum SelfTest {
                 expectToolSide: nil, expectActionSide: "above",
                 requireWrap: false).map { "bottom \($0)" }
 
+            let fullSelection = CGRect(
+                x: 4, y: 4, width: b.width - 8, height: b.height - 8)
+            let (fullLayoutOverlay, fullLayoutView) = reviewView()
+            _ = fullLayoutOverlay
+            fullLayoutView.selectForTesting(rect: fullSelection)
+            layout12Failures += inspectAreaLayout12(
+                view: fullLayoutView, selection: fullSelection,
+                expectToolSide: nil, expectActionSide: nil,
+                requireWrap: false).map { "full \($0)" }
+
             let (tinyLayoutOverlay, tinyLayoutView) = reviewView()
             _ = tinyLayoutOverlay
-            tinyLayoutView.frame = CGRect(x: 0, y: 0, width: 300, height: 260)
-            let tinySelection = CGRect(x: 130, y: 110, width: 40, height: 40)
+            let tinySelection = CGRect(
+                x: b.width / 2 - 20, y: b.height / 2 - 20,
+                width: 40, height: 40)
             tinyLayoutView.selectForTesting(rect: tinySelection)
             layout12Failures += inspectAreaLayout12(
                 view: tinyLayoutView, selection: tinySelection,
                 expectToolSide: nil, expectActionSide: nil,
                 requireWrap: true).map { "tiny \($0)" }
+
+            let tinyCornerOrigins = [
+                CGPoint(x: 4, y: 4),
+                CGPoint(x: b.width - 44, y: 4),
+                CGPoint(x: 4, y: b.height - 44),
+                CGPoint(x: b.width - 44, y: b.height - 44),
+            ]
+            for (corner, origin) in tinyCornerOrigins.enumerated() {
+                let (cornerOverlay, cornerView) = reviewView()
+                _ = cornerOverlay
+                let selection = CGRect(origin: origin, size: CGSize(
+                    width: 40, height: 40))
+                cornerView.selectForTesting(rect: selection)
+                layout12Failures += inspectAreaLayout12(
+                    view: cornerView, selection: selection,
+                    expectToolSide: nil, expectActionSide: nil,
+                    requireWrap: true).map { "corner\(corner) \($0)" }
+                let cornerButtons = allButtons12(in: cornerView)
+                let cornerToolFrames = cornerButtons.filter { $0.tag >= 100 }
+                    .map { buttonFrame12($0, in: cornerView) }
+                let cornerActionFrames = cornerButtons.filter { $0.tag < 100 }
+                    .map { buttonFrame12($0, in: cornerView) }
+                for (name, frames) in [
+                    ("tools", cornerToolFrames),
+                    ("actions", cornerActionFrames),
+                ] {
+                    if let frame = union12(frames),
+                       separation12(frame, selection)
+                        > max(frame.width, frame.height) * 2 + 20 {
+                        layout12Failures.append(
+                            "corner\(corner) \(name) teleported \(frame)")
+                    }
+                }
+            }
 
             let layoutPanel = ScrollResultPanel.show(
                 image: CapturedImage(
@@ -4585,6 +4656,19 @@ enum SelfTest {
                         where frame.intersects(frames[j]) {
                         layout12Failures.append("panel buttons \(i)/\(j) overlap")
                     }
+                    if let content = layoutPanel.contentView {
+                        let center = CGPoint(
+                            x: bar.minX + frame.midX,
+                            y: bar.minY + frame.midY)
+                        if !(content.hitTest(center) is NSButton) {
+                            layout12Failures.append(
+                                "panel button \(i) not hit-testable")
+                        }
+                    }
+                }
+                if let host = layoutPanel.annotationHostForTesting,
+                   host.frame.intersects(bar) {
+                    layout12Failures.append("panel host intersects toolbar")
                 }
                 if layoutPanel.frame.width > screen.visibleFrame.width * 0.9 + 1
                     || layoutPanel.frame.height > screen.visibleFrame.height * 0.9 + 1 {
@@ -4594,6 +4678,44 @@ enum SelfTest {
                 layout12Failures.append("panel has no toolbar")
             }
             layoutPanel.performActionForTesting(.copy)
+
+            // Regression for the 5K×40K class: natural width is huge, but
+            // vertical fit makes the displayed image narrow. Panel chrome
+            // must converge to that FITTED width (plus the 206pt HUD floor)
+            // instead of leaving an almost-screen-wide empty toolbar.
+            let wideTallPanel = ScrollResultPanel.show(
+                image: CapturedImage(
+                    cgImage: makeStripePattern(
+                        width: 250, height: 2000, seed: 0x5125_7003),
+                    scale: 0.1), // 2500×20000pt without a 200MB fixture
+                inputs: OverlaySessionInputs(
+                    afterShow: true, afterCopy: false, afterSave: false),
+                screen: screen, dependencies: noopDeps())
+            if let wideBar = wideTallPanel.toolbarFrameForTesting,
+               let wideHost = wideTallPanel.annotationHostForTesting {
+                let minimumWidth = min(screen.visibleFrame.width * 0.9, 206)
+                let expectedCompactWidth = max(minimumWidth, wideHost.frame.width)
+                if wideTallPanel.frame.width > expectedCompactWidth + 1 {
+                    layout12Failures.append(
+                        "wide-tall chrome waste panel \(wideTallPanel.frame.width) host \(wideHost.frame.width)")
+                }
+                if distinct12(
+                    wideTallPanel.toolbarButtonFramesForTesting.map(\.minY)) <= 1 {
+                    layout12Failures.append("wide-tall panel did not wrap")
+                }
+                if wideHost.frame.intersects(wideBar) {
+                    layout12Failures.append("wide-tall host intersects toolbar")
+                }
+                if wideTallPanel.frame.width > screen.visibleFrame.width * 0.9 + 1
+                    || wideTallPanel.frame.height
+                        > screen.visibleFrame.height * 0.9 + 1 {
+                    layout12Failures.append(
+                        "wide-tall panel exceeds 90% \(wideTallPanel.frame)")
+                }
+            } else {
+                layout12Failures.append("wide-tall panel missing geometry")
+            }
+            wideTallPanel.performActionForTesting(.copy)
             check("overlay12-layout-s5", layout12Failures.isEmpty,
                   layout12Failures.joined(separator: "; "))
 

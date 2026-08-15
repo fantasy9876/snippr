@@ -44,6 +44,9 @@ final class ScrollResultPanel: NSPanel {
     private let inputs: OverlaySessionInputs
     private let dependencies: CaptureActionRouter.Dependencies?
     private var saving = false
+    /// A retained/delayed reference must not replay a terminal action after
+    /// the panel has detached and started presenting its destination.
+    private var terminalActionClaimed = false
     private var toolbarButtons: [NSButton] = []
     private var actionBar: NSView?
     /// Slice 4: shared annotation surface over the stitched image.
@@ -55,7 +58,7 @@ final class ScrollResultPanel: NSPanel {
         image: CapturedImage, inputs: OverlaySessionInputs, screen: NSScreen,
         dependencies: CaptureActionRouter.Dependencies? = nil
     ) -> ScrollResultPanel {
-        current?.orderOut(nil)
+        current?.dismiss()
         let panel = ScrollResultPanel(
             image: image, inputs: inputs, screen: screen,
             dependencies: dependencies)
@@ -78,11 +81,49 @@ final class ScrollResultPanel: NSPanel {
         let maxSize = CGSize(
             width: visible.width * 0.9, height: visible.height * 0.9)
         let pointSize = image.pointSize
-        let toolbarHeight: CGFloat = 44
+        let toolbarButtonCount = OverlayAnnotationTool.allCases.count + 3
+            + OverlayActionCatalog.items.count + 1 // Color/Undo/Redo + Close
+        // A narrow stitch gets only enough chrome width for the 190pt
+        // stroke HUD plus margins; controls wrap instead of widening the
+        // panel to a full toolbar row.
+        let minimumContentWidth = min(maxSize.width, 206)
+        // Width and toolbar height are coupled: a tall 5K×40K stitch may be
+        // vertically fitted down to a ~150pt image even though its natural
+        // point width exceeds the screen. Start at the screen cap, then
+        // monotonically converge to the FITTED image width; each wrap step
+        // can only increase toolbar height and reduce the next width.
+        var contentWidth = maxSize.width
+        var toolbarLayout = OverlayToolbarLayout.panel(
+            buttonCount: toolbarButtonCount,
+            availableWidth: contentWidth)
+        for _ in 0..<toolbarButtonCount {
+            let availableImageHeight = max(
+                1, maxSize.height - toolbarLayout.size.height)
+            let candidateFit = min(
+                1,
+                contentWidth / max(1, pointSize.width),
+                availableImageHeight / max(1, pointSize.height))
+            let fittedImageWidth = max(1, pointSize.width * candidateFit)
+            let nextWidth = min(
+                maxSize.width,
+                max(minimumContentWidth, fittedImageWidth))
+            if abs(nextWidth - contentWidth) < 0.5 { break }
+            contentWidth = nextWidth
+            toolbarLayout = OverlayToolbarLayout.panel(
+                buttonCount: toolbarButtonCount,
+                availableWidth: contentWidth)
+        }
+        // Re-evaluate once at the converged width so bar height, image fit
+        // and the actual panel frame all share one exact geometry snapshot.
+        toolbarLayout = OverlayToolbarLayout.panel(
+            buttonCount: toolbarButtonCount,
+            availableWidth: contentWidth)
+        let toolbarHeight = toolbarLayout.size.height
         let fit = min(
             1,
-            maxSize.width / max(1, pointSize.width),
-            (maxSize.height - toolbarHeight) / max(1, pointSize.height))
+            contentWidth / max(1, pointSize.width),
+            max(1, maxSize.height - toolbarHeight)
+                / max(1, pointSize.height))
         // EXACT aspect fit — no per-axis min clamps: a distorted or
         // letterboxed image view would break the single pixels-per-point
         // factor the annotation host relies on.
@@ -99,11 +140,8 @@ final class ScrollResultPanel: NSPanel {
         // Pixel COORDINATES stay absolute; only pt→px size conversion moves.
         let pixelsPerPoint = CGFloat(image.cgImage.width) / imageSize.width
         self.annotationSurface = AnnotationSurface(pixelScale: pixelsPerPoint)
-        // The toolbar needs room for every button INCLUDING Close — a tall,
-        // narrow stitch must widen the panel, not overflow the buttons.
-        let toolbarMinWidth = ScrollResultPanel.requiredToolbarWidth
         let contentSize = CGSize(
-            width: max(imageSize.width, toolbarMinWidth),
+            width: contentWidth,
             height: imageSize.height + toolbarHeight)
         let origin = CGPoint(
             x: visible.midX - contentSize.width / 2,
@@ -150,7 +188,7 @@ final class ScrollResultPanel: NSPanel {
         content.addSubview(host)
         annotationHost = host
 
-        let bar = buildToolbar(width: contentSize.width, height: toolbarHeight)
+        let bar = buildToolbar(layout: toolbarLayout)
         content.addSubview(bar)
         actionBar = bar
         contentView = content
@@ -164,29 +202,11 @@ final class ScrollResultPanel: NSPanel {
 
     override var canBecomeKey: Bool { true }
 
-    private static let items: [(symbol: String, tooltip: String, intent: CaptureIntent)] = [
-        ("doc.on.doc", "Copy (Enter, ⌘C)", .copy),
-        ("square.and.arrow.down", "Save…", .save),
-        ("pin", "Pin to screen", .pin),
-        ("text.viewfinder", "Copy text (OCR)", .ocr),
-        ("macwindow", "Open in editor window", .openEditor),
-    ]
-
     private static let colorPresets: [NSColor] = [
         .systemRed, .systemOrange, .systemYellow, .systemGreen,
         .systemBlue, .black, .white,
     ]
     private var colorIndex = 0
-
-    /// Width every button (plus Close and paddings) needs without overlap.
-    static var requiredToolbarWidth: CGFloat {
-        let buttonWidth: CGFloat = 34, spacing: CGFloat = 2
-        let count = CGFloat(
-            items.count + OverlayAnnotationTool.allCases.count + 3)
-        // leading 8 + buttons + gap 12 + close + trailing 8
-        return 8 + count * buttonWidth + (count - 1) * spacing + 12
-            + buttonWidth + 8
-    }
 
     var toolbarButtonFramesForTesting: [CGRect] {
         toolbarButtons.map { $0.frame }
@@ -195,18 +215,15 @@ final class ScrollResultPanel: NSPanel {
         toolbarButtons.map { ($0.tag, $0.toolTip ?? "") }
     }
 
-    private func buildToolbar(width: CGFloat, height: CGFloat) -> NSView {
-        let bar = NSView(frame: CGRect(x: 0, y: 0, width: width, height: height))
+    private func buildToolbar(
+        layout: OverlayToolbarLayout.Panel
+    ) -> NSView {
+        let bar = NSView(frame: CGRect(origin: .zero, size: layout.size))
         var buttons: [NSButton] = []
-        let size = CGSize(width: 34, height: 30)
-        let spacing: CGFloat = 2
-        var x: CGFloat = 8
         @MainActor func makeButton(
             symbol: String, tooltip: String, tag: Int, tint: NSColor
         ) -> NSButton {
-            let button = NSButton(frame: CGRect(
-                x: x, y: (height - size.height) / 2,
-                width: size.width, height: size.height))
+            let button = NSButton(frame: .zero)
             button.bezelStyle = .regularSquare
             button.isBordered = false
             button.image = NSImage(
@@ -218,7 +235,6 @@ final class ScrollResultPanel: NSPanel {
             button.action = #selector(toolbarPressed(_:))
             bar.addSubview(button)
             buttons.append(button)
-            x += size.width + spacing
             return button
         }
         for tool in OverlayAnnotationTool.allCases {
@@ -237,25 +253,17 @@ final class ScrollResultPanel: NSPanel {
         _ = makeButton(
             symbol: "arrow.uturn.forward", tooltip: "Redo (⇧⌘Z)",
             tag: OverlayAnnotationTool.redoToolbarTag, tint: .labelColor)
-        for (index, item) in Self.items.enumerated() {
+        for (index, item) in OverlayActionCatalog.items.enumerated() {
             _ = makeButton(
                 symbol: item.symbol, tooltip: item.tooltip,
                 tag: index, tint: .labelColor)
         }
-        let close = NSButton(frame: CGRect(
-            x: max(x + 12, width - size.width - 8),
-            y: (height - size.height) / 2,
-            width: size.width, height: size.height))
-        close.bezelStyle = .regularSquare
-        close.isBordered = false
-        close.image = NSImage(
-            systemSymbolName: "xmark", accessibilityDescription: "Close (Esc)")
-        close.toolTip = "Close (Esc)"
-        close.tag = -1
-        close.target = self
-        close.action = #selector(toolbarPressed(_:))
-        bar.addSubview(close)
-        buttons.append(close)
+        _ = makeButton(
+            symbol: "xmark", tooltip: "Close (Esc)",
+            tag: -1, tint: .labelColor)
+        for (button, frame) in zip(buttons, layout.buttonFrames) {
+            button.frame = frame
+        }
         toolbarButtons = buttons
         return bar
     }
@@ -284,14 +292,14 @@ final class ScrollResultPanel: NSPanel {
     }
 
     private func performHistoryAction(redo: Bool) {
-        guard !saving else { return }
+        guard !saving, !terminalActionClaimed else { return }
         let changed = redo
             ? annotationSurface.redo() : annotationSurface.undo()
         if changed { annotationHost?.needsDisplay = true }
     }
 
     @objc private func toolbarPressed(_ sender: NSButton) {
-        if saving { return }
+        if saving || terminalActionClaimed { return }
         if sender.tag == -1 {
             dismiss()
             return
@@ -314,8 +322,9 @@ final class ScrollResultPanel: NSPanel {
             performHistoryAction(redo: true)
             return
         }
-        guard sender.tag >= 0, sender.tag < Self.items.count else { return }
-        perform(intent: Self.items[sender.tag].intent)
+        guard sender.tag >= 0,
+              sender.tag < OverlayActionCatalog.items.count else { return }
+        perform(intent: OverlayActionCatalog.items[sender.tag].intent)
     }
 
     func performActionForTesting(_ intent: CaptureIntent) {
@@ -344,7 +353,7 @@ final class ScrollResultPanel: NSPanel {
         }
         let flags = event.modifierFlags.intersection(
             [.command, .shift, .control, .option])
-        if !saving, flags.isEmpty,
+        if !saving, !terminalActionClaimed, flags.isEmpty,
            let key = event.charactersIgnoringModifiers,
            let tool = OverlayAnnotationTool.tool(forShortcutKey: key) {
             selectAnnotationTool(tool)
@@ -391,6 +400,7 @@ final class ScrollResultPanel: NSPanel {
     }
 
     private func dismiss() {
+        terminalActionClaimed = true
         if ScrollResultPanel.current === self { ScrollResultPanel.current = nil }
         orderOut(nil)
     }
@@ -414,12 +424,13 @@ final class ScrollResultPanel: NSPanel {
     var exportSnapshotForTesting: CapturedImage? { exportSnapshot }
 
     /// Same exactly-once + terminal-order rules as the area review: Copy
-    /// commits then closes; Pin/OCR/editor tear down BEFORE presenting; Save
+    /// commits then closes; Pin/OCR/Translate/editor tear down BEFORE
+    /// presenting; Save
     /// locks the panel in-flight and stays open on cancel/failure. All
     /// commits use source `.scrollResult` with a nil rect, so the
     /// Repeat-Area memory is never touched.
     private func perform(intent: CaptureIntent) {
-        guard !saving else { return }
+        guard !saving, !terminalActionClaimed else { return }
         // A terminal click must never race the in-flight text entry: commit
         // the active field BEFORE exportSnapshot reads the surface (same
         // contract as the area review — no Return required first).
@@ -435,6 +446,7 @@ final class ScrollResultPanel: NSPanel {
         }
         switch intent {
         case .copy:
+            terminalActionClaimed = true
             CaptureActionRouter.commit(
                 image, source: .scrollResult, intent: .copy,
                 inputs: inputs, finalGlobalRect: nil,
@@ -461,13 +473,14 @@ final class ScrollResultPanel: NSPanel {
                     self.updateHistoryButtons()
                     if outcome == .completed { self.dismiss() }
                 })
-        case .pin, .ocr, .openEditor:
+        case .pin, .ocr, .translate, .openEditor:
+            terminalActionClaimed = true
             dismiss()
             CaptureActionRouter.commit(
                 image, source: .scrollResult, intent: intent,
                 inputs: inputs, finalGlobalRect: nil,
                 dependencies: dependencies)
-        case .translate, .initialCapture, .scrollFinished:
+        case .initialCapture, .scrollFinished:
             break
         }
     }
