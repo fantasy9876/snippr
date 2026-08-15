@@ -1213,6 +1213,10 @@ final class StrokePreviewView: NSView {
     var strokeWidth: CGFloat = 3
     var color: NSColor = .systemRed
 
+    /// HUD chrome must never steal the next drawing click during its
+    /// one-second lifetime (editor and both in-place surfaces reuse it).
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
     override func draw(_ dirtyRect: NSRect) {
         let bg = NSBezierPath(roundedRect: bounds, xRadius: 10, yRadius: 10)
         NSColor.black.withAlphaComponent(0.82).setFill()

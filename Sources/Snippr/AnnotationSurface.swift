@@ -39,6 +39,30 @@ enum OverlayAnnotationTool: String, CaseIterable {
         return allCases[index]
     }
 
+    /// The editor's exact persisted raw value. Keep this explicit instead of
+    /// deriving it from toolbar order/tooltip so both surfaces always share
+    /// the canonical `toolWidth_<EditorTool.rawValue>` preference.
+    var strokeWidthSettingsKey: String? {
+        switch self {
+        case .pen: return EditorTool.pen.rawValue
+        case .arrow: return EditorTool.arrow.rawValue
+        case .line: return EditorTool.line.rawValue
+        case .rect: return EditorTool.rect.rawValue
+        case .oval: return EditorTool.oval.rawValue
+        case .highlight: return EditorTool.highlight.rawValue
+        default: return nil
+        }
+    }
+
+    /// Mirrors EditorCanvasView.isStrokeTool exactly: Highlighter is a filled
+    /// region and therefore does not consume the width wheel gesture.
+    var adjustsStrokeWidth: Bool {
+        switch self {
+        case .pen, .arrow, .line, .rect, .oval: return true
+        default: return false
+        }
+    }
+
     var symbol: String {
         switch self {
         case .select: return "cursorarrow"
@@ -93,6 +117,7 @@ final class AnnotationSurface {
     private var activePen: PenAnnotation?
     private var activeBlur: BlurAnnotation?
     private var activeBlurAnchor: CGPoint?
+    private var strokeTrackpadAccum: CGFloat = 0
 
     init(
         pixelScale: CGFloat,
@@ -106,6 +131,44 @@ final class AnnotationSurface {
 
     var isEmpty: Bool { annotations.isEmpty }
 
+    var adjustsStrokeWidth: Bool { tool.adjustsStrokeWidth }
+
+    private func storedStrokeWidth(for tool: OverlayAnnotationTool) -> CGFloat {
+        guard let key = tool.strokeWidthSettingsKey else { return 3 }
+        return min(20, max(1, strokeWidthStore.read(key)))
+    }
+
+    /// Shared by both real hosts. A stroke tool consumes the gesture even
+    /// while a precise trackpad delta is still below the editor's threshold,
+    /// preventing the scroll panel from panning under a width adjustment.
+    func adjustStrokeWidthForScroll(
+        deltaY: CGFloat, precise: Bool
+    ) -> (width: CGFloat, color: NSColor)? {
+        guard tool.adjustsStrokeWidth,
+              let key = tool.strokeWidthSettingsKey,
+              deltaY != 0
+        else {
+            strokeTrackpadAccum = 0
+            return nil
+        }
+        let step: CGFloat
+        if precise {
+            strokeTrackpadAccum += deltaY
+            guard abs(strokeTrackpadAccum) >= 18 else { return nil }
+            step = strokeTrackpadAccum > 0 ? 0.5 : -0.5
+            strokeTrackpadAccum = 0
+        } else {
+            step = deltaY > 0 ? 0.5 : -0.5
+        }
+        let width = min(20, max(1, strokeWidthStore.read(key) + step))
+        strokeWidthStore.write(width, key)
+        return (width, color)
+    }
+
+    func resetStrokeScrollAccumulator() {
+        strokeTrackpadAccum = 0
+    }
+
     // MARK: drag lifecycle (image-pixel coordinates)
 
     /// Returns true when the surface consumed the drag start (tool != select).
@@ -116,6 +179,7 @@ final class AnnotationSurface {
         case .pen:
             let pen = PenAnnotation(uiScale: pixelScale)
             pen.color = color
+            pen.strokeWidthPt = storedStrokeWidth(for: tool)
             pen.points = [p]
             activePen = pen
             annotations.append(pen)
@@ -134,6 +198,7 @@ final class AnnotationSurface {
                 kind: kind,
                 start: p, end: p, uiScale: pixelScale)
             shape.color = color
+            shape.strokeWidthPt = storedStrokeWidth(for: tool)
             activeShape = shape
             annotations.append(shape)
             return true

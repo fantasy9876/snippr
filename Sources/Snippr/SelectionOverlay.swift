@@ -268,6 +268,8 @@ final class SelectionOverlayView: NSView {
     private var annotationDragging = false
     private var textField: NSTextField?
     private var textFieldPixelOrigin: CGPoint = .zero
+    private var strokeHUD: StrokePreviewView?
+    private var strokeHUDHide: DispatchWorkItem?
     private var mousePos: CGPoint = .zero
     private var hoverWindow: WindowInfo?
 
@@ -755,6 +757,67 @@ final class SelectionOverlayView: NSView {
     }
 
     // MARK: Events
+
+    private func showStrokeHUD(width: CGFloat, color: NSColor) {
+        let hud: StrokePreviewView
+        if let existing = strokeHUD {
+            hud = existing
+        } else {
+            hud = StrokePreviewView(
+                frame: CGRect(x: 0, y: 0, width: 190, height: 44))
+            addSubview(hud, positioned: .above, relativeTo: nil)
+            strokeHUD = hud
+        }
+        hud.strokeWidth = width
+        hud.color = color
+        let anchor = areaSelection ?? bounds
+        let margin: CGFloat = 8
+        let maxX = max(bounds.minX + margin,
+                       bounds.maxX - hud.frame.width - margin)
+        let maxY = max(bounds.minY + margin,
+                       bounds.maxY - hud.frame.height - margin)
+        hud.frame.origin = CGPoint(
+            x: min(max(anchor.midX - hud.frame.width / 2,
+                       bounds.minX + margin), maxX),
+            y: min(max(anchor.minY + 16, bounds.minY + margin), maxY))
+        hud.isHidden = false
+        hud.needsDisplay = true
+        strokeHUDHide?.cancel()
+        let work = DispatchWorkItem { [weak hud] in hud?.isHidden = true }
+        strokeHUDHide = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0, execute: work)
+    }
+
+    override func scrollWheel(with event: NSEvent) {
+        guard mode == .area, let surface = annotationSurface else {
+            super.scrollWheel(with: event)
+            return
+        }
+        guard owner?.session.phase != .saving else {
+            surface.resetStrokeScrollAccumulator()
+            return
+        }
+        guard owner?.session.phase == .reviewing,
+              !textEditingActive,
+              surface.adjustsStrokeWidth
+        else {
+            surface.resetStrokeScrollAccumulator()
+            super.scrollWheel(with: event)
+            return
+        }
+        let mods = event.modifierFlags
+        if mods.contains(.command) || mods.contains(.control)
+            || mods.contains(.shift) {
+            super.scrollWheel(with: event)
+            return
+        }
+        if let changed = surface.adjustStrokeWidthForScroll(
+            deltaY: event.scrollingDeltaY,
+            precise: event.hasPreciseScrollingDeltas) {
+            showStrokeHUD(width: changed.width, color: changed.color)
+        }
+        // Eligible tools consume even a sub-threshold precise gesture.
+    }
 
     override func mouseMoved(with event: NSEvent) {
         mousePos = convert(event.locationInWindow, from: nil)

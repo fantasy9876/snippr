@@ -146,6 +146,7 @@ final class ScrollResultPanel: NSPanel {
             baseImage: image.cgImage,
             pixelsPerPoint: pixelsPerPoint)
         host.isLocked = { [weak self] in self?.saving ?? false }
+        host.strokeHUDContainer = content
         content.addSubview(host)
         annotationHost = host
 
@@ -438,6 +439,12 @@ final class AnnotationHostView: NSView {
     private let baseImage: CGImage
     private let pixelsPerPoint: CGFloat
     private var dragging = false
+    private var strokeHUD: StrokePreviewView?
+    private var strokeHUDHide: DispatchWorkItem?
+    /// The panel is deliberately wider than a tall/narrow stitched image so
+    /// toolbar chrome fits. Put the fixed 190pt HUD on that wide content
+    /// surface too; keeping it under the image host would clip it.
+    weak var strokeHUDContainer: NSView?
     /// While the owning surface has a save in flight, ALL annotation input
     /// is frozen — the exported state must be exactly what the user saw when
     /// they pressed Save.
@@ -507,6 +514,63 @@ final class AnnotationHostView: NSView {
 
     override var acceptsFirstResponder: Bool { true }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    private func showStrokeHUD(width: CGFloat, color: NSColor) {
+        let container = strokeHUDContainer ?? self
+        let hud: StrokePreviewView
+        if let existing = strokeHUD {
+            hud = existing
+        } else {
+            hud = StrokePreviewView(
+                frame: CGRect(x: 0, y: 0, width: 190, height: 44))
+            container.addSubview(hud, positioned: .above, relativeTo: nil)
+            strokeHUD = hud
+        }
+        hud.strokeWidth = width
+        hud.color = color
+        let anchor = convert(bounds, to: container)
+        let vis = container.bounds
+        let margin: CGFloat = 8
+        let maxX = max(vis.minX + margin,
+                       vis.maxX - hud.frame.width - margin)
+        let maxY = max(vis.minY + margin,
+                       vis.maxY - hud.frame.height - margin)
+        hud.frame.origin = CGPoint(
+            x: min(max(anchor.midX - hud.frame.width / 2,
+                       vis.minX + margin), maxX),
+            y: min(max(anchor.minY + 16, vis.minY + margin), maxY))
+        hud.isHidden = false
+        hud.needsDisplay = true
+        strokeHUDHide?.cancel()
+        let work = DispatchWorkItem { [weak hud] in hud?.isHidden = true }
+        strokeHUDHide = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0, execute: work)
+    }
+
+    override func scrollWheel(with event: NSEvent) {
+        guard !isLocked() else {
+            surface.resetStrokeScrollAccumulator()
+            return
+        }
+        guard !textEditingActive, surface.adjustsStrokeWidth else {
+            surface.resetStrokeScrollAccumulator()
+            super.scrollWheel(with: event)
+            return
+        }
+        let mods = event.modifierFlags
+        if mods.contains(.command) || mods.contains(.control)
+            || mods.contains(.shift) {
+            super.scrollWheel(with: event)
+            return
+        }
+        if let changed = surface.adjustStrokeWidthForScroll(
+            deltaY: event.scrollingDeltaY,
+            precise: event.hasPreciseScrollingDeltas) {
+            showStrokeHUD(width: changed.width, color: changed.color)
+        }
+        // Do not call super for an eligible tool: width scrolling must not
+        // pan the stitched image underneath the annotation gesture.
+    }
 
     override func hitTest(_ point: NSPoint) -> NSView? {
         // transparent to clicks while the select tool is active so the panel
