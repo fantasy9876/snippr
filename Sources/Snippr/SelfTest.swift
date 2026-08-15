@@ -62,6 +62,17 @@ enum SelfTest {
                 && !UpdateChecker.isAllowedUpdateServerURL(
                     URL(string: "https://snippr.pages.dev:444/version.json")))
 
+        // The updater must preserve TCC grants by accepting only candidates
+        // signed by the one release identity. Identifier-only verification is
+        // insufficient: a second certificate can sign the same bundle ID and
+        // macOS will treat that update as a different app.
+        let expectedReleaseRoot = "946c43e6456970f5ec11544b3244c192aae949d6"
+        let installerScript = UpdateChecker.detachedInstallerScript()
+        check("updater14-release-signer-pinned",
+              installerScript.contains("certificate root = H\\\"\(expectedReleaseRoot)\\\"")
+                && installerScript.contains("identifier \\\"com.manhhoang.snippr\\\""),
+              "detached verifier does not pin the canonical release root")
+
         let latchOK = MainActor.assumeIsolated { () -> Bool in
             UpdateChecker.releaseUpdateAttempt()
             let first = UpdateChecker.claimUpdateAttempt()
