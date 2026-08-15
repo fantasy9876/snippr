@@ -4270,6 +4270,100 @@ enum SelfTest {
                     && resizePixelsLive && resizePixelsNoJump,
                   "moveLive \(movePixelsLive) moveNoJump \(movePixelsNoJump) resizeLive \(resizePixelsLive) resizeNoJump \(resizePixelsNoJump)")
 
+            // Full-toolbar S1 fail-first gate. It compiles against the old
+            // five-tool enum, but stays red until Line/Oval/Highlighter and
+            // Counter are actually routed through the production area-view
+            // mouse handlers and rendered into the exported crop.
+            let s1Names = ["Line", "Oval", "Highlighter", "Counter"]
+            let s1Tools = OverlayAnnotationTool.allCases.filter { tool in
+                s1Names.contains { tool.tooltip.hasPrefix($0) }
+            }
+            var s1Failures: [String] = []
+            if s1Tools.count != s1Names.count {
+                s1Failures.append("catalog \(s1Tools.count)/\(s1Names.count)")
+            }
+            for tool in s1Tools {
+                let name = s1Names.first { tool.tooltip.hasPrefix($0) }
+                    ?? tool.tooltip
+                let (overlay, view) = reviewView()
+                let selection = CGRect(
+                    x: max(40, b.width / 2 - 150),
+                    y: max(100, b.height / 2 - 100),
+                    width: 300, height: 200)
+                view.selectForTesting(rect: selection)
+                guard let surface = view.annotationSurface else {
+                    s1Failures.append("\(name) no surface")
+                    continue
+                }
+                surface.tool = tool
+                let start = CGPoint(
+                    x: selection.minX + 55,
+                    y: selection.minY + 55)
+                let end = CGPoint(
+                    x: selection.minX + 175,
+                    y: selection.minY + 125)
+                if let down = liveMouse(.leftMouseDown, start) {
+                    view.mouseDown(with: down)
+                }
+                if let drag = liveMouse(.leftMouseDragged, end) {
+                    view.mouseDragged(with: drag)
+                }
+                if let up = liveMouse(.leftMouseUp, end) {
+                    view.mouseUp(with: up)
+                }
+                guard let annotation = surface.annotations.last else {
+                    s1Failures.append("\(name) no annotation")
+                    continue
+                }
+                let correctKind: Bool
+                switch (name, annotation) {
+                case ("Line", let shape as ShapeAnnotation):
+                    if case .line = shape.kind { correctKind = true }
+                    else { correctKind = false }
+                case ("Oval", let shape as ShapeAnnotation):
+                    if case .oval = shape.kind { correctKind = true }
+                    else { correctKind = false }
+                case ("Highlighter", let shape as ShapeAnnotation):
+                    if case .highlight = shape.kind { correctKind = true }
+                    else { correctKind = false }
+                case ("Counter", let counter as CounterAnnotation):
+                    correctKind = counter.number == 1
+                default:
+                    correctKind = false
+                }
+                if !correctKind {
+                    s1Failures.append("\(name) wrong model")
+                }
+                let plain = frozenImage.cgImage.cropping(
+                    to: overlay.session.pixelRect)
+                let flat = surface.flattened(
+                    base: frozenImage.cgImage,
+                    cropPixels: overlay.session.pixelRect)
+                if plain == nil || flat == nil
+                    || imagesEqual(plain!, flat!) {
+                    s1Failures.append("\(name) no export ink")
+                }
+                if name == "Counter" {
+                    let second = CGPoint(
+                        x: selection.minX + 220,
+                        y: selection.minY + 145)
+                    if let down = liveMouse(.leftMouseDown, second) {
+                        view.mouseDown(with: down)
+                    }
+                    if let up = liveMouse(.leftMouseUp, second) {
+                        view.mouseUp(with: up)
+                    }
+                    let counters = surface.annotations.compactMap {
+                        ($0 as? CounterAnnotation)?.number
+                    }
+                    if counters != [1, 2] {
+                        s1Failures.append("Counter sequence \(counters)")
+                    }
+                }
+            }
+            check("overlay8-full-tools-s1", s1Failures.isEmpty,
+                  s1Failures.joined(separator: "; "))
+
             // Retina 2x + shrink→re-expand: the SAME edges give the SAME
             // integral pixelRect — no 1px drift through a resize round trip.
             let retinaFrozen = CapturedImage(
