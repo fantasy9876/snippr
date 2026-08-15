@@ -1,6 +1,21 @@
 import AppKit
 import Vision
 
+/// RED-only compile seam for S4. Before production owns a second history
+/// stack the default witness is deliberately false; once AnnotationSurface
+/// supplies concrete `canRedo`/`redo`, this conformance exercises them.
+@MainActor private protocol S4RedoProbe {
+    var canRedo: Bool { get }
+    func redo() -> Bool
+}
+
+private extension S4RedoProbe {
+    var canRedo: Bool { false }
+    func redo() -> Bool { false }
+}
+
+extension AnnotationSurface: S4RedoProbe {}
+
 /// Headless feature tests: `Snippr --selftest [outdir]`.
 /// Exercises everything that doesn't need Screen Recording permission.
 enum SelfTest {
@@ -4609,6 +4624,289 @@ enum SelfTest {
                       hostFailures.joined(separator: "; "))
             }
 
+            // S4 live-host gate: both real responders, both real toolbar
+            // target/actions, shortcut routing, and the panel save lock.
+            do {
+                let redoTag = 202
+                @MainActor func keyEvent(
+                    _ characters: String,
+                    modifiers: NSEvent.ModifierFlags = []
+                ) -> NSEvent? {
+                    NSEvent.keyEvent(
+                        with: .keyDown, location: .zero,
+                        modifierFlags: modifiers, timestamp: 0,
+                        windowNumber: 0, context: nil,
+                        characters: characters,
+                        charactersIgnoringModifiers: characters.lowercased(),
+                        isARepeat: false, keyCode: 0)
+                }
+                @MainActor func buttons(in root: NSView) -> [NSButton] {
+                    root.subviews.flatMap { child -> [NSButton] in
+                        let own = (child as? NSButton).map { [$0] } ?? []
+                        return own + buttons(in: child)
+                    }
+                }
+                @MainActor func addAreaCounter(
+                    view: SelectionOverlayView, surface: AnnotationSurface,
+                    at point: CGPoint
+                ) {
+                    surface.tool = .counter
+                    if let down = liveMouse(.leftMouseDown, point) {
+                        view.mouseDown(with: down)
+                    }
+                    if let up = liveMouse(.leftMouseUp, point) {
+                        view.mouseUp(with: up)
+                    }
+                }
+
+                var hostFailures: [String] = []
+                let (historyOverlay, historyView) = reviewView()
+                let historySelection = CGRect(
+                    x: max(40, b.width / 2 - 150),
+                    y: max(100, b.height / 2 - 100),
+                    width: 300, height: 200)
+                historyView.selectForTesting(rect: historySelection)
+                guard let areaSurface = historyView.annotationSurface else {
+                    check("overlay11-undo-redo-hosts-s4", false,
+                          "area surface")
+                    return
+                }
+                addAreaCounter(
+                    view: historyView, surface: areaSurface,
+                    at: CGPoint(
+                        x: historySelection.minX + 60,
+                        y: historySelection.minY + 60))
+                addAreaCounter(
+                    view: historyView, surface: areaSurface,
+                    at: CGPoint(
+                        x: historySelection.minX + 120,
+                        y: historySelection.minY + 100))
+                let areaSecond = areaSurface.annotations.last
+                historyView.clickReviewToolbarButtonForTesting(
+                    tag: OverlayAnnotationTool.undoToolbarTag)
+                let areaButtonsAfterUndo = buttons(in: historyView)
+                let areaCatalog = areaButtonsAfterUndo.filter {
+                    $0.tag == OverlayAnnotationTool.undoToolbarTag
+                        || $0.tag == redoTag
+                }
+                let areaHistoryButtonsReady = areaCatalog.count == 2
+                    && areaCatalog.allSatisfy(\.isEnabled)
+                historyView.clickReviewToolbarButtonForTesting(tag: redoTag)
+                let areaButtonRedo = areaSurface.annotations.count == 2
+                    && areaSurface.annotations.last === areaSecond
+                if let cmdZ = keyEvent("z", modifiers: [.command]) {
+                    _ = historyView.performKeyEquivalent(with: cmdZ)
+                }
+                let areaKeyUndo = areaSurface.annotations.count == 1
+                if let shiftCmdZ = keyEvent(
+                    "z", modifiers: [.command, .shift]) {
+                    _ = historyView.performKeyEquivalent(with: shiftCmdZ)
+                }
+                let areaKeyRedo = areaSurface.annotations.count == 2
+                    && areaSurface.annotations.last === areaSecond
+                if let cmdZ = keyEvent("z", modifiers: [.command]) {
+                    _ = historyView.performKeyEquivalent(with: cmdZ)
+                }
+                addAreaCounter(
+                    view: historyView, surface: areaSurface,
+                    at: CGPoint(
+                        x: historySelection.minX + 180,
+                        y: historySelection.minY + 130))
+                let areaBranchCount = areaSurface.annotations.count
+                let areaBranchLast = areaSurface.annotations.last
+                if let shiftCmdZ = keyEvent(
+                    "z", modifiers: [.command, .shift]) {
+                    _ = historyView.performKeyEquivalent(with: shiftCmdZ)
+                }
+                let areaBranchCleared = areaBranchCount == 2
+                    && areaSurface.annotations.count == areaBranchCount
+                if let capsCmdZ = keyEvent(
+                    "z", modifiers: [.capsLock, .command]) {
+                    _ = historyView.performKeyEquivalent(with: capsCmdZ)
+                }
+                let areaCapsUndo = areaSurface.annotations.count == 1
+                if let capsShiftCmdZ = keyEvent(
+                    "z", modifiers: [.capsLock, .command, .shift]) {
+                    _ = historyView.performKeyEquivalent(with: capsShiftCmdZ)
+                }
+                let areaCapsRedo = areaSurface.annotations.count == 2
+                    && areaSurface.annotations.last === areaBranchLast
+                if !areaHistoryButtonsReady || !areaButtonRedo
+                    || !areaKeyUndo || !areaKeyRedo || !areaBranchCleared
+                    || !areaCapsUndo || !areaCapsRedo {
+                    hostFailures.append(
+                        "area catalog \(areaCatalog.map { ($0.tag, $0.isEnabled) }) button \(areaButtonRedo) keys \(areaKeyUndo)/\(areaKeyRedo) branch \(areaBranchCleared) caps \(areaCapsUndo)/\(areaCapsRedo)")
+                }
+
+                let areaShortcuts: [(String, OverlayAnnotationTool)] = [
+                    ("l", .line), ("o", .oval), ("h", .highlight),
+                    ("n", .counter), ("b", .blur),
+                ]
+                var areaShortcutsOK = true
+                for (key, tool) in areaShortcuts {
+                    if let event = keyEvent(key) { historyView.keyDown(with: event) }
+                    if areaSurface.tool != tool { areaShortcutsOK = false }
+                }
+                let textWindow = NSWindow(
+                    contentRect: historyView.bounds,
+                    styleMask: [.borderless], backing: .buffered, defer: false)
+                textWindow.contentView = historyView
+                areaSurface.tool = .text
+                historyView.beginTextEntryForTesting(atView: CGPoint(
+                    x: historySelection.midX, y: historySelection.midY))
+                if let event = keyEvent("l") { historyView.keyDown(with: event) }
+                let areaTextGuard = areaSurface.tool == .text
+                    && historyView.textFieldForTesting != nil
+                historyView.commitTextEntryForTesting(text: "")
+                textWindow.contentView = nil
+                if !areaShortcutsOK || !areaTextGuard {
+                    hostFailures.append(
+                        "area shortcuts \(areaShortcutsOK) text \(areaTextGuard)")
+                }
+                _ = historyOverlay.session.phase
+
+                let panelImage = CapturedImage(
+                    cgImage: makeNoiseImage(width: 320, height: 480), scale: 1)
+                var panelSaveDone: (@MainActor (SaveAsOutcome) -> Void)?
+                let panelDeps = CaptureActionRouter.Dependencies(
+                    copyToClipboard: { _ in }, autoSave: { _, _ in },
+                    saveAs: { _, done in panelSaveDone = done },
+                    pin: { _ in }, ocr: { _ in }, openEditor: { _ in },
+                    toast: { _ in }, setLastCapture: { _ in },
+                    setLastAreaRect: { _ in }, logEvent: { _ in })
+                let panel = ScrollResultPanel.show(
+                    image: panelImage,
+                    inputs: OverlaySessionInputs(
+                        afterShow: true, afterCopy: false, afterSave: false),
+                    screen: screen, dependencies: panelDeps)
+                panel.clickToolbarButtonForTesting(
+                    tag: OverlayAnnotationTool.counter.toolbarTag)
+                panel.drawWithRealEventsForTesting(
+                    fromView: CGPoint(x: 40, y: 60),
+                    toView: CGPoint(x: 40, y: 60))
+                panel.drawWithRealEventsForTesting(
+                    fromView: CGPoint(x: 90, y: 120),
+                    toView: CGPoint(x: 90, y: 120))
+                let panelSecond = panel.annotationSurface.annotations.last
+                panel.clickToolbarButtonForTesting(
+                    tag: OverlayAnnotationTool.undoToolbarTag)
+                let panelButtonsAfterUndo = panel.contentView.map {
+                    buttons(in: $0)
+                } ?? []
+                let panelCatalog = panelButtonsAfterUndo.filter {
+                    $0.tag == OverlayAnnotationTool.undoToolbarTag
+                        || $0.tag == redoTag
+                }
+                let panelHistoryButtonsReady = panelCatalog.count == 2
+                    && panelCatalog.allSatisfy(\.isEnabled)
+                panel.clickToolbarButtonForTesting(tag: redoTag)
+                let panelButtonRedo = panel.annotationSurface.annotations.count == 2
+                    && panel.annotationSurface.annotations.last === panelSecond
+                if let cmdZ = keyEvent("z", modifiers: [.command]) {
+                    _ = panel.performKeyEquivalent(with: cmdZ)
+                }
+                let panelKeyUndo = panel.annotationSurface.annotations.count == 1
+                if let shiftCmdZ = keyEvent(
+                    "z", modifiers: [.command, .shift]) {
+                    _ = panel.performKeyEquivalent(with: shiftCmdZ)
+                }
+                let panelKeyRedo = panel.annotationSurface.annotations.count == 2
+                    && panel.annotationSurface.annotations.last === panelSecond
+                if let capsCmdZ = keyEvent(
+                    "z", modifiers: [.capsLock, .command]) {
+                    _ = panel.performKeyEquivalent(with: capsCmdZ)
+                }
+                let panelCapsUndo = panel.annotationSurface.annotations.count == 1
+                if let capsShiftCmdZ = keyEvent(
+                    "z", modifiers: [.capsLock, .command, .shift]) {
+                    _ = panel.performKeyEquivalent(with: capsShiftCmdZ)
+                }
+                let panelCapsRedo = panel.annotationSurface.annotations.count == 2
+                    && panel.annotationSurface.annotations.last === panelSecond
+                if !panelHistoryButtonsReady || !panelButtonRedo
+                    || !panelKeyUndo || !panelKeyRedo
+                    || !panelCapsUndo || !panelCapsRedo {
+                    hostFailures.append(
+                        "panel catalog \(panelCatalog.map { ($0.tag, $0.isEnabled) }) button \(panelButtonRedo) keys \(panelKeyUndo)/\(panelKeyRedo) caps \(panelCapsUndo)/\(panelCapsRedo)")
+                }
+
+                var panelShortcutsOK = true
+                for (key, tool) in areaShortcuts {
+                    if let event = keyEvent(key) { panel.keyDown(with: event) }
+                    if panel.annotationSurface.tool != tool {
+                        panelShortcutsOK = false
+                    }
+                }
+                panel.clickToolbarButtonForTesting(
+                    tag: OverlayAnnotationTool.text.toolbarTag)
+                panel.drawWithRealEventsForTesting(
+                    fromView: CGPoint(x: 120, y: 160),
+                    toView: CGPoint(x: 120, y: 160))
+                if let event = keyEvent("l") { panel.keyDown(with: event) }
+                let panelTextGuard = panel.annotationSurface.tool == .text
+                    && panel.annotationHostForTesting?.textFieldForTesting != nil
+                panel.annotationHostForTesting?.commitActiveTextEntry()
+                if !panelShortcutsOK || !panelTextGuard {
+                    hostFailures.append(
+                        "panel shortcuts \(panelShortcutsOK) text \(panelTextGuard)")
+                }
+
+                if let cmdZ = keyEvent("z", modifiers: [.command]) {
+                    _ = panel.performKeyEquivalent(with: cmdZ)
+                }
+                let panelBeforeSave = panel.annotationSurface.annotations.count
+                let panelRedoBeforeSave = panelBeforeSave == 1
+                let panelLockedLast = panel.annotationSurface.annotations.last
+                panel.annotationSurface.tool = .line
+                panel.performActionForTesting(.save)
+                let lockedButtons = panel.contentView.map { buttons(in: $0) }
+                    ?? []
+                let lockedHistory = lockedButtons.filter {
+                    $0.tag == OverlayAnnotationTool.undoToolbarTag
+                        || $0.tag == redoTag
+                }
+                let panelButtonsLocked = lockedHistory.count == 2
+                    && lockedHistory.allSatisfy { !$0.isEnabled }
+                if let cmdZ = keyEvent("z", modifiers: [.command]) {
+                    _ = panel.performKeyEquivalent(with: cmdZ)
+                }
+                let panelCmdFrozen =
+                    panel.annotationSurface.annotations.count == panelBeforeSave
+                    && panel.annotationSurface.annotations.last === panelLockedLast
+                if let shiftCmdZ = keyEvent(
+                    "z", modifiers: [.command, .shift]) {
+                    _ = panel.performKeyEquivalent(with: shiftCmdZ)
+                }
+                let panelShiftFrozen =
+                    panel.annotationSurface.annotations.count == panelBeforeSave
+                    && panel.annotationSurface.annotations.last === panelLockedLast
+                panel.clickToolbarButtonForTesting(
+                    tag: OverlayAnnotationTool.undoToolbarTag)
+                panel.clickToolbarButtonForTesting(tag: redoTag)
+                if let shortcut = keyEvent("b") { panel.keyDown(with: shortcut) }
+                let panelFrozen = panelSaveDone != nil
+                    && panel.annotationSurface.annotations.count == panelBeforeSave
+                    && panel.annotationSurface.tool == .line
+                    && panelButtonsLocked && panelCmdFrozen && panelShiftFrozen
+                panelSaveDone?(.cancelled)
+                if let shiftCmdZ = keyEvent(
+                    "z", modifiers: [.command, .shift]) {
+                    _ = panel.performKeyEquivalent(with: shiftCmdZ)
+                }
+                let panelUnlockedRedo = panelRedoBeforeSave
+                    && panel.annotationSurface.annotations.count == 2
+                    && panel.annotationSurface.annotations.last === panelSecond
+                if !panelFrozen || !panelUnlockedRedo {
+                    hostFailures.append(
+                        "panel lock \(panelFrozen) unlockRedo \(panelUnlockedRedo)")
+                }
+                panel.clickToolbarButtonForTesting(tag: -1)
+
+                check("overlay11-undo-redo-hosts-s4",
+                      hostFailures.isEmpty,
+                      hostFailures.joined(separator: "; "))
+            }
+
             // Retina 2x + shrink→re-expand: the SAME edges give the SAME
             // integral pixelRect — no 1px drift through a resize round trip.
             let retinaFrozen = CapturedImage(
@@ -4855,6 +5153,106 @@ enum SelfTest {
                       "create \(creationOK) default \(defaultOK) eligible \(eligibleScrollOK) precise \(preciseOK) hud \(hudOK) model \(persistedModelOK) nonStroke \(nonStrokeIgnored) modifiers \(modifierIgnored) negative \(negativeStepOK) clamp \(lowerClampOK)/\(upperClampOK) isolated \(perToolIsolationOK) reads \(reads) writes \(writes)")
             }
 
+            // S4 headless gate of record: a real second history stack must
+            // restore the exact annotation object, and any new mutation after
+            // undo must invalidate that branch. The shortcut catalog is also
+            // shared here so the two UI hosts cannot silently drift.
+            do {
+                @MainActor func addCounter(
+                    _ surface: AnnotationSurface, at point: CGPoint
+                ) {
+                    surface.tool = .counter
+                    _ = surface.beginDrag(atPixel: point)
+                    surface.endDrag()
+                }
+
+                let history = AnnotationSurface(pixelScale: 1)
+                addCounter(history, at: CGPoint(x: 10, y: 10))
+                addCounter(history, at: CGPoint(x: 20, y: 20))
+                addCounter(history, at: CGPoint(x: 30, y: 30))
+                let first = history.annotations.first
+                let second = history.annotations[1]
+                let third = history.annotations.last
+                let historyProbe: any S4RedoProbe = history
+                let undoOK = history.undo() && history.undo()
+                    && history.annotations.count == 1
+                    && history.annotations.first === first
+                    && historyProbe.canRedo
+                let firstRedo = historyProbe.redo()
+                    && history.annotations.count == 2
+                    && history.annotations.first === first
+                    && history.annotations.last === second
+                    && historyProbe.canRedo
+                let secondRedo = historyProbe.redo()
+                    && history.annotations.count == 3
+                    && history.annotations.first === first
+                    && history.annotations[1] === second
+                    && history.annotations.last === third
+                    && !historyProbe.canRedo
+
+                let branch = AnnotationSurface(pixelScale: 1)
+                addCounter(branch, at: CGPoint(x: 30, y: 30))
+                addCounter(branch, at: CGPoint(x: 40, y: 40))
+                let removed = branch.annotations.last
+                let branchProbe: any S4RedoProbe = branch
+                let branchUndo = branch.undo()
+                    && branchProbe.canRedo
+                    && branch.annotations.count == 1
+                addCounter(branch, at: CGPoint(x: 50, y: 50))
+                let branchCleared = !branchProbe.canRedo
+                    && !branchProbe.redo()
+                    && branch.annotations.count == 2
+                    && branch.annotations.last !== removed
+
+                let textBranch = AnnotationSurface(pixelScale: 1)
+                addCounter(textBranch, at: CGPoint(x: 60, y: 60))
+                addCounter(textBranch, at: CGPoint(x: 70, y: 70))
+                let textProbe: any S4RedoProbe = textBranch
+                let textUndo = textBranch.undo() && textProbe.canRedo
+                textBranch.addText("C", atPixel: CGPoint(x: 80, y: 80))
+                let textCleared = textUndo && !textProbe.canRedo
+                    && !textProbe.redo()
+                    && textBranch.annotations.count == 2
+                    && textBranch.annotations.last is TextAnnotation
+
+                let blurNoop = AnnotationSurface(pixelScale: 1)
+                addCounter(blurNoop, at: CGPoint(x: 90, y: 90))
+                addCounter(blurNoop, at: CGPoint(x: 100, y: 100))
+                let blurRemoved = blurNoop.annotations.last
+                let blurProbe: any S4RedoProbe = blurNoop
+                let blurUndo = blurNoop.undo() && blurProbe.canRedo
+                blurNoop.tool = .blur
+                _ = blurNoop.beginDrag(atPixel: CGPoint(x: 110, y: 110))
+                blurNoop.endDrag()
+                let emptyBlurPreserved = blurUndo && blurProbe.canRedo
+                    && blurProbe.redo()
+                    && blurNoop.annotations.last === blurRemoved
+
+                let validBlur = AnnotationSurface(pixelScale: 1)
+                addCounter(validBlur, at: CGPoint(x: 120, y: 120))
+                addCounter(validBlur, at: CGPoint(x: 130, y: 130))
+                let validBlurProbe: any S4RedoProbe = validBlur
+                let validBlurUndo = validBlur.undo()
+                    && validBlurProbe.canRedo
+                validBlur.tool = .blur
+                _ = validBlur.beginDrag(
+                    atPixel: CGPoint(x: 140, y: 140))
+                validBlur.continueDrag(
+                    toPixel: CGPoint(x: 180, y: 175))
+                validBlur.endDrag()
+                let validBlurCleared = validBlurUndo
+                    && !validBlurProbe.canRedo
+                    && !validBlurProbe.redo()
+                    && validBlur.annotations.last is BlurAnnotation
+
+                check("overlay11-undo-redo-core-s4",
+                      undoOK && firstRedo && secondRedo
+                        && branchUndo && branchCleared
+                        && textCleared && emptyBlurPreserved
+                        && validBlurCleared,
+                      "undo \(undoOK) redo \(firstRedo)/\(secondRedo) branch \(branchUndo)/\(branchCleared) text \(textCleared) blur \(emptyBlurPreserved)/\(validBlurCleared)")
+            }
+
             // S2 regional pixelation must allocate only the requested blur
             // region, preserve pixels outside it (including the Y-mirrored
             // wrong region), and fail closed if Core Image cannot render.
@@ -5053,10 +5451,19 @@ enum SelfTest {
                 check("overlay6-ui-surface", false)
                 return
             }
-            surface6.tool = .pen
-            _ = surface6.beginDrag(atPixel: CGPoint(x: 100, y: 100))
-            surface6.continueDrag(toPixel: CGPoint(x: 140, y: 140))
-            surface6.endDrag()
+            @MainActor func appendPen6(_ start: CGPoint, _ end: CGPoint) {
+                surface6.tool = .pen
+                _ = surface6.beginDrag(atPixel: start)
+                surface6.continueDrag(toPixel: end)
+                surface6.endDrag()
+            }
+            appendPen6(
+                CGPoint(x: 90, y: 90), CGPoint(x: 130, y: 130))
+            appendPen6(
+                CGPoint(x: 110, y: 100), CGPoint(x: 155, y: 145))
+            let redoAnnotation6 = surface6.annotations.last
+            let preparedRedo6 = surface6.undo()
+                && surface6.annotations.count == 1
             let annotationsBeforeSave = surface6.annotations.count
             surface6.tool = .select
             view.performReviewActionForTesting(.save)
@@ -5087,6 +5494,27 @@ enum SelfTest {
                     _ = view.performKeyEquivalent(with: cmdZ)
                 }
             }
+            @MainActor func sendShiftCmdZ() {
+                if let redo = NSEvent.keyEvent(
+                    with: .keyDown, location: .zero,
+                    modifierFlags: [.command, .shift],
+                    timestamp: 0, windowNumber: 0, context: nil,
+                    characters: "z", charactersIgnoringModifiers: "z",
+                    isARepeat: false, keyCode: 6) {
+                    _ = view.performKeyEquivalent(with: redo)
+                }
+            }
+            @MainActor func buttons6(in root: NSView) -> [NSButton] {
+                root.subviews.flatMap { child -> [NSButton] in
+                    let own = (child as? NSButton).map { [$0] } ?? []
+                    return own + buttons6(in: child)
+                }
+            }
+            let historyButtons6 = buttons6(in: view).filter {
+                $0.tag == OverlayAnnotationTool.undoToolbarTag || $0.tag == 202
+            }
+            let historyButtonsLocked6 = historyButtons6.count == 2
+                && historyButtons6.allSatisfy { !$0.isEnabled }
             // STEP-WISE asserts: a drag(+1) cancelled by an undo(−1) must not
             // be able to hide two missing guards behind an unchanged total.
             sendDrag(to: CGPoint(x: 160, y: 160))
@@ -5095,22 +5523,45 @@ enum SelfTest {
             sendCmdZ()
             let invariantAfterUndo =
                 surface6.annotations.count == annotationsBeforeSave
+            sendShiftCmdZ()
+            let invariantAfterRedo =
+                surface6.annotations.count == annotationsBeforeSave
+            view.clickReviewToolbarButtonForTesting(
+                tag: OverlayAnnotationTool.undoToolbarTag)
+            let invariantAfterUndoButton =
+                surface6.annotations.count == annotationsBeforeSave
+            view.clickReviewToolbarButtonForTesting(tag: 202)
+            let invariantAfterRedoButton =
+                surface6.annotations.count == annotationsBeforeSave
             let stillSaving = overlay.session.phase == .saving
             spy.saveDone?(.cancelled)
             let backToReview = overlay.session.phase == .reviewing
                 && surface6.annotations.count == annotationsBeforeSave
-            // after cancel: the SAME drag draws (+1)…
+            // after cancel: the exact redo object returns; undo it, then a
+            // new mark forks history and Shift-Cmd-Z must become a no-op.
+            sendShiftCmdZ()
+            let redoAfterCancel = surface6.annotations.count == 2
+                && surface6.annotations.last === redoAnnotation6
+            sendCmdZ()
+            let undoBeforeBranch = surface6.annotations.count == 1
             sendDrag(to: CGPoint(x: 170, y: 150))
             let drawsAfterCancel =
                 surface6.annotations.count == annotationsBeforeSave + 1
-            // …and the SAME Cmd-Z undoes back to the exact old snapshot
+            sendShiftCmdZ()
+            let redoClearedAfterDraw =
+                surface6.annotations.count == annotationsBeforeSave + 1
             sendCmdZ()
             let undoAfterCancel =
                 surface6.annotations.count == annotationsBeforeSave
             check("overlay6-save-lock-annotations",
-                  invariantAfterDrag && invariantAfterUndo && stillSaving
-                    && backToReview && drawsAfterCancel && undoAfterCancel,
-                  "drag \(invariantAfterDrag) undo \(invariantAfterUndo) saving \(stillSaving) back \(backToReview) redraw \(drawsAfterCancel) reundo \(undoAfterCancel)")
+                  preparedRedo6 && historyButtonsLocked6
+                    && invariantAfterDrag && invariantAfterUndo
+                    && invariantAfterRedo && invariantAfterUndoButton
+                    && invariantAfterRedoButton && stillSaving
+                    && backToReview && redoAfterCancel && undoBeforeBranch
+                    && drawsAfterCancel && redoClearedAfterDraw
+                    && undoAfterCancel,
+                  "prepared \(preparedRedo6) buttons \(historyButtonsLocked6) drag \(invariantAfterDrag) undo/redo \(invariantAfterUndo)/\(invariantAfterRedo) click \(invariantAfterUndoButton)/\(invariantAfterRedoButton) saving \(stillSaving) back \(backToReview) postRedo \(redoAfterCancel) branch \(undoBeforeBranch)/\(drawsAfterCancel)/\(redoClearedAfterDraw) reundo \(undoAfterCancel)")
 
             // Area flatten failure: 0 actions, 1 toast, review + drawings
             // intact (fail-closed parity with the panel).
