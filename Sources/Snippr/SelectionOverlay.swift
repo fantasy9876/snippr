@@ -565,7 +565,11 @@ final class SelectionOverlayView: NSView {
             if let toast = owner.routerDependenciesOverride?.toast {
                 toast("Không xuất được ảnh có nét vẽ — thử lại")
             } else {
-                ToastHUD.show("Không xuất được ảnh có nét vẽ — thử lại")
+                // the overlay is live at .screenSaver on THIS screen — a
+                // default .statusBar toast would be invisible behind it
+                ToastHUD.show(
+                    "Không xuất được ảnh có nét vẽ — thử lại",
+                    on: window?.screen ?? screen, above: window?.level)
             }
             return
         }

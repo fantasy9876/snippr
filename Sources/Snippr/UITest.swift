@@ -31,6 +31,11 @@ enum UITest {
         // opened the way the menu's "About Snippr" does — must land on About
         PreferencesWindowController.show(tab: .about)
         ToastHUD.show("Snippr UI test — toast OK", symbol: "checkmark.seal.fill", duration: 6)
+        // Routed failure toast: must outrank a .screenSaver overlay on the
+        // target screen (the area fail-closed path passes these values).
+        ToastHUD.show(
+            "UI test — toast above overlay", symbol: "exclamationmark.triangle.fill",
+            duration: 6, on: NSScreen.main, above: .screenSaver)
         TextResultWindow.show(text: "Snippr — chụp màn hình, nhận diện chữ (OCR), dịch đa ngôn ngữ.\nScreenshot → OCR → Translate, everything on your machine.")
         ThumbnailHUD.show(sample) { _ in }
         PinWindow.pin(CapturedImage(cgImage: SelfTest.makeTestImage(width: 400, height: 260), scale: 2))
@@ -499,6 +504,22 @@ enum UITest {
         }
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+            // the routed toast was shown LAST, so the live toast panel must
+            // carry its level (> .screenSaver) and sit on the target screen
+            let toastStyleOn = Settings.shared.confirmationStyle != .none
+            var toastAboveOverlayOK = true
+            if toastStyleOn {
+                let toastPanel = ToastHUD.panelForTesting
+                toastAboveOverlayOK =
+                    (toastPanel?.level.rawValue ?? 0)
+                        > NSWindow.Level.screenSaver.rawValue
+                    && (toastPanel.flatMap { p in
+                        NSScreen.main.map { p.frame.intersects($0.frame) }
+                    } ?? false)
+            } else {
+                print("UITEST toast-above-overlay SKIP "
+                      + "(confirmationStyle=none) — MUST re-run with toasts on")
+            }
             let fitOK = fittedEditor.imageFitsViewportForTesting()
                 && smallEditor.imageFitsViewportForTesting()
                 && tallEditor.imageFitsViewportForTesting()
@@ -509,6 +530,9 @@ enum UITest {
             print("UITEST scroll-panel \(scrollPanelOK ? "PASS" : "FAIL")")
             print("UITEST scroll-panel-preview \(panelPreviewOK ? "PASS" : "FAIL")")
             print("UITEST panel-text-terminals \(panelTextTerminalsOK ? "PASS" : "FAIL")")
+            if toastStyleOn {
+                print("UITEST toast-above-overlay \(toastAboveOverlayOK ? "PASS" : "FAIL")")
+            }
             var index = 0
             for window in NSApp.windows where window.isVisible {
                 guard let view = window.contentView, view.bounds.width > 10 else { continue }
@@ -523,7 +547,7 @@ enum UITest {
             print("UITEST captured \(index) windows → \(outDir)")
             exit(index >= 3 && fitOK && tallCropControlsOK && overlayReviewOK
                  && scrollPanelOK && panelPreviewOK
-                 && panelTextTerminalsOK ? 0 : 1)
+                 && panelTextTerminalsOK && toastAboveOverlayOK ? 0 : 1)
         }
     }
 }

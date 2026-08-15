@@ -6,12 +6,29 @@ final class ToastHUD {
     private static var panel: NSPanel?
     private static var hideWorkItem: DispatchWorkItem?
 
-    static func show(_ message: String, symbol: String = "checkmark.circle.fill", duration: TimeInterval = 2.2) {
+    /// `on`/`above` route a toast that must outrank a specific surface:
+    /// an area-overlay failure toast at the default .statusBar level would
+    /// sit BEHIND the .screenSaver overlay on the capture screen. Callers
+    /// with such a surface pass its screen and level; everything else keeps
+    /// the defaults (no global level raise).
+    static func show(
+        _ message: String, symbol: String = "checkmark.circle.fill",
+        duration: TimeInterval = 2.2,
+        on screen: NSScreen? = nil, above minLevel: NSWindow.Level? = nil
+    ) {
         guard Settings.shared.confirmationStyle != .none else { return }
-        DispatchQueue.main.async { showNow(message, symbol: symbol, duration: duration) }
+        DispatchQueue.main.async {
+            showNow(message, symbol: symbol, duration: duration,
+                    screen: screen, minLevel: minLevel)
+        }
     }
 
-    private static func showNow(_ message: String, symbol: String, duration: TimeInterval) {
+    static var panelForTesting: NSPanel? { panel }
+
+    private static func showNow(
+        _ message: String, symbol: String, duration: TimeInterval,
+        screen preferredScreen: NSScreen?, minLevel: NSWindow.Level?
+    ) {
         hideWorkItem?.cancel()
         panel?.orderOut(nil)
 
@@ -48,7 +65,7 @@ final class ToastHUD {
         ])
 
         let size = stack.fittingSize
-        let screen = NSScreen.main ?? NSScreen.screens[0]
+        let screen = preferredScreen ?? NSScreen.main ?? NSScreen.screens[0]
         let origin = CGPoint(
             x: screen.visibleFrame.midX - size.width / 2,
             y: screen.visibleFrame.minY + 60
@@ -59,7 +76,12 @@ final class ToastHUD {
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered, defer: false
         )
-        p.level = .statusBar
+        if let minLevel {
+            p.level = NSWindow.Level(rawValue: max(
+                minLevel.rawValue + 1, NSWindow.Level.statusBar.rawValue))
+        } else {
+            p.level = .statusBar
+        }
         p.isOpaque = false
         p.backgroundColor = .clear
         p.hasShadow = true
