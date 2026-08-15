@@ -4377,7 +4377,7 @@ enum SelfTest {
             if let tool = s2Tools.first,
                let index = OverlayAnnotationTool.allCases.firstIndex(of: tool) {
                 let expectedTag = 100 + index
-                let (_, view) = reviewView()
+                let (areaOverlay, view) = reviewView()
                 let selection = CGRect(
                     x: max(40, b.width / 2 - 150),
                     y: max(100, b.height / 2 - 100),
@@ -4387,7 +4387,8 @@ enum SelfTest {
                     $0.tooltip.hasPrefix("Pixelate")
                 }
                 if areaPixelate.map(\.tag) != [expectedTag] {
-                    s2ToolbarFailures.append("area tags \(areaPixelate.map(\.tag))")
+                    s2ToolbarFailures.append(
+                        "area tags \(areaPixelate.map(\.tag)) all \(view.reviewToolbarButtonsForTesting)")
                 }
                 view.clickReviewToolbarButtonForTesting(tag: expectedTag)
                 if view.annotationSurface?.tool != tool {
@@ -4420,6 +4421,7 @@ enum SelfTest {
                 } else {
                     s2ToolbarFailures.append("area no BlurAnnotation")
                 }
+                _ = areaOverlay.session.phase // retain weak owner through input
 
                 let panel = ScrollResultPanel.show(
                     image: frozenImage,
@@ -4507,61 +4509,106 @@ enum SelfTest {
             // wrong region), and fail closed if Core Image cannot render.
             let pixelBase = makeNoiseImage(width: 320, height: 240)
             let pixelSurface = AnnotationSurface(pixelScale: 1)
-            let blurRect = CGRect(x: 149, y: 31, width: 53, height: 37)
+            let blurRect = CGRect(x: 149, y: 60, width: 53, height: 25)
             pixelSurface.addBlurForTesting(rect: blurRect)
-            AnnotationSurface.regionalPixelateAllocationsForTesting = 0
-            AnnotationSurface.lastRegionalPixelateRectForTesting = nil
-            let pixelDestBefore = AnnotationSurface.flattenAllocationsForTesting
-            let pixelFlat = pixelSurface.flattened(
-                base: pixelBase,
-                cropPixels: CGRect(x: 0, y: 0, width: 320, height: 240))
+            let clickOnlySurface = AnnotationSurface(pixelScale: 1)
+            clickOnlySurface.tool = .blur
+            _ = clickOnlySurface.beginDrag(atPixel: CGPoint(x: 20, y: 20))
+            clickOnlySurface.endDrag()
+            let clickOnlyRemoved = clickOnlySurface.isEmpty
             func equalCrops(_ a: CGImage, _ b: CGImage, _ rect: CGRect) -> Bool {
                 guard let ac = a.cropping(to: rect),
                       let bc = b.cropping(to: rect) else { return false }
                 return imagesEqual(ac, bc)
             }
-            let blurTL = CGRect(
+            let previewCtx = ctx(pixelBase.width, pixelBase.height)
+            previewCtx.draw(
+                pixelBase,
+                in: CGRect(
+                    x: 0, y: 0,
+                    width: pixelBase.width, height: pixelBase.height))
+            AnnotationSurface.regionalPixelateAllocationsForTesting = 0
+            AnnotationSurface.lastRegionalPixelateRectForTesting = nil
+            AnnotationSurface.lastRegionalPixelateBaseSizeForTesting = nil
+            let previewRendered = pixelSurface.drawForPreview(
+                in: previewCtx, base: pixelBase)
+            let pixelPreview = previewCtx.makeImage()
+            let previewBlurTL = CGRect(
                 x: blurRect.minX,
                 y: CGFloat(pixelBase.height) - blurRect.maxY,
                 width: blurRect.width, height: blurRect.height)
-            let mirroredTL = CGRect(
+            let previewMirrorTL = CGRect(
                 x: blurRect.minX, y: blurRect.minY,
+                width: blurRect.width, height: blurRect.height)
+            let previewPixelsOK = previewRendered
+                && pixelPreview.map {
+                    !equalCrops(pixelBase, $0, previewBlurTL)
+                        && equalCrops(pixelBase, $0, previewMirrorTL)
+                } == true
+                && AnnotationSurface.regionalPixelateAllocationsForTesting == 1
+                && AnnotationSurface.lastRegionalPixelateRectForTesting
+                    == blurRect.integral
+                && AnnotationSurface.lastRegionalPixelateBaseSizeForTesting
+                    == CGSize(width: pixelBase.width, height: pixelBase.height)
+
+            AnnotationSurface.regionalPixelateAllocationsForTesting = 0
+            AnnotationSurface.lastRegionalPixelateRectForTesting = nil
+            AnnotationSurface.lastRegionalPixelateBaseSizeForTesting = nil
+            let pixelDestBefore = AnnotationSurface.flattenAllocationsForTesting
+            let pixelCrop = CGRect(x: 80, y: 40, width: 180, height: 150)
+            let plainPixelCrop = pixelBase.cropping(to: pixelCrop)!
+            let pixelFlat = pixelSurface.flattened(
+                base: pixelBase, cropPixels: pixelCrop)
+            let visibleBLMinY = CGFloat(pixelBase.height) - pixelCrop.maxY
+            let blurTL = CGRect(
+                x: blurRect.minX - pixelCrop.minX,
+                y: pixelCrop.height
+                    - (blurRect.maxY - visibleBLMinY),
+                width: blurRect.width, height: blurRect.height)
+            let mirroredTL = CGRect(
+                x: blurRect.minX - pixelCrop.minX,
+                y: blurRect.minY - visibleBLMinY,
                 width: blurRect.width, height: blurRect.height)
             var regionalPixelsOK = false
             if let pixelFlat {
-                regionalPixelsOK = !equalCrops(pixelBase, pixelFlat, blurTL)
+                regionalPixelsOK = !equalCrops(
+                        plainPixelCrop, pixelFlat, blurTL)
                     && equalCrops(
-                        pixelBase, pixelFlat,
+                        plainPixelCrop, pixelFlat,
                         CGRect(x: 0, y: 0, width: 24, height: 24))
-                    && equalCrops(pixelBase, pixelFlat, mirroredTL)
+                    && equalCrops(plainPixelCrop, pixelFlat, mirroredTL)
             }
             let regionalAllocOK =
                 AnnotationSurface.regionalPixelateAllocationsForTesting == 1
                 && AnnotationSurface.lastRegionalPixelateRectForTesting
                     == blurRect.integral
+                && AnnotationSurface.lastRegionalPixelateBaseSizeForTesting
+                    == CGSize(width: pixelBase.width, height: pixelBase.height)
                 && blurRect.width * blurRect.height
                     < CGFloat(pixelBase.width * pixelBase.height) / 10
                 && AnnotationSurface.flattenAllocationsForTesting
                     == pixelDestBefore + 1
             pixelSurface.forceRegionalPixelateFailureForTesting = true
             let regionalFailed = pixelSurface.flattened(
-                base: pixelBase,
-                cropPixels: CGRect(x: 0, y: 0, width: 320, height: 240)) == nil
+                base: pixelBase, cropPixels: pixelCrop) == nil
             pixelSurface.forceRegionalPixelateFailureForTesting = false
             check("overlay9-pixelate-regional-s2",
-                  regionalPixelsOK && regionalAllocOK && regionalFailed
-                    && pixelSurface.annotations.count == 1,
-                  "pixels \(regionalPixelsOK) alloc \(regionalAllocOK) failClosed \(regionalFailed) count \(pixelSurface.annotations.count) region \(String(describing: AnnotationSurface.lastRegionalPixelateRectForTesting))")
+                  previewPixelsOK && regionalPixelsOK
+                    && regionalAllocOK && regionalFailed
+                    && pixelSurface.annotations.count == 1
+                    && clickOnlyRemoved,
+                  "preview \(previewPixelsOK) export \(regionalPixelsOK) alloc \(regionalAllocOK) failClosed \(regionalFailed) count \(pixelSurface.annotations.count) clickOnlyRemoved \(clickOnlyRemoved) region \(String(describing: AnnotationSurface.lastRegionalPixelateRectForTesting))")
 
             // allocation spy: exactly one destination buffer, zero
             // materialized copies, on a large flatten with annotations
             let big = makeStripePattern(width: 720, height: 4000, seed: 0x000B_16F1)
             let surface = AnnotationSurface(pixelScale: 1)
-            surface.tool = .rect
-            _ = surface.beginDrag(atPixel: CGPoint(x: 100, y: 500))
-            surface.continueDrag(toPixel: CGPoint(x: 400, y: 2200))
-            surface.endDrag()
+            let bigBlur = CGRect(x: 100, y: 500, width: 80, height: 96)
+            surface.addBlurForTesting(rect: bigBlur)
             let allocBefore = AnnotationSurface.flattenAllocationsForTesting
+            AnnotationSurface.regionalPixelateAllocationsForTesting = 0
+            AnnotationSurface.lastRegionalPixelateRectForTesting = nil
+            AnnotationSurface.lastRegionalPixelateBaseSizeForTesting = nil
             let matBefore = MaterializeSpy.count
             let flat = surface.flattened(
                 base: big,
@@ -4569,8 +4616,15 @@ enum SelfTest {
             check("overlay6-flatten-single-buffer",
                   flat != nil
                     && AnnotationSurface.flattenAllocationsForTesting == allocBefore + 1
+                    && AnnotationSurface.regionalPixelateAllocationsForTesting == 1
+                    && AnnotationSurface.lastRegionalPixelateRectForTesting
+                        == bigBlur
+                    && AnnotationSurface.lastRegionalPixelateBaseSizeForTesting
+                        == CGSize(width: big.width, height: big.height)
+                    && bigBlur.width * bigBlur.height
+                        < CGFloat(big.width * big.height) / 100
                     && MaterializeSpy.count == matBefore,
-                  "allocΔ \(AnnotationSurface.flattenAllocationsForTesting - allocBefore) matΔ \(MaterializeSpy.count - matBefore)")
+                  "destΔ \(AnnotationSurface.flattenAllocationsForTesting - allocBefore) regionΔ \(AnnotationSurface.regionalPixelateAllocationsForTesting) region \(String(describing: AnnotationSurface.lastRegionalPixelateRectForTesting)) base \(String(describing: AnnotationSurface.lastRegionalPixelateBaseSizeForTesting)) matΔ \(MaterializeSpy.count - matBefore)")
 
             // fail-closed: forced allocation failure returns nil — never a
             // silent un-annotated fallback

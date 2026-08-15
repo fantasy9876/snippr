@@ -1,7 +1,7 @@
 import AppKit
 
 /// V1 in-place annotation tools (plan P1): a deliberate subset of the editor.
-enum OverlayAnnotationTool: CaseIterable {
+enum OverlayAnnotationTool: String, CaseIterable {
     case select
     case pen
     case arrow
@@ -11,6 +11,21 @@ enum OverlayAnnotationTool: CaseIterable {
     case oval
     case highlight
     case counter
+    case blur
+
+    static let toolbarTagBase = 100
+    static let colorToolbarTag = 200
+    static let undoToolbarTag = 201
+
+    var toolbarTag: Int {
+        Self.toolbarTagBase + Self.allCases.firstIndex(of: self)!
+    }
+
+    static func tool(forToolbarTag tag: Int) -> Self? {
+        let index = tag - toolbarTagBase
+        guard allCases.indices.contains(index) else { return nil }
+        return allCases[index]
+    }
 
     var symbol: String {
         switch self {
@@ -23,6 +38,7 @@ enum OverlayAnnotationTool: CaseIterable {
         case .oval: return "circle"
         case .highlight: return "highlighter"
         case .counter: return "1.circle"
+        case .blur: return "drop.halffull"
         }
     }
 
@@ -37,6 +53,7 @@ enum OverlayAnnotationTool: CaseIterable {
         case .oval: return "Oval (O)"
         case .highlight: return "Highlighter (H)"
         case .counter: return "Counter (N)"
+        case .blur: return "Pixelate (B)"
         }
     }
 }
@@ -57,6 +74,8 @@ final class AnnotationSurface {
 
     private var activeShape: ShapeAnnotation?
     private var activePen: PenAnnotation?
+    private var activeBlur: BlurAnnotation?
+    private var activeBlurAnchor: CGPoint?
 
     init(pixelScale: CGFloat) {
         self.pixelScale = max(1, pixelScale)
@@ -104,6 +123,13 @@ final class AnnotationSurface {
             counter.color = color
             annotations.append(counter)
             return true
+        case .blur:
+            let blur = BlurAnnotation(uiScale: pixelScale)
+            blur.rect = CGRect(origin: p, size: .zero)
+            activeBlur = blur
+            activeBlurAnchor = p
+            annotations.append(blur)
+            return true
         case .text:
             // text placement is click-driven; the host creates the field
             return false
@@ -115,12 +141,23 @@ final class AnnotationSurface {
             pen.points.append(p)
         } else if let shape = activeShape {
             shape.end = p
+        } else if let blur = activeBlur, let anchor = activeBlurAnchor {
+            blur.rect = CGRect(
+                x: min(anchor.x, p.x), y: min(anchor.y, p.y),
+                width: abs(anchor.x - p.x), height: abs(anchor.y - p.y))
         }
     }
 
     func endDrag() {
+        if let blur = activeBlur,
+           (blur.rect.width <= 1 || blur.rect.height <= 1),
+           annotations.last === blur {
+            annotations.removeLast()
+        }
         activeShape = nil
         activePen = nil
+        activeBlur = nil
+        activeBlurAnchor = nil
     }
 
     func addText(_ string: String, atPixel p: CGPoint) {
@@ -139,6 +176,8 @@ final class AnnotationSurface {
         annotations.removeLast()
         activeShape = nil
         activePen = nil
+        activeBlur = nil
+        activeBlurAnchor = nil
         return true
     }
 
@@ -146,10 +185,48 @@ final class AnnotationSurface {
 
     /// Draws the annotations for on-screen preview into a context whose
     /// transform already maps image pixels to the destination.
-    func drawForPreview(in ctx: CGContext) {
+    @discardableResult
+    func drawForPreview(in ctx: CGContext, base: CGImage) -> Bool {
+        drawAnnotations(
+            in: ctx, base: base,
+            visiblePixels: CGRect(
+                x: 0, y: 0, width: base.width, height: base.height))
+    }
+
+    /// Shared preview/export renderer. Pixelation asks Core Image only for
+    /// the intersecting region; it never materializes a second full stitch.
+    private func drawAnnotations(
+        in ctx: CGContext, base: CGImage, visiblePixels: CGRect
+    ) -> Bool {
+        let baseBounds = CGRect(
+            x: 0, y: 0, width: base.width, height: base.height)
+        var renderedAll = true
         for annotation in annotations {
-            annotation.draw(in: ctx, pixellated: nil)
+            guard let blur = annotation as? BlurAnnotation else {
+                annotation.draw(in: ctx, pixellated: nil)
+                continue
+            }
+            let requested = blur.rect.standardized
+                .intersection(visiblePixels)
+                .intersection(baseBounds)
+            guard requested.width > 1, requested.height > 1 else { continue }
+            let region = requested.integral.intersection(baseBounds)
+            guard !forceRegionalPixelateFailureForTesting else {
+                renderedAll = false
+                continue
+            }
+            guard let pixelated = AnnotationRenderer.pixellateRegion(
+                base, rect: region, scale: pixelScale)
+            else {
+                renderedAll = false
+                continue
+            }
+            ctx.saveGState()
+            ctx.clip(to: blur.rect)
+            ctx.draw(pixelated, in: region)
+            ctx.restoreGState()
         }
+        return renderedAll
     }
 
     /// Allocation spy for the export path: exactly ONE full-size destination
@@ -159,6 +236,7 @@ final class AnnotationSurface {
     /// pixelation exists.  Tests use them to reject a hidden full-image cache.
     nonisolated(unsafe) static var regionalPixelateAllocationsForTesting = 0
     nonisolated(unsafe) static var lastRegionalPixelateRectForTesting: CGRect?
+    nonisolated(unsafe) static var lastRegionalPixelateBaseSizeForTesting: CGSize?
     /// Test hook: simulates destination-allocation failure.
     var forceRenderFailureForTesting = false
     /// Test hook: regional pixelation must fail closed during export.
@@ -206,9 +284,13 @@ final class AnnotationSurface {
         ctx.translateBy(
             x: -crop.minX,
             y: -(CGFloat(base.height) - crop.maxY))
-        for annotation in annotations {
-            annotation.draw(in: ctx, pixellated: nil)
-        }
+        let visibleBL = CGRect(
+            x: crop.minX,
+            y: CGFloat(base.height) - crop.maxY,
+            width: crop.width, height: crop.height)
+        guard drawAnnotations(
+            in: ctx, base: base, visiblePixels: visibleBL)
+        else { return nil }
         return ctx.makeImage()
     }
 }

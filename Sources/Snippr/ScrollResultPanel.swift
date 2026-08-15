@@ -143,6 +143,7 @@ final class ScrollResultPanel: NSPanel {
         let host = AnnotationHostView(
             frame: imageView.frame,
             surface: annotationSurface,
+            baseImage: image.cgImage,
             pixelsPerPoint: pixelsPerPoint)
         host.isLocked = { [weak self] in self?.saving ?? false }
         content.addSubview(host)
@@ -166,12 +167,6 @@ final class ScrollResultPanel: NSPanel {
         ("macwindow", "Open in editor window", .openEditor),
     ]
 
-    /// Annotation tools mirror the area review: tags 100+ tools, 200 color,
-    /// 201 undo.
-    private static let toolItems: [OverlayAnnotationTool] = [
-        .select, .pen, .arrow, .rect, .text,
-        .line, .oval, .highlight, .counter,
-    ]
     private static let colorPresets: [NSColor] = [
         .systemRed, .systemOrange, .systemYellow, .systemGreen,
         .systemBlue, .black, .white,
@@ -181,7 +176,8 @@ final class ScrollResultPanel: NSPanel {
     /// Width every button (plus Close and paddings) needs without overlap.
     static var requiredToolbarWidth: CGFloat {
         let buttonWidth: CGFloat = 34, spacing: CGFloat = 2
-        let count = CGFloat(items.count + toolItems.count + 2) // + color, undo
+        let count = CGFloat(
+            items.count + OverlayAnnotationTool.allCases.count + 2)
         // leading 8 + buttons + gap 12 + close + trailing 8
         return 8 + count * buttonWidth + (count - 1) * spacing + 12
             + buttonWidth + 8
@@ -220,18 +216,19 @@ final class ScrollResultPanel: NSPanel {
             x += size.width + spacing
             return button
         }
-        for (index, tool) in Self.toolItems.enumerated() {
+        for tool in OverlayAnnotationTool.allCases {
             _ = makeButton(
                 symbol: tool.symbol, tooltip: tool.tooltip,
-                tag: 100 + index,
+                tag: tool.toolbarTag,
                 tint: tool == .select ? .controlAccentColor : .labelColor)
         }
         _ = makeButton(
-            symbol: "circle.fill", tooltip: "Color", tag: 200,
+            symbol: "circle.fill", tooltip: "Color",
+            tag: OverlayAnnotationTool.colorToolbarTag,
             tint: Self.colorPresets[colorIndex])
         _ = makeButton(
             symbol: "arrow.uturn.backward", tooltip: "Undo (⌘Z)",
-            tag: 201, tint: .labelColor)
+            tag: OverlayAnnotationTool.undoToolbarTag, tint: .labelColor)
         for (index, item) in Self.items.enumerated() {
             _ = makeButton(
                 symbol: item.symbol, tooltip: item.tooltip,
@@ -261,11 +258,10 @@ final class ScrollResultPanel: NSPanel {
             dismiss()
             return
         }
-        if sender.tag >= 100, sender.tag < 100 + Self.toolItems.count {
-            let tool = Self.toolItems[sender.tag - 100]
+        if let tool = OverlayAnnotationTool.tool(forToolbarTag: sender.tag) {
             annotationSurface.tool = tool
-            for button in toolbarButtons where button.tag >= 100
-                && button.tag < 100 + Self.toolItems.count {
+            for button in toolbarButtons
+                where OverlayAnnotationTool.tool(forToolbarTag: button.tag) != nil {
                 button.contentTintColor =
                     button.tag == sender.tag ? .controlAccentColor : .labelColor
             }
@@ -273,13 +269,13 @@ final class ScrollResultPanel: NSPanel {
             if tool != .text { annotationHost?.commitActiveTextEntry() }
             return
         }
-        if sender.tag == 200 {
+        if sender.tag == OverlayAnnotationTool.colorToolbarTag {
             colorIndex = (colorIndex + 1) % Self.colorPresets.count
             annotationSurface.color = Self.colorPresets[colorIndex]
             sender.contentTintColor = Self.colorPresets[colorIndex]
             return
         }
-        if sender.tag == 201 {
+        if sender.tag == OverlayAnnotationTool.undoToolbarTag {
             if annotationSurface.undo() { annotationHost?.needsDisplay = true }
             return
         }
@@ -439,6 +435,7 @@ final class ScrollResultPanel: NSPanel {
 @MainActor
 final class AnnotationHostView: NSView {
     private let surface: AnnotationSurface
+    private let baseImage: CGImage
     private let pixelsPerPoint: CGFloat
     private var dragging = false
     /// While the owning surface has a save in flight, ALL annotation input
@@ -446,8 +443,12 @@ final class AnnotationHostView: NSView {
     /// they pressed Save.
     var isLocked: @MainActor () -> Bool = { false }
 
-    init(frame: CGRect, surface: AnnotationSurface, pixelsPerPoint: CGFloat) {
+    init(
+        frame: CGRect, surface: AnnotationSurface, baseImage: CGImage,
+        pixelsPerPoint: CGFloat
+    ) {
         self.surface = surface
+        self.baseImage = baseImage
         self.pixelsPerPoint = max(0.01, pixelsPerPoint)
         super.init(frame: frame)
     }
@@ -522,7 +523,7 @@ final class AnnotationHostView: NSView {
         guard let ctx = NSGraphicsContext.current?.cgContext else { return }
         ctx.saveGState()
         ctx.scaleBy(x: 1 / pixelsPerPoint, y: 1 / pixelsPerPoint)
-        surface.drawForPreview(in: ctx)
+        surface.drawForPreview(in: ctx, base: baseImage)
         ctx.restoreGState()
     }
 

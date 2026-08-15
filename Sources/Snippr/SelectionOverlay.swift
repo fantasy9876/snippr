@@ -386,11 +386,6 @@ final class SelectionOverlayView: NSView {
         ("macwindow", "Open in editor window", .openEditor),
     ]
 
-    /// Annotation tool buttons occupy tags 100+; color cycler 200; undo 201.
-    private static let toolItems: [OverlayAnnotationTool] = [
-        .select, .pen, .arrow, .rect, .text,
-        .line, .oval, .highlight, .counter,
-    ]
     private static let colorPresets: [NSColor] = [
         .systemRed, .systemOrange, .systemYellow, .systemGreen,
         .systemBlue, .black, .white,
@@ -404,7 +399,7 @@ final class SelectionOverlayView: NSView {
             NSColor.black.withAlphaComponent(0.82).cgColor
         container.layer?.cornerRadius = 8
         var buttons: [NSButton] = []
-        for (index, tool) in Self.toolItems.enumerated() {
+        for tool in OverlayAnnotationTool.allCases {
             let button = NSButton(frame: .zero)
             button.bezelStyle = .regularSquare
             button.isBordered = false
@@ -413,7 +408,7 @@ final class SelectionOverlayView: NSView {
                 accessibilityDescription: tool.tooltip)
             button.contentTintColor = tool == .select ? .controlAccentColor : .white
             button.toolTip = tool.tooltip
-            button.tag = 100 + index
+            button.tag = tool.toolbarTag
             button.target = self
             button.action = #selector(reviewToolbarButtonPressed(_:))
             container.addSubview(button)
@@ -426,7 +421,7 @@ final class SelectionOverlayView: NSView {
             systemSymbolName: "circle.fill", accessibilityDescription: "Color")
         colorButton.contentTintColor = Self.colorPresets[colorIndex]
         colorButton.toolTip = "Color"
-        colorButton.tag = 200
+        colorButton.tag = OverlayAnnotationTool.colorToolbarTag
         colorButton.target = self
         colorButton.action = #selector(reviewToolbarButtonPressed(_:))
         container.addSubview(colorButton)
@@ -439,7 +434,7 @@ final class SelectionOverlayView: NSView {
             accessibilityDescription: "Undo (⌘Z)")
         undoButton.contentTintColor = .white
         undoButton.toolTip = "Undo (⌘Z)"
-        undoButton.tag = 201
+        undoButton.tag = OverlayAnnotationTool.undoToolbarTag
         undoButton.target = self
         undoButton.action = #selector(reviewToolbarButtonPressed(_:))
         container.addSubview(undoButton)
@@ -526,24 +521,23 @@ final class SelectionOverlayView: NSView {
             owner?.finish(.cancelled)
             return
         }
-        if sender.tag >= 100, sender.tag < 100 + Self.toolItems.count {
-            let tool = Self.toolItems[sender.tag - 100]
+        if let tool = OverlayAnnotationTool.tool(forToolbarTag: sender.tag) {
             annotationSurface?.tool = tool
-            for button in toolbarButtons where button.tag >= 100
-                && button.tag < 100 + Self.toolItems.count {
+            for button in toolbarButtons
+                where OverlayAnnotationTool.tool(forToolbarTag: button.tag) != nil {
                 button.contentTintColor =
-                    button.tag - 100 == sender.tag - 100 ? .controlAccentColor : .white
+                    button.tag == sender.tag ? .controlAccentColor : .white
             }
             if tool != .text { endTextEntry(commit: true) }
             return
         }
-        if sender.tag == 200 {
+        if sender.tag == OverlayAnnotationTool.colorToolbarTag {
             colorIndex = (colorIndex + 1) % Self.colorPresets.count
             annotationSurface?.color = Self.colorPresets[colorIndex]
             sender.contentTintColor = Self.colorPresets[colorIndex]
             return
         }
-        if sender.tag == 201 {
+        if sender.tag == OverlayAnnotationTool.undoToolbarTag {
             if annotationSurface?.undo() == true { needsDisplay = true }
             return
         }
@@ -664,12 +658,12 @@ final class SelectionOverlayView: NSView {
         }
 
         if let surface = annotationSurface, !surface.isEmpty,
-           let sel = areaSelection {
-            let scale = frozen?.scale ?? 1
+           let sel = areaSelection, let frozen {
+            let scale = frozen.scale
             ctx.saveGState()
             ctx.clip(to: sel)
             ctx.scaleBy(x: 1 / scale, y: 1 / scale)
-            surface.drawForPreview(in: ctx)
+            surface.drawForPreview(in: ctx, base: frozen.cgImage)
             ctx.restoreGState()
         }
 
