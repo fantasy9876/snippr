@@ -367,13 +367,43 @@ enum AnnotationRenderer {
 
     /// CIPixellate over the whole image; BlurAnnotation clips regions out of this.
     static func pixellate(_ image: CGImage, scale: CGFloat) -> CGImage? {
+        guard let out = pixelatedCIImage(image, scale: scale) else { return nil }
+        return ciContext.createCGImage(
+            out, from: CGRect(
+                x: 0, y: 0, width: image.width, height: image.height))
+    }
+
+    /// Regional output for in-place overlays. Core Image remains lazy over
+    /// the base descriptor and materializes only `rect`, preserving the
+    /// original image-space pixel grid without a 5K×40K RGBA cache.
+    static func pixellateRegion(
+        _ image: CGImage, rect: CGRect, scale: CGFloat
+    ) -> CGImage? {
+        let bounds = CGRect(
+            x: 0, y: 0, width: image.width, height: image.height)
+        let region = rect.standardized.integral.intersection(bounds)
+        guard region.width > 1, region.height > 1,
+              let out = pixelatedCIImage(image, scale: scale)
+        else { return nil }
+        // Record the exact extent passed to Core Image, not merely the blur's
+        // requested bounds. This keeps the allocation gate coupled to the
+        // actual output materialization call.
+        AnnotationSurface.regionalPixelateAllocationsForTesting += 1
+        AnnotationSurface.lastRegionalPixelateRectForTesting = region
+        AnnotationSurface.lastRegionalPixelateBaseSizeForTesting = CGSize(
+            width: image.width, height: image.height)
+        return ciContext.createCGImage(out, from: region)
+    }
+
+    private static func pixelatedCIImage(
+        _ image: CGImage, scale: CGFloat
+    ) -> CIImage? {
         let ci = CIImage(cgImage: image)
         guard let filter = CIFilter(name: "CIPixellate") else { return nil }
         filter.setValue(ci, forKey: kCIInputImageKey)
         filter.setValue(max(8, 8 * scale), forKey: kCIInputScaleKey)
         filter.setValue(CIVector(x: 0, y: 0), forKey: kCIInputCenterKey)
-        guard let out = filter.outputImage else { return nil }
-        return ciContext.createCGImage(out, from: CGRect(x: 0, y: 0, width: image.width, height: image.height))
+        return filter.outputImage
     }
 }
 

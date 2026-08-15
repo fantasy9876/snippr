@@ -390,42 +390,22 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
         window?.close()
     }
 
-    /// ⌘S / Save button: choose where to save via the system panel.
+    /// ⌘S / Save button: choose where to save via the system panel. Shares
+    /// SaveService.saveAs with the overlay action router so the panel/write
+    /// behavior cannot drift between the two surfaces.
     @objc func saveImage() {
         guard let window else { return }
-        var flat = canvas.flattened()
-        if Settings.shared.downscaleRetina {
-            flat = flat.downscaledTo1x()
-        }
-        let panel = NSSavePanel()
-        panel.nameFieldStringValue = SaveService.suggestedFileName(ext: "png")
-        panel.directoryURL = Settings.shared.screenshotsFolder
-        panel.allowedContentTypes = [.png, .jpeg]
-        panel.canCreateDirectories = true
-        let image = flat
-        panel.beginSheetModal(for: window) { response in
-            guard response == .OK, let url = panel.url else { return }
-            let ext = url.pathExtension.lowercased()
-            let format: ImageFileFormat = (ext == "jpg" || ext == "jpeg") ? .jpeg : .png
-            // encode + write off the main thread — a 5K PNG encode is seconds.
-            // Tracked so quitting mid-write can't truncate the file.
-            SaveService.beginBackgroundWrite()
-            Task.detached(priority: .userInitiated) {
-                let data = SaveService.data(for: image.cgImage, format: format)
-                var ok = false
-                if let data {
-                    do {
-                        try data.write(to: url)
-                        ok = true
-                    } catch {}
-                }
-                let succeeded = ok
-                await MainActor.run {
-                    ToastHUD.show(
-                        succeeded ? "Saved \(url.lastPathComponent)" : "Save failed",
-                        symbol: succeeded ? "square.and.arrow.down.fill" : "exclamationmark.triangle.fill")
-                    SaveService.endBackgroundWrite()
-                }
+        SaveService.shared.saveAs(canvas.flattened(), for: window) { outcome in
+            switch outcome {
+            case let .saved(url):
+                ToastHUD.show(
+                    "Saved \(url.lastPathComponent)",
+                    symbol: "square.and.arrow.down.fill")
+            case .failed:
+                ToastHUD.show(
+                    "Save failed", symbol: "exclamationmark.triangle.fill")
+            case .cancelled:
+                break
             }
         }
     }
@@ -1232,6 +1212,10 @@ final class EditorCanvasView: NSView {
 final class StrokePreviewView: NSView {
     var strokeWidth: CGFloat = 3
     var color: NSColor = .systemRed
+
+    /// HUD chrome must never steal the next drawing click during its
+    /// one-second lifetime (editor and both in-place surfaces reuse it).
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
 
     override func draw(_ dirtyRect: NSRect) {
         let bg = NSBezierPath(roundedRect: bounds, xRadius: 10, yRadius: 10)

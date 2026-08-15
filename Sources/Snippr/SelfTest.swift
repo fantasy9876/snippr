@@ -1,6 +1,21 @@
 import AppKit
 import Vision
 
+/// RED-only compile seam for S4. Before production owns a second history
+/// stack the default witness is deliberately false; once AnnotationSurface
+/// supplies concrete `canRedo`/`redo`, this conformance exercises them.
+@MainActor private protocol S4RedoProbe {
+    var canRedo: Bool { get }
+    func redo() -> Bool
+}
+
+private extension S4RedoProbe {
+    var canRedo: Bool { false }
+    func redo() -> Bool { false }
+}
+
+extension AnnotationSurface: S4RedoProbe {}
+
 /// Headless feature tests: `Snippr --selftest [outdir]`.
 /// Exercises everything that doesn't need Screen Recording permission.
 enum SelfTest {
@@ -110,11 +125,1275 @@ enum SelfTest {
         if let f0 = periodic.cropping(to: CGRect(x: 0, y: 0, width: 400, height: 500)),
            let f1 = periodic.cropping(to: CGRect(x: 0, y: 100, width: 400, height: 500)) {
             let s2 = VerticalStitcher(first: f0)
-            let appended = s2.append(f1)
+            let appended = s2.append(f1).newRows
             check("stitch-ambiguous-rejected", appended == 0,
                   "appended \(appended) rows from ambiguous content")
         } else {
             check("stitch-ambiguous-crop", false)
+        }
+
+        // 2b-up. Bottom-to-top capture ---------------------------------------------
+        // Scrolling upward reveals new content at the TOP of the viewport. The
+        // matcher finds the reversed overlap and the stitcher prepends, so a
+        // session that starts at the end of a page still produces the full page.
+        do {
+            let doc = makeStripePattern(width: 400, height: 2000, seed: 0xB1D1_5EED)
+            let vp = 500
+            var upOffsets: [Int] = []
+            var position = 2000 - vp
+            while position > 0 {
+                upOffsets.append(position)
+                position -= 320
+            }
+            upOffsets.append(0)
+            var up: VerticalStitcher?
+            var prepends = 0
+            var rejects = 0
+            for off in upOffsets {
+                guard let frame = doc.cropping(to: CGRect(
+                    x: 0, y: off, width: 400, height: vp)) else {
+                    check("stitch-upscroll-crop", false); break
+                }
+                if let s = up {
+                    switch s.append(frame) {
+                    case .prepended: prepends += 1
+                    case .rejected: rejects += 1
+                    default: break
+                    }
+                } else {
+                    up = VerticalStitcher(first: frame)
+                }
+            }
+            let upComposed = up?.compose()
+            check("stitch-upscroll-height", upComposed?.height == 2000,
+                  "got \(upComposed?.height ?? -1), want 2000")
+            check("stitch-upscroll-all-prepended",
+                  prepends == upOffsets.count - 1 && rejects == 0,
+                  "prepends \(prepends)/\(upOffsets.count - 1), rejects \(rejects)")
+            if let upComposed {
+                check("stitch-upscroll-content", imagesRoughlyEqual(doc, upComposed),
+                      "up-scrolled content mismatch")
+                writePNG(upComposed, to: "\(outputDir)/stitched-upscroll.png")
+            }
+        }
+
+        // 2b-retrace. Reversing over already-captured rows -------------------------
+        // Scrolling back up to re-read (then continuing down) used to reject
+        // every reversed frame until the session dead-locked into a new segment
+        // full of duplicates. A reversal over captured content must be a
+        // confirmed `moved`, never a reject, and must not duplicate rows.
+        do {
+            let doc = makeStripePattern(width: 400, height: 2000, seed: 0x0FF5_E70D)
+            let vp = 500
+            let path = [0, 320, 640, 320, 80, 400, 720, 1040, 1360, 1500]
+            var s: VerticalStitcher?
+            var rejects = 0
+            var moves = 0
+            for off in path {
+                guard let frame = doc.cropping(to: CGRect(
+                    x: 0, y: off, width: 400, height: vp)) else {
+                    check("stitch-retrace-crop", false); break
+                }
+                if let st = s {
+                    switch st.append(frame) {
+                    case .rejected: rejects += 1
+                    case .moved: moves += 1
+                    default: break
+                    }
+                } else {
+                    s = VerticalStitcher(first: frame)
+                }
+            }
+            let composed = s?.compose()
+            check("stitch-retrace-height", composed?.height == 2000,
+                  "got \(composed?.height ?? -1), want 2000")
+            check("stitch-retrace-no-rejects", rejects == 0 && moves == 3,
+                  "rejects \(rejects), moves \(moves) (want 0 and 3)")
+            if let composed {
+                check("stitch-retrace-content", imagesRoughlyEqual(doc, composed),
+                      "retraced content mismatch")
+            }
+        }
+
+        // 2b-mixed. Start mid-page, scroll up first, then down past the start ------
+        do {
+            let doc = makeStripePattern(width: 400, height: 2000, seed: 0x001A_ED00)
+            let vp = 500
+            let path = [800, 480, 160, 480, 800, 1120, 1440]
+            var s: VerticalStitcher?
+            var rejects = 0
+            var prepends = 0
+            var appends = 0
+            for off in path {
+                guard let frame = doc.cropping(to: CGRect(
+                    x: 0, y: off, width: 400, height: vp)) else {
+                    check("stitch-mixed-crop", false); break
+                }
+                if let st = s {
+                    switch st.append(frame) {
+                    case .rejected: rejects += 1
+                    case .prepended: prepends += 1
+                    case .appended: appends += 1
+                    default: break
+                    }
+                } else {
+                    s = VerticalStitcher(first: frame)
+                }
+            }
+            let composed = s?.compose()
+            let wantHeight = (1440 + vp) - 160
+            check("stitch-mixed-height", composed?.height == wantHeight,
+                  "got \(composed?.height ?? -1), want \(wantHeight)")
+            check("stitch-mixed-outcomes",
+                  rejects == 0 && prepends == 2 && appends == 2,
+                  "rejects \(rejects), prepends \(prepends), appends \(appends)")
+            if let composed,
+               let wantImage = doc.cropping(to: CGRect(
+                x: 0, y: 160, width: 400, height: wantHeight)) {
+                check("stitch-mixed-content", imagesRoughlyEqual(wantImage, composed),
+                      "mixed-direction content mismatch")
+            }
+        }
+
+        // 2b-header-up. Up-scroll under fixed top chrome ---------------------------
+        // Prepended strips must slide UNDER the header: the composed page keeps
+        // the chrome on top exactly once, never repeated mid-page.
+        do {
+            let hW = 400, hViewport = 500, hHeader = 40
+            let doc = makeStripePattern(width: hW, height: 2000, seed: 0x4EAD_F00D)
+            let chrome = makeStripePattern(width: hW, height: hHeader, seed: 0xC0FF_EE00)
+            func chromedFrame(offset: Int) -> CGImage? {
+                guard let body = doc.cropping(to: CGRect(
+                    x: 0, y: offset + hHeader, width: hW,
+                    height: hViewport - hHeader)) else { return nil }
+                let c = ctx(hW, hViewport)
+                c.draw(chrome, in: CGRect(
+                    x: 0, y: CGFloat(hViewport - hHeader),
+                    width: CGFloat(hW), height: CGFloat(hHeader)))
+                c.draw(body, in: CGRect(
+                    x: 0, y: 0, width: CGFloat(hW),
+                    height: CGFloat(hViewport - hHeader)))
+                return c.makeImage()
+            }
+            let path = [1000, 700, 400, 100]
+            var s: VerticalStitcher?
+            var prepends = 0
+            var rejects = 0
+            for off in path {
+                guard let frame = chromedFrame(offset: off) else {
+                    check("stitch-header-up-crop", false); break
+                }
+                if let st = s {
+                    switch st.append(frame) {
+                    case .prepended: prepends += 1
+                    case .rejected: rejects += 1
+                    default: break
+                    }
+                } else {
+                    s = VerticalStitcher(first: frame)
+                }
+            }
+            let composed = s?.compose()
+            // chrome once + doc body from (100 + hHeader) to (1000 + hViewport)
+            let wantHeight = hHeader + (1000 + hViewport) - (100 + hHeader)
+            check("stitch-header-up-height", composed?.height == wantHeight,
+                  "got \(composed?.height ?? -1), want \(wantHeight)")
+            check("stitch-header-up-outcomes", prepends == 3 && rejects == 0,
+                  "prepends \(prepends), rejects \(rejects)")
+            if let composed,
+               let composedTop = composed.cropping(to: CGRect(
+                x: 0, y: 0, width: hW, height: hHeader)) {
+                check("stitch-header-up-chrome-on-top",
+                      imagesRoughlyEqual(chrome, composedTop),
+                      "top of composed image is not the fixed chrome")
+            }
+        }
+
+        // 2b-dup. Duplicated content blocks vs the reverse matcher -----------------
+        // A block appearing twice on the page (an image posted twice, repeated
+        // cards) is a near-perfect unique template hit in the WRONG direction.
+        // Whole-overlap coherence must veto it — without regressing correct
+        // same-direction matches on the same page.
+        func withDuplicatedBlock(
+            _ src: CGImage, from: Int, to: Int, rows: Int
+        ) -> CGImage? {
+            guard let block = src.cropping(to: CGRect(
+                x: 0, y: from, width: src.width, height: rows)) else { return nil }
+            let c = ctx(src.width, src.height)
+            c.draw(src, in: CGRect(
+                x: 0, y: 0, width: src.width, height: src.height))
+            c.draw(block, in: CGRect(
+                x: 0, y: src.height - to - rows,
+                width: src.width, height: rows))
+            return c.makeImage()
+        }
+        do {
+            // No genuine overlap (fast down flick) + duplicated block: the up
+            // direction "finds" the duplicate. Must reject, never prepend.
+            if let doc = withDuplicatedBlock(
+                makeStripePattern(width: 400, height: 1200, seed: 0xD0B1_0C05),
+                from: 100, to: 975, rows: 125),
+               let a = doc.cropping(to: CGRect(x: 0, y: 0, width: 400, height: 500)),
+               let b = doc.cropping(to: CGRect(x: 0, y: 600, width: 400, height: 500)) {
+                let s = VerticalStitcher(first: a)
+                let result = s.append(b)
+                check("stitch-dup-block-flick-rejected", result == .rejected,
+                      "no-overlap flick over duplicated block got \(result)")
+            } else {
+                check("stitch-dup-block-flick-frames", false)
+            }
+
+            // Same duplicated-block page, frames presented in the REVERSED
+            // order: the spurious hit now lands in the DOWN direction. A lone
+            // down match must pass whole-overlap coherence exactly like a lone
+            // up match — neither direction is exempt.
+            if let doc = withDuplicatedBlock(
+                makeStripePattern(width: 400, height: 1200, seed: 0xD0B1_0C05),
+                from: 100, to: 975, rows: 125),
+               let a = doc.cropping(to: CGRect(x: 0, y: 0, width: 400, height: 500)),
+               let b = doc.cropping(to: CGRect(x: 0, y: 600, width: 400, height: 500)) {
+                let s = VerticalStitcher(first: b)
+                let result = s.append(a)
+                check("stitch-dup-block-flick-reversed-rejected", result == .rejected,
+                      "reversed no-overlap flick over duplicated block got \(result)")
+            } else {
+                check("stitch-dup-block-flick-reversed-frames", false)
+            }
+
+            // Healthy down overlap on a page with one duplicated block: the up
+            // direction also matches (on the duplicate), but the down match is
+            // whole-overlap coherent and must win — not be rejected as
+            // ambiguous. (This was the old field failure mode resurfacing.)
+            if let doc = withDuplicatedBlock(
+                makeStripePattern(width: 400, height: 2000, seed: 0xD0B2_0C05),
+                from: 625, to: 925, rows: 150),
+               let a = doc.cropping(to: CGRect(x: 0, y: 300, width: 400, height: 500)),
+               let b = doc.cropping(to: CGRect(x: 0, y: 550, width: 400, height: 500)) {
+                let s = VerticalStitcher(first: a)
+                let result = s.append(b)
+                check("stitch-dup-block-down-still-appends",
+                      result == .appended(rows: 250),
+                      "healthy down overlap got \(result), want appended(250)")
+            } else {
+                check("stitch-dup-block-down-frames", false)
+            }
+        }
+
+        // 2b-window. Bounded preview windows ---------------------------------------
+        // The live preview refresh after a direction flip must render only the
+        // visible window: at source width it is BYTE-identical to cropping the
+        // full compose, the full-compose spy proves zero full composes, and a
+        // wide-display source still allocates only the target-sized canvas.
+        do {
+            let doc = makeStripePattern(width: 400, height: 2000, seed: 0x81D0_11E4)
+            let vp = 500
+            let path = [800, 480, 160, 480, 800, 1120, 1440]
+            var s: SegmentedVerticalStitcher?
+            for off in path {
+                guard let frame = doc.cropping(to: CGRect(
+                    x: 0, y: off, width: 400, height: vp)) else {
+                    check("stitch-window-crop", false); break
+                }
+                if let st = s { _ = st.append(frame) } else {
+                    s = SegmentedVerticalStitcher(first: frame)
+                }
+            }
+            if let s {
+                let windowRows = 300
+                let top = s.previewWindowImage(
+                    targetWidth: 400, maxHeight: windowRows, anchor: .currentTop)
+                let bottom = s.previewWindowImage(
+                    targetWidth: 400, maxHeight: windowRows, anchor: .bottom)
+                check("stitch-window-no-full-compose", s.fullComposeCount == 0,
+                      "window render performed \(s.fullComposeCount) full composes")
+                if let top, let bottom, let full = s.compose(),
+                   let wantTop = full.cropping(to: CGRect(
+                    x: 0, y: 0, width: 400, height: windowRows)),
+                   let wantBottom = full.cropping(to: CGRect(
+                    x: 0, y: full.height - windowRows,
+                    width: 400, height: windowRows)) {
+                    check("stitch-window-top-content",
+                          imagesEqual(wantTop, top),
+                          "top window differs from full-compose crop")
+                    check("stitch-window-bottom-content",
+                          imagesEqual(wantBottom, bottom),
+                          "bottom window differs from full-compose crop")
+                } else {
+                    check("stitch-window-compose", false)
+                }
+            }
+
+            // Wide display: the returned canvas must be target-sized no
+            // matter the source width (the old path allocated
+            // width × (1400·width/400) — ~350 MiB at width 5120).
+            let wideDoc = makeStripePattern(
+                width: 5120, height: 1400, seed: 0x81D0_57DE)
+            if let w0 = wideDoc.cropping(to: CGRect(
+                x: 0, y: 0, width: 5120, height: 500)),
+               let w1 = wideDoc.cropping(to: CGRect(
+                x: 0, y: 300, width: 5120, height: 500)) {
+                let wide = SegmentedVerticalStitcher(first: w0)
+                _ = wide.append(w1)
+                if let window = wide.previewWindowImage(
+                    targetWidth: 400, maxHeight: 1400, anchor: .bottom) {
+                    check("stitch-window-wide-allocation-capped",
+                          window.width == 400 && window.height <= 1400,
+                          "got \(window.width)x\(window.height)")
+                    // Fractional-scale geometry: 800 source rows at 400/5120
+                    // is 62.5 — cumulative floor must yield exactly 62 (the
+                    // same rule scaledForPreview uses) with no blank seam
+                    // row anywhere in the window.
+                    let expectedRows = Int(CGFloat(800) * 400.0 / 5120.0)
+                    check("stitch-window-wide-floor-height",
+                          window.height == expectedRows,
+                          "got \(window.height), want \(expectedRows)")
+                    var blankRow = -1
+                    var bytes = [UInt8](
+                        repeating: 0, count: window.width * window.height * 4)
+                    if let c = CGContext(
+                        data: &bytes, width: window.width, height: window.height,
+                        bitsPerComponent: 8, bytesPerRow: window.width * 4,
+                        space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) {
+                        c.draw(window, in: CGRect(
+                            x: 0, y: 0,
+                            width: window.width, height: window.height))
+                        for row in 0..<window.height {
+                            var sum = 0
+                            for x in 0..<window.width {
+                                sum += Int(bytes[(row * window.width + x) * 4 + 3])
+                            }
+                            if sum == 0 { blankRow = row; break }
+                        }
+                    }
+                    check("stitch-window-wide-no-blank-seam", blankRow == -1,
+                          "blank seam at scaled row \(blankRow)")
+                } else {
+                    check("stitch-window-wide-render", false)
+                }
+            } else {
+                check("stitch-window-wide-frames", false)
+            }
+        }
+
+        // 2b-window-marker. Gap separator must survive a direction flip ------------
+        // After a re-anchor the composed strip contains segment + separator +
+        // segment; the flip preview window over that region must be
+        // pixel-EXACT against the full compose, separator included.
+        do {
+            let doc = makeStripePattern(width: 400, height: 3000, seed: 0x5E9A_9A99)
+            let vp = 500
+            // 0→300: appends; flick to 1200 (no overlap) rejects and builds
+            // the pending segment at 1200/1400/1600/1800; promote inserts the
+            // marked gap. Then scroll back up inside segment 2 until a real
+            // prepend happens.
+            let path = [0, 300, 1200, 1400, 1600, 1800, 1650, 1350, 1050]
+            if let first = doc.cropping(to: CGRect(
+                x: 0, y: path[0], width: 400, height: vp)) {
+                let segmented = SegmentedVerticalStitcher(first: first)
+                var sawSegment = false
+                var sawPrepend = false
+                for off in path.dropFirst() {
+                    guard let frame = doc.cropping(to: CGRect(
+                        x: 0, y: off, width: 400, height: vp)) else {
+                        check("stitch-window-marker-crop", false); break
+                    }
+                    switch segmented.append(frame) {
+                    case .startedSegment: sawSegment = true
+                    case .prepended: sawPrepend = true
+                    default: break
+                    }
+                }
+                check("stitch-window-marker-fixture",
+                      sawSegment && sawPrepend && segmented.segmentCount == 2,
+                      "segment \(sawSegment) prepend \(sawPrepend) count \(segmented.segmentCount)")
+                // segment 1 composes to rows [0, 800); the separator starts
+                // there. currentTop anchors on that separator (clamped so the
+                // window still fills), bottom anchors on the composition end.
+                if let full = segmented.compose() {
+                    let windowRows = 1400
+                    let separatorStart = 800
+                    for (label, anchor, origin) in [
+                        ("top", SegmentedVerticalStitcher.PreviewAnchor.currentTop,
+                         min(separatorStart, full.height - windowRows)),
+                        ("bottom", .bottom, full.height - windowRows),
+                    ] {
+                        if let window = segmented.previewWindowImage(
+                            targetWidth: 400, maxHeight: windowRows, anchor: anchor),
+                           let want = full.cropping(to: CGRect(
+                            x: 0, y: origin, width: 400, height: windowRows)) {
+                            check("stitch-window-marker-\(label)-exact",
+                                  imagesEqual(want, window),
+                                  "\(label) window differs from full compose (separator lost?)")
+                        } else {
+                            check("stitch-window-marker-\(label)-render", false)
+                        }
+                    }
+                } else {
+                    check("stitch-window-marker-compose", false)
+                }
+            } else {
+                check("stitch-window-marker-crop", false)
+            }
+        }
+
+        // 2b-window-tallseg. Anchor must follow the CURRENT segment ----------------
+        // With a first segment TALLER than the preview window, a global-top
+        // anchor would show only old content and the preview would look
+        // frozen during upward capture. The window must start at the gap
+        // separator and contain the current segment's newest prepends.
+        do {
+            let doc = makeStripePattern(width: 400, height: 4200, seed: 0x7A11_5E91)
+            let vp = 500
+            let path = [0, 300, 600, 900, 1200,
+                        3000, 3200, 3400, 3600,
+                        3450, 3150, 2850]
+            if let first = doc.cropping(to: CGRect(
+                x: 0, y: path[0], width: 400, height: vp)) {
+                let segmented = SegmentedVerticalStitcher(first: first)
+                var sawSegment = false
+                var sawPrepend = false
+                for off in path.dropFirst() {
+                    guard let frame = doc.cropping(to: CGRect(
+                        x: 0, y: off, width: 400, height: vp)) else {
+                        check("stitch-window-tallseg-crop", false); break
+                    }
+                    switch segmented.append(frame) {
+                    case .startedSegment: sawSegment = true
+                    case .prepended: sawPrepend = true
+                    default: break
+                    }
+                }
+                let full = segmented.compose()
+                check("stitch-window-tallseg-fixture",
+                      sawSegment && sawPrepend && full?.height == 2962,
+                      "segment \(sawSegment) prepend \(sawPrepend) height \(full?.height ?? -1)")
+                let windowRows = 1400
+                if let full,
+                   let window = segmented.previewWindowImage(
+                    targetWidth: 400, maxHeight: windowRows, anchor: .currentTop),
+                   let want = full.cropping(to: CGRect(
+                    // separator starts at segment-1 height 1700; window is
+                    // clamped so it still fills: origin 2962-1400 = 1562,
+                    // which keeps the separator AND the prepends in view.
+                    x: 0, y: min(1700, full.height - windowRows),
+                    width: 400, height: windowRows)) {
+                    check("stitch-window-tallseg-anchored",
+                          imagesEqual(want, window),
+                          "tall-segment window not anchored on current segment")
+                } else {
+                    check("stitch-window-tallseg-render", false)
+                }
+            } else {
+                check("stitch-window-tallseg-crop", false)
+            }
+        }
+
+        // 2b-window-materialize. Preview refresh copies no pixel buffers -----------
+        // A 5K source with sticky chrome and prepends used to materialize the
+        // trimmed first viewport (~54 MiB) on every preview rebuild. The
+        // ref-based window render must perform ZERO materializations and no
+        // full composes.
+        do {
+            let wW = 5120, wViewport = 800, wHeader = 100
+            let doc = makeStripePattern(width: wW, height: 2400, seed: 0x3A55_17E0)
+            let chrome = makeStripePattern(width: wW, height: wHeader, seed: 0xC42F_EE00)
+            func chromedWideFrame(offset: Int) -> CGImage? {
+                guard let body = doc.cropping(to: CGRect(
+                    x: 0, y: offset + wHeader, width: wW,
+                    height: wViewport - wHeader)) else { return nil }
+                let c = ctx(wW, wViewport)
+                c.draw(chrome, in: CGRect(
+                    x: 0, y: CGFloat(wViewport - wHeader),
+                    width: CGFloat(wW), height: CGFloat(wHeader)))
+                c.draw(body, in: CGRect(
+                    x: 0, y: 0, width: CGFloat(wW),
+                    height: CGFloat(wViewport - wHeader)))
+                return c.makeImage()
+            }
+            let path = [1000, 700, 400]
+            if let first = chromedWideFrame(offset: path[0]) {
+                let segmented = SegmentedVerticalStitcher(first: first)
+                var prepends = 0
+                for off in path.dropFirst() {
+                    guard let frame = chromedWideFrame(offset: off) else {
+                        check("stitch-window-materialize-crop", false); break
+                    }
+                    if case .prepended = segmented.append(frame) { prepends += 1 }
+                }
+                let composesBefore = segmented.fullComposeCount
+                let materializesBefore = MaterializeSpy.count
+                let window = segmented.previewWindowImage(
+                    targetWidth: 400, maxHeight: 1400, anchor: .currentTop)
+                let materializeDelta = MaterializeSpy.count - materializesBefore
+                let composeDelta = segmented.fullComposeCount - composesBefore
+                check("stitch-window-materialize-free",
+                      prepends == 2 && window != nil
+                        && materializeDelta == 0 && composeDelta == 0
+                        && (window?.width ?? 0) == 400
+                        && (window?.height ?? 9999) <= 1400,
+                      "prepends \(prepends), materialize \(materializeDelta), "
+                      + "compose \(composeDelta), "
+                      + "size \(window?.width ?? -1)x\(window?.height ?? -1)")
+            } else {
+                check("stitch-window-materialize-crop", false)
+            }
+        }
+
+        // 2b-flip-production. Direction flips through the PRODUCTION dispatch ------
+        // Drives applyStitchOutcome — the exact function the capture loop
+        // calls — through down→up→down flips: every preview refresh must do
+        // zero full composes and zero pixel materializations, and the
+        // rebuilt preview must be the anchored bounded window.
+        do {
+            let doc = makeStripePattern(width: 400, height: 2700, seed: 0xF11B_0D0D)
+            let vp = 500
+            // The down phase captures 1700 rows (> the 1400-px preview
+            // window) BEFORE the flip, so a buggy incremental append after
+            // the up phase cannot coincidentally equal the bottom window.
+            let path = [600, 900, 1200, 1500, 1800,
+                        1500, 1200, 900, 600, 300,
+                        600, 900, 1200, 1500, 1800, 2100]
+            MainActor.assumeIsolated {
+                guard let first = doc.cropping(to: CGRect(
+                    x: 0, y: path[0], width: 400, height: vp)) else {
+                    check("stitch-flip-production-crop", false)
+                    return
+                }
+                let session = ScrollingCapture(onFinish: { _ in })
+                session.startPreviewForTesting(with: first)
+                let segmented = SegmentedVerticalStitcher(first: first)
+                var prepends = 0
+                var appends = 0
+                var previewSpyClean = true
+                var pinnedAfterPrepend = false
+                var firstAppendAfterFlipRebuilt = false
+                var awaitingFlipBack = false
+                for off in path.dropFirst() {
+                    guard let frame = doc.cropping(to: CGRect(
+                        x: 0, y: off, width: 400, height: vp)) else {
+                        check("stitch-flip-production-crop", false)
+                        return
+                    }
+                    let outcome = segmented.append(frame)
+                    switch outcome {
+                    case .prepended: prepends += 1
+                    case .appended: appends += 1
+                    default: break
+                    }
+                    let composesBefore = segmented.fullComposeCount
+                    let materializesBefore = MaterializeSpy.count
+                    session.applyStitchOutcome(
+                        outcome, stitcher: segmented, stopHint: "test")
+                    if segmented.fullComposeCount != composesBefore
+                        || MaterializeSpy.count != materializesBefore {
+                        previewSpyClean = false
+                    }
+                    if case .prepended = outcome {
+                        pinnedAfterPrepend = session.previewPinnedTop
+                        awaitingFlipBack = true
+                    } else if case .appended = outcome, awaitingFlipBack {
+                        // The FIRST appended frame after an upward phase must
+                        // rebuild the bottom-anchored window immediately —
+                        // this is the branch a nil preview view used to skip.
+                        awaitingFlipBack = false
+                        if let preview = session.previewImageForTesting,
+                           let want = segmented.previewWindowImage(
+                            targetWidth: 400, maxHeight: 1400,
+                            anchor: .bottom) {
+                            firstAppendAfterFlipRebuilt =
+                                !session.previewPinnedTop
+                                && imagesEqual(want, preview)
+                        }
+                    }
+                }
+                check("stitch-flip-production-outcomes",
+                      prepends == 1 && appends == 5,
+                      "prepends \(prepends), appends \(appends)")
+                check("stitch-flip-production-spy-clean", previewSpyClean,
+                      "preview dispatch performed a full compose or materialize")
+                check("stitch-flip-production-pinned-state", pinnedAfterPrepend,
+                      "previewPinnedTop not set by the prepend rebuild")
+                check("stitch-flip-production-first-append-rebuilds",
+                      firstAppendAfterFlipRebuilt,
+                      "first append after up-phase did not rebuild bottom window")
+                if let preview = session.previewImageForTesting,
+                   let want = segmented.previewWindowImage(
+                    targetWidth: 400, maxHeight: 1400, anchor: .bottom) {
+                    check("stitch-flip-production-anchored",
+                          imagesEqual(want, preview),
+                          "preview after down-flip is not the bottom-anchored window")
+                } else {
+                    check("stitch-flip-production-preview", false)
+                }
+            }
+        }
+
+        // 2b-preview-parity. Incremental and rebuilt previews agree ----------------
+        // Incremental strip heights use the same cumulative floor as the
+        // rebuilt window. At 5120→400 with 500 + 4×30 source rows, per-slice
+        // floors summed to 47 while the rebuild showed 48 — a visible jump on
+        // every flip.
+        do {
+            let doc = makeStripePattern(width: 5120, height: 700, seed: 0x0F10_0AA1)
+            let vp = 500
+            let path = [0, 30, 60, 90, 120]
+            MainActor.assumeIsolated {
+                guard let first = doc.cropping(to: CGRect(
+                    x: 0, y: path[0], width: 5120, height: vp)) else {
+                    check("stitch-preview-parity-crop", false)
+                    return
+                }
+                let session = ScrollingCapture(onFinish: { _ in })
+                session.startPreviewForTesting(with: first)
+                let segmented = SegmentedVerticalStitcher(first: first)
+                var appends = 0
+                for off in path.dropFirst() {
+                    guard let frame = doc.cropping(to: CGRect(
+                        x: 0, y: off, width: 5120, height: vp)) else {
+                        check("stitch-preview-parity-crop", false)
+                        return
+                    }
+                    let outcome = segmented.append(frame)
+                    if case .appended = outcome { appends += 1 }
+                    session.applyStitchOutcome(
+                        outcome, stitcher: segmented, stopHint: "test")
+                }
+                let wantRows = Int(CGFloat(620) * 400.0 / 5120.0)
+                let incremental = session.previewImageForTesting?.height ?? -1
+                let rebuilt = segmented.previewWindowImage(
+                    targetWidth: 400, maxHeight: 1400, anchor: .bottom)?
+                    .height ?? -2
+                check("stitch-preview-parity",
+                      appends == 4 && incremental == wantRows
+                        && rebuilt == wantRows,
+                      "appends \(appends), incremental \(incremental), "
+                      + "rebuilt \(rebuilt), want \(wantRows)")
+            }
+        }
+
+        // 2b-preview-footer-live. Sticky footer stays at the live preview's
+        // bottom. The final compose re-attaches a latched footer at the very
+        // bottom; the incremental paste used to leave the FIRST frame's
+        // footer band mid-image with no footer at the bottom. Every accepted
+        // outcome must leave the production preview byte-equal to the
+        // bounded window.
+        do {
+            let fW = 400, fViewport = 500, fFooter = 60
+            let content = makeStripePattern(width: fW, height: 2000, seed: 0xF007_E210)
+            let footerBand = makeStripePattern(width: fW, height: fFooter, seed: 0xF007_BA9D)
+            func footeredFrame(offset: Int, blinkFooter: Bool = false) -> CGImage? {
+                guard let body = content.cropping(to: CGRect(
+                    x: 0, y: offset, width: fW,
+                    height: fViewport - fFooter)) else { return nil }
+                let c = ctx(fW, fViewport)
+                c.draw(footerBand, in: CGRect(
+                    x: 0, y: 0, width: fW, height: fFooter))
+                if blinkFooter {
+                    // one blinking row inside the sticky bar — within the
+                    // footer-stability tolerance, but a real pixel change the
+                    // preview must show after the retrace
+                    c.setFillColor(CGColor(gray: 0.95, alpha: 1))
+                    c.fill(CGRect(x: 0, y: 30, width: fW, height: 1))
+                }
+                c.draw(body, in: CGRect(
+                    x: 0, y: fFooter, width: fW,
+                    height: fViewport - fFooter))
+                return c.makeImage()
+            }
+            // The last frame is a RETRACE whose footer carries the blink: if
+            // the moved branch stopped rebuilding, the preview would keep the
+            // pre-blink footer while the bounded window shows the new one —
+            // the gate is red without the moved-branch rebuild.
+            let path = [0, 320, 640, 320]
+            MainActor.assumeIsolated {
+                guard let first = footeredFrame(offset: path[0]) else {
+                    check("stitch-footer-preview-live-crop", false)
+                    return
+                }
+                let session = ScrollingCapture(onFinish: { _ in })
+                session.startPreviewForTesting(with: first)
+                let segmented = SegmentedVerticalStitcher(first: first)
+                var appended = 0
+                var moved = 0
+                var allExact = true
+                for (index, off) in path.dropFirst().enumerated() {
+                    let isLast = index == path.count - 2
+                    guard let frame = footeredFrame(
+                        offset: off, blinkFooter: isLast) else {
+                        check("stitch-footer-preview-live-crop", false)
+                        return
+                    }
+                    let outcome = segmented.append(frame)
+                    session.applyStitchOutcome(
+                        outcome, stitcher: segmented, stopHint: "test")
+                    if isLast, case .moved = outcome {} else if isLast {
+                        allExact = false // blink frame must be a retrace
+                    }
+                    switch outcome {
+                    case .appended, .prepended, .moved:
+                        if case .appended = outcome { appended += 1 }
+                        if case .moved = outcome { moved += 1 }
+                        if session.previewSourceRowsForTesting
+                            != segmented.totalHeight {
+                            allExact = false
+                        }
+                        if let preview = session.previewImageForTesting,
+                           let want = segmented.previewWindowImage(
+                            targetWidth: 400, maxHeight: 1400,
+                            anchor: session.previewPinnedTop
+                                ? .currentTop : .bottom) {
+                            if !imagesEqual(want, preview) { allExact = false }
+                        } else {
+                            allExact = false
+                        }
+                    default: break
+                    }
+                }
+                // Both patched branches must actually run: at least one
+                // appended AND one moved (retrace) accepted outcome.
+                check("stitch-footer-preview-live",
+                      appended >= 1 && moved >= 1
+                        && segmented.currentSegment.footerRows == fFooter
+                        && allExact,
+                      "appended \(appended), moved \(moved), footer "
+                      + "\(segmented.currentSegment.footerRows), exact \(allExact)")
+            }
+        }
+
+        // 2b-preview-omit-revocation. Header-omit revocation resyncs preview ------
+        // Segment 2 initially omits its proven duplicate header; a later
+        // accepted frame with changed chrome revokes the omit, raising
+        // totalHeight by the restored header WITHOUT any rows in the outcome
+        // (the restored band lives in the first slice, not lastSlice). The
+        // preview must resync to the bounded window immediately — on the
+        // appended outcome AND on a moved outcome.
+        do {
+            let rW = 400, rViewport = 500, rHeader = 40
+            let content = makeStripePattern(width: rW, height: 3000, seed: 0x4EAD_0117)
+            let band = makeStripePattern(width: rW, height: rHeader, seed: 0xBAA0_0001)
+            let changedBand = makeStripePattern(width: rW, height: rHeader, seed: 0xBAA0_0002)
+            func revFrame(offset: Int, band: CGImage) -> CGImage? {
+                guard let body = content.cropping(to: CGRect(
+                    x: 0, y: offset, width: rW,
+                    height: rViewport - rHeader)) else { return nil }
+                let c = ctx(rW, rViewport)
+                c.draw(body, in: CGRect(
+                    x: 0, y: 0, width: rW, height: rViewport - rHeader))
+                c.draw(band, in: CGRect(
+                    x: 0, y: rViewport - rHeader, width: rW, height: rHeader))
+                return c.makeImage()
+            }
+            // variant true = revocation lands on an APPENDED frame,
+            // false = revocation lands on a MOVED (retrace) frame.
+            for revokeOnAppend in [true, false] {
+                let label = revokeOnAppend ? "appended" : "moved"
+                let basePath = [0, 200, 2000, 2041, 2083, 2126]
+                let revokeOffset = revokeOnAppend ? 2170 : 2085
+                MainActor.assumeIsolated {
+                    guard let first = revFrame(offset: basePath[0], band: band) else {
+                        check("stitch-omit-revocation-\(label)-crop", false)
+                        return
+                    }
+                    let session = ScrollingCapture(onFinish: { _ in })
+                    session.startPreviewForTesting(with: first)
+                    let segmented = SegmentedVerticalStitcher(first: first)
+                    var sawSegment = false
+                    for off in basePath.dropFirst() {
+                        guard let frame = revFrame(offset: off, band: band) else {
+                            check("stitch-omit-revocation-\(label)-crop", false)
+                            return
+                        }
+                        let outcome = segmented.append(frame)
+                        if case .startedSegment = outcome { sawSegment = true }
+                        session.applyStitchOutcome(
+                            outcome, stitcher: segmented, stopHint: "test")
+                    }
+                    let omitBefore = segmented.totalHeight
+                    guard sawSegment,
+                          let revoker = revFrame(
+                            offset: revokeOffset, band: changedBand) else {
+                        check("stitch-omit-revocation-\(label)-fixture", false)
+                        return
+                    }
+                    let outcome = segmented.append(revoker)
+                    let expectedOutcome: Bool
+                    var outcomeRows = 0
+                    switch outcome {
+                    case let .appended(rows):
+                        expectedOutcome = revokeOnAppend
+                        outcomeRows = rows
+                    case .moved:
+                        expectedOutcome = !revokeOnAppend
+                    default:
+                        expectedOutcome = false
+                    }
+                    session.applyStitchOutcome(
+                        outcome, stitcher: segmented, stopHint: "test")
+                    // totalHeight must have grown by the outcome's rows PLUS
+                    // the restored header — that surplus is the revocation.
+                    let revoked = segmented.totalHeight - omitBefore
+                        == outcomeRows + rHeader
+                    check("stitch-omit-revocation-\(label)-fixture",
+                          expectedOutcome && revoked,
+                          "outcome \(outcome), Δtotal \(segmented.totalHeight - omitBefore), rows \(outcomeRows)")
+                    let basisSynced = session.previewSourceRowsForTesting
+                        == segmented.totalHeight
+                    if let preview = session.previewImageForTesting,
+                       let want = segmented.previewWindowImage(
+                        targetWidth: 400, maxHeight: 1400, anchor: .bottom) {
+                        check("stitch-omit-revocation-\(label)-resync",
+                              basisSynced && imagesEqual(want, preview),
+                              "basis synced \(basisSynced) "
+                              + "(\(session.previewSourceRowsForTesting) vs "
+                              + "\(segmented.totalHeight))")
+                    } else {
+                        check("stitch-omit-revocation-\(label)-preview", false)
+                    }
+                }
+            }
+        }
+
+        // 2b-promotion-compose. Promotion composes ONLY the old segment ------------
+        // The startedSegment payload is gone; promoting a pending segment
+        // must compose exactly the outgoing segment (it becomes the completed
+        // raster) and never the new one — the dead pending.compose() used to
+        // allocate a source-resolution canvas on the capture loop per
+        // re-anchor.
+        do {
+            let doc = makeStripePattern(width: 400, height: 3000, seed: 0x9407_C0DE)
+            let vp = 500
+            let path = [0, 300, 1200, 1400, 1600, 1800]
+            if let first = doc.cropping(to: CGRect(
+                x: 0, y: path[0], width: 400, height: vp)) {
+                let segmented = SegmentedVerticalStitcher(first: first)
+                var promoteDelta = -1
+                var nonPromoteDelta = 0
+                var sawSegment = false
+                for off in path.dropFirst() {
+                    guard let frame = doc.cropping(to: CGRect(
+                        x: 0, y: off, width: 400, height: vp)) else {
+                        check("stitch-promotion-compose-crop", false); break
+                    }
+                    let before = FullComposeSpy.count
+                    let outcome = segmented.append(frame)
+                    let delta = FullComposeSpy.count - before
+                    if case .startedSegment = outcome {
+                        sawSegment = true
+                        promoteDelta = delta
+                    } else {
+                        nonPromoteDelta += delta
+                    }
+                }
+                check("stitch-promotion-compose-old-only",
+                      sawSegment && promoteDelta == 1 && nonPromoteDelta == 0
+                        && segmented.fullComposeCount == 0,
+                      "segment \(sawSegment), promoteΔ \(promoteDelta), "
+                      + "otherΔ \(nonPromoteDelta), "
+                      + "current \(segmented.fullComposeCount)")
+                check("stitch-promotion-compose-preview-works",
+                      segmented.previewWindowImage(
+                        targetWidth: 400, maxHeight: 1400,
+                        anchor: .currentTop) != nil,
+                      "bounded preview failed after payloadless promotion")
+            } else {
+                check("stitch-promotion-compose-crop", false)
+            }
+        }
+
+        // 2b-preview-parity-reanchor. Re-anchor keeps the global floor basis -------
+        // startedSegment used to seed the incremental preview from separator
+        // + segment image, resetting the cumulative-floor basis to a local
+        // value while flip rebuilds used the global total — a 1px jump after
+        // every re-anchor at fractional scales. The re-anchor now rebuilds
+        // the bounded window, so incremental and rebuilt geometry stay equal
+        // through gap + append.
+        do {
+            let doc = makeStripePattern(width: 5120, height: 4200, seed: 0x9EA9_C40A)
+            let vp = 800
+            let path = [0, 600, 2400, 2600, 2800, 3000, 3200]
+            MainActor.assumeIsolated {
+                guard let first = doc.cropping(to: CGRect(
+                    x: 0, y: path[0], width: 5120, height: vp)) else {
+                    check("stitch-preview-reanchor-crop", false)
+                    return
+                }
+                let session = ScrollingCapture(onFinish: { _ in })
+                session.startPreviewForTesting(with: first)
+                let segmented = SegmentedVerticalStitcher(first: first)
+                var sawSegment = false
+                var appendsAfterSegment = 0
+                for off in path.dropFirst() {
+                    guard let frame = doc.cropping(to: CGRect(
+                        x: 0, y: off, width: 5120, height: vp)) else {
+                        check("stitch-preview-reanchor-crop", false)
+                        return
+                    }
+                    let outcome = segmented.append(frame)
+                    switch outcome {
+                    case .startedSegment: sawSegment = true
+                    case .appended: if sawSegment { appendsAfterSegment += 1 }
+                    default: break
+                    }
+                    session.applyStitchOutcome(
+                        outcome, stitcher: segmented, stopHint: "test")
+                }
+                let incremental = session.previewImageForTesting?.height ?? -1
+                let rebuilt = segmented.previewWindowImage(
+                    targetWidth: 400, maxHeight: 1400, anchor: .bottom)?
+                    .height ?? -2
+                check("stitch-preview-reanchor-parity",
+                      sawSegment && appendsAfterSegment >= 1
+                        && incremental == rebuilt,
+                      "segment \(sawSegment), appends \(appendsAfterSegment), "
+                      + "incremental \(incremental), rebuilt \(rebuilt)")
+            }
+        }
+
+        // 2b-window-gap-marker-wide. 5K + gap + prepend: marker survives, no
+        // source-width canvas after the cache warms, no materialize/compose.
+        do {
+            let gW = 5120, gViewport = 800
+            // Blue-only stripes so the ORANGE gap marker is unmistakable in
+            // the scaled output — the gate detects real marker pixels, not
+            // just a nonzero destination height.
+            func blueStripes(width: Int, height: Int, seed: UInt64) -> CGImage {
+                let c = ctx(width, height)
+                var seed = seed
+                for y in 0..<height {
+                    seed = seed &* 6364136223846793005 &+ 1442695040888963407
+                    let b = 0.25 + 0.75 * CGFloat((seed >> 33) & 0xFF) / 255
+                    c.setFillColor(CGColor(
+                        srgbRed: 0.05, green: 0.08, blue: b, alpha: 1))
+                    c.fill(CGRect(x: 0, y: y, width: width, height: 1))
+                }
+                return c.makeImage()!
+            }
+            let doc = blueStripes(width: gW, height: 4000, seed: 0x5EA9_A9B1)
+            // Completed segment = 1024 rows: at 400/5120 the separator's 12
+            // source rows floor to ZERO destination pixels, so the 1-px
+            // marker floor branch is genuinely exercised (asserted below).
+            let path = [0, 224, 2400, 2600, 2800, 3000, 2500, 2000]
+            if let first = doc.cropping(to: CGRect(
+                x: 0, y: path[0], width: gW, height: gViewport)) {
+                let segmented = SegmentedVerticalStitcher(first: first)
+                var sawSegment = false
+                var sawPrepend = false
+                for off in path.dropFirst() {
+                    guard let frame = doc.cropping(to: CGRect(
+                        x: 0, y: off, width: gW, height: gViewport)) else {
+                        check("stitch-window-gap-wide-crop", false); break
+                    }
+                    switch segmented.append(frame) {
+                    case .startedSegment: sawSegment = true
+                    case .prepended: sawPrepend = true
+                    default: break
+                    }
+                }
+                check("stitch-window-gap-wide-fixture",
+                      sawSegment && sawPrepend && segmented.segmentCount == 2,
+                      "segment \(sawSegment) prepend \(sawPrepend) count \(segmented.segmentCount)")
+                // Lock the fixture's intent: without the floor, the separator
+                // occupies zero scaled pixels at this geometry.
+                let sepStart = 1024
+                let sepScaled = Int(CGFloat(sepStart + 12) * 400.0 / 5120.0)
+                    - Int(CGFloat(sepStart) * 400.0 / 5120.0)
+                check("stitch-window-gap-wide-floor-branch", sepScaled == 0,
+                      "separator naturally scales to \(sepScaled)px — fixture no longer exercises the floor")
+                // Warm call may build the cached separator once; afterwards
+                // repeated refreshes must allocate NOTHING at source width.
+                let warm = segmented.previewWindowImage(
+                    targetWidth: 400, maxHeight: 1400, anchor: .currentTop)
+                let canvasesAfterWarm = SourceCanvasSpy.count
+                let materializesAfterWarm = MaterializeSpy.count
+                let composesAfterWarm = segmented.fullComposeCount
+                let window = segmented.previewWindowImage(
+                    targetWidth: 400, maxHeight: 1400, anchor: .currentTop)
+                _ = segmented.previewWindowImage(
+                    targetWidth: 400, maxHeight: 1400, anchor: .bottom)
+                check("stitch-window-gap-wide-no-source-canvas",
+                      warm != nil
+                        && SourceCanvasSpy.count == canvasesAfterWarm
+                        && MaterializeSpy.count == materializesAfterWarm
+                        && segmented.fullComposeCount == composesAfterWarm,
+                      "canvases +\(SourceCanvasSpy.count - canvasesAfterWarm), "
+                      + "materializes +\(MaterializeSpy.count - materializesAfterWarm), "
+                      + "composes +\(segmented.fullComposeCount - composesAfterWarm)")
+                if let window {
+                    var markerFound = false
+                    var bytes = [UInt8](
+                        repeating: 0, count: window.width * window.height * 4)
+                    if let c = CGContext(
+                        data: &bytes, width: window.width, height: window.height,
+                        bitsPerComponent: 8, bytesPerRow: window.width * 4,
+                        space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) {
+                        c.interpolationQuality = .none
+                        c.draw(window, in: CGRect(
+                            x: 0, y: 0,
+                            width: window.width, height: window.height))
+                        for i in stride(from: 0, to: bytes.count, by: 4) {
+                            let r = Int(bytes[i]), g = Int(bytes[i + 1])
+                            let b = Int(bytes[i + 2])
+                            // orange marker: strong red, moderate green, low blue
+                            if r > 120, g > 40, b < 80, r > b * 2 {
+                                markerFound = true
+                                break
+                            }
+                        }
+                    }
+                    check("stitch-window-gap-wide-marker-visible", markerFound,
+                          "gap marker pixels absent from scaled 5K window")
+                } else {
+                    check("stitch-window-gap-wide-render", false)
+                }
+            } else {
+                check("stitch-window-gap-wide-crop", false)
+            }
+        }
+
+        // 2b-halfrow. Coherence at an exact half-row offset ------------------------
+        // The subpixel matcher's smallest emission is offset 0.5 (floor 0).
+        // Coherence must compare rows 0/1 blends, not shift everything by a
+        // whole row — a synthetic half-row blend must pass in BOTH directions.
+        do {
+            let rows = 64
+            var baseBands = [Double](repeating: 0, count: rows * 4)
+            var seed: UInt64 = 0x4A1F_0BEE
+            for i in 0..<baseBands.count {
+                seed = seed &* 6364136223846793005 &+ 1442695040888963407
+                baseBands[i] = Double((seed >> 33) & 0xFF)
+            }
+            var shiftedBands = [Double](repeating: 0, count: rows * 4)
+            for y in 0..<(rows - 1) {
+                for band in 0..<4 {
+                    shiftedBands[y * 4 + band] =
+                        (baseBands[y * 4 + band] + baseBands[(y + 1) * 4 + band]) * 0.5
+                }
+            }
+            for band in 0..<4 {
+                shiftedBands[(rows - 1) * 4 + band] = baseBands[(rows - 1) * 4 + band]
+            }
+            let energy = [Double](repeating: 4.0, count: rows)
+            let baseSig = VerticalStitcher.RowSig(bands: baseBands, energy: energy)
+            let shiftedSig = VerticalStitcher.RowSig(bands: shiftedBands, energy: energy)
+            check("stitch-halfrow-coherence-forward",
+                  VerticalStitcher.wholeOverlapAgrees(
+                    base: baseSig, shifted: shiftedSig, offset: 0.5,
+                    headerRows: 0, effectiveHeight: rows),
+                  "half-row blend rejected (base→shifted)")
+            check("stitch-halfrow-coherence-reverse",
+                  VerticalStitcher.wholeOverlapAgrees(
+                    base: shiftedSig, shifted: baseSig, offset: 0.5,
+                    headerRows: 0, effectiveHeight: rows),
+                  "half-row blend rejected (shifted→base)")
+        }
+
+        // 2b-sparse. Sparse white page + repeated detailed card --------------------
+        // Blank rows agree under any offset, so an unweighted quorum let a
+        // duplicated card carry a fake match on a mostly-white page (75% of
+        // rows "agreed" while every real content row differed). Blank rows
+        // must not vote — with them excluded, the card cannot outvote the
+        // differing content, in either direction.
+        do {
+            let sW = 400, sViewport = 500
+            let cardSrc = makeStripePattern(width: sW, height: 125, seed: 0x0CA9_D0CA)
+            let contentA = makeStripePattern(width: sW, height: 100, seed: 0x0C0A_AAAA)
+            let contentB = makeStripePattern(width: sW, height: 100, seed: 0x0C0B_BBBB)
+            func sparseFrame(
+                card cardTop: Int, content: CGImage, contentTop: Int
+            ) -> CGImage? {
+                let c = ctx(sW, sViewport)
+                c.setFillColor(CGColor(gray: 1, alpha: 1))
+                c.fill(CGRect(x: 0, y: 0, width: sW, height: sViewport))
+                c.draw(cardSrc, in: CGRect(
+                    x: 0, y: sViewport - cardTop - 125,
+                    width: sW, height: 125))
+                c.draw(content, in: CGRect(
+                    x: 0, y: sViewport - contentTop - content.height,
+                    width: sW, height: content.height))
+                return c.makeImage()
+            }
+            // Claimed offset 100: cards align (a[375..500) ↔ b[275..400)) and
+            // the whitespace matches too, but the only real content rows
+            // (a[100..200) vs b[0..100)) disagree — no true overlap exists.
+            if let a = sparseFrame(card: 375, content: contentA, contentTop: 100),
+               let b = sparseFrame(card: 275, content: contentB, contentTop: 0) {
+                let down = VerticalStitcher(first: a)
+                let downResult = down.append(b)
+                check("stitch-sparse-card-rejected", downResult == .rejected,
+                      "sparse repeated-card page got \(downResult) (a→b)")
+                let up = VerticalStitcher(first: b)
+                let upResult = up.append(a)
+                check("stitch-sparse-card-reversed-rejected", upResult == .rejected,
+                      "sparse repeated-card page got \(upResult) (b→a)")
+            } else {
+                check("stitch-sparse-card-frames", false)
+            }
+
+            // Same geometry but the differing content blocks are SOLID fills
+            // (zero energy, zero interior contrast). Flat-but-DIFFERENT rows
+            // must vote against the offset — skipping them as neutral let the
+            // repeated card become nearly the entire electorate.
+            let solidA = makeSolidImage(
+                width: sW, height: 100, color: CGColor(gray: 0.3, alpha: 1))
+            let solidB = makeSolidImage(
+                width: sW, height: 100, color: CGColor(gray: 0.6, alpha: 1))
+            if let a = sparseFrame(card: 375, content: solidA, contentTop: 100),
+               let b = sparseFrame(card: 275, content: solidB, contentTop: 0) {
+                let down = VerticalStitcher(first: a)
+                let downResult = down.append(b)
+                check("stitch-sparse-solid-card-rejected", downResult == .rejected,
+                      "solid-panel repeated-card page got \(downResult) (a→b)")
+                let up = VerticalStitcher(first: b)
+                let upResult = up.append(a)
+                check("stitch-sparse-solid-card-reversed-rejected",
+                      upResult == .rejected,
+                      "solid-panel repeated-card page got \(upResult) (b→a)")
+            } else {
+                check("stitch-sparse-solid-card-frames", false)
+            }
+
+            // Fail-closed liveness decision (team-locked): from two frames an
+            // animated band is indistinguishable from genuinely different
+            // content next to a duplicated card, so a TRUE sparse overlap
+            // with an 80-row animated band REJECTS rather than risking
+            // silent row loss. (80 rows, not 60: anti-aliased block edges
+            // contribute a handful of extra matching votes, and 60 sat at a
+            // brittle 71% — the fixture must sit clearly below the 70%
+            // quorum.) A page with a large animation re-anchors with a
+            // visible marker instead.
+            func liveFrame(
+                anim: CGImage, extra: CGImage?, offset: Int
+            ) -> CGImage? {
+                // document: detail block at doc[475..600); animated band at
+                // doc[250..330) (inside the 400-row overlap of both shots);
+                // extra content at doc[600..700) (revealed by the scroll);
+                // white elsewhere. Frame shows doc[offset..offset+500).
+                let c = ctx(sW, sViewport)
+                c.setFillColor(CGColor(gray: 1, alpha: 1))
+                c.fill(CGRect(x: 0, y: 0, width: sW, height: sViewport))
+                func place(_ image: CGImage, docTop: Int) {
+                    let top = docTop - offset
+                    guard top + image.height > 0, top < sViewport else { return }
+                    c.draw(image, in: CGRect(
+                        x: 0, y: sViewport - top - image.height,
+                        width: sW, height: image.height))
+                }
+                place(cardSrc, docTop: 475)      // shared detail (125 rows)
+                place(anim, docTop: 250)         // animated band (80 rows)
+                if let extra { place(extra, docTop: 600) }
+                return c.makeImage()
+            }
+            let animFrame1 = makeStripePattern(width: sW, height: 80, seed: 0x0A11_0001)
+            let animFrame2 = makeStripePattern(width: sW, height: 80, seed: 0x0A11_0002)
+            let extraContent = makeStripePattern(width: sW, height: 100, seed: 0x0E17_0000)
+            if let a = liveFrame(anim: animFrame1, extra: nil, offset: 100),
+               let b = liveFrame(anim: animFrame2, extra: extraContent, offset: 200) {
+                let down = VerticalStitcher(first: a)
+                let downResult = down.append(b)
+                check("stitch-sparse-animated-band-rejected",
+                      downResult == .rejected,
+                      "sparse page with animated band got \(downResult) (down)")
+                let up = VerticalStitcher(first: b)
+                let upResult = up.append(a)
+                check("stitch-sparse-animated-band-reversed-rejected",
+                      upResult == .rejected,
+                      "sparse page with animated band got \(upResult) (up)")
+            } else {
+                check("stitch-sparse-animated-frames", false)
+            }
+
+            // The case that killed the escape hatch: an 80-row block of REAL
+            // differing content next to the repeated 125-row card satisfied
+            // "majority match + disagreement ≤ 20% of overlap" and was
+            // silently swallowed. Must reject in both directions.
+            let content80A = makeStripePattern(width: sW, height: 80, seed: 0x0C8A_0001)
+            let content80B = makeStripePattern(width: sW, height: 80, seed: 0x0C8B_0002)
+            if let a = sparseFrame(card: 375, content: content80A, contentTop: 120),
+               let b = sparseFrame(card: 275, content: content80B, contentTop: 20) {
+                let down = VerticalStitcher(first: a)
+                let downResult = down.append(b)
+                check("stitch-sparse-card-d80-rejected", downResult == .rejected,
+                      "80-row real-content page got \(downResult) (a→b)")
+                let up = VerticalStitcher(first: b)
+                let upResult = up.append(a)
+                check("stitch-sparse-card-d80-reversed-rejected",
+                      upResult == .rejected,
+                      "80-row real-content page got \(upResult) (b→a)")
+            } else {
+                check("stitch-sparse-card-d80-frames", false)
+            }
+        }
+
+        // 2b-alternating. A raster that is NOT one translation must reject ---------
+        // Even rows copied from offset k, odd rows from k+1: every single
+        // phase explains only half the rows, so no globally-consistent
+        // translation exists. Both directions must reject.
+        do {
+            let rows = 80
+            var baseBands = [Double](repeating: 0, count: rows * 4)
+            var seed: UInt64 = 0xA17E_44A7
+            for i in 0..<baseBands.count {
+                seed = seed &* 6364136223846793005 &+ 1442695040888963407
+                baseBands[i] = Double((seed >> 33) & 0xFF)
+            }
+            let k = 10
+            var mixedBands = [Double](repeating: 0, count: rows * 4)
+            for y in 0..<rows {
+                let source = min(rows - 1, y + k + (y % 2))
+                for band in 0..<4 {
+                    mixedBands[y * 4 + band] = baseBands[source * 4 + band]
+                }
+            }
+            let energy = [Double](repeating: 4.0, count: rows)
+            let baseSig = VerticalStitcher.RowSig(bands: baseBands, energy: energy)
+            let mixedSig = VerticalStitcher.RowSig(bands: mixedBands, energy: energy)
+            check("stitch-alternating-raster-rejected",
+                  !VerticalStitcher.wholeOverlapAgrees(
+                    base: baseSig, shifted: mixedSig, offset: Double(k) + 0.5,
+                    headerRows: 0, effectiveHeight: rows),
+                  "alternating floor/ceil raster passed (base→mixed)")
+            check("stitch-alternating-raster-reversed-rejected",
+                  !VerticalStitcher.wholeOverlapAgrees(
+                    base: mixedSig, shifted: baseSig, offset: Double(k) + 0.5,
+                    headerRows: 0, effectiveHeight: rows),
+                  "alternating floor/ceil raster passed (mixed→base)")
+        }
+
+        // 2b-anchor. Prepend anchor must not drift with the header estimate --------
+        // Two identical bands 30 rows apart fake a 20-row "header" on the first
+        // up pair; the next pair disproves it. Cutting the second prepend at
+        // the tightened header would drop and duplicate rows. The anchor is
+        // latched instead and the disproving frame is rejected fail-closed;
+        // everything accepted must still compose to the exact page raster.
+        do {
+            if let doc = withDuplicatedBlock(
+                makeStripePattern(width: 400, height: 2000, seed: 0x0A2C_4042),
+                from: 1010, to: 1040, rows: 20),
+               let f0 = doc.cropping(to: CGRect(x: 0, y: 1040, width: 400, height: 500)),
+               let f1 = doc.cropping(to: CGRect(x: 0, y: 1010, width: 400, height: 500)),
+               let f2 = doc.cropping(to: CGRect(x: 0, y: 980, width: 400, height: 500)) {
+                let s = VerticalStitcher(first: f0)
+                let r1 = s.append(f1)
+                let r2 = s.append(f2)
+                check("stitch-anchor-first-prepend", r1 == .prepended(rows: 30),
+                      "got \(r1), want prepended(30)")
+                check("stitch-anchor-disproven-rejected", r2 == .rejected,
+                      "header-estimate collapse got \(r2), want rejected")
+                let composed = s.compose()
+                check("stitch-anchor-height", composed?.height == 530,
+                      "got \(composed?.height ?? -1), want 530")
+                if let composed,
+                   let want = doc.cropping(to: CGRect(
+                    x: 0, y: 1010, width: 400, height: 530)) {
+                    check("stitch-anchor-content",
+                          imagesRoughlyEqual(want, composed),
+                          "anchored prepend composed wrong rows")
+                }
+            } else {
+                check("stitch-anchor-frames", false)
+            }
         }
 
         // 2c. Sticky footer inside the viewport ------------------------------------
@@ -143,7 +1422,7 @@ enum SelfTest {
             for (i, off) in offsets.enumerated() {
                 guard let frame = footerFrame(offset: off) else { appendsOK = false; break }
                 if let s = s3 {
-                    let rows = s.append(frame)
+                    let rows = s.append(frame).newRows
                     let want = off - offsets[i - 1]
                     if rows != want {
                         appendsOK = false
@@ -172,6 +1451,184 @@ enum SelfTest {
             } else {
                 check("stitch-footer-compose", false)
             }
+
+            // The short-overlap path must apply the same footer geometry as
+            // the primary matcher: recover the body, then attach the bar once.
+            let recoveryOffsets = [0, 350, 390]
+            var footerRecovery: VerticalStitcher?
+            var recoveryRows: [Int] = []
+            for off in recoveryOffsets {
+                guard let frame = footerFrame(offset: off) else { break }
+                if let footerRecovery {
+                    recoveryRows.append(footerRecovery.append(frame).newRows)
+                } else {
+                    footerRecovery = VerticalStitcher(first: frame)
+                }
+            }
+            check("stitch-footer-short-overlap-appends",
+                  recoveryRows == [350, 40],
+                  "appended \(recoveryRows), want [350, 40]")
+            if let recovered = footerRecovery?.compose() {
+                let totalBody = bodyH + recoveryOffsets.last!
+                let expected = ctx(fW, totalBody + fFooterH)
+                if let allBody = content.cropping(to: CGRect(
+                    x: 0, y: 0, width: fW, height: totalBody)) {
+                    expected.draw(footerBand, in: CGRect(
+                        x: 0, y: 0, width: fW, height: fFooterH))
+                    expected.draw(allBody, in: CGRect(
+                        x: 0, y: fFooterH, width: fW, height: totalBody))
+                }
+                let expectedImage = expected.makeImage()!
+                check("stitch-footer-short-overlap-height",
+                      recovered.height == totalBody + fFooterH,
+                      "got \(recovered.height), want \(totalBody + fFooterH)")
+                check("stitch-footer-short-overlap-content",
+                      imagesRoughlyEqual(expectedImage, recovered),
+                      "short-overlap footer was duplicated or misplaced")
+            } else {
+                check("stitch-footer-short-overlap-compose", false)
+            }
+        }
+
+        // 2c2. A low-detail fixed footer must beat a plausible no-footer match ----
+        // Solid chat/cookie bars carry little horizontal energy. The moving body
+        // can dominate the no-footer template enough to make both geometries
+        // look confident, so footer selection must compare their actual scores.
+        do {
+            let fW = 400, fViewport = 500, fFooterH = 60
+            let bodyH = fViewport - fFooterH
+            let content = makeNoiseImage(width: fW, height: 1800)
+            let footerBand = makeSolidImage(
+                width: fW, height: fFooterH,
+                color: CGColor(gray: 0.94, alpha: 1))
+
+            func lowDetailFooterFrame(offset: Int) -> CGImage? {
+                guard let body = content.cropping(to: CGRect(
+                    x: 0, y: offset, width: fW, height: bodyH))
+                else { return nil }
+                let c = ctx(fW, fViewport)
+                c.draw(footerBand, in: CGRect(
+                    x: 0, y: 0, width: fW, height: fFooterH))
+                c.draw(body, in: CGRect(
+                    x: 0, y: fFooterH, width: fW, height: bodyH))
+                return c.makeImage()
+            }
+
+            let positions = [0, 320, 640]
+            var lowDetail: VerticalStitcher?
+            var rows: [Int] = []
+            for position in positions {
+                guard let frame = lowDetailFooterFrame(offset: position) else { break }
+                if let lowDetail {
+                    rows.append(lowDetail.append(frame).newRows)
+                } else {
+                    lowDetail = VerticalStitcher(first: frame)
+                }
+            }
+            check("stitch-low-detail-footer-appends",
+                  rows == [320, 320], "appended \(rows)")
+            check("stitch-low-detail-footer-detected",
+                  lowDetail?.footerRows == fFooterH,
+                  "got footer \(lowDetail?.footerRows ?? -1)")
+            if let composed = lowDetail?.compose() {
+                let totalBody = bodyH + positions.last!
+                let expected = ctx(fW, totalBody + fFooterH)
+                if let body = content.cropping(to: CGRect(
+                    x: 0, y: 0, width: fW, height: totalBody)) {
+                    expected.draw(footerBand, in: CGRect(
+                        x: 0, y: 0, width: fW, height: fFooterH))
+                    expected.draw(body, in: CGRect(
+                        x: 0, y: fFooterH, width: fW, height: totalBody))
+                }
+                check("stitch-low-detail-footer-content",
+                      imagesRoughlyEqual(expected.makeImage()!, composed),
+                      "low-detail footer duplicated or body rows dropped")
+            } else {
+                check("stitch-low-detail-footer-compose", false)
+            }
+        }
+
+        // 2c3. A coincidentally static page tail is not a sticky footer ---------
+        // A long blank/repeated block can make both footer hypotheses score
+        // perfectly. Latching a footer on that tie would silently discard real
+        // page rows, so the complete-viewport interpretation must win.
+        do {
+            let height = 500, shift = 120, staticTail = 60
+            var seed: UInt64 = 0xF00D_CAFE
+            var document = [Double](repeating: 0, count: 620 * 4)
+            for index in document.indices {
+                seed = seed &* 6364136223846793005 &+ 1442695040888963407
+                document[index] = Double((seed >> 32) & 0xFF)
+            }
+            for row in 0..<staticTail {
+                for band in 0..<4 {
+                    document[(560 + row) * 4 + band]
+                        = document[(440 + row) * 4 + band]
+                }
+            }
+            func signature(start: Int) -> VerticalStitcher.RowSig {
+                let first = start * 4
+                let last = (start + height) * 4
+                return VerticalStitcher.RowSig(
+                    bands: Array(document[first..<last]),
+                    energy: [Double](repeating: 10, count: height))
+            }
+            let match = VerticalStitcher.findOverlap(
+                prev: signature(start: 0), next: signature(start: shift),
+                height: height, scale: 1)
+            check("stitch-static-page-tail-not-footer",
+                  match?.footerRows == 0,
+                  "got footer \(match?.footerRows ?? -1)")
+            check("stitch-static-page-tail-offset",
+                  abs((match?.preciseOffset ?? -1) - Double(shift)) < 0.001,
+                  "got offset \(match?.preciseOffset ?? -1)")
+        }
+
+        // 2c4. Conflicting footer hypotheses must fail closed ---------------------
+        // Two individually confident offsets describe mutually exclusive seams.
+        // Score tie-breaking is unsafe here regardless of which geometry wins.
+        do {
+            let height = 500, footerRows = 60
+            var seed: UInt64 = 0xF007_EA11
+            func randomBands() -> [Double] {
+                var values = [Double](repeating: 0, count: height * 4)
+                for index in values.indices {
+                    seed = seed &* 6364136223846793005
+                        &+ 1442695040888963407
+                    values[index] = Double((seed >> 32) & 0xFF)
+                }
+                return values
+            }
+            let previousBands = randomBands()
+            var nextBands = randomBands()
+            func copyRows(
+                previousStart: Int, nextStart: Int, count: Int
+            ) {
+                for row in 0..<count {
+                    for band in 0..<4 {
+                        nextBands[(nextStart + row) * 4 + band]
+                            = previousBands[(previousStart + row) * 4 + band]
+                    }
+                }
+            }
+            copyRows(previousStart: 375, nextStart: 255, count: 125)
+            copyRows(previousStart: 330, nextStart: 130, count: 110)
+            copyRows(
+                previousStart: height - footerRows,
+                nextStart: height - footerRows,
+                count: footerRows)
+            let previous = VerticalStitcher.RowSig(
+                bands: previousBands,
+                energy: [Double](repeating: 10, count: height))
+            let next = VerticalStitcher.RowSig(
+                bands: nextBands,
+                energy: [Double](repeating: 10, count: height))
+            let match = VerticalStitcher.findOverlap(
+                prev: previous, next: next, height: height, scale: 1)
+            check("stitch-conflicting-footer-hypotheses-rejected",
+                  match == nil,
+                  "accepted offset \(match?.preciseOffset ?? -1), "
+                    + "footer \(match?.footerRows ?? -1)")
         }
 
         // 2d. Sticky footer with a BLINKING cursor row ------------------------------
@@ -208,7 +1665,7 @@ enum SelfTest {
             for (i, off) in offsets.enumerated() {
                 guard let frame = blinkFrame(offset: off, phase: i) else { blinkOK = false; break }
                 if let s = s4 {
-                    let rows = s.append(frame)
+                    let rows = s.append(frame).newRows
                     let want = off - offsets[i - 1]
                     if rows != want {
                         blinkOK = false
@@ -223,6 +1680,20 @@ enum SelfTest {
                 let totalBody = bodyH + 880
                 check("stitch-footer-blink-height", composed4.height == totalBody + fFooterH,
                       "got \(composed4.height), want \(totalBody + fFooterH)")
+                check("stitch-footer-blink-detected",
+                      s4.footerRows == fFooterH,
+                      "got footer \(s4.footerRows), want \(fFooterH)")
+                let expected = ctx(fW, totalBody + fFooterH)
+                if let body = content.cropping(to: CGRect(
+                    x: 0, y: 0, width: fW, height: totalBody)) {
+                    expected.draw(barB, in: CGRect(
+                        x: 0, y: 0, width: fW, height: fFooterH))
+                    expected.draw(body, in: CGRect(
+                        x: 0, y: fFooterH, width: fW, height: totalBody))
+                }
+                check("stitch-footer-blink-content",
+                      imagesRoughlyEqual(expected.makeImage()!, composed4),
+                      "blinking footer duplicated or misplaced")
             } else {
                 check("stitch-footer-blink-compose", false)
             }
@@ -278,7 +1749,7 @@ enum SelfTest {
                 guard let frame = scrollerFrame(offset: off, thumbY: thumbPositions[i])
                 else { scrollerOK = false; break }
                 if let s = s5 {
-                    let rows = s.append(frame)
+                    let rows = s.append(frame).newRows
                     let want = off - offsets[i - 1]
                     if rows != want {
                         scrollerOK = false
@@ -325,7 +1796,7 @@ enum SelfTest {
                 var rows: [Int] = []
                 for position in positions.dropFirst() {
                     guard let next = frame(offset: position) else { break }
-                    rows.append(fractional.append(next))
+                    rows.append(fractional.append(next).newRows)
                 }
                 check("stitch-fractional-trackpad-sequence", rows == expectedRows,
                       "got \(rows), want \(expectedRows)")
@@ -339,7 +1810,1241 @@ enum SelfTest {
             }
         }
 
-        // 2g. capture backend fallback state ---------------------------------------
+        // 2g. Fine text while a macOS trackpad is between backing pixels ----------
+        // The coarse stripe fixture above stays easy after interpolation. Real
+        // glyph strokes are only a couple of pixels tall: WindowServer's
+        // subpixel re-rasterization changes their raw per-row signatures enough
+        // that the correct offset can lose the matcher's absolute-score gate.
+        do {
+            let fW = 1000, fViewport = 1200, documentHeight = 8000
+            let content: CGImage = {
+                let c = ctx(fW, documentHeight)
+                c.setFillColor(CGColor(gray: 1, alpha: 1))
+                c.fill(CGRect(x: 0, y: 0, width: fW, height: documentHeight))
+                var seed: UInt64 = 0xBEEF_F00D
+                func next() -> CGFloat {
+                    seed = seed &* 6364136223846793005 &+ 1442695040888963407
+                    return CGFloat((seed >> 33) & 0xFF) / 255
+                }
+                c.translateBy(x: 0, y: CGFloat(documentHeight))
+                c.scaleBy(x: 1, y: -1)
+                var y: CGFloat = 10
+                while y < CGFloat(documentHeight) {
+                    var x: CGFloat = 40 + next() * 60
+                    let lineEnd = 200 + next() * 700
+                    while x < lineEnd {
+                        c.setFillColor(CGColor(gray: 0.15 + next() * 0.25, alpha: 1))
+                        c.fill(CGRect(x: x, y: y, width: 4 + next() * 14, height: 2))
+                        x += 6 + next() * 12
+                    }
+                    y += 32
+                }
+                return c.makeImage()!
+            }()
+
+            func fineTextFrame(offset: Double) -> CGImage? {
+                let c = ctx(fW, fViewport)
+                c.interpolationQuality = .high
+                c.draw(content, in: CGRect(
+                    x: 0,
+                    y: CGFloat(fViewport - documentHeight) + CGFloat(offset),
+                    width: CGFloat(fW),
+                    height: CGFloat(documentHeight)))
+                return c.makeImage()
+            }
+
+            let positions = [0.0, 100.4, 220.7, 340.3, 500.6, 640.2]
+            if let first = fineTextFrame(offset: positions[0]) {
+                let fineText = VerticalStitcher(first: first, scale: 2)
+                var rows: [Int] = []
+                for position in positions.dropFirst() {
+                    guard let next = fineTextFrame(offset: position) else { break }
+                    rows.append(fineText.append(next).newRows)
+                }
+                check("stitch-fine-text-fractional-accepts-all",
+                      rows.count == positions.count - 1 && rows.allSatisfy { $0 > 0 },
+                      "appended \(rows)")
+                let expectedHeight = fViewport + Int(positions.last!.rounded())
+                check("stitch-fine-text-fractional-no-drift",
+                      abs(fineText.totalHeight - expectedHeight) <= 1,
+                      "got \(fineText.totalHeight), want \(expectedHeight)±1")
+
+                // Same fractional trackpad positions, scrolled bottom-to-top.
+                // The macOS failure mode (odd backing-pixel offsets from
+                // momentum scrolling) must not resurface in the up direction.
+                if let upFirst = fineTextFrame(offset: positions.last!) {
+                    let fineTextUp = VerticalStitcher(first: upFirst, scale: 2)
+                    var upRows: [Int] = []
+                    var upRejects = 0
+                    for position in positions.dropLast().reversed() {
+                        guard let next = fineTextFrame(offset: position) else { break }
+                        let result = fineTextUp.append(next)
+                        upRows.append(result.newRows)
+                        if !result.isAccepted { upRejects += 1 }
+                    }
+                    check("stitch-fine-text-fractional-upscroll-accepts-all",
+                          upRows.count == positions.count - 1 && upRejects == 0
+                            && upRows.allSatisfy { $0 > 0 },
+                          "prepended \(upRows), rejects \(upRejects)")
+                    check("stitch-fine-text-fractional-upscroll-no-drift",
+                          abs(fineTextUp.totalHeight - expectedHeight) <= 1,
+                          "got \(fineTextUp.totalHeight), want \(expectedHeight)±1")
+                }
+
+                // A real flick combines both failure modes: fractional
+                // re-rasterization and less overlap than the primary 25%
+                // template. Keep this distinct from the small-step case above
+                // and the integer stripe recovery below.
+                let recoveryViewport = 1000
+                func recoveryFrame(offset: Double) -> CGImage? {
+                    let c = ctx(fW, recoveryViewport)
+                    c.interpolationQuality = .high
+                    c.draw(content, in: CGRect(
+                        x: 0,
+                        y: CGFloat(recoveryViewport - documentHeight) + CGFloat(offset),
+                        width: CGFloat(fW),
+                        height: CGFloat(documentHeight)))
+                    return c.makeImage()
+                }
+                let recoveryPositions = [0.0, 800.4, 880.4]
+                if let recoveryFirst = recoveryFrame(offset: recoveryPositions[0]) {
+                    let fractionalRecovery = VerticalStitcher(
+                        first: recoveryFirst, scale: 2)
+                    var recoveryRows: [Int] = []
+                    for position in recoveryPositions.dropFirst() {
+                        guard let next = recoveryFrame(offset: position) else { break }
+                        recoveryRows.append(fractionalRecovery.append(next).newRows)
+                    }
+                    check("stitch-fine-text-fractional-short-overlap-recovers",
+                          recoveryRows.count == recoveryPositions.count - 1
+                            && recoveryRows.allSatisfy { $0 > 0 },
+                          "appended \(recoveryRows)")
+                    let expectedRecoveryHeight = recoveryViewport
+                        + Int(recoveryPositions.last!.rounded())
+                    check("stitch-fine-text-fractional-short-overlap-no-drift",
+                          abs(fractionalRecovery.totalHeight
+                              - expectedRecoveryHeight) <= 1,
+                          "got \(fractionalRecovery.totalHeight), "
+                            + "want \(expectedRecoveryHeight)±1")
+                    check("stitch-fine-text-fractional-short-overlap-no-footer",
+                          fractionalRecovery.footerRows == 0,
+                          "false footer \(fractionalRecovery.footerRows)")
+                    if let recoveredImage = fractionalRecovery.compose() {
+                        let expected = ctx(fW, expectedRecoveryHeight)
+                        expected.interpolationQuality = .high
+                        expected.draw(content, in: CGRect(
+                            x: 0,
+                            y: CGFloat(expectedRecoveryHeight - documentHeight),
+                            width: CGFloat(fW),
+                            height: CGFloat(documentHeight)))
+                        check("stitch-fine-text-fractional-short-overlap-content",
+                              imagesRoughlyEqual(
+                                expected.makeImage()!, recoveredImage),
+                              "fractional short-overlap content mismatch")
+                    } else {
+                        check("stitch-fine-text-fractional-short-overlap-compose",
+                              false)
+                    }
+
+                    let driftPositions = [
+                        0.0, 800.4, 1600.8, 2401.2, 3201.6, 4002.0
+                    ]
+                    if let driftFirst = recoveryFrame(offset: driftPositions[0]) {
+                        let driftRecovery = VerticalStitcher(
+                            first: driftFirst, scale: 2)
+                        var driftRows: [Int] = []
+                        for position in driftPositions.dropFirst() {
+                            guard let next = recoveryFrame(offset: position) else {
+                                break
+                            }
+                            driftRows.append(driftRecovery.append(next).newRows)
+                        }
+                        let expectedDriftHeight = recoveryViewport
+                            + Int(driftPositions.last!.rounded())
+                        check("stitch-fine-text-fractional-short-overlap-sequence",
+                              driftRows.count == driftPositions.count - 1
+                                && driftRows.allSatisfy { $0 > 0 },
+                              "appended \(driftRows)")
+                        check("stitch-fine-text-fractional-short-overlap-carries-phase",
+                              driftRecovery.totalHeight == expectedDriftHeight,
+                              "got \(driftRecovery.totalHeight), "
+                                + "want \(expectedDriftHeight)")
+                        check("stitch-fine-text-fractional-short-overlap-sequence-no-footer",
+                              driftRecovery.footerRows == 0,
+                              "false footer \(driftRecovery.footerRows)")
+                        if let driftImage = driftRecovery.compose() {
+                            let expected = ctx(fW, expectedDriftHeight)
+                            expected.interpolationQuality = .high
+                            expected.draw(content, in: CGRect(
+                                x: 0,
+                                y: CGFloat(expectedDriftHeight - documentHeight),
+                                width: CGFloat(fW),
+                                height: CGFloat(documentHeight)))
+                            check("stitch-fine-text-fractional-short-overlap-sequence-content",
+                                  imagesRoughlyEqual(
+                                    expected.makeImage()!, driftImage),
+                                  "fractional short-overlap sequence mismatch")
+                        } else {
+                            check("stitch-fine-text-fractional-short-overlap-sequence-compose",
+                                  false)
+                        }
+                    } else {
+                        check("stitch-fine-text-fractional-short-overlap-drift-frame",
+                              false)
+                    }
+                } else {
+                    check("stitch-fine-text-fractional-short-overlap-frame", false)
+                }
+            } else {
+                check("stitch-fine-text-fractional-frame", false)
+            }
+        }
+
+        // 2g2. Raw short-overlap must preserve fractional phase -------------------
+        // Not every fractional flick needs the blur fallback. On a smooth but
+        // unique signal the raw short matcher can score below 2.0 at the right
+        // integer row while the true displacement is still fractional. Returning
+        // the integer valley here loses that phase on every fast step.
+        do {
+            let height = 500
+            func signal(_ row: Double, band: Int) -> Double {
+                128 + 100 * sin(
+                    2 * Double.pi * row / 800
+                    + Double(band) * Double.pi / 2)
+            }
+            func signature(offset: Double) -> VerticalStitcher.RowSig {
+                var bands: [Double] = []
+                bands.reserveCapacity(height * 4)
+                for row in 0..<height {
+                    for band in 0..<4 {
+                        bands.append(signal(Double(row) + offset, band: band))
+                    }
+                }
+                return VerticalStitcher.RowSig(
+                    bands: bands,
+                    energy: [Double](repeating: 10, count: height))
+            }
+
+            let previous = signature(offset: 0)
+            let fractional = VerticalStitcher.findOverlap(
+                prev: previous, next: signature(offset: 400.4),
+                height: height, scale: 1, lockedFooter: 0)
+            check("stitch-raw-short-overlap-preserves-fractional-phase",
+                  abs((fractional?.preciseOffset ?? -1) - 400.4) < 0.15,
+                  "got \(fractional?.preciseOffset ?? -1), want 400.4±0.15")
+
+            let exact = VerticalStitcher.findOverlap(
+                prev: previous, next: signature(offset: 400),
+                height: height, scale: 1, lockedFooter: 0)
+            check("stitch-raw-short-overlap-keeps-exact-integer",
+                  abs((exact?.preciseOffset ?? -1) - 400) < 0.001,
+                  "got \(exact?.preciseOffset ?? -1), want 400")
+        }
+
+        // 2h. Short-overlap recovery after a fast trackpad step -------------------
+        // The primary matcher deliberately requires about 25% overlap. A fast
+        // but still recoverable step can leave 10–20%; without a conservative
+        // second pass, the reference frame never advances and all later slow
+        // frames are rejected too.
+        do {
+            let fW = 400, fViewport = 500
+            let content = makeStripePattern(width: fW, height: 1100, seed: 0x5A07_0A11)
+            let positions = [0, 400, 440]
+            var recovery: VerticalStitcher?
+            var rows: [Int] = []
+            for position in positions {
+                guard let frame = content.cropping(to: CGRect(
+                    x: 0, y: position, width: fW, height: fViewport))
+                else { break }
+                if let recovery {
+                    rows.append(recovery.append(frame).newRows)
+                } else {
+                    recovery = VerticalStitcher(first: frame)
+                }
+            }
+            check("stitch-short-overlap-recovers",
+                  rows == [400, 40], "appended \(rows), want [400, 40]")
+            check("stitch-short-overlap-height",
+                  recovery?.totalHeight == 940,
+                  "got \(recovery?.totalHeight ?? -1), want 940")
+            if let composed = recovery?.compose(),
+               let expected = content.cropping(to: CGRect(
+                   x: 0, y: 0, width: fW, height: 940)) {
+                check("stitch-short-overlap-content",
+                      imagesRoughlyEqual(expected, composed),
+                      "short-overlap stitch content mismatch")
+            } else {
+                check("stitch-short-overlap-compose", false)
+            }
+
+            let ambiguous = makePeriodicPattern(width: fW, height: 1000, period: 37)
+            if let a0 = ambiguous.cropping(to: CGRect(
+                   x: 0, y: 0, width: fW, height: fViewport)),
+               let a400 = ambiguous.cropping(to: CGRect(
+                   x: 0, y: 400, width: fW, height: fViewport)) {
+                let alias = VerticalStitcher(first: a0)
+                check("stitch-short-overlap-ambiguous-rejected",
+                      alias.append(a400).newRows == 0)
+            } else {
+                check("stitch-short-overlap-ambiguous-frame", false)
+            }
+
+            if let n0 = content.cropping(to: CGRect(
+                   x: 0, y: 0, width: fW, height: fViewport)),
+               let n500 = content.cropping(to: CGRect(
+                   x: 0, y: 500, width: fW, height: fViewport)) {
+                let noOverlap = VerticalStitcher(first: n0)
+                check("stitch-no-overlap-rejected", noOverlap.append(n500).newRows == 0)
+            } else {
+                check("stitch-no-overlap-frame", false)
+            }
+
+            func replacingRows(
+                in image: CGImage, destinationStart: Int,
+                from source: CGImage, sourceStart: Int, count: Int
+            ) -> CGImage? {
+                let rowBytes = fW * 4
+                let sourceBytes = rgbaBytes(source)
+                var destinationBytes = rgbaBytes(image)
+                for row in 0..<count {
+                    let sourceOffset = (sourceStart + row) * rowBytes
+                    let destinationOffset = (destinationStart + row) * rowBytes
+                    destinationBytes.replaceSubrange(
+                        destinationOffset..<(destinationOffset + rowBytes),
+                        with: sourceBytes[sourceOffset..<(sourceOffset + rowBytes)])
+                }
+                return destinationBytes.withUnsafeMutableBytes { bytes in
+                    guard let context = CGContext(
+                        data: bytes.baseAddress,
+                        width: fW, height: fViewport,
+                        bitsPerComponent: 8, bytesPerRow: rowBytes,
+                        space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+                    else { return nil }
+                    return context.makeImage()
+                }
+            }
+
+            // A copied strip shorter than the recovery evidence must not turn
+            // two adjacent, non-overlapping frames into a fabricated seam.
+            if let a = content.cropping(to: CGRect(
+                   x: 0, y: 0, width: fW, height: fViewport)),
+               let b = content.cropping(to: CGRect(
+                   x: 0, y: fViewport, width: fW, height: fViewport)),
+               let decoy = replacingRows(
+                   in: b, destinationStart: 0,
+                   from: a, sourceStart: fViewport - 64, count: 64) {
+                let decoyRecovery = VerticalStitcher(first: a)
+                check("stitch-short-overlap-64-row-decoy-rejected",
+                      decoyRecovery.append(decoy).newRows == 0)
+            } else {
+                check("stitch-short-overlap-64-row-decoy-frame", false)
+            }
+
+            // A long primary template can be an exact one-off duplicate while
+            // the true displacement lives just outside its search range. The
+            // shorter global probe must expose both basins and veto the alias.
+            if let a = content.cropping(to: CGRect(
+                   x: 0, y: 0, width: fW, height: fViewport)),
+               let b = content.cropping(to: CGRect(
+                   x: 0, y: 400, width: fW, height: fViewport)),
+               let decoy = replacingRows(
+                   in: b, destinationStart: 275,
+                   from: a, sourceStart: 375, count: 125) {
+                let primaryDecoy = VerticalStitcher(first: a)
+                check("stitch-primary-alias-with-short-overlap-rejected",
+                      primaryDecoy.append(decoy).newRows == 0,
+                      "ambiguous 100/400-row basins must not be guessed")
+            } else {
+                check("stitch-primary-alias-with-short-overlap-frame", false)
+            }
+
+            // A primary candidate that reaches into a fixed header is not a
+            // valid body overlap. A one-off copied block spanning that boundary
+            // must be rejected instead of silently dropping page content.
+            do {
+                let height = 500, headerRows = 60
+                var seed: UInt64 = 0xA11A_5EAD
+                func randomBands() -> [Double] {
+                    var values = [Double](repeating: 0, count: height * 4)
+                    for index in values.indices {
+                        seed = seed &* 6364136223846793005
+                            &+ 1442695040888963407
+                        values[index] = Double((seed >> 32) & 0xFF)
+                    }
+                    return values
+                }
+                var previousBands = randomBands()
+                var nextBands = randomBands()
+                for row in 0..<headerRows {
+                    for band in 0..<4 {
+                        nextBands[row * 4 + band]
+                            = previousBands[row * 4 + band]
+                    }
+                }
+                // next[5..<130] = previous[375..<500]. Preserve the already
+                // static header where those ranges intersect.
+                for row in 0..<55 {
+                    for band in 0..<4 {
+                        previousBands[(375 + row) * 4 + band]
+                            = previousBands[(5 + row) * 4 + band]
+                    }
+                }
+                for row in 0..<125 {
+                    for band in 0..<4 {
+                        nextBands[(5 + row) * 4 + band]
+                            = previousBands[(375 + row) * 4 + band]
+                    }
+                }
+                let previous = VerticalStitcher.RowSig(
+                    bands: previousBands,
+                    energy: [Double](repeating: 10, count: height))
+                let next = VerticalStitcher.RowSig(
+                    bands: nextBands,
+                    energy: [Double](repeating: 10, count: height))
+                let match = VerticalStitcher.findOverlap(
+                    prev: previous, next: next, height: height,
+                    scale: 1, lockedFooter: 0)
+                check("stitch-primary-alias-crossing-header-rejected",
+                      match == nil,
+                      "accepted offset \(match?.preciseOffset ?? -1) "
+                        + "from an ambiguous header/body frame")
+            }
+
+            let retinaContent = makeStripePattern(
+                width: fW, height: 2200, seed: 0x2A2A_8008)
+            if let r0 = retinaContent.cropping(to: CGRect(
+                   x: 0, y: 0, width: fW, height: 1000)),
+               let r800 = retinaContent.cropping(to: CGRect(
+                   x: 0, y: 800, width: fW, height: 1000)) {
+                let retina = VerticalStitcher(first: r0, scale: 2)
+                check("stitch-short-overlap-retina-recovers",
+                      retina.append(r800).newRows == 800)
+            } else {
+                check("stitch-short-overlap-retina-frame", false)
+            }
+
+            // A fixed top navigation bar is not part of the moving overlap.
+            // Recovery must validate only the body while keeping the header
+            // once at the top of the composed shot.
+            let headerH = 60
+            let headerBodyH = fViewport - headerH
+            let headerContent = makeStripePattern(
+                width: fW, height: 1200, seed: 0x1EA0_EA01)
+            let headerBand = makeStripePattern(
+                width: fW, height: headerH, seed: 0xAEAD_EA01)
+            func headerFrame(offset: Int) -> CGImage? {
+                guard let body = headerContent.cropping(to: CGRect(
+                    x: 0, y: offset, width: fW, height: headerBodyH))
+                else { return nil }
+                let c = ctx(fW, fViewport)
+                c.draw(body, in: CGRect(
+                    x: 0, y: 0, width: fW, height: headerBodyH))
+                c.draw(headerBand, in: CGRect(
+                    x: 0, y: headerBodyH, width: fW, height: headerH))
+                return c.makeImage()
+            }
+            let headerPositions = [0, 350, 390]
+            var headerRecovery: VerticalStitcher?
+            var headerRows: [Int] = []
+            for position in headerPositions {
+                guard let frame = headerFrame(offset: position) else { break }
+                if let headerRecovery {
+                    headerRows.append(headerRecovery.append(frame).newRows)
+                } else {
+                    headerRecovery = VerticalStitcher(first: frame)
+                }
+            }
+            check("stitch-short-overlap-sticky-header-appends",
+                  headerRows == [350, 40],
+                  "appended \(headerRows), want [350, 40]")
+            if let headerImage = headerRecovery?.compose() {
+                let totalBody = headerBodyH + headerPositions.last!
+                let expected = ctx(fW, headerH + totalBody)
+                if let body = headerContent.cropping(to: CGRect(
+                    x: 0, y: 0, width: fW, height: totalBody)) {
+                    expected.draw(body, in: CGRect(
+                        x: 0, y: 0, width: fW, height: totalBody))
+                    expected.draw(headerBand, in: CGRect(
+                        x: 0, y: totalBody, width: fW, height: headerH))
+                }
+                check("stitch-short-overlap-sticky-header-content",
+                      imagesRoughlyEqual(expected.makeImage()!, headerImage),
+                      "sticky header duplicated or body seam corrupted")
+            } else {
+                check("stitch-short-overlap-sticky-header-compose", false)
+            }
+        }
+
+        // 2h1b. Mid-session reversal must NOT split a segment ----------------------
+        // The field failure behind duplicated blocks: scroll down, scroll back
+        // up to re-read, continue down. Reversed frames used to reject until
+        // the session re-anchored a new segment from the higher viewport and
+        // re-captured everything below it. Now the reversal is a confirmed
+        // move: one segment, no separator, no duplicate rows.
+        do {
+            let doc = makeStripePattern(width: 400, height: 2200, seed: 0x5E63_4EAD)
+            let vp = 500
+            let path = [0, 300, 600, 900, 600, 300, 600, 900, 1200, 1500, 1700]
+            if let first = doc.cropping(to: CGRect(
+                x: 0, y: path[0], width: 400, height: vp)) {
+                let segmented = SegmentedVerticalStitcher(first: first)
+                var splits = 0
+                var rejects = 0
+                for off in path.dropFirst() {
+                    guard let frame = doc.cropping(to: CGRect(
+                        x: 0, y: off, width: 400, height: vp)) else {
+                        check("stitch-segment-reversal-crop", false); break
+                    }
+                    switch segmented.append(frame) {
+                    case .startedSegment: splits += 1
+                    case .rejected: rejects += 1
+                    default: break
+                    }
+                }
+                check("stitch-segment-reversal-single-segment",
+                      splits == 0 && rejects == 0 && segmented.segmentCount == 1,
+                      "splits \(splits), rejects \(rejects), segments \(segmented.segmentCount)")
+                let composed = segmented.compose()
+                check("stitch-segment-reversal-height", composed?.height == 2200,
+                      "got \(composed?.height ?? -1), want 2200")
+                if let composed {
+                    check("stitch-segment-reversal-content",
+                          imagesRoughlyEqual(doc, composed),
+                          "reversal duplicated or dropped rows")
+                }
+            } else {
+                check("stitch-segment-reversal-crop", false)
+            }
+        }
+
+        // 2h2. Complete overlap loss re-anchors only to a proven new segment -------
+        // A fast flick can move farther than the viewport. There is no honest
+        // seam to infer in that case, so the session waits until later frames
+        // prove a new contiguous strip, then inserts a visible boundary marker.
+        do {
+            func expectedSegmentedImage(
+                upper: CGImage, separator: CGImage, lower: CGImage
+            ) -> CGImage? {
+                guard upper.width == lower.width,
+                      upper.width == separator.width else { return nil }
+                let height = upper.height + separator.height + lower.height
+                let c = ctx(upper.width, height)
+                var y = height
+                for image in [upper, separator, lower] {
+                    y -= image.height
+                    c.draw(image, in: CGRect(
+                        x: 0, y: y, width: image.width, height: image.height))
+                }
+                return c.makeImage()
+            }
+
+            // S-C: one valid step, a huge flick, then several slow frames.
+            let width = 400, viewport = 600
+            let document = makeStripePattern(
+                width: width, height: 3600, seed: 0x5C00_0F11)
+            let positions = [0, 150, 2650, 2690, 2730, 2770, 2810]
+            if let first = document.cropping(to: CGRect(
+                x: 0, y: positions[0], width: width, height: viewport)) {
+                let segmented = SegmentedVerticalStitcher(first: first)
+                var promotedAt: Int?
+                var lastRows = 0
+                for position in positions.dropFirst() {
+                    guard let frame = document.cropping(to: CGRect(
+                        x: 0, y: position, width: width, height: viewport))
+                    else { break }
+                    switch segmented.append(frame) {
+                    case let .appended(rows):
+                        lastRows = rows
+                    case .prepended, .moved, .rejected:
+                        break
+                    case .startedSegment:
+                        promotedAt = position
+                    }
+                }
+                check("stitch-segment-reanchor-after-flick",
+                      promotedAt == 2770 && segmented.segmentCount == 2,
+                      "promotedAt \(promotedAt ?? -1), segments "
+                        + "\(segmented.segmentCount)")
+                check("stitch-segment-reanchor-continues",
+                      lastRows == 40 && segmented.totalHeight
+                        == 750 + segmented.separatorRows + 760,
+                      "lastRows \(lastRows), height \(segmented.totalHeight)")
+                if let upper = document.cropping(to: CGRect(
+                       x: 0, y: 0, width: width, height: 750)),
+                   let lower = document.cropping(to: CGRect(
+                       x: 0, y: 2650, width: width, height: 760)),
+                   let separator = segmented.segmentSeparator(),
+                   let expected = expectedSegmentedImage(
+                       upper: upper, separator: separator, lower: lower),
+                   let actual = segmented.compose() {
+                    check("stitch-segment-reanchor-marked-content",
+                          imagesRoughlyEqual(expected, actual),
+                          "segment boundary/content mismatch")
+                } else {
+                    check("stitch-segment-reanchor-compose", false)
+                }
+            } else {
+                check("stitch-segment-reanchor-frame", false)
+            }
+
+            // S-F: 200 pt selection at 2x, 170 pt steps. The first three
+            // candidates cannot prove the minimum 64 pt overlap; 1020→1060 can,
+            // so reject #4 promotes that pending strip and 1100 continues it.
+            let retinaViewport = 400
+            let fineDocument: CGImage = {
+                let c = ctx(width, 1800)
+                c.setFillColor(CGColor(gray: 1, alpha: 1))
+                c.fill(CGRect(x: 0, y: 0, width: width, height: 1800))
+                var seed: UInt64 = 0x5F00_2A2A
+                for y in stride(from: 8, to: 1790, by: 24) {
+                    seed = seed &* 6364136223846793005
+                        &+ 1442695040888963407
+                    let inset = Int((seed >> 32) % 90)
+                    c.setFillColor(CGColor(gray: 0.18, alpha: 1))
+                    c.fill(CGRect(
+                        x: 24 + inset, y: y,
+                        width: 180 + Int((seed >> 40) % 150), height: 2))
+                }
+                return c.makeImage()!
+            }()
+            let retinaPositions = [0, 340, 680, 1020, 1060, 1100]
+            if let first = fineDocument.cropping(to: CGRect(
+                x: 0, y: 0, width: width, height: retinaViewport)) {
+                let segmented = SegmentedVerticalStitcher(first: first, scale: 2)
+                var promotedAt: Int?
+                var successfulFrames = 0
+                for position in retinaPositions.dropFirst() {
+                    guard let frame = fineDocument.cropping(to: CGRect(
+                        x: 0, y: position,
+                        width: width, height: retinaViewport)) else { break }
+                    switch segmented.append(frame) {
+                    case .appended:
+                        successfulFrames += 1
+                    case .startedSegment:
+                        successfulFrames += 1
+                        promotedAt = position
+                    case .prepended, .moved, .rejected:
+                        break
+                    }
+                }
+                check("stitch-small-retina-reanchor",
+                      promotedAt == 1060 && successfulFrames >= 2
+                        && segmented.segmentCount == 2,
+                      "promotedAt \(promotedAt ?? -1), successes "
+                        + "\(successfulFrames), segments \(segmented.segmentCount)")
+                let expectedHeight = 400 + segmented.separatorRows + 480
+                check("stitch-small-retina-reanchor-height",
+                      segmented.totalHeight == expectedHeight
+                        && segmented.compose()?.height == expectedHeight,
+                      "got \(segmented.totalHeight), want \(expectedHeight)")
+                if let upper = fineDocument.cropping(to: CGRect(
+                       x: 0, y: 0, width: width, height: 400)),
+                   let lower = fineDocument.cropping(to: CGRect(
+                       x: 0, y: 1020, width: width, height: 480)),
+                   let separator = segmented.segmentSeparator(),
+                   let expected = expectedSegmentedImage(
+                       upper: upper, separator: separator, lower: lower),
+                   let actual = segmented.compose() {
+                    check("stitch-small-retina-reanchor-marked-content",
+                          imagesRoughlyEqual(expected, actual))
+                } else {
+                    check("stitch-small-retina-reanchor-compose", false)
+                }
+            } else {
+                check("stitch-small-retina-reanchor-frame", false)
+            }
+
+            // Each re-anchored strip starts from a full viewport, so a fixed
+            // navigation bar would otherwise be repeated after every visible
+            // gap marker. Keep it on the first segment only; later segments
+            // may trim it only after their own first transition proves it is
+            // fixed chrome.
+            let segmentedHeaderHeight = 60
+            let segmentedHeaderBodyHeight = viewport - segmentedHeaderHeight
+            let segmentedHeaderContent = makeStripePattern(
+                width: width, height: 3000, seed: 0x5E67_AEAD)
+            let segmentedHeaderBand = makeStripePattern(
+                width: width, height: segmentedHeaderHeight,
+                seed: 0xBAA0_AEAD)
+            func segmentedHeaderFrame(
+                offset: Int, band: CGImage
+            ) -> CGImage? {
+                guard let body = segmentedHeaderContent.cropping(to: CGRect(
+                    x: 0, y: offset,
+                    width: width, height: segmentedHeaderBodyHeight
+                )) else { return nil }
+                let c = ctx(width, viewport)
+                c.draw(body, in: CGRect(
+                    x: 0, y: 0,
+                    width: width, height: segmentedHeaderBodyHeight))
+                c.draw(band, in: CGRect(
+                    x: 0, y: segmentedHeaderBodyHeight,
+                    width: width, height: segmentedHeaderHeight))
+                return c.makeImage()
+            }
+            let segmentedHeaderPositions = [
+                0, 200, 2000, 2041, 2083, 2126, 2170,
+            ]
+            if let first = segmentedHeaderFrame(
+                offset: segmentedHeaderPositions[0],
+                band: segmentedHeaderBand) {
+                let segmented = SegmentedVerticalStitcher(first: first)
+                for position in segmentedHeaderPositions.dropFirst() {
+                    if let frame = segmentedHeaderFrame(
+                        offset: position, band: segmentedHeaderBand) {
+                        _ = segmented.append(frame)
+                    }
+                }
+                let upperBodyHeight = segmentedHeaderBodyHeight + 200
+                let lowerBodyHeight = segmentedHeaderBodyHeight + 170
+                let upper = ctx(
+                    width, upperBodyHeight + segmentedHeaderHeight)
+                if let upperBody = segmentedHeaderContent.cropping(to: CGRect(
+                       x: 0, y: 0,
+                       width: width, height: upperBodyHeight)),
+                   let lower = segmentedHeaderContent.cropping(to: CGRect(
+                       x: 0, y: 2000,
+                       width: width, height: lowerBodyHeight)),
+                   let separator = segmented.segmentSeparator() {
+                    upper.draw(upperBody, in: CGRect(
+                        x: 0, y: 0,
+                        width: width, height: upperBodyHeight))
+                    upper.draw(segmentedHeaderBand, in: CGRect(
+                        x: 0, y: upperBodyHeight,
+                        width: width, height: segmentedHeaderHeight))
+                    if let upperImage = upper.makeImage(),
+                       let expected = expectedSegmentedImage(
+                           upper: upperImage,
+                           separator: separator,
+                           lower: lower),
+                       let actual = segmented.compose() {
+                        let expectedHeight = upperBodyHeight
+                            + segmentedHeaderHeight
+                            + segmented.separatorRows + lowerBodyHeight
+                        check("stitch-segment-header-only-on-first-segment",
+                              segmented.segmentCount == 2
+                                && segmented.currentSegment.headerRows
+                                    == segmentedHeaderHeight
+                                && imagesRoughlyEqual(expected, actual),
+                              "segments \(segmented.segmentCount), header "
+                                + "\(segmented.currentSegment.headerRows)")
+                        check("stitch-segment-header-height",
+                              segmented.totalHeight == expectedHeight
+                                && actual.height == expectedHeight,
+                              "total \(segmented.totalHeight), image \(actual.height), "
+                                + "want \(expectedHeight)")
+                    } else {
+                        check("stitch-segment-header-compose", false)
+                    }
+                } else {
+                    check("stitch-segment-header-crops", false)
+                }
+            } else {
+                check("stitch-segment-header-frame", false)
+            }
+
+            // Local stability does not mean duplicate chrome. If the first
+            // segment had no header, a stable header introduced later is page
+            // content and must be retained in full.
+            if let first = segmentedHeaderContent.cropping(to: CGRect(
+                   x: 0, y: 0, width: width, height: viewport)),
+               let second = segmentedHeaderContent.cropping(to: CGRect(
+                   x: 0, y: 200, width: width, height: viewport)) {
+                let segmented = SegmentedVerticalStitcher(first: first)
+                _ = segmented.append(second)
+                for position in segmentedHeaderPositions.dropFirst(2) {
+                    if let frame = segmentedHeaderFrame(
+                        offset: position, band: segmentedHeaderBand) {
+                        _ = segmented.append(frame)
+                    }
+                }
+                let upperHeight = viewport + 200
+                let lowerBodyHeight = segmentedHeaderBodyHeight + 170
+                let lower = ctx(
+                    width, lowerBodyHeight + segmentedHeaderHeight)
+                if let upper = segmentedHeaderContent.cropping(to: CGRect(
+                       x: 0, y: 0, width: width, height: upperHeight)),
+                   let body = segmentedHeaderContent.cropping(to: CGRect(
+                       x: 0, y: 2000,
+                       width: width, height: lowerBodyHeight)),
+                   let separator = segmented.segmentSeparator() {
+                    lower.draw(body, in: CGRect(
+                        x: 0, y: 0,
+                        width: width, height: lowerBodyHeight))
+                    lower.draw(segmentedHeaderBand, in: CGRect(
+                        x: 0, y: lowerBodyHeight,
+                        width: width, height: segmentedHeaderHeight))
+                    if let lowerImage = lower.makeImage(),
+                       let expected = expectedSegmentedImage(
+                           upper: upper,
+                           separator: separator,
+                           lower: lowerImage),
+                       let actual = segmented.compose() {
+                        check("stitch-segment-later-new-header-retained",
+                              segmented.segmentCount == 2
+                                && imagesRoughlyEqual(expected, actual),
+                              "later header was removed")
+                    } else {
+                        check("stitch-segment-later-new-header-compose", false)
+                    }
+                } else {
+                    check("stitch-segment-later-new-header-crops", false)
+                }
+            } else {
+                check("stitch-segment-later-new-header-frames", false)
+            }
+
+            // Two locally fixed headers can name different sections. Keep the
+            // later one unless its raw raster and height match the canonical
+            // header retained from segment one.
+            let differentHeaderBand = makeStripePattern(
+                width: width, height: segmentedHeaderHeight,
+                seed: 0xD1FF_AEAD)
+            if let first = segmentedHeaderFrame(
+                   offset: 0, band: segmentedHeaderBand),
+               let second = segmentedHeaderFrame(
+                   offset: 200, band: segmentedHeaderBand) {
+                let segmented = SegmentedVerticalStitcher(first: first)
+                _ = segmented.append(second)
+                for position in segmentedHeaderPositions.dropFirst(2) {
+                    if let frame = segmentedHeaderFrame(
+                        offset: position, band: differentHeaderBand) {
+                        _ = segmented.append(frame)
+                    }
+                }
+                let upperBodyHeight = segmentedHeaderBodyHeight + 200
+                let lowerBodyHeight = segmentedHeaderBodyHeight + 170
+                let upper = ctx(
+                    width, upperBodyHeight + segmentedHeaderHeight)
+                let lower = ctx(
+                    width, lowerBodyHeight + segmentedHeaderHeight)
+                if let upperBody = segmentedHeaderContent.cropping(to: CGRect(
+                       x: 0, y: 0,
+                       width: width, height: upperBodyHeight)),
+                   let lowerBody = segmentedHeaderContent.cropping(to: CGRect(
+                       x: 0, y: 2000,
+                       width: width, height: lowerBodyHeight)),
+                   let separator = segmented.segmentSeparator() {
+                    upper.draw(upperBody, in: CGRect(
+                        x: 0, y: 0,
+                        width: width, height: upperBodyHeight))
+                    upper.draw(segmentedHeaderBand, in: CGRect(
+                        x: 0, y: upperBodyHeight,
+                        width: width, height: segmentedHeaderHeight))
+                    lower.draw(lowerBody, in: CGRect(
+                        x: 0, y: 0,
+                        width: width, height: lowerBodyHeight))
+                    lower.draw(differentHeaderBand, in: CGRect(
+                        x: 0, y: lowerBodyHeight,
+                        width: width, height: segmentedHeaderHeight))
+                    if let upperImage = upper.makeImage(),
+                       let lowerImage = lower.makeImage(),
+                       let expected = expectedSegmentedImage(
+                           upper: upperImage,
+                           separator: separator,
+                           lower: lowerImage),
+                       let actual = segmented.compose() {
+                        check("stitch-segment-different-header-retained",
+                              segmented.segmentCount == 2
+                                && imagesRoughlyEqual(expected, actual),
+                              "different later header was removed")
+                    } else {
+                        check("stitch-segment-different-header-compose", false)
+                    }
+                } else {
+                    check("stitch-segment-different-header-crops", false)
+                }
+            } else {
+                check("stitch-segment-different-header-frames", false)
+            }
+
+            // De-duplication is optional, so its identity proof is byte-exact
+            // over the full width. A tiny meaningful glyph/badge change in the
+            // middle or at the edge must fail closed and retain the new header.
+            let tinyCenterContext = ctx(width, segmentedHeaderHeight)
+            tinyCenterContext.draw(segmentedHeaderBand, in: CGRect(
+                x: 0, y: 0,
+                width: width, height: segmentedHeaderHeight))
+            tinyCenterContext.setFillColor(CGColor(
+                srgbRed: 1, green: 0, blue: 1, alpha: 1))
+            tinyCenterContext.fill(CGRect(
+                x: width / 2, y: segmentedHeaderHeight / 2,
+                width: 2, height: 2))
+            let tinyEdgeContext = ctx(width, segmentedHeaderHeight)
+            tinyEdgeContext.draw(segmentedHeaderBand, in: CGRect(
+                x: 0, y: 0,
+                width: width, height: segmentedHeaderHeight))
+            tinyEdgeContext.setFillColor(CGColor(
+                srgbRed: 1, green: 0, blue: 1, alpha: 1))
+            tinyEdgeContext.fill(CGRect(
+                x: 1, y: segmentedHeaderHeight / 2,
+                width: 2, height: 2))
+            if let tinyCenterBand = tinyCenterContext.makeImage(),
+               let tinyEdgeBand = tinyEdgeContext.makeImage(),
+               let canonicalFirst = segmentedHeaderFrame(
+                   offset: 0, band: segmentedHeaderBand),
+               let canonicalNext = segmentedHeaderFrame(
+                   offset: 41, band: segmentedHeaderBand),
+               let centerFirst = segmentedHeaderFrame(
+                   offset: 2000, band: tinyCenterBand),
+               let centerNext = segmentedHeaderFrame(
+                   offset: 2041, band: tinyCenterBand),
+               let edgeFirst = segmentedHeaderFrame(
+                   offset: 2000, band: tinyEdgeBand),
+               let edgeNext = segmentedHeaderFrame(
+                   offset: 2041, band: tinyEdgeBand) {
+                let canonical = VerticalStitcher(first: canonicalFirst)
+                let center = VerticalStitcher(first: centerFirst)
+                let edge = VerticalStitcher(first: edgeFirst)
+                _ = canonical.append(canonicalNext)
+                _ = center.append(centerNext)
+                _ = edge.append(edgeNext)
+                if let reference = canonical.topRowsImage(
+                    rows: canonical.headerRows) {
+                    check("stitch-segment-tiny-center-header-change-retained",
+                          canonical.headerRows == segmentedHeaderHeight
+                            && center.headerRows == segmentedHeaderHeight
+                            && !center.topRowsMatch(
+                                reference, rows: center.headerRows))
+                    check("stitch-segment-tiny-edge-header-change-retained",
+                          edge.headerRows == segmentedHeaderHeight
+                            && !edge.topRowsMatch(
+                                reference, rows: edge.headerRows))
+                } else {
+                    check("stitch-segment-tiny-header-reference", false)
+                }
+            } else {
+                check("stitch-segment-tiny-header-frames", false)
+            }
+
+            // A sticky composer belongs only at the bottom of the final page,
+            // not before every marked segment boundary.
+            let footerViewport = 500, footerHeight = 60
+            let footerBodyHeight = footerViewport - footerHeight
+            let footerContent = makeStripePattern(
+                width: width, height: 3000, seed: 0x5E67_F007)
+            let footerBand = makeStripePattern(
+                width: width, height: footerHeight, seed: 0xBAA0_F007)
+            func segmentedFooterFrame(offset: Int) -> CGImage? {
+                guard let body = footerContent.cropping(to: CGRect(
+                    x: 0, y: offset,
+                    width: width, height: footerBodyHeight)) else { return nil }
+                let c = ctx(width, footerViewport)
+                c.draw(footerBand, in: CGRect(
+                    x: 0, y: 0, width: width, height: footerHeight))
+                c.draw(body, in: CGRect(
+                    x: 0, y: footerHeight,
+                    width: width, height: footerBodyHeight))
+                return c.makeImage()
+            }
+            let footerPositions = [0, 200, 2000, 2040, 2080, 2120, 2160]
+            if let first = segmentedFooterFrame(offset: footerPositions[0]) {
+                let segmented = SegmentedVerticalStitcher(first: first)
+                for position in footerPositions.dropFirst() {
+                    if let frame = segmentedFooterFrame(offset: position) {
+                        _ = segmented.append(frame)
+                    }
+                }
+                let upperBodyHeight = footerBodyHeight + 200
+                let lowerBodyHeight = footerBodyHeight + 160
+                let lower = ctx(width, lowerBodyHeight + footerHeight)
+                if let body = footerContent.cropping(to: CGRect(
+                    x: 0, y: 2000,
+                    width: width, height: lowerBodyHeight)) {
+                    lower.draw(footerBand, in: CGRect(
+                        x: 0, y: 0, width: width, height: footerHeight))
+                    lower.draw(body, in: CGRect(
+                        x: 0, y: footerHeight,
+                        width: width, height: lowerBodyHeight))
+                }
+                if let upper = footerContent.cropping(to: CGRect(
+                       x: 0, y: 0,
+                       width: width, height: upperBodyHeight)),
+                   let separator = segmented.segmentSeparator(),
+                   let lowerImage = lower.makeImage(),
+                   let expected = expectedSegmentedImage(
+                       upper: upper, separator: separator, lower: lowerImage),
+                   let actual = segmented.compose() {
+                    check("stitch-segment-footer-only-on-final-segment",
+                          segmented.segmentCount == 2
+                            && imagesRoughlyEqual(expected, actual),
+                          "segments \(segmented.segmentCount), footer duplicated")
+                    check("stitch-segment-footer-height",
+                          actual.height == upperBodyHeight
+                            + segmented.separatorRows
+                            + lowerBodyHeight + footerHeight,
+                          "got \(actual.height)")
+                } else {
+                    check("stitch-segment-footer-compose", false)
+                }
+            } else {
+                check("stitch-segment-footer-frame", false)
+            }
+
+            // The gap can happen immediately after the first frame, before
+            // the old segment has an accepted transition from which to latch
+            // its footer. The proven footer on the new segment may infer and
+            // trim the matching bottom band from that one-frame segment, but
+            // it must still appear exactly once at the final page bottom.
+            let immediateFooterPositions = [0, 2000, 2040, 2080, 2120, 2160]
+            if let first = segmentedFooterFrame(
+                offset: immediateFooterPositions[0]) {
+                let segmented = SegmentedVerticalStitcher(first: first)
+                for position in immediateFooterPositions.dropFirst() {
+                    if let frame = segmentedFooterFrame(offset: position) {
+                        _ = segmented.append(frame)
+                    }
+                }
+                let lowerBodyHeight = footerBodyHeight + 160
+                let lower = ctx(width, lowerBodyHeight + footerHeight)
+                if let upper = footerContent.cropping(to: CGRect(
+                       x: 0, y: 0,
+                       width: width, height: footerBodyHeight)),
+                   let body = footerContent.cropping(to: CGRect(
+                       x: 0, y: 2000,
+                       width: width, height: lowerBodyHeight)),
+                   let separator = segmented.segmentSeparator() {
+                    lower.draw(footerBand, in: CGRect(
+                        x: 0, y: 0, width: width, height: footerHeight))
+                    lower.draw(body, in: CGRect(
+                        x: 0, y: footerHeight,
+                        width: width, height: lowerBodyHeight))
+                    if let lowerImage = lower.makeImage(),
+                       let expected = expectedSegmentedImage(
+                           upper: upper,
+                           separator: separator,
+                           lower: lowerImage),
+                       let actual = segmented.compose() {
+                        check("stitch-segment-first-frame-footer-only-final",
+                              segmented.segmentCount == 2
+                                && imagesRoughlyEqual(expected, actual),
+                              "segments \(segmented.segmentCount), footer duplicated")
+                        check("stitch-segment-first-frame-footer-height",
+                              actual.height == footerBodyHeight
+                                + segmented.separatorRows
+                                + lowerBodyHeight + footerHeight,
+                              "got \(actual.height)")
+                    } else {
+                        check("stitch-segment-first-frame-footer-compose", false)
+                    }
+                } else {
+                    check("stitch-segment-first-frame-footer-crops", false)
+                }
+            } else {
+                check("stitch-segment-first-frame-footer-frame", false)
+            }
+
+            // Inference may delete rows, so local footer similarity is not
+            // enough. A tiny edge badge/change in a footer-like one-frame page
+            // tail must make the cross-segment proof fail closed and preserve
+            // that entire first viewport.
+            let changedFooterContext = ctx(width, footerHeight)
+            changedFooterContext.draw(footerBand, in: CGRect(
+                x: 0, y: 0, width: width, height: footerHeight))
+            changedFooterContext.setFillColor(CGColor(
+                srgbRed: 1, green: 0, blue: 1, alpha: 1))
+            changedFooterContext.fill(CGRect(
+                x: 1, y: footerHeight / 2, width: 2, height: 2))
+            if let changedFooterBand = changedFooterContext.makeImage(),
+               let firstBody = footerContent.cropping(to: CGRect(
+                   x: 0, y: 0,
+                   width: width, height: footerBodyHeight)) {
+                let firstContext = ctx(width, footerViewport)
+                firstContext.draw(changedFooterBand, in: CGRect(
+                    x: 0, y: 0, width: width, height: footerHeight))
+                firstContext.draw(firstBody, in: CGRect(
+                    x: 0, y: footerHeight,
+                    width: width, height: footerBodyHeight))
+                if let first = firstContext.makeImage() {
+                    let segmented = SegmentedVerticalStitcher(first: first)
+                    for position in immediateFooterPositions.dropFirst() {
+                        if let frame = segmentedFooterFrame(offset: position) {
+                            _ = segmented.append(frame)
+                        }
+                    }
+                    let lowerBodyHeight = footerBodyHeight + 160
+                    let lower = ctx(width, lowerBodyHeight + footerHeight)
+                    if let body = footerContent.cropping(to: CGRect(
+                           x: 0, y: 2000,
+                           width: width, height: lowerBodyHeight)),
+                       let separator = segmented.segmentSeparator() {
+                        lower.draw(footerBand, in: CGRect(
+                            x: 0, y: 0,
+                            width: width, height: footerHeight))
+                        lower.draw(body, in: CGRect(
+                            x: 0, y: footerHeight,
+                            width: width, height: lowerBodyHeight))
+                        if let lowerImage = lower.makeImage(),
+                           let expected = expectedSegmentedImage(
+                               upper: first,
+                               separator: separator,
+                               lower: lowerImage),
+                           let actual = segmented.compose() {
+                            check("stitch-segment-tiny-footer-change-retained",
+                                  segmented.segmentCount == 2
+                                    && imagesRoughlyEqual(expected, actual),
+                                  "footer-like first-frame tail was removed")
+                            check("stitch-segment-tiny-footer-change-height",
+                                  actual.height == footerViewport
+                                    + segmented.separatorRows
+                                    + lowerBodyHeight + footerHeight,
+                                  "got \(actual.height)")
+                        } else {
+                            check("stitch-segment-tiny-footer-change-compose", false)
+                        }
+                    } else {
+                        check("stitch-segment-tiny-footer-change-crops", false)
+                    }
+                } else {
+                    check("stitch-segment-tiny-footer-change-first", false)
+                }
+            } else {
+                check("stitch-segment-tiny-footer-change-band", false)
+            }
+
+            // Footer inference is safe only for a segment that never accepted
+            // an append. Here the old multi-frame segment has no footer, but
+            // its LAST viewport happens to end in the exact band later used as
+            // a sticky footer. Trimming that band from its FIRST viewport would
+            // delete unrelated page rows, so the entire old segment must stay.
+            if let lateFooterBand = footerContent.cropping(to: CGRect(
+                x: 0, y: 640, width: width, height: footerHeight
+            )) {
+                func lateFooterFrame(offset: Int) -> CGImage? {
+                    guard let body = footerContent.cropping(to: CGRect(
+                        x: 0, y: offset,
+                        width: width, height: footerBodyHeight)) else {
+                        return nil
+                    }
+                    let c = ctx(width, footerViewport)
+                    c.draw(lateFooterBand, in: CGRect(
+                        x: 0, y: 0,
+                        width: width, height: footerHeight))
+                    c.draw(body, in: CGRect(
+                        x: 0, y: footerHeight,
+                        width: width, height: footerBodyHeight))
+                    return c.makeImage()
+                }
+                if let first = footerContent.cropping(to: CGRect(
+                       x: 0, y: 0, width: width, height: footerViewport)),
+                   let second = footerContent.cropping(to: CGRect(
+                       x: 0, y: 200, width: width, height: footerViewport)) {
+                    let segmented = SegmentedVerticalStitcher(first: first)
+                    _ = segmented.append(second)
+                    for position in [2000, 2040, 2080, 2120, 2160] {
+                        if let frame = lateFooterFrame(offset: position) {
+                            _ = segmented.append(frame)
+                        }
+                    }
+                    let upperHeight = footerViewport + 200
+                    let lowerBodyHeight = footerBodyHeight + 160
+                    let lower = ctx(width, lowerBodyHeight + footerHeight)
+                    if let upper = footerContent.cropping(to: CGRect(
+                           x: 0, y: 0,
+                           width: width, height: upperHeight)),
+                       let body = footerContent.cropping(to: CGRect(
+                           x: 0, y: 2000,
+                           width: width, height: lowerBodyHeight)),
+                       let separator = segmented.segmentSeparator() {
+                        lower.draw(lateFooterBand, in: CGRect(
+                            x: 0, y: 0,
+                            width: width, height: footerHeight))
+                        lower.draw(body, in: CGRect(
+                            x: 0, y: footerHeight,
+                            width: width, height: lowerBodyHeight))
+                        if let lowerImage = lower.makeImage(),
+                           let expected = expectedSegmentedImage(
+                               upper: upper,
+                               separator: separator,
+                               lower: lowerImage),
+                           let actual = segmented.compose() {
+                            check("stitch-segment-no-false-footer-inference",
+                                  segmented.segmentCount == 2
+                                    && imagesRoughlyEqual(expected, actual),
+                                  "segments \(segmented.segmentCount), old rows trimmed")
+                            check("stitch-segment-no-false-footer-height",
+                                  actual.height == upperHeight
+                                    + segmented.separatorRows
+                                    + lowerBodyHeight + footerHeight,
+                                  "got \(actual.height)")
+                        } else {
+                            check("stitch-segment-no-false-footer-compose", false)
+                        }
+                    } else {
+                        check("stitch-segment-no-false-footer-crops", false)
+                    }
+                } else {
+                    check("stitch-segment-no-false-footer-active-frames", false)
+                }
+            } else {
+                check("stitch-segment-no-false-footer-band", false)
+            }
+
+            // Unrelated/ambiguous frames must never turn into a segment merely
+            // because four rejects elapsed.
+            let unrelatedFirst = makeSolidImage(
+                width: width, height: viewport, color: NSColor.red.cgColor)
+            let unrelated = SegmentedVerticalStitcher(first: unrelatedFirst)
+            let colors: [NSColor] = [
+                .blue, .green, .yellow, .purple, .orange, .brown,
+            ]
+            for color in colors {
+                _ = unrelated.append(makeSolidImage(
+                    width: width, height: viewport, color: color.cgColor))
+            }
+            check("stitch-unproven-segment-not-promoted",
+                  unrelated.segmentCount == 1
+                    && unrelated.compose()?.height == viewport,
+                  "segments \(unrelated.segmentCount)")
+
+            let periodic = makePeriodicPattern(
+                width: width, height: 1300, period: 37)
+            if let p0 = periodic.cropping(to: CGRect(
+                x: 0, y: 0, width: width, height: viewport)) {
+                let ambiguous = SegmentedVerticalStitcher(first: p0)
+                for position in [100, 200, 300, 400, 500, 600] {
+                    if let frame = periodic.cropping(to: CGRect(
+                        x: 0, y: position, width: width, height: viewport)) {
+                        _ = ambiguous.append(frame)
+                    }
+                }
+                check("stitch-ambiguous-segment-not-promoted",
+                      ambiguous.segmentCount == 1,
+                      "segments \(ambiguous.segmentCount)")
+            } else {
+                check("stitch-ambiguous-segment-frame", false)
+            }
+
+            // A later match against the active strip cancels an uncommitted
+            // candidate, and a geometry error does not advance the reject gate.
+            if let active0 = document.cropping(to: CGRect(
+                x: 0, y: 0, width: width, height: viewport)),
+               let active100 = document.cropping(to: CGRect(
+                x: 0, y: 100, width: width, height: viewport)) {
+                let resumed = SegmentedVerticalStitcher(first: active0)
+                for color in [NSColor.blue, .green, .yellow] {
+                    _ = resumed.append(makeSolidImage(
+                        width: width, height: viewport, color: color.cgColor))
+                }
+                let outcome = resumed.append(active100)
+                let resumedRows: Int
+                if case let .appended(rows) = outcome { resumedRows = rows }
+                else { resumedRows = 0 }
+                _ = resumed.append(makeSolidImage(
+                    width: width + 1, height: viewport,
+                    color: NSColor.black.cgColor))
+                check("stitch-active-resume-cancels-pending",
+                      resumedRows == 100 && resumed.segmentCount == 1
+                        && resumed.consecutiveRejects == 0,
+                      "rows \(resumedRows), segments \(resumed.segmentCount), "
+                        + "rejects \(resumed.consecutiveRejects)")
+            } else {
+                check("stitch-active-resume-frame", false)
+            }
+        }
+
+        // 2i. capture backend fallback state ---------------------------------------
         // A transient sourceRect error must keep the fast path. Three consecutive
         // failures switch once to full-display crop without discarding content
         // already stitched from sourceRect (both backends produce the same pixel
@@ -414,7 +3119,7 @@ enum SelfTest {
                       retained.totalHeight == 640, "got \(retained.totalHeight), want 640")
                 if let f3 = content.cropping(to: CGRect(
                     x: 0, y: 360, width: 200, height: 400)) {
-                    let continued = retained.append(f3)
+                    let continued = retained.append(f3).newRows
                     check("scroll-fallback-continues-after-switch", continued == 120,
                           "appended \(continued), want 120")
                     check("scroll-fallback-continued-height", retained.totalHeight == 760,
@@ -435,6 +3140,70 @@ enum SelfTest {
                             stitcher: retained, frame: wrongGeometry))
                 } else {
                     check("scroll-fallback-geometry-frame", false)
+                }
+
+                // If the three sourceRect failures coincide with a flick, the
+                // first full-crop frame may no longer overlap the old baseline.
+                // Two mutually consistent fallback frames must start a marked
+                // segment instead of leaving the backend handshake stuck.
+                let switchedContent = makeStripePattern(
+                    width: 200, height: 1600, seed: 0xFA11_5E67)
+                if let a0 = switchedContent.cropping(to: CGRect(
+                       x: 0, y: 0, width: 200, height: 400)),
+                   let a100 = switchedContent.cropping(to: CGRect(
+                       x: 0, y: 100, width: 200, height: 400)),
+                   let b720 = switchedContent.cropping(to: CGRect(
+                       x: 0, y: 720, width: 200, height: 400)),
+                   let b760 = switchedContent.cropping(to: CGRect(
+                       x: 0, y: 760, width: 200, height: 400)),
+                   let b800 = switchedContent.cropping(to: CGRect(
+                       x: 0, y: 800, width: 200, height: 400)),
+                   let b840 = switchedContent.cropping(to: CGRect(
+                       x: 0, y: 840, width: 200, height: 400)) {
+                    let segmented = SegmentedVerticalStitcher(first: a0)
+                    _ = segmented.append(a100)
+                    // Leave a proven-but-uncommitted sourceRect candidate in
+                    // place. Switching backends must discard it; otherwise a
+                    // single fallback frame could complete a mixed-backend
+                    // segment and be promoted without fallback-only proof.
+                    let oldPendingFirst = segmented.append(b720)
+                    let oldPendingSecond = segmented.append(b760)
+                    let oldPendingStayedUncommitted: Bool
+                    if case .rejected = oldPendingFirst,
+                       case .rejected = oldPendingSecond {
+                        oldPendingStayedUncommitted = segmented.segmentCount == 1
+                    } else {
+                        oldPendingStayedUncommitted = false
+                    }
+                    segmented.prepareForBackendTransition()
+                    check("scroll-fallback-lost-overlap-detected",
+                          !ScrollingCapture.validateBackendTransition(
+                            stitcher: segmented.currentSegment, frame: b800))
+                    let firstFallback = segmented
+                        .appendBackendTransitionFrame(b800)
+                    let secondFallback = segmented
+                        .appendBackendTransitionFrame(b840)
+                    let firstWasPending: Bool
+                    if case .rejected = firstFallback { firstWasPending = true }
+                    else { firstWasPending = false }
+                    let secondStarted: Bool
+                    if case .startedSegment = secondFallback {
+                        secondStarted = true
+                    } else {
+                        secondStarted = false
+                    }
+                    let expectedHeight = 500 + segmented.separatorRows + 440
+                    check("scroll-fallback-reanchors-proven-segment",
+                          oldPendingStayedUncommitted
+                            && firstWasPending && secondStarted
+                            && segmented.segmentCount == 2
+                            && segmented.totalHeight == expectedHeight,
+                          "segments \(segmented.segmentCount), height "
+                            + "\(segmented.totalHeight), want \(expectedHeight)")
+                    check("scroll-fallback-reanchor-compose",
+                          segmented.compose()?.height == expectedHeight)
+                } else {
+                    check("scroll-fallback-reanchor-frames", false)
                 }
             } else {
                 check("scroll-fallback-retains-frames", false)
@@ -532,6 +3301,2772 @@ enum SelfTest {
         // 7. Retina downscale -----------------------------------------------------------
         let down = windowShot.downscaledTo1x()
         check("downscale-1x", down.cgImage.width == 200 && down.scale == 1)
+
+        // 8. Overlay session + action router (slice 1) -----------------------------
+        MainActor.assumeIsolated {
+            @MainActor func makeSession(
+                _ purpose: OverlayPurpose,
+                afterShow: Bool = true, afterCopy: Bool = false,
+                afterSave: Bool = false
+            ) -> OverlaySession {
+                OverlaySession(purpose: purpose, inputs: OverlaySessionInputs(
+                    afterShow: afterShow, afterCopy: afterCopy,
+                    afterSave: afterSave))
+            }
+
+            // Reducer: area-review with afterShow reviews; headless completes.
+            let review = makeSession(.areaReview, afterShow: true)
+            check("overlay-session-initial-once",
+                  review.commitInitialCapture()
+                    && review.phase == .reviewing
+                    && !review.commitInitialCapture()
+                    && review.acceptsCommits,
+                  "phase \(review.phase)")
+            // Reviewing is unreachable via transition() even for area-review:
+            // only the atomic latch may enter it.
+            let latchOnly = makeSession(.areaReview, afterShow: true)
+            check("overlay-session-reviewing-latch-only",
+                  !latchOnly.transition(to: .reviewing)
+                    && latchOnly.phase == .selecting,
+                  "phase \(latchOnly.phase)")
+            let headless = makeSession(.areaReview, afterShow: false)
+            check("overlay-session-headless-completes",
+                  headless.commitInitialCapture()
+                    && headless.phase == .completed
+                    && !headless.acceptsCommits,
+                  "phase \(headless.phase)")
+
+            // Save round trip: reviewing → saving → (fail) reviewing →
+            // saving → completed; completed accepts nothing further.
+            check("overlay-session-save-cycle",
+                  review.transition(to: .saving)
+                    && !review.acceptsCommits
+                    && review.transition(to: .reviewing)
+                    && review.transition(to: .saving)
+                    && review.transition(to: .completed)
+                    && !review.transition(to: .reviewing)
+                    && review.phase == .completed,
+                  "phase \(review.phase)")
+
+            // Non-area purposes: initialCapture latch refused, review/saving
+            // transitions forbidden with phase untouched, straight completion
+            // allowed.
+            for purpose in [OverlayPurpose.scrollRegion, .instantOCRRegion, .windowPick] {
+                let s = makeSession(purpose, afterShow: true)
+                let latchRefused = !s.commitInitialCapture()
+                let reviewingRefused = !s.transition(to: .reviewing)
+                let savingRefused = !s.transition(to: .saving)
+                check("overlay-session-purpose-locked-\(purpose)",
+                      latchRefused && reviewingRefused && savingRefused
+                        && s.phase == .selecting
+                        && s.transition(to: .completed),
+                      "phase \(s.phase)")
+            }
+
+            // Router intent matrix with spies.
+            let snapshotImage = CapturedImage(
+                cgImage: makeSolidImage(
+                    width: 8, height: 8, color: NSColor.systemTeal.cgColor),
+                scale: 1)
+            final class Spy {
+                var copies = 0, autoSaves = 0, saveAsCalls = 0
+                var pins = 0, ocrs = 0, editors = 0
+                var ocrModes: [Bool] = []
+                var toasts: [String] = []
+                var lastCaptures = 0
+                var areaRects: [CGRect] = []
+                var logs = 0
+                var autoSaveDone: (@MainActor (URL?) -> Void)?
+                var saveAsDone: (@MainActor (SaveAsOutcome) -> Void)?
+            }
+            @MainActor func deps(_ spy: Spy) -> CaptureActionRouter.Dependencies {
+                CaptureActionRouter.Dependencies(
+                    copyToClipboard: { _ in spy.copies += 1 },
+                    autoSave: { _, done in
+                        spy.autoSaves += 1; spy.autoSaveDone = done },
+                    saveAs: { _, done in
+                        spy.saveAsCalls += 1; spy.saveAsDone = done },
+                    pin: { _ in spy.pins += 1 },
+                    ocrWithMode: { _, autoTranslate in
+                        spy.ocrs += 1
+                        spy.ocrModes.append(autoTranslate)
+                    },
+                    openEditor: { _ in spy.editors += 1 },
+                    toast: { spy.toasts.append($0) },
+                    setLastCapture: { _ in spy.lastCaptures += 1 },
+                    setLastAreaRect: { spy.areaRects.append($0) },
+                    logEvent: { _ in spy.logs += 1 })
+            }
+            let rect = CGRect(x: 10, y: 20, width: 30, height: 40)
+
+            // initialCapture entering review: auto-copy only, no toast, no
+            // lastAreaRect yet (the action that completes review writes it).
+            let s1 = Spy()
+            let o1 = CaptureActionRouter.commit(
+                snapshotImage, source: .areaReview, intent: .initialCapture,
+                inputs: .init(afterShow: true, afterCopy: true, afterSave: false),
+                finalGlobalRect: rect, dependencies: deps(s1))
+            check("overlay-router-initial-reviewing",
+                  o1 == .completed && s1.copies == 1 && s1.toasts.isEmpty
+                    && s1.areaRects.isEmpty && s1.lastCaptures == 1
+                    && s1.logs == 1 && s1.autoSaves == 0,
+                  "copies \(s1.copies) toasts \(s1.toasts) rects \(s1.areaRects)")
+
+            // initialCapture headless with nothing configured: rescue copy +
+            // toast + lastAreaRect written.
+            let s2 = Spy()
+            _ = CaptureActionRouter.commit(
+                snapshotImage, source: .areaReview, intent: .initialCapture,
+                inputs: .init(afterShow: false, afterCopy: false, afterSave: false),
+                finalGlobalRect: rect, dependencies: deps(s2))
+            check("overlay-router-initial-headless-fallback",
+                  s2.copies == 1 && s2.toasts.count == 1
+                    && s2.areaRects == [rect],
+                  "copies \(s2.copies) toasts \(s2.toasts) rects \(s2.areaRects)")
+
+            // initialCapture headless with afterSave: announce toast comes
+            // from the save completion, exactly once.
+            let s3 = Spy()
+            _ = CaptureActionRouter.commit(
+                snapshotImage, source: .areaReview, intent: .initialCapture,
+                inputs: .init(afterShow: false, afterCopy: false, afterSave: true),
+                finalGlobalRect: rect, dependencies: deps(s3))
+            s3.autoSaveDone?(URL(fileURLWithPath: "/tmp/x.png"))
+            check("overlay-router-initial-autosave",
+                  s3.autoSaves == 1 && s3.toasts.count == 1
+                    && s3.copies == 0 && s3.areaRects == [rect],
+                  "saves \(s3.autoSaves) toasts \(s3.toasts)")
+
+            // Manual copy: one clipboard write, NO auto-save replay even with
+            // afterSave configured; lastAreaRect written at completion.
+            let s4 = Spy()
+            let o4 = CaptureActionRouter.commit(
+                snapshotImage, source: .areaReview, intent: .copy,
+                inputs: .init(afterShow: true, afterCopy: true, afterSave: true),
+                finalGlobalRect: rect, dependencies: deps(s4))
+            check("overlay-router-copy-no-replay",
+                  o4 == .completed && s4.copies == 1 && s4.autoSaves == 0
+                    && s4.saveAsCalls == 0 && s4.areaRects == [rect],
+                  "copies \(s4.copies) autoSaves \(s4.autoSaves)")
+
+            // Save-As success: .saving outcome, one-shot resolution, area
+            // rect written once even if the dependency calls back twice.
+            let s5 = Spy()
+            var resolutions: [CaptureCommitOutcome] = []
+            let o5 = CaptureActionRouter.commit(
+                snapshotImage, source: .areaReview, intent: .save,
+                inputs: .init(afterShow: true, afterCopy: false, afterSave: false),
+                finalGlobalRect: rect, dependencies: deps(s5),
+                resolution: { resolutions.append($0) })
+            s5.saveAsDone?(.saved(URL(fileURLWithPath: "/tmp/y.png")))
+            s5.saveAsDone?(.saved(URL(fileURLWithPath: "/tmp/z.png")))
+            check("overlay-router-save-once",
+                  o5 == .saving && s5.saveAsCalls == 1
+                    && resolutions == [.completed]
+                    && s5.areaRects == [rect] && s5.autoSaves == 0,
+                  "resolutions \(resolutions) rects \(s5.areaRects)")
+
+            // Save-As cancel: back to review, silent, no lastAreaRect.
+            let s6 = Spy()
+            var cancelResolutions: [CaptureCommitOutcome] = []
+            _ = CaptureActionRouter.commit(
+                snapshotImage, source: .areaReview, intent: .save,
+                inputs: .init(afterShow: true, afterCopy: false, afterSave: false),
+                finalGlobalRect: rect, dependencies: deps(s6),
+                resolution: { cancelResolutions.append($0) })
+            s6.saveAsDone?(.cancelled)
+            check("overlay-router-save-cancel",
+                  cancelResolutions == [.cancelled] && s6.areaRects.isEmpty
+                    && s6.toasts.isEmpty,
+                  "resolutions \(cancelResolutions) toasts \(s6.toasts)")
+
+            // Save-As failure: toast, resolution .failed, no lastAreaRect —
+            // review state is the session's job, the router must not
+            // complete anything.
+            let s6b = Spy()
+            var failResolutions: [CaptureCommitOutcome] = []
+            _ = CaptureActionRouter.commit(
+                snapshotImage, source: .areaReview, intent: .save,
+                inputs: .init(afterShow: true, afterCopy: false, afterSave: false),
+                finalGlobalRect: rect, dependencies: deps(s6b),
+                resolution: { failResolutions.append($0) })
+            s6b.saveAsDone?(.failed)
+            check("overlay-router-save-failed",
+                  failResolutions == [.failed] && s6b.areaRects.isEmpty
+                    && s6b.toasts == ["Save failed"] && s6b.lastCaptures == 0,
+                  "resolutions \(failResolutions) toasts \(s6b.toasts)")
+
+            // Inputs are a value-type SNAPSHOT: mutating the source value
+            // after the session captured it must change nothing. (Real
+            // Settings/UserDefaults are never touched in selftest.)
+            var mutableInputs = OverlaySessionInputs(
+                afterShow: false, afterCopy: true, afterSave: false)
+            let frozenSession = OverlaySession(
+                purpose: .areaReview, inputs: mutableInputs)
+            mutableInputs.afterCopy = false
+            mutableInputs.afterSave = true
+            mutableInputs.afterShow = true
+            let s9 = Spy()
+            _ = CaptureActionRouter.commit(
+                snapshotImage, source: .areaReview, intent: .initialCapture,
+                inputs: frozenSession.inputs,
+                finalGlobalRect: rect, dependencies: deps(s9))
+            check("overlay-router-inputs-snapshot",
+                  frozenSession.inputs == OverlaySessionInputs(
+                    afterShow: false, afterCopy: true, afterSave: false)
+                    && s9.copies == 1 && s9.autoSaves == 0
+                    && s9.areaRects == [rect],
+                  "inputs \(frozenSession.inputs), copies \(s9.copies), autoSaves \(s9.autoSaves)")
+
+            // scrollFinished positive matrix: headless runs auto actions +
+            // toast; presenting runs auto silently; NEVER a Repeat-Area rect.
+            let s10 = Spy()
+            let o10 = CaptureActionRouter.commit(
+                snapshotImage, source: .scrollResult, intent: .scrollFinished,
+                inputs: .init(afterShow: false, afterCopy: true, afterSave: false),
+                finalGlobalRect: rect, dependencies: deps(s10))
+            check("overlay-router-scrollfinished-headless",
+                  o10 == .completed && s10.copies == 1
+                    && s10.toasts.count == 1 && s10.areaRects.isEmpty,
+                  "copies \(s10.copies) toasts \(s10.toasts) rects \(s10.areaRects)")
+            let s10b = Spy()
+            let o10b = CaptureActionRouter.commit(
+                snapshotImage, source: .scrollResult, intent: .scrollFinished,
+                inputs: .init(afterShow: true, afterCopy: true, afterSave: false),
+                finalGlobalRect: rect, dependencies: deps(s10b))
+            check("overlay-router-scrollfinished-presenting",
+                  o10b == .completed && s10b.copies == 1
+                    && s10b.toasts.isEmpty && s10b.areaRects.isEmpty,
+                  "copies \(s10b.copies) toasts \(s10b.toasts)")
+            let s10c = Spy()
+            let o10c = CaptureActionRouter.commit(
+                snapshotImage, source: .scrollResult, intent: .scrollFinished,
+                inputs: .init(afterShow: false, afterCopy: false, afterSave: true),
+                finalGlobalRect: nil, dependencies: deps(s10c))
+            s10c.autoSaveDone?(URL(fileURLWithPath: "/tmp/s.png"))
+            check("overlay-router-scrollfinished-autosave",
+                  o10c == .completed && s10c.autoSaves == 1
+                    && s10c.toasts.count == 1 && s10c.areaRects.isEmpty,
+                  "saves \(s10c.autoSaves) toasts \(s10c.toasts)")
+
+            // Wrong intent×source pairings fail closed with ZERO side
+            // effects of any kind.
+            let s11 = Spy()
+            let wrong1 = CaptureActionRouter.commit(
+                snapshotImage, source: .areaReview, intent: .scrollFinished,
+                inputs: .init(afterShow: false, afterCopy: true, afterSave: false),
+                finalGlobalRect: rect, dependencies: deps(s11))
+            let wrong2 = CaptureActionRouter.commit(
+                snapshotImage, source: .scrollResult, intent: .initialCapture,
+                inputs: .init(afterShow: false, afterCopy: true, afterSave: false),
+                finalGlobalRect: rect, dependencies: deps(s11))
+            let wrong3 = CaptureActionRouter.commit(
+                snapshotImage, source: .area, intent: .initialCapture,
+                inputs: .init(afterShow: false, afterCopy: true, afterSave: false),
+                finalGlobalRect: rect, dependencies: deps(s11))
+            check("overlay-router-intent-source-enforced",
+                  wrong1 == .failed && wrong2 == .failed && wrong3 == .failed
+                    && s11.copies == 0 && s11.autoSaves == 0
+                    && s11.lastCaptures == 0 && s11.logs == 0
+                    && s11.toasts.isEmpty && s11.areaRects.isEmpty,
+                  "w1 \(wrong1) w2 \(wrong2) w3 \(wrong3) copies \(s11.copies)")
+
+            // Pin / OCR / open editor: exactly one respective effect, no auto
+            // replay.
+            let s7 = Spy()
+            _ = CaptureActionRouter.commit(
+                snapshotImage, source: .areaReview, intent: .pin,
+                inputs: .init(afterShow: true, afterCopy: true, afterSave: true),
+                finalGlobalRect: rect, dependencies: deps(s7))
+            _ = CaptureActionRouter.commit(
+                snapshotImage, source: .areaReview, intent: .ocr,
+                inputs: .init(afterShow: true, afterCopy: true, afterSave: true),
+                finalGlobalRect: rect, dependencies: deps(s7))
+            _ = CaptureActionRouter.commit(
+                snapshotImage, source: .areaReview, intent: .openEditor,
+                inputs: .init(afterShow: true, afterCopy: true, afterSave: true),
+                finalGlobalRect: rect, dependencies: deps(s7))
+            check("overlay-router-terminal-intents",
+                  s7.pins == 1 && s7.ocrs == 1 && s7.editors == 1
+                    && s7.copies == 0 && s7.autoSaves == 0
+                    && s7.saveAsCalls == 0,
+                  "pins \(s7.pins) ocrs \(s7.ocrs) editors \(s7.editors)")
+
+            // S5 fail-first gate of record. Normal OCR must remain offline
+            // (`false`); explicit Translate must route exactly one `true`
+            // presentation, preserve area-rect authority, and never replay
+            // the initial capture's copy/save settings.
+            let s12OCR = Spy()
+            let o12OCR = CaptureActionRouter.commit(
+                snapshotImage, source: .areaReview, intent: .ocr,
+                inputs: .init(afterShow: true, afterCopy: true, afterSave: true),
+                finalGlobalRect: rect, dependencies: deps(s12OCR))
+            let s12Area = Spy()
+            let o12Area = CaptureActionRouter.commit(
+                snapshotImage, source: .areaReview, intent: .translate,
+                inputs: .init(afterShow: true, afterCopy: true, afterSave: true),
+                finalGlobalRect: rect, dependencies: deps(s12Area))
+            let s12Scroll = Spy()
+            let o12Scroll = CaptureActionRouter.commit(
+                snapshotImage, source: .scrollResult, intent: .translate,
+                inputs: .init(afterShow: true, afterCopy: true, afterSave: true),
+                finalGlobalRect: rect, dependencies: deps(s12Scroll))
+            let translateRouterOK = o12OCR == .completed
+                && s12OCR.ocrModes == [false]
+                && o12Area == .completed && s12Area.ocrModes == [true]
+                && s12Area.lastCaptures == 1 && s12Area.areaRects == [rect]
+                && s12Area.copies == 0 && s12Area.autoSaves == 0
+                && s12Area.saveAsCalls == 0
+                && o12Scroll == .completed && s12Scroll.ocrModes == [true]
+                && s12Scroll.lastCaptures == 1 && s12Scroll.areaRects.isEmpty
+                && s12Scroll.copies == 0 && s12Scroll.autoSaves == 0
+                && s12Scroll.saveAsCalls == 0
+            check("overlay12-translate-router-s5", translateRouterOK,
+                  "ocr \(o12OCR)/\(s12OCR.ocrModes) area \(o12Area)/\(s12Area.ocrModes) last/rect \(s12Area.lastCaptures)/\(s12Area.areaRects) replay \(s12Area.copies)/\(s12Area.autoSaves)/\(s12Area.saveAsCalls) scroll \(o12Scroll)/\(s12Scroll.ocrModes) rect \(s12Scroll.areaRects)")
+
+            // Source enforcement: finalGlobalRect from any non-areaReview
+            // source is IGNORED by the router itself.
+            let s8 = Spy()
+            for source in [CaptureSource.area, .scrolling, .scrollResult,
+                           .fullscreen, .window] {
+                _ = CaptureActionRouter.commit(
+                    snapshotImage, source: source, intent: .copy,
+                    inputs: .init(afterShow: false, afterCopy: false,
+                                  afterSave: false),
+                    finalGlobalRect: rect, dependencies: deps(s8))
+            }
+            check("overlay-router-source-enforced", s8.areaRects.isEmpty,
+                  "rects \(s8.areaRects)")
+
+            // Late-view guard: after the single terminal route ran, the
+            // production addOverlay guard refuses new windows and `current`
+            // stays detached.
+            if let screen = NSScreen.main {
+                let overlay = SelectionOverlay(
+                    purpose: .areaReview, completion: { _ in })
+                overlay.finish(.cancelled)
+                let windowsAfter = overlay.addOverlayForTesting(
+                    screen: screen, frozen: nil)
+                check("overlay-late-view-guard",
+                      windowsAfter == 0
+                        && overlay.session.phase == .completed
+                        && SelectionOverlay.current == nil,
+                      "windows \(windowsAfter), phase \(overlay.session.phase)")
+            } else {
+                // headless display environment — the guard path is still
+                // covered by the reducer checks above
+                check("overlay-late-view-guard", true)
+            }
+        }
+
+        // 9. Overlay slice 2: in-place area review (production paths, headless) ----
+        MainActor.assumeIsolated {
+            guard let screen = NSScreen.main ?? NSScreen.screens.first else {
+                print("SKIP overlay2-environment — no display attached; MUST re-run on an unlocked session")
+                return
+            }
+            let frozenImage = CapturedImage(
+                cgImage: makeStripePattern(width: 800, height: 600, seed: 0x0F0E_0D0C),
+                scale: 1)
+
+            final class Spy2 {
+                var copies: [CapturedImage] = []
+                var toasts: [String] = []
+                var areaRects: [CGRect] = []
+                var logs = 0
+                var editors: [(phase: OverlaySessionPhase, completionDone: Bool)] = []
+                var saveAsDone: (@MainActor (SaveAsOutcome) -> Void)?
+                var saveAsCalls = 0
+                var completionDone = false
+            }
+            @MainActor func makeOverlay(
+                afterShow: Bool, afterCopy: Bool = false, afterSave: Bool = false,
+                spy: Spy2
+            ) -> (SelectionOverlay, SelectionOverlayView) {
+                let overlay = SelectionOverlay(
+                    purpose: .areaReview,
+                    inputs: OverlaySessionInputs(
+                        afterShow: afterShow, afterCopy: afterCopy,
+                        afterSave: afterSave),
+                    completion: { [weak spy] result in
+                        if case .handled = result { spy?.completionDone = true }
+                        if case .cancelled = result { spy?.completionDone = true }
+                    })
+                overlay.routerDependenciesOverride =
+                    CaptureActionRouter.Dependencies(
+                        copyToClipboard: { spy.copies.append($0) },
+                        autoSave: { _, _ in },
+                        saveAs: { _, done in
+                            spy.saveAsCalls += 1; spy.saveAsDone = done },
+                        pin: { _ in },
+                        ocr: { _ in },
+                        openEditor: { [weak overlay] _ in
+                            spy.editors.append((
+                                overlay?.session.phase ?? .selecting,
+                                spy.completionDone)) },
+                        toast: { spy.toasts.append($0) },
+                        setLastCapture: { _ in },
+                        setLastAreaRect: { spy.areaRects.append($0) },
+                        logEvent: { _ in spy.logs += 1 })
+                let view = SelectionOverlayView(
+                    mode: .area, screen: screen, frozen: frozenImage,
+                    windowList: [], owner: overlay)
+                return (overlay, view)
+            }
+
+            // Headless mouse-up: one initialCapture, rescue copy + toast +
+            // Repeat-Area rect, overlay handled, snapshot pixel-exact.
+            let h = Spy2()
+            let (headlessOverlay, headlessView) = makeOverlay(
+                afterShow: false, spy: h)
+            let rect1 = CGRect(x: 40, y: 50, width: 120, height: 90)
+            headlessView.selectForTesting(rect: rect1)
+            let wantGlobal1 = CGRect(
+                x: 40 + screen.frame.minX, y: 50 + screen.frame.minY,
+                width: 120, height: 90)
+            var snapshotExact = false
+            if let image = h.copies.first,
+               let want = frozenImage.cropping(toViewRect: rect1) {
+                snapshotExact = imagesEqual(want.cgImage, image.cgImage)
+            }
+            check("overlay2-headless-flow",
+                  h.copies.count == 1 && h.toasts.count == 1 && h.logs == 1
+                    && h.areaRects == [wantGlobal1]
+                    && headlessOverlay.session.phase == .completed
+                    && h.completionDone && snapshotExact,
+                  "copies \(h.copies.count) toasts \(h.toasts) rects \(h.areaRects) phase \(headlessOverlay.session.phase)")
+
+            // Review mouse-up: auto-copy runs silently, session reviews,
+            // toolbar laid out inside bounds, completion NOT called yet.
+            let r = Spy2()
+            let (reviewOverlay, reviewView) = makeOverlay(
+                afterShow: true, afterCopy: true, spy: r)
+            reviewView.selectForTesting(rect: rect1)
+            let toolbarFrame = reviewView.reviewToolbarFrameForTesting
+            check("overlay2-review-begins",
+                  r.copies.count == 1 && r.toasts.isEmpty && r.logs == 1
+                    && r.areaRects.isEmpty
+                    && reviewOverlay.session.phase == .reviewing
+                    && !r.completionDone
+                    && toolbarFrame != nil
+                    && reviewView.bounds.contains(toolbarFrame ?? .null),
+                  "copies \(r.copies.count) phase \(reviewOverlay.session.phase) toolbar \(String(describing: toolbarFrame))")
+
+            // Competing second mouse-up (late display / double gesture): no
+            // second initialCapture side effects.
+            let (_, competingView) = (reviewOverlay, SelectionOverlayView(
+                mode: .area, screen: screen, frozen: frozenImage,
+                windowList: [], owner: reviewOverlay))
+            competingView.selectForTesting(rect: rect1)
+            check("overlay2-competing-mouseup",
+                  r.copies.count == 1 && r.logs == 1
+                    && reviewOverlay.session.phase == .reviewing,
+                  "copies \(r.copies.count) logs \(r.logs)")
+
+            // Resize during review, then manual Copy: the action reads the
+            // FINAL rect — snapshot pixel-exact vs the resized crop, and the
+            // Repeat-Area rect equals the final global rect.
+            let rect2 = CGRect(x: 30, y: 40, width: 200, height: 150)
+            reviewView.adjustSelectionForTesting(rect: rect2)
+            reviewView.performReviewActionForTesting(.copy)
+            let wantGlobal2 = CGRect(
+                x: 30 + screen.frame.minX, y: 40 + screen.frame.minY,
+                width: 200, height: 150)
+            var finalExact = false
+            if r.copies.count == 2,
+               let want = frozenImage.cropping(toViewRect: rect2) {
+                finalExact = imagesEqual(want.cgImage, r.copies[1].cgImage)
+                    && r.copies[1].cgImage.width == 200
+                    && r.copies[1].cgImage.height == 150
+            }
+            check("overlay2-final-rect-copy",
+                  finalExact && r.areaRects == [wantGlobal2]
+                    && reviewOverlay.session.phase == .completed
+                    && r.completionDone,
+                  "copies \(r.copies.count) rects \(r.areaRects) phase \(reviewOverlay.session.phase)")
+
+            // Save cycle on the production dispatch: .saving blocks competing
+            // intents, double callback resolves once, cancel returns to
+            // review, a later successful save completes exactly once.
+            let s = Spy2()
+            let (saveOverlay, saveView) = makeOverlay(
+                afterShow: true, spy: s)
+            saveView.selectForTesting(rect: rect1)
+            saveView.performReviewActionForTesting(.save)
+            let phaseDuringSave = saveOverlay.session.phase
+            saveView.performReviewActionForTesting(.copy) // must be swallowed
+            let copiesDuringSave = s.copies.count
+            // While saving: Esc, outside click and Close must NOT tear the
+            // overlay down; the canvas stays locked until the typed callback.
+            saveView.handleEscapeForTesting()
+            saveView.handleOutsideClickForTesting()
+            let survivedSaving = saveOverlay.session.phase == .saving
+                && !s.completionDone
+            s.saveAsDone?(.cancelled)
+            let phaseAfterCancel = saveOverlay.session.phase
+            s.saveAsDone?(.cancelled) // double callback: ignored
+            saveView.performReviewActionForTesting(.save)
+            s.saveAsDone?(.saved(URL(fileURLWithPath: "/tmp/ov.png")))
+            check("overlay2-save-cycle",
+                  phaseDuringSave == .saving && copiesDuringSave == 0
+                    && survivedSaving
+                    && phaseAfterCancel == .reviewing
+                    && s.saveAsCalls == 2
+                    && saveOverlay.session.phase == .completed
+                    && s.completionDone
+                    && s.areaRects.count == 1,
+                  "during \(phaseDuringSave) afterCancel \(phaseAfterCancel) calls \(s.saveAsCalls) rects \(s.areaRects.count)")
+
+            // Synchronous save callback: a dependency that resolves INSIDE
+            // commit must behave identically — the session entered .saving
+            // before the effect, so the sync resolution lands on the right
+            // phase and completes exactly once.
+            let sync = Spy2()
+            let (syncOverlay, syncView) = makeOverlay(afterShow: true, spy: sync)
+            syncView.selectForTesting(rect: rect1)
+            syncOverlay.routerDependenciesOverride?.saveAs = { _, done in
+                sync.saveAsCalls += 1
+                done(.saved(URL(fileURLWithPath: "/tmp/sync.png")))
+                done(.saved(URL(fileURLWithPath: "/tmp/sync2.png"))) // double
+            }
+            syncView.performReviewActionForTesting(.save)
+            check("overlay2-save-sync-callback",
+                  sync.saveAsCalls == 1
+                    && syncOverlay.session.phase == .completed
+                    && sync.completionDone
+                    && sync.areaRects.count == 1,
+                  "calls \(sync.saveAsCalls) phase \(syncOverlay.session.phase) rects \(sync.areaRects.count)")
+
+            // Frozen-blit spy: N redraws must not re-blit the 5K source —
+            // the background layer was committed exactly once per view.
+            let blitBefore = SelectionOverlayView.frozenBlitCountForTesting
+            let b = Spy2()
+            let (blitOverlay, blitView) = makeOverlay(afterShow: true, spy: b)
+            _ = blitOverlay
+            blitView.selectForTesting(rect: rect1)
+            let afterSetup = SelectionOverlayView.frozenBlitCountForTesting
+            for step in 0..<5 {
+                blitView.adjustSelectionForTesting(rect: CGRect(
+                    x: 40, y: 50, width: 120 + CGFloat(step) * 10, height: 90))
+                var buffer = [UInt8](repeating: 0, count: 64 * 64 * 4)
+                if let ctx = CGContext(
+                    data: &buffer, width: 64, height: 64,
+                    bitsPerComponent: 8, bytesPerRow: 64 * 4,
+                    space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                    bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) {
+                    let ns = NSGraphicsContext(cgContext: ctx, flipped: false)
+                    NSGraphicsContext.saveGraphicsState()
+                    NSGraphicsContext.current = ns
+                    blitView.draw(blitView.bounds)
+                    NSGraphicsContext.restoreGraphicsState()
+                }
+            }
+            check("overlay2-frozen-blit-once",
+                  afterSetup == blitBefore + 1
+                    && SelectionOverlayView.frozenBlitCountForTesting == afterSetup,
+                  "setup Δ\(afterSetup - blitBefore), after draws Δ\(SelectionOverlayView.frozenBlitCountForTesting - afterSetup)")
+
+            // Terminal order: openEditor presents only AFTER teardown — the
+            // dependency observes phase completed and completion already run.
+            let t = Spy2()
+            let (terminalOverlay, terminalView) = makeOverlay(afterShow: true, spy: t)
+            _ = terminalOverlay // keep the weakly-owned overlay alive
+            terminalView.selectForTesting(rect: rect1)
+            terminalView.performReviewActionForTesting(.openEditor)
+            check("overlay2-teardown-before-present",
+                  t.editors.count == 1
+                    && t.editors[0].phase == .completed
+                    && t.editors[0].completionDone,
+                  "editors \(t.editors)")
+        }
+
+        // 10. Overlay slice 3: scroll finish payload + teardown order --------------
+        MainActor.assumeIsolated {
+            // finalize: cleanup BEFORE callback, exactly once, payload
+            // carries the snapshotted inputs + origin screen.
+            let inputs = OverlaySessionInputs(
+                afterShow: true, afterCopy: true, afterSave: false)
+            var callbacks = 0
+            var activeAtCall: ScrollingCapture?
+            var payloadInputs: OverlaySessionInputs?
+            let session = ScrollingCapture(inputs: inputs, onFinish: { finish in
+                callbacks += 1
+                activeAtCall = ScrollingCapture.active
+                payloadInputs = finish.inputs
+            })
+            ScrollingCapture.active = session
+            session.finalizeForTesting(image: nil)
+            session.finalizeForTesting(image: nil) // double: must be one-shot
+            check("overlay3-finalize-order",
+                  callbacks == 1 && activeAtCall == nil
+                    && payloadInputs == inputs
+                    && ScrollingCapture.active == nil
+                    && session.previewPanelForTesting == nil,
+                  "callbacks \(callbacks), active \(String(describing: activeAtCall)), inputs \(String(describing: payloadInputs))")
+
+            // presenter headless: scrollFinished auto exactly once, no panel.
+            let img = CapturedImage(
+                cgImage: makeSolidImage(
+                    width: 12, height: 12, color: NSColor.systemBlue.cgColor),
+                scale: 1)
+            var copies = 0
+            var toasts = 0
+            var rects = 0
+            let deps = CaptureActionRouter.Dependencies(
+                copyToClipboard: { _ in copies += 1 },
+                autoSave: { _, _ in },
+                saveAs: { _, _ in },
+                pin: { _ in }, ocr: { _ in }, openEditor: { _ in },
+                toast: { _ in toasts += 1 },
+                setLastCapture: { _ in },
+                setLastAreaRect: { _ in rects += 1 },
+                logEvent: { _ in })
+            let screen = NSScreen.main ?? NSScreen.screens.first
+            if let screen {
+                ScrollResultPresenter.present(
+                    ScrollFinish(
+                        image: img,
+                        inputs: OverlaySessionInputs(
+                            afterShow: false, afterCopy: true, afterSave: false),
+                        screen: screen),
+                    dependencies: deps)
+            }
+            check("overlay3-presenter-headless",
+                  screen == nil || (copies == 1 && toasts == 1 && rects == 0
+                    && ScrollResultPanel.current == nil),
+                  "copies \(copies) toasts \(toasts) rects \(rects) panel \(String(describing: ScrollResultPanel.current))")
+
+            // screen-nil with afterShow=true: the shot must still be
+            // secured through the headless auto path — all 4 copy/save
+            // combos, exactly one action set, zero panels.
+            var screenNilOK = true
+            for copyOn in [false, true] {
+                for saveOn in [false, true] {
+                    var copies2 = 0, saves2 = 0, toasts2 = 0
+                    var deps2 = CaptureActionRouter.Dependencies(
+                        copyToClipboard: { _ in copies2 += 1 },
+                        autoSave: { _, done in
+                            saves2 += 1
+                            done(URL(fileURLWithPath: "/tmp/n.png")) },
+                        saveAs: { _, _ in },
+                        pin: { _ in }, ocr: { _ in }, openEditor: { _ in },
+                        toast: { _ in toasts2 += 1 },
+                        setLastCapture: { _ in },
+                        setLastAreaRect: { _ in }, logEvent: { _ in })
+                    _ = deps2
+                    ScrollResultPresenter.present(
+                        ScrollFinish(
+                            image: img,
+                            inputs: OverlaySessionInputs(
+                                afterShow: true, afterCopy: copyOn,
+                                afterSave: saveOn),
+                            screen: nil),
+                        dependencies: deps2)
+                    let wantCopies2 = copyOn ? 1 : (saveOn ? 0 : 1)
+                    let wantSaves2 = saveOn ? 1 : 0
+                    if copies2 != wantCopies2 || saves2 != wantSaves2
+                        || toasts2 != 1
+                        || ScrollResultPanel.current != nil {
+                        screenNilOK = false
+                        print("  screen-nil mismatch copy=\(copyOn) save=\(saveOn): c\(copies2)/\(wantCopies2) s\(saves2)/\(wantSaves2) t\(toasts2)")
+                    }
+                }
+            }
+            check("overlay6-screen-nil-secured", screenNilOK, "see above")
+
+            // nil image: nothing runs, nothing presents.
+            if let screen {
+                ScrollResultPresenter.present(
+                    ScrollFinish(
+                        image: nil,
+                        inputs: OverlaySessionInputs(
+                            afterShow: true, afterCopy: true, afterSave: false),
+                        screen: screen),
+                    dependencies: deps)
+            }
+            check("overlay3-presenter-nil-image",
+                  copies <= 1 && ScrollResultPanel.current == nil,
+                  "copies \(copies)")
+        }
+
+        // 11. Overlay slice 4: annotations (shared surface, both paths) -----------
+        MainActor.assumeIsolated {
+            guard let screen = NSScreen.main ?? NSScreen.screens.first else {
+                print("SKIP overlay4-environment — no display attached; MUST re-run on an unlocked session")
+                return
+            }
+            let base = makeStripePattern(width: 800, height: 600, seed: 0x4A4A_4A4A)
+            let frozenImage = CapturedImage(cgImage: base, scale: 1)
+
+            final class Spy4 {
+                var copies: [CapturedImage] = []
+            }
+            let spy = Spy4()
+            let overlay = SelectionOverlay(
+                purpose: .areaReview,
+                inputs: OverlaySessionInputs(
+                    afterShow: true, afterCopy: false, afterSave: false),
+                completion: { _ in })
+            overlay.routerDependenciesOverride = CaptureActionRouter.Dependencies(
+                copyToClipboard: { spy.copies.append($0) },
+                autoSave: { _, _ in }, saveAs: { _, _ in },
+                pin: { _ in }, ocr: { _ in }, openEditor: { _ in },
+                toast: { _ in }, setLastCapture: { _ in },
+                setLastAreaRect: { _ in }, logEvent: { _ in })
+            let view = SelectionOverlayView(
+                mode: .area, screen: screen, frozen: frozenImage,
+                windowList: [], owner: overlay)
+            let rect = CGRect(x: 100, y: 100, width: 300, height: 200)
+            view.selectForTesting(rect: rect)
+            guard let surface = view.annotationSurface else {
+                check("overlay4-surface-created", false)
+                return
+            }
+            check("overlay4-surface-created", true)
+
+            // draw a rect annotation inside the crop (pixel coords, BL)
+            surface.tool = .rect
+            _ = surface.beginDrag(atPixel: CGPoint(x: 150, y: 150))
+            surface.continueDrag(toPixel: CGPoint(x: 250, y: 220))
+            surface.endDrag()
+            surface.tool = .select
+            let plainCrop = base.cropping(
+                to: overlay.session.pixelRect)!
+            view.performReviewActionForTesting(.copy)
+            var flattenChanged = false
+            var flattenMatchesSurface = false
+            if let copied = spy.copies.first {
+                flattenChanged = !imagesEqual(plainCrop, copied.cgImage)
+                if let want = surface.flattened(
+                    base: base, cropPixels: overlay.session.pixelRect) {
+                    flattenMatchesSurface = imagesEqual(want, copied.cgImage)
+                }
+            }
+            check("overlay4-flatten-hash",
+                  flattenChanged && flattenMatchesSurface,
+                  "changed \(flattenChanged) matches \(flattenMatchesSurface)")
+
+            // Remap/clip: a fresh session — annotation OUTSIDE a shrunken
+            // crop disappears from flatten (absolute positions, clipped),
+            // and returns when the crop expands again.
+            let spyB = Spy4()
+            let overlayB = SelectionOverlay(
+                purpose: .areaReview,
+                inputs: OverlaySessionInputs(
+                    afterShow: true, afterCopy: false, afterSave: false),
+                completion: { _ in })
+            overlayB.routerDependenciesOverride = CaptureActionRouter.Dependencies(
+                copyToClipboard: { spyB.copies.append($0) },
+                autoSave: { _, _ in }, saveAs: { _, _ in },
+                pin: { _ in }, ocr: { _ in }, openEditor: { _ in },
+                toast: { _ in }, setLastCapture: { _ in },
+                setLastAreaRect: { _ in }, logEvent: { _ in })
+            let viewB = SelectionOverlayView(
+                mode: .area, screen: screen, frozen: frozenImage,
+                windowList: [], owner: overlayB)
+            viewB.selectForTesting(rect: rect)
+            guard let surfaceB = viewB.annotationSurface else {
+                check("overlay4-remap-surface", false)
+                return
+            }
+            surfaceB.tool = .rect
+            _ = surfaceB.beginDrag(atPixel: CGPoint(x: 320, y: 150))
+            surfaceB.continueDrag(toPixel: CGPoint(x: 380, y: 250))
+            surfaceB.endDrag()
+            surfaceB.tool = .select
+            // shrink so the annotation (x 320..380) is fully outside
+            viewB.adjustSelectionForTesting(rect: CGRect(
+                x: 100, y: 100, width: 150, height: 200))
+            let shrunkenPlain = base.cropping(to: overlayB.session.pixelRect)!
+            let shrunkenFlat = surfaceB.flattened(
+                base: base, cropPixels: overlayB.session.pixelRect)
+            let clipped = shrunkenFlat.map { imagesEqual(shrunkenPlain, $0) } ?? false
+            // expand back: the annotation is visible again
+            viewB.adjustSelectionForTesting(rect: rect)
+            let expandedPlain = base.cropping(to: overlayB.session.pixelRect)!
+            let expandedFlat = surfaceB.flattened(
+                base: base, cropPixels: overlayB.session.pixelRect)
+            let restored = expandedFlat.map { !imagesEqual(expandedPlain, $0) } ?? false
+            check("overlay4-remap-clip", clipped && restored,
+                  "clipped \(clipped) restored \(restored)")
+
+            // Undo removes the newest annotation; text adds via the shared
+            // API and changes flatten.
+            let before = surfaceB.annotations.count
+            surfaceB.addText("Snippr", atPixel: CGPoint(x: 150, y: 150))
+            let afterText = surfaceB.annotations.count
+            _ = surfaceB.undo()
+            check("overlay4-text-and-undo",
+                  afterText == before + 1
+                    && surfaceB.annotations.count == before,
+                  "before \(before) afterText \(afterText) final \(surfaceB.annotations.count)")
+        }
+
+        // 12. Overlay slice 5: final layout/matrix gates ---------------------------
+        MainActor.assumeIsolated {
+            // The setting matrix is PURE router logic — it must run even on
+            // a headless runner, so it lives before the screen guard.
+            let tinyHeadless = CapturedImage(
+                cgImage: makeSolidImage(
+                    width: 6, height: 6, color: NSColor.systemPink.cgColor),
+                scale: 1)
+            var matrixHeadlessOK = true
+            for intent in [CaptureIntent.initialCapture, .scrollFinished] {
+                let source: CaptureSource =
+                    intent == .initialCapture ? .areaReview : .scrollResult
+                for show in [false, true] {
+                    for copy in [false, true] {
+                        for save in [false, true] {
+                            var copies = 0, saves = 0, toasts = 0, rects = 0
+                            let deps = CaptureActionRouter.Dependencies(
+                                copyToClipboard: { _ in copies += 1 },
+                                autoSave: { _, done in
+                                    saves += 1
+                                    done(URL(fileURLWithPath: "/tmp/m.png")) },
+                                saveAs: { _, _ in },
+                                pin: { _ in }, ocr: { _ in },
+                                openEditor: { _ in },
+                                toast: { _ in toasts += 1 },
+                                setLastCapture: { _ in },
+                                setLastAreaRect: { _ in rects += 1 },
+                                logEvent: { _ in })
+                            _ = CaptureActionRouter.commit(
+                                tinyHeadless, source: source, intent: intent,
+                                inputs: OverlaySessionInputs(
+                                    afterShow: show, afterCopy: copy,
+                                    afterSave: save),
+                                finalGlobalRect: CGRect(
+                                    x: 1, y: 2, width: 3, height: 4),
+                                dependencies: deps)
+                            let wantCopies = copy
+                                ? 1 : ((show || save) ? 0 : 1)
+                            let wantSaves = save ? 1 : 0
+                            let wantToasts = show ? 0 : 1
+                            let wantRects = (intent == .initialCapture && !show)
+                                ? 1 : 0
+                            if copies != wantCopies || saves != wantSaves
+                                || toasts != wantToasts || rects != wantRects {
+                                matrixHeadlessOK = false
+                                print("  matrix mismatch: \(intent) show=\(show) copy=\(copy) save=\(save) → c\(copies)/\(wantCopies) s\(saves)/\(wantSaves) t\(toasts)/\(wantToasts) r\(rects)/\(wantRects)")
+                            }
+                        }
+                    }
+                }
+            }
+            check("overlay5-setting-matrix", matrixHeadlessOK, "see mismatches above")
+
+            guard let screen = NSScreen.main ?? NSScreen.screens.first else {
+                print("SKIP overlay5-environment — no display attached; MUST re-run on an unlocked session")
+                return
+            }
+            // frozen must cover the whole screen: edge selections crop from
+            // it through the pixel authority
+            let frozenImage = CapturedImage(
+                cgImage: makeStripePattern(
+                    width: max(8, Int(screen.frame.width)),
+                    height: max(8, Int(screen.frame.height)),
+                    seed: 0x5555_AAAA),
+                scale: 1)
+            @MainActor func noopDeps() -> CaptureActionRouter.Dependencies {
+                CaptureActionRouter.Dependencies(
+                    copyToClipboard: { _ in }, autoSave: { _, _ in },
+                    saveAs: { _, _ in }, pin: { _ in }, ocr: { _ in },
+                    openEditor: { _ in }, toast: { _ in },
+                    setLastCapture: { _ in }, setLastAreaRect: { _ in },
+                    logEvent: { _ in })
+            }
+            @MainActor func reviewView() -> (SelectionOverlay, SelectionOverlayView) {
+                let overlay = SelectionOverlay(
+                    purpose: .areaReview,
+                    inputs: OverlaySessionInputs(
+                        afterShow: true, afterCopy: false, afterSave: false),
+                    completion: { _ in })
+                overlay.routerDependenciesOverride = noopDeps()
+                let view = SelectionOverlayView(
+                    mode: .area, screen: screen, frozen: frozenImage,
+                    windowList: [], owner: overlay)
+                return (overlay, view)
+            }
+
+            // Toolbar at the edges: bottom-left, bottom-right, top edge,
+            // full-frame — always inside bounds, never over a handle hit rect.
+            let b = screen.frame.size
+            let edgeRects = [
+                CGRect(x: 4, y: 4, width: 200, height: 120),
+                CGRect(x: b.width - 210, y: 4, width: 200, height: 120),
+                CGRect(x: b.width / 2 - 100, y: b.height - 130, width: 200, height: 120),
+                CGRect(x: 4, y: 4, width: b.width - 8, height: b.height - 8),
+            ]
+            var edgeFailures: [String] = []
+            for (index, rect) in edgeRects.enumerated() {
+                let (overlay, view) = reviewView()
+                _ = overlay
+                view.selectForTesting(rect: rect)
+                let buttonFrames = view.reviewToolbarButtonFramesForTesting
+                guard !buttonFrames.isEmpty else {
+                    edgeFailures.append("#\(index) no toolbar"); continue
+                }
+                for (buttonIndex, buttonFrame) in buttonFrames.enumerated() {
+                    if !view.bounds.contains(buttonFrame) {
+                        edgeFailures.append(
+                            "#\(index) button \(buttonIndex) out of bounds \(buttonFrame)")
+                    }
+                    if let sel = view.hasAreaSelectionForTesting
+                        ? rect.intersection(view.bounds) : nil {
+                        for (handle, handleRect) in EditableSelectionGeometry
+                            .handleRects(for: sel, size: 18)
+                            where buttonFrame.intersects(handleRect) {
+                            edgeFailures.append(
+                                "#\(index) button \(buttonIndex) overlaps \(handle) \(handleRect) frame \(buttonFrame)")
+                        }
+                    }
+                }
+            }
+            check("overlay5-toolbar-edges", edgeFailures.isEmpty,
+                  edgeFailures.joined(separator: "; "))
+
+            // Regression: the review toolbar and pixel-crop authority must
+            // follow a REAL move/resize drag before mouseUp.  The old edge
+            // gate used adjustSelectionForTesting(), which performs sync +
+            // layout itself and therefore stayed green while production
+            // mouseDragged left both values stale until the button released.
+            @MainActor func liveMouse(
+                _ type: NSEvent.EventType, _ point: CGPoint
+            ) -> NSEvent? {
+                NSEvent.mouseEvent(
+                    with: type, location: point, modifierFlags: [],
+                    timestamp: 0, windowNumber: 0, context: nil,
+                    eventNumber: 0, clickCount: 1, pressure: 1)
+            }
+            @MainActor func expectedPixels(
+                for rect: CGRect, frozen: CapturedImage
+            ) -> CGRect {
+                let scale = frozen.scale
+                return CGRect(
+                    x: rect.minX * scale,
+                    y: (CGFloat(frozen.cgImage.height) / scale - rect.maxY) * scale,
+                    width: rect.width * scale,
+                    height: rect.height * scale
+                ).integral
+            }
+
+            let moveRect = CGRect(
+                x: max(40, b.width / 2 - 130),
+                y: max(100, b.height / 2 - 80),
+                width: 260, height: 160)
+            let moveDelta = CGPoint(x: 37, y: 29)
+            let movedRect = EditableSelectionGeometry.moved(
+                moveRect, by: moveDelta,
+                within: CGRect(origin: .zero, size: b))
+            let (moveOverlay, moveView) = reviewView()
+            moveView.selectForTesting(rect: moveRect)
+            let moveBarBefore = moveView.reviewToolbarFrameForTesting
+            let moveStart = CGPoint(x: moveRect.midX, y: moveRect.midY)
+            let moveEnd = CGPoint(
+                x: moveStart.x + moveDelta.x,
+                y: moveStart.y + moveDelta.y)
+            if let down = liveMouse(.leftMouseDown, moveStart) {
+                moveView.mouseDown(with: down)
+            }
+            if let drag = liveMouse(.leftMouseDragged, moveEnd) {
+                moveView.mouseDragged(with: drag)
+            }
+            let moveBarDuring = moveView.reviewToolbarFrameForTesting
+            let movePixelsDuring = moveOverlay.session.pixelRect
+            let moveToolbarLive = moveBarBefore != nil
+                && moveBarDuring != moveBarBefore
+            let movePixelsLive = movePixelsDuring == expectedPixels(
+                for: movedRect, frozen: frozenImage)
+            if let up = liveMouse(.leftMouseUp, moveEnd) {
+                moveView.mouseUp(with: up)
+            }
+            let moveToolbarNoJump =
+                moveView.reviewToolbarFrameForTesting == moveBarDuring
+            let movePixelsNoJump =
+                moveOverlay.session.pixelRect == movePixelsDuring
+
+            let resizeRect = CGRect(
+                x: max(40, b.width / 2 - 130),
+                y: min(max(180, b.height / 3), b.height - 220),
+                width: 260, height: 180)
+            let resizedRect = EditableSelectionGeometry.resized(
+                resizeRect, using: .bottom,
+                to: CGPoint(x: resizeRect.midX, y: 5),
+                within: CGRect(origin: .zero, size: b))
+            let (resizeOverlay, resizeView) = reviewView()
+            resizeView.selectForTesting(rect: resizeRect)
+            let resizeBarBefore = resizeView.reviewToolbarFrameForTesting
+            let resizeStart = SelectionHandle.bottom.point(in: resizeRect)
+            let resizeEnd = CGPoint(x: resizeStart.x, y: 5)
+            if let down = liveMouse(.leftMouseDown, resizeStart) {
+                resizeView.mouseDown(with: down)
+            }
+            if let drag = liveMouse(.leftMouseDragged, resizeEnd) {
+                resizeView.mouseDragged(with: drag)
+            }
+            let resizeBarDuring = resizeView.reviewToolbarFrameForTesting
+            let resizePixelsDuring = resizeOverlay.session.pixelRect
+            let resizeToolbarLive = resizeBarBefore != nil
+                && resizeBarDuring != resizeBarBefore
+            let resizePixelsLive = resizePixelsDuring == expectedPixels(
+                for: resizedRect, frozen: frozenImage)
+            if let up = liveMouse(.leftMouseUp, resizeEnd) {
+                resizeView.mouseUp(with: up)
+            }
+            let resizeToolbarNoJump =
+                resizeView.reviewToolbarFrameForTesting == resizeBarDuring
+            let resizePixelsNoJump =
+                resizeOverlay.session.pixelRect == resizePixelsDuring
+
+            check("overlay7-toolbar-live-follow",
+                  moveToolbarLive && moveToolbarNoJump
+                    && resizeToolbarLive && resizeToolbarNoJump,
+                  "moveLive \(moveToolbarLive) moveNoJump \(moveToolbarNoJump) resizeLive \(resizeToolbarLive) resizeNoJump \(resizeToolbarNoJump)")
+            check("overlay7-pixelrect-live-follow",
+                  movePixelsLive && movePixelsNoJump
+                    && resizePixelsLive && resizePixelsNoJump,
+                  "moveLive \(movePixelsLive) moveNoJump \(movePixelsNoJump) resizeLive \(resizePixelsLive) resizeNoJump \(resizePixelsNoJump)")
+
+            // S5 fail-first: Translate is a real shared toolbar action and
+            // both terminal hosts claim it BEFORE the dependency can
+            // synchronously re-enter. The dependency observes teardown,
+            // preventing duplicate OCR tasks/windows/network requests.
+            @MainActor func allButtons12(in root: NSView) -> [NSButton] {
+                root.subviews.flatMap { child -> [NSButton] in
+                    let own = (child as? NSButton).map { [$0] } ?? []
+                    return own + allButtons12(in: child)
+                }
+            }
+            @MainActor func actionCatalog12(in root: NSView)
+                -> [(Int, String)] {
+                allButtons12(in: root)
+                    .filter { $0.tag >= 0 && $0.tag < 100 }
+                    .map { ($0.tag, $0.toolTip ?? "") }
+                    .sorted { $0.0 < $1.0 }
+            }
+
+            var areaTranslateCalls = 0
+            var areaTranslateModes: [Bool] = []
+            var areaCompletion = 0
+            var areaPhaseDuring: OverlaySessionPhase?
+            var areaCompletionDuring = -1
+            var areaTranslateRects: [CGRect] = []
+            weak var areaTranslateView: SelectionOverlayView?
+            let areaTranslateOverlay = SelectionOverlay(
+                purpose: .areaReview,
+                inputs: OverlaySessionInputs(
+                    afterShow: true, afterCopy: true, afterSave: true),
+                completion: { _ in areaCompletion += 1 })
+            areaTranslateOverlay.routerDependenciesOverride =
+                CaptureActionRouter.Dependencies(
+                    copyToClipboard: { _ in }, autoSave: { _, _ in },
+                    saveAs: { _, _ in }, pin: { _ in },
+                    ocrWithMode: { _, autoTranslate in
+                        areaTranslateCalls += 1
+                        areaTranslateModes.append(autoTranslate)
+                        areaPhaseDuring = areaTranslateOverlay.session.phase
+                        areaCompletionDuring = areaCompletion
+                        if areaTranslateCalls == 1 {
+                            areaTranslateView?.performReviewActionForTesting(
+                                .translate)
+                        }
+                    },
+                    openEditor: { _ in }, toast: { _ in },
+                    setLastCapture: { _ in },
+                    setLastAreaRect: { areaTranslateRects.append($0) },
+                    logEvent: { _ in })
+            let areaTranslateHost = SelectionOverlayView(
+                mode: .area, screen: screen, frozen: frozenImage,
+                windowList: [], owner: areaTranslateOverlay)
+            areaTranslateView = areaTranslateHost
+            let areaTranslateSelection = CGRect(
+                x: max(80, b.width / 2 - 120),
+                y: max(100, b.height / 2 - 80),
+                width: 240, height: 160)
+            areaTranslateHost.selectForTesting(rect: areaTranslateSelection)
+            let areaTranslateButtons = allButtons12(in: areaTranslateHost)
+                .filter { $0.toolTip == "OCR + Translate" }
+            areaTranslateButtons.first?.performClick(nil)
+
+            var panelTranslateCalls = 0
+            var panelTranslateModes: [Bool] = []
+            var panelDetachedDuring = false
+            var panelAreaRects = 0
+            weak var panelTranslateProbe: ScrollResultPanel?
+            let panelTranslateDeps = CaptureActionRouter.Dependencies(
+                copyToClipboard: { _ in }, autoSave: { _, _ in },
+                saveAs: { _, _ in }, pin: { _ in },
+                ocrWithMode: { _, autoTranslate in
+                    panelTranslateCalls += 1
+                    panelTranslateModes.append(autoTranslate)
+                    panelDetachedDuring = ScrollResultPanel.current == nil
+                    if panelTranslateCalls == 1 {
+                        panelTranslateProbe?.performActionForTesting(.translate)
+                    }
+                },
+                openEditor: { _ in }, toast: { _ in },
+                setLastCapture: { _ in },
+                setLastAreaRect: { _ in panelAreaRects += 1 },
+                logEvent: { _ in })
+            let panelTranslate = ScrollResultPanel.show(
+                image: CapturedImage(
+                    cgImage: makeStripePattern(
+                        width: 96, height: 900, seed: 0x5125_7001),
+                    scale: 1),
+                inputs: OverlaySessionInputs(
+                    afterShow: true, afterCopy: true, afterSave: true),
+                screen: screen, dependencies: panelTranslateDeps)
+            panelTranslateProbe = panelTranslate
+            let panelRoot12 = panelTranslate.contentView ?? NSView()
+            let panelTranslateButtons = allButtons12(in: panelRoot12)
+                .filter { $0.toolTip == "OCR + Translate" }
+            let areaCatalog12 = actionCatalog12(in: areaTranslateHost)
+            let panelCatalog12 = actionCatalog12(in: panelRoot12)
+            panelTranslateButtons.first?.performClick(nil)
+            let catalogsMatch12 = areaCatalog12.count == panelCatalog12.count
+                && zip(areaCatalog12, panelCatalog12).allSatisfy {
+                    $0.0.0 == $0.1.0 && $0.0.1 == $0.1.1
+                }
+            let translateHostsOK = areaTranslateButtons.count == 1
+                && panelTranslateButtons.count == 1
+                && areaCatalog12.count == 6
+                && catalogsMatch12
+                && Set(areaCatalog12.map(\.0)).count == 6
+                && areaTranslateCalls == 1
+                && areaTranslateModes == [true]
+                && areaTranslateOverlay.session.phase == .completed
+                && areaCompletion == 1
+                && areaPhaseDuring == .completed
+                && areaCompletionDuring == 1
+                && areaTranslateRects.count == 1
+                && panelTranslateCalls == 1
+                && panelTranslateModes == [true]
+                && panelDetachedDuring && panelAreaRects == 0
+            check("overlay12-translate-hosts-s5", translateHostsOK,
+                  "buttons \(areaTranslateButtons.count)/\(panelTranslateButtons.count) catalog \(areaCatalog12)/\(panelCatalog12) calls \(areaTranslateCalls)/\(panelTranslateCalls) modes \(areaTranslateModes)/\(panelTranslateModes) area phase/completion \(areaTranslateOverlay.session.phase)/\(areaCompletion) observed \(String(describing: areaPhaseDuring))/\(areaCompletionDuring) rects \(areaTranslateRects.count)/\(panelAreaRects) detached \(panelDetachedDuring)")
+            // RED cleanup: if no Translate button existed, close the retained
+            // panel through an existing terminal route.
+            if ScrollResultPanel.current === panelTranslate {
+                panelTranslate.performActionForTesting(.copy)
+            }
+
+            // S5 layout contract. Editing chrome is a vertical rail beside
+            // the selection; terminal actions are a horizontal strip below
+            // it. Both flip at screen edges and wrap under constrained
+            // geometry. Assertions use REAL button frames, not a synthetic
+            // geometry helper, so host wiring cannot be vacuous.
+            @MainActor func buttonFrame12(
+                _ button: NSButton, in root: NSView
+            ) -> CGRect {
+                button.convert(button.bounds, to: root)
+            }
+            @MainActor func union12(_ frames: [CGRect]) -> CGRect? {
+                guard var result = frames.first else { return nil }
+                for frame in frames.dropFirst() { result = result.union(frame) }
+                return result
+            }
+            @MainActor func distinct12(_ values: [CGFloat]) -> Int {
+                Set(values.map { Int(($0 * 10).rounded()) }).count
+            }
+            @MainActor func separation12(_ a: CGRect, _ b: CGRect) -> CGFloat {
+                let dx = max(0, max(a.minX - b.maxX, b.minX - a.maxX))
+                let dy = max(0, max(a.minY - b.maxY, b.minY - a.maxY))
+                return max(dx, dy)
+            }
+            @MainActor func inspectAreaLayout12(
+                view: SelectionOverlayView, selection: CGRect,
+                expectToolSide: String?, expectActionSide: String?,
+                requireWrap: Bool
+            ) -> [String] {
+                let buttons = allButtons12(in: view)
+                let editing = buttons.filter { $0.tag >= 100 }
+                let actions = buttons.filter { $0.tag < 100 }
+                let editingFrames = editing.map { buttonFrame12($0, in: view) }
+                let actionFrames = actions.map { buttonFrame12($0, in: view) }
+                let orderedButtons = editing + actions
+                let allFrames = editingFrames + actionFrames
+                var failures: [String] = []
+                if editing.count != OverlayAnnotationTool.allCases.count + 3 {
+                    failures.append("editing count \(editing.count)")
+                }
+                if actions.count != 7 { failures.append("action count \(actions.count)") }
+                if let frame = union12(editingFrames), let side = expectToolSide {
+                    if side == "right", frame.minX < selection.maxX {
+                        failures.append("tools not right \(frame)")
+                    }
+                    if side == "left", frame.maxX > selection.minX {
+                        failures.append("tools not left \(frame)")
+                    }
+                } else if editingFrames.isEmpty { failures.append("no tool frames") }
+                if let frame = union12(actionFrames), let side = expectActionSide {
+                    if side == "below", frame.maxY > selection.minY {
+                        failures.append("actions not below \(frame)")
+                    }
+                    if side == "above", frame.minY < selection.maxY {
+                        failures.append("actions not above \(frame)")
+                    }
+                } else if actionFrames.isEmpty { failures.append("no action frames") }
+                for (i, frame) in allFrames.enumerated() {
+                    if !view.bounds.contains(frame) {
+                        failures.append("button \(i) outside \(frame)")
+                    }
+                    let center = CGPoint(x: frame.midX, y: frame.midY)
+                    if view.hitTest(center) !== orderedButtons[i] {
+                        failures.append("button \(i) not hit-testable")
+                    }
+                    for j in (i + 1)..<allFrames.count
+                        where frame.intersects(allFrames[j]) {
+                        failures.append("buttons \(i)/\(j) overlap")
+                    }
+                    for (handle, handleRect) in EditableSelectionGeometry
+                        .handleRects(for: selection, size: 18)
+                        where frame.intersects(handleRect) {
+                        failures.append("button \(i) hits \(handle)")
+                    }
+                }
+                if requireWrap {
+                    if distinct12(editingFrames.map(\.minX)) <= 1 {
+                        failures.append("tools did not wrap columns")
+                    }
+                    if distinct12(actionFrames.map(\.minY)) <= 1 {
+                        failures.append("actions did not wrap rows")
+                    }
+                    if editingFrames.count >= 2,
+                       abs(editingFrames[0].midX - editingFrames[1].midX) > 0.1
+                        || editingFrames[0].minY <= editingFrames[1].minY {
+                        failures.append("tool order is not top-to-bottom")
+                    }
+                    if actionFrames.count >= 2,
+                       abs(actionFrames[0].midY - actionFrames[1].midY) > 0.1
+                        || actionFrames[0].minX >= actionFrames[1].minX {
+                        failures.append("action order is not left-to-right")
+                    }
+                }
+                return failures
+            }
+
+            var layout12Failures: [String] = []
+            let normalSelection = CGRect(
+                x: max(80, b.width / 2 - 100),
+                y: max(120, b.height / 2 - 70),
+                width: 200, height: 140)
+            let (normalLayoutOverlay, normalLayoutView) = reviewView()
+            _ = normalLayoutOverlay
+            normalLayoutView.selectForTesting(rect: normalSelection)
+            layout12Failures += inspectAreaLayout12(
+                view: normalLayoutView, selection: normalSelection,
+                expectToolSide: "right", expectActionSide: "below",
+                requireWrap: false).map { "normal \($0)" }
+
+            let rightSelection = CGRect(
+                x: b.width - 164, y: max(120, b.height / 2 - 50),
+                width: 160, height: 100)
+            let (rightLayoutOverlay, rightLayoutView) = reviewView()
+            _ = rightLayoutOverlay
+            rightLayoutView.selectForTesting(rect: rightSelection)
+            layout12Failures += inspectAreaLayout12(
+                view: rightLayoutView, selection: rightSelection,
+                expectToolSide: "left", expectActionSide: nil,
+                requireWrap: false).map { "right \($0)" }
+
+            let bottomSelection = CGRect(
+                x: max(80, b.width / 2 - 80), y: 4,
+                width: 160, height: 100)
+            let (bottomLayoutOverlay, bottomLayoutView) = reviewView()
+            _ = bottomLayoutOverlay
+            bottomLayoutView.selectForTesting(rect: bottomSelection)
+            layout12Failures += inspectAreaLayout12(
+                view: bottomLayoutView, selection: bottomSelection,
+                expectToolSide: nil, expectActionSide: "above",
+                requireWrap: false).map { "bottom \($0)" }
+
+            let fullSelection = CGRect(
+                x: 4, y: 4, width: b.width - 8, height: b.height - 8)
+            let (fullLayoutOverlay, fullLayoutView) = reviewView()
+            _ = fullLayoutOverlay
+            fullLayoutView.selectForTesting(rect: fullSelection)
+            layout12Failures += inspectAreaLayout12(
+                view: fullLayoutView, selection: fullSelection,
+                expectToolSide: nil, expectActionSide: nil,
+                requireWrap: false).map { "full \($0)" }
+
+            let (tinyLayoutOverlay, tinyLayoutView) = reviewView()
+            _ = tinyLayoutOverlay
+            let tinySelection = CGRect(
+                x: b.width / 2 - 20, y: b.height / 2 - 20,
+                width: 40, height: 40)
+            tinyLayoutView.selectForTesting(rect: tinySelection)
+            layout12Failures += inspectAreaLayout12(
+                view: tinyLayoutView, selection: tinySelection,
+                expectToolSide: nil, expectActionSide: nil,
+                requireWrap: true).map { "tiny \($0)" }
+
+            let tinyCornerOrigins = [
+                CGPoint(x: 4, y: 4),
+                CGPoint(x: b.width - 44, y: 4),
+                CGPoint(x: 4, y: b.height - 44),
+                CGPoint(x: b.width - 44, y: b.height - 44),
+            ]
+            for (corner, origin) in tinyCornerOrigins.enumerated() {
+                let (cornerOverlay, cornerView) = reviewView()
+                _ = cornerOverlay
+                let selection = CGRect(origin: origin, size: CGSize(
+                    width: 40, height: 40))
+                cornerView.selectForTesting(rect: selection)
+                layout12Failures += inspectAreaLayout12(
+                    view: cornerView, selection: selection,
+                    expectToolSide: nil, expectActionSide: nil,
+                    requireWrap: true).map { "corner\(corner) \($0)" }
+                let cornerButtons = allButtons12(in: cornerView)
+                let cornerToolFrames = cornerButtons.filter { $0.tag >= 100 }
+                    .map { buttonFrame12($0, in: cornerView) }
+                let cornerActionFrames = cornerButtons.filter { $0.tag < 100 }
+                    .map { buttonFrame12($0, in: cornerView) }
+                for (name, frames) in [
+                    ("tools", cornerToolFrames),
+                    ("actions", cornerActionFrames),
+                ] {
+                    if let frame = union12(frames),
+                       separation12(frame, selection)
+                        > max(frame.width, frame.height) * 2 + 20 {
+                        layout12Failures.append(
+                            "corner\(corner) \(name) teleported \(frame)")
+                    }
+                }
+            }
+
+            let layoutPanel = ScrollResultPanel.show(
+                image: CapturedImage(
+                    cgImage: makeStripePattern(
+                        width: 64, height: 800, seed: 0x5125_7002),
+                    scale: 1),
+                inputs: OverlaySessionInputs(
+                    afterShow: true, afterCopy: false, afterSave: false),
+                screen: screen, dependencies: noopDeps())
+            if let bar = layoutPanel.toolbarFrameForTesting {
+                let frames = layoutPanel.toolbarButtonFramesForTesting
+                let rowCount = distinct12(frames.map(\.minY))
+                if rowCount <= 1 { layout12Failures.append("panel did not wrap") }
+                let barBounds = CGRect(origin: .zero, size: bar.size)
+                for (i, frame) in frames.enumerated() {
+                    if !barBounds.contains(frame) {
+                        layout12Failures.append("panel button \(i) outside")
+                    }
+                    for j in (i + 1)..<frames.count
+                        where frame.intersects(frames[j]) {
+                        layout12Failures.append("panel buttons \(i)/\(j) overlap")
+                    }
+                    if let content = layoutPanel.contentView {
+                        let center = CGPoint(
+                            x: bar.minX + frame.midX,
+                            y: bar.minY + frame.midY)
+                        if !(content.hitTest(center) is NSButton) {
+                            layout12Failures.append(
+                                "panel button \(i) not hit-testable")
+                        }
+                    }
+                }
+                if let host = layoutPanel.annotationHostForTesting,
+                   host.frame.intersects(bar) {
+                    layout12Failures.append("panel host intersects toolbar")
+                }
+                if layoutPanel.frame.width > screen.visibleFrame.width * 0.9 + 1
+                    || layoutPanel.frame.height > screen.visibleFrame.height * 0.9 + 1 {
+                    layout12Failures.append("panel exceeds 90% \(layoutPanel.frame)")
+                }
+            } else {
+                layout12Failures.append("panel has no toolbar")
+            }
+            layoutPanel.performActionForTesting(.copy)
+
+            // Regression for the 5K×40K class: natural width is huge, but
+            // vertical fit makes the displayed image narrow. Panel chrome
+            // must converge to that FITTED width (plus the 206pt HUD floor)
+            // instead of leaving an almost-screen-wide empty toolbar.
+            let wideTallPanel = ScrollResultPanel.show(
+                image: CapturedImage(
+                    cgImage: makeStripePattern(
+                        width: 250, height: 2000, seed: 0x5125_7003),
+                    scale: 0.1), // 2500×20000pt without a 200MB fixture
+                inputs: OverlaySessionInputs(
+                    afterShow: true, afterCopy: false, afterSave: false),
+                screen: screen, dependencies: noopDeps())
+            if let wideBar = wideTallPanel.toolbarFrameForTesting,
+               let wideHost = wideTallPanel.annotationHostForTesting {
+                let minimumWidth = min(screen.visibleFrame.width * 0.9, 206)
+                let expectedCompactWidth = max(minimumWidth, wideHost.frame.width)
+                if wideTallPanel.frame.width > expectedCompactWidth + 1 {
+                    layout12Failures.append(
+                        "wide-tall chrome waste panel \(wideTallPanel.frame.width) host \(wideHost.frame.width)")
+                }
+                if distinct12(
+                    wideTallPanel.toolbarButtonFramesForTesting.map(\.minY)) <= 1 {
+                    layout12Failures.append("wide-tall panel did not wrap")
+                }
+                if wideHost.frame.intersects(wideBar) {
+                    layout12Failures.append("wide-tall host intersects toolbar")
+                }
+                if wideTallPanel.frame.width > screen.visibleFrame.width * 0.9 + 1
+                    || wideTallPanel.frame.height
+                        > screen.visibleFrame.height * 0.9 + 1 {
+                    layout12Failures.append(
+                        "wide-tall panel exceeds 90% \(wideTallPanel.frame)")
+                }
+            } else {
+                layout12Failures.append("wide-tall panel missing geometry")
+            }
+            wideTallPanel.performActionForTesting(.copy)
+            check("overlay12-layout-s5", layout12Failures.isEmpty,
+                  layout12Failures.joined(separator: "; "))
+
+            // Full-toolbar S1 fail-first gate. It compiles against the old
+            // five-tool enum, but stays red until Line/Oval/Highlighter and
+            // Counter are actually routed through the production area-view
+            // mouse handlers and rendered into the exported crop.
+            let s1Names = ["Line", "Oval", "Highlighter", "Counter"]
+            let s1Tools = OverlayAnnotationTool.allCases.filter { tool in
+                s1Names.contains { tool.tooltip.hasPrefix($0) }
+            }
+            var s1Failures: [String] = []
+            if s1Tools.count != s1Names.count {
+                s1Failures.append("catalog \(s1Tools.count)/\(s1Names.count)")
+            }
+            for tool in s1Tools {
+                let name = s1Names.first { tool.tooltip.hasPrefix($0) }
+                    ?? tool.tooltip
+                let (overlay, view) = reviewView()
+                let selection = CGRect(
+                    x: max(40, b.width / 2 - 150),
+                    y: max(100, b.height / 2 - 100),
+                    width: 300, height: 200)
+                view.selectForTesting(rect: selection)
+                guard let surface = view.annotationSurface else {
+                    s1Failures.append("\(name) no surface")
+                    continue
+                }
+                surface.tool = tool
+                let start = CGPoint(
+                    x: selection.minX + 55,
+                    y: selection.minY + 55)
+                let end = CGPoint(
+                    x: selection.minX + 175,
+                    y: selection.minY + 125)
+                if let down = liveMouse(.leftMouseDown, start) {
+                    view.mouseDown(with: down)
+                }
+                if let drag = liveMouse(.leftMouseDragged, end) {
+                    view.mouseDragged(with: drag)
+                }
+                if let up = liveMouse(.leftMouseUp, end) {
+                    view.mouseUp(with: up)
+                }
+                guard let annotation = surface.annotations.last else {
+                    s1Failures.append("\(name) no annotation")
+                    continue
+                }
+                let correctKind: Bool
+                switch (name, annotation) {
+                case ("Line", let shape as ShapeAnnotation):
+                    if case .line = shape.kind { correctKind = true }
+                    else { correctKind = false }
+                case ("Oval", let shape as ShapeAnnotation):
+                    if case .oval = shape.kind { correctKind = true }
+                    else { correctKind = false }
+                case ("Highlighter", let shape as ShapeAnnotation):
+                    if case .highlight = shape.kind { correctKind = true }
+                    else { correctKind = false }
+                case ("Counter", let counter as CounterAnnotation):
+                    correctKind = counter.number == 1
+                default:
+                    correctKind = false
+                }
+                if !correctKind {
+                    s1Failures.append("\(name) wrong model")
+                }
+                let plain = frozenImage.cgImage.cropping(
+                    to: overlay.session.pixelRect)
+                let flat = surface.flattened(
+                    base: frozenImage.cgImage,
+                    cropPixels: overlay.session.pixelRect)
+                if plain == nil || flat == nil
+                    || imagesEqual(plain!, flat!) {
+                    s1Failures.append("\(name) no export ink")
+                }
+                if name == "Counter" {
+                    let second = CGPoint(
+                        x: selection.minX + 220,
+                        y: selection.minY + 145)
+                    if let down = liveMouse(.leftMouseDown, second) {
+                        view.mouseDown(with: down)
+                    }
+                    if let up = liveMouse(.leftMouseUp, second) {
+                        view.mouseUp(with: up)
+                    }
+                    let counters = surface.annotations.compactMap {
+                        ($0 as? CounterAnnotation)?.number
+                    }
+                    if counters != [1, 2] {
+                        s1Failures.append("Counter sequence \(counters)")
+                    }
+                }
+            }
+            check("overlay8-full-tools-s1", s1Failures.isEmpty,
+                  s1Failures.joined(separator: "; "))
+
+            // S2 production/catalog gate: Pixelate must be the SAME real
+            // toolbar item/tag on area + scroll, and reverse-drag must create
+            // the editor's BlurAnnotation model through live mouse handlers.
+            let s2Tools = OverlayAnnotationTool.allCases.filter {
+                $0.tooltip.hasPrefix("Pixelate")
+            }
+            var s2ToolbarFailures: [String] = []
+            if s2Tools.count != 1 {
+                s2ToolbarFailures.append("catalog \(s2Tools.count)/1")
+            }
+            if let tool = s2Tools.first,
+               let index = OverlayAnnotationTool.allCases.firstIndex(of: tool) {
+                let expectedTag = 100 + index
+                let (areaOverlay, view) = reviewView()
+                let selection = CGRect(
+                    x: max(40, b.width / 2 - 150),
+                    y: max(100, b.height / 2 - 100),
+                    width: 300, height: 200)
+                view.selectForTesting(rect: selection)
+                let areaPixelate = view.reviewToolbarButtonsForTesting.filter {
+                    $0.tooltip.hasPrefix("Pixelate")
+                }
+                if areaPixelate.map(\.tag) != [expectedTag] {
+                    s2ToolbarFailures.append(
+                        "area tags \(areaPixelate.map(\.tag)) all \(view.reviewToolbarButtonsForTesting)")
+                }
+                view.clickReviewToolbarButtonForTesting(tag: expectedTag)
+                if view.annotationSurface?.tool != tool {
+                    s2ToolbarFailures.append("area click did not select")
+                }
+                let start = CGPoint(
+                    x: selection.minX + 220,
+                    y: selection.minY + 145)
+                let end = CGPoint(
+                    x: selection.minX + 65,
+                    y: selection.minY + 45)
+                if let down = liveMouse(.leftMouseDown, start) {
+                    view.mouseDown(with: down)
+                }
+                if let drag = liveMouse(.leftMouseDragged, end) {
+                    view.mouseDragged(with: drag)
+                }
+                if let up = liveMouse(.leftMouseUp, end) {
+                    view.mouseUp(with: up)
+                }
+                let wantRect = CGRect(
+                    x: end.x, y: end.y,
+                    width: start.x - end.x, height: start.y - end.y)
+                if let blur = view.annotationSurface?.annotations.last
+                    as? BlurAnnotation {
+                    if blur.rect != wantRect {
+                        s2ToolbarFailures.append(
+                            "reverse rect \(blur.rect) want \(wantRect)")
+                    }
+                } else {
+                    s2ToolbarFailures.append("area no BlurAnnotation")
+                }
+                _ = areaOverlay.session.phase // retain weak owner through input
+
+                let panel = ScrollResultPanel.show(
+                    image: frozenImage,
+                    inputs: OverlaySessionInputs(
+                        afterShow: true, afterCopy: false, afterSave: false),
+                    screen: screen, dependencies: noopDeps())
+                let panelPixelate = panel.toolbarButtonsForTesting.filter {
+                    $0.tooltip.hasPrefix("Pixelate")
+                }
+                if panelPixelate.map(\.tag) != [expectedTag] {
+                    s2ToolbarFailures.append("panel tags \(panelPixelate.map(\.tag))")
+                }
+                panel.clickToolbarButtonForTesting(tag: expectedTag)
+                if panel.annotationSurface.tool != tool {
+                    s2ToolbarFailures.append("panel click did not select")
+                }
+                panel.clickToolbarButtonForTesting(tag: -1)
+            }
+            check("overlay9-pixelate-toolbar-s2", s2ToolbarFailures.isEmpty,
+                  s2ToolbarFailures.joined(separator: "; "))
+
+            // S3 live-host gate: both real area and scroll-panel responders
+            // must write the same editor keys, show the same HUD, and stamp
+            // the persisted point width onto marks created afterward.
+            do {
+                var widths: [String: CGFloat] = [
+                    EditorTool.arrow.rawValue: 7,
+                    EditorTool.pen.rawValue: 6,
+                ]
+                var writes: [(key: String, value: CGFloat)] = []
+                AnnotationSurface.strokeWidthStoreOverrideForTesting =
+                    OverlayStrokeWidthStore(
+                        read: { widths[$0] ?? 3 },
+                        write: { value, key in
+                            widths[key] = value
+                            writes.append((key, value))
+                        })
+                defer {
+                    AnnotationSurface.strokeWidthStoreOverrideForTesting = nil
+                }
+                func lineScroll(_ delta: Int32) -> NSEvent? {
+                    guard let cg = CGEvent(
+                        scrollWheelEvent2Source: nil, units: .line,
+                        wheelCount: 1, wheel1: delta,
+                        wheel2: 0, wheel3: 0)
+                    else { return nil }
+                    return NSEvent(cgEvent: cg)
+                }
+
+                var hostFailures: [String] = []
+                let (strokeOverlay, strokeView) = reviewView()
+                let strokeSelection = CGRect(
+                    x: max(40, b.width / 2 - 160),
+                    y: max(100, b.height / 2 - 110),
+                    width: 320, height: 220)
+                strokeView.selectForTesting(rect: strokeSelection)
+                strokeView.clickReviewToolbarButtonForTesting(
+                    tag: OverlayAnnotationTool.arrow.toolbarTag)
+                if let up = lineScroll(1) {
+                    strokeView.scrollWheel(with: up)
+                    strokeView.scrollWheel(with: up)
+                }
+                let areaHUD = strokeView.subviews.compactMap {
+                    $0 as? StrokePreviewView
+                }.last
+                if widths[EditorTool.arrow.rawValue] != 8
+                    || areaHUD?.isHidden != false
+                    || areaHUD?.strokeWidth != 8
+                    || areaHUD?.hitTest(CGPoint(
+                        x: areaHUD?.bounds.midX ?? 0,
+                        y: areaHUD?.bounds.midY ?? 0)) != nil
+                    || areaHUD.map({ strokeView.bounds.contains($0.frame) })
+                        != true {
+                    hostFailures.append(
+                        "area width \(String(describing: widths[EditorTool.arrow.rawValue])) hud \(String(describing: areaHUD?.strokeWidth))")
+                }
+                let areaStart = CGPoint(
+                    x: strokeSelection.minX + 40,
+                    y: strokeSelection.minY + 40)
+                let areaEnd = CGPoint(
+                    x: strokeSelection.minX + 150,
+                    y: strokeSelection.minY + 120)
+                if let down = liveMouse(.leftMouseDown, areaStart) {
+                    strokeView.mouseDown(with: down)
+                }
+                if let drag = liveMouse(.leftMouseDragged, areaEnd) {
+                    strokeView.mouseDragged(with: drag)
+                }
+                if let up = liveMouse(.leftMouseUp, areaEnd) {
+                    strokeView.mouseUp(with: up)
+                }
+                if (strokeView.annotationSurface?.annotations.last
+                    as? ShapeAnnotation)?.strokeWidthPt != 8 {
+                    hostFailures.append("area model width")
+                }
+
+                areaHUD?.isHidden = true
+                guard strokeOverlay.session.transition(to: .saving) else {
+                    hostFailures.append("area save transition")
+                    check("overlay10-stroke-width-hosts-s3", false,
+                          hostFailures.joined(separator: "; "))
+                    return
+                }
+                let writesBeforeAreaLock = writes.count
+                if let up = lineScroll(1) {
+                    strokeView.scrollWheel(with: up)
+                }
+                if writes.count != writesBeforeAreaLock
+                    || areaHUD?.isHidden == false {
+                    hostFailures.append("area save-lock")
+                }
+                _ = strokeOverlay.session.transition(to: .reviewing)
+
+                var panelSaveDone: (@MainActor (SaveAsOutcome) -> Void)?
+                let panelDeps = CaptureActionRouter.Dependencies(
+                    copyToClipboard: { _ in }, autoSave: { _, _ in },
+                    saveAs: { _, done in panelSaveDone = done },
+                    pin: { _ in }, ocr: { _ in }, openEditor: { _ in },
+                    toast: { _ in }, setLastCapture: { _ in },
+                    setLastAreaRect: { _ in }, logEvent: { _ in })
+                let narrowPanelImage = CapturedImage(
+                    cgImage: makeNoiseImage(width: 64, height: 800), scale: 1)
+                let panel = ScrollResultPanel.show(
+                    image: narrowPanelImage,
+                    inputs: OverlaySessionInputs(
+                        afterShow: true, afterCopy: false, afterSave: false),
+                    screen: screen, dependencies: panelDeps)
+                panel.clickToolbarButtonForTesting(
+                    tag: OverlayAnnotationTool.pen.toolbarTag)
+                if let host = panel.annotationHostForTesting,
+                   let up = lineScroll(1) {
+                    host.scrollWheel(with: up)
+                    host.scrollWheel(with: up)
+                    let panelHUD = (panel.contentView?.subviews ?? [])
+                        .compactMap { $0 as? StrokePreviewView }.last
+                        ?? host.subviews.compactMap {
+                            $0 as? StrokePreviewView
+                        }.last
+                    let panelHUDFrameOK = panel.contentView.map { content in
+                        guard let panelHUD else { return false }
+                        let frame = panelHUD.convert(panelHUD.bounds, to: content)
+                        return content.bounds.contains(frame)
+                            && panelHUD.superview === content
+                    } == true
+                    if widths[EditorTool.pen.rawValue] != 7
+                        || panelHUD?.isHidden != false
+                        || panelHUD?.strokeWidth != 7
+                        || panelHUD?.hitTest(CGPoint(
+                            x: panelHUD?.bounds.midX ?? 0,
+                            y: panelHUD?.bounds.midY ?? 0)) != nil
+                        || !panelHUDFrameOK {
+                        hostFailures.append(
+                            "panel width \(String(describing: widths[EditorTool.pen.rawValue])) hud \(String(describing: panelHUD?.strokeWidth)) frame \(panelHUDFrameOK)")
+                    }
+                    panel.drawWithRealEventsForTesting(
+                        fromView: CGPoint(x: 10, y: 20),
+                        toView: CGPoint(x: 50, y: 90))
+                    if (panel.annotationSurface.annotations.last
+                        as? PenAnnotation)?.strokeWidthPt != 7 {
+                        hostFailures.append("panel model width")
+                    }
+                    panelHUD?.isHidden = true
+                    panel.performActionForTesting(.save)
+                    let writesBeforePanelLock = writes.count
+                    host.scrollWheel(with: up)
+                    if panelSaveDone == nil
+                        || writes.count != writesBeforePanelLock
+                        || panelHUD?.isHidden == false {
+                        hostFailures.append("panel save-lock")
+                    }
+                    panelSaveDone?(.cancelled)
+                    host.scrollWheel(with: up)
+                    if writes.count != writesBeforePanelLock + 1
+                        || widths[EditorTool.pen.rawValue] != 7.5
+                        || panelHUD?.isHidden != false {
+                        hostFailures.append("panel unlock")
+                    }
+                } else {
+                    hostFailures.append("panel host/event")
+                }
+                panel.clickToolbarButtonForTesting(tag: -1)
+
+                check("overlay10-stroke-width-hosts-s3",
+                      hostFailures.isEmpty,
+                      hostFailures.joined(separator: "; "))
+            }
+
+            // S4 live-host gate: both real responders, both real toolbar
+            // target/actions, shortcut routing, and the panel save lock.
+            do {
+                let redoTag = 202
+                @MainActor func keyEvent(
+                    _ characters: String,
+                    modifiers: NSEvent.ModifierFlags = []
+                ) -> NSEvent? {
+                    NSEvent.keyEvent(
+                        with: .keyDown, location: .zero,
+                        modifierFlags: modifiers, timestamp: 0,
+                        windowNumber: 0, context: nil,
+                        characters: characters,
+                        charactersIgnoringModifiers: characters.lowercased(),
+                        isARepeat: false, keyCode: 0)
+                }
+                @MainActor func buttons(in root: NSView) -> [NSButton] {
+                    root.subviews.flatMap { child -> [NSButton] in
+                        let own = (child as? NSButton).map { [$0] } ?? []
+                        return own + buttons(in: child)
+                    }
+                }
+                @MainActor func addAreaCounter(
+                    view: SelectionOverlayView, surface: AnnotationSurface,
+                    at point: CGPoint
+                ) {
+                    surface.tool = .counter
+                    if let down = liveMouse(.leftMouseDown, point) {
+                        view.mouseDown(with: down)
+                    }
+                    if let up = liveMouse(.leftMouseUp, point) {
+                        view.mouseUp(with: up)
+                    }
+                }
+
+                var hostFailures: [String] = []
+                let (historyOverlay, historyView) = reviewView()
+                let historySelection = CGRect(
+                    x: max(40, b.width / 2 - 150),
+                    y: max(100, b.height / 2 - 100),
+                    width: 300, height: 200)
+                historyView.selectForTesting(rect: historySelection)
+                guard let areaSurface = historyView.annotationSurface else {
+                    check("overlay11-undo-redo-hosts-s4", false,
+                          "area surface")
+                    return
+                }
+                addAreaCounter(
+                    view: historyView, surface: areaSurface,
+                    at: CGPoint(
+                        x: historySelection.minX + 60,
+                        y: historySelection.minY + 60))
+                addAreaCounter(
+                    view: historyView, surface: areaSurface,
+                    at: CGPoint(
+                        x: historySelection.minX + 120,
+                        y: historySelection.minY + 100))
+                let areaSecond = areaSurface.annotations.last
+                historyView.clickReviewToolbarButtonForTesting(
+                    tag: OverlayAnnotationTool.undoToolbarTag)
+                let areaButtonsAfterUndo = buttons(in: historyView)
+                let areaCatalog = areaButtonsAfterUndo.filter {
+                    $0.tag == OverlayAnnotationTool.undoToolbarTag
+                        || $0.tag == redoTag
+                }
+                let areaHistoryButtonsReady = areaCatalog.count == 2
+                    && areaCatalog.allSatisfy(\.isEnabled)
+                historyView.clickReviewToolbarButtonForTesting(tag: redoTag)
+                let areaButtonRedo = areaSurface.annotations.count == 2
+                    && areaSurface.annotations.last === areaSecond
+                if let cmdZ = keyEvent("z", modifiers: [.command]) {
+                    _ = historyView.performKeyEquivalent(with: cmdZ)
+                }
+                let areaKeyUndo = areaSurface.annotations.count == 1
+                if let shiftCmdZ = keyEvent(
+                    "z", modifiers: [.command, .shift]) {
+                    _ = historyView.performKeyEquivalent(with: shiftCmdZ)
+                }
+                let areaKeyRedo = areaSurface.annotations.count == 2
+                    && areaSurface.annotations.last === areaSecond
+                if let cmdZ = keyEvent("z", modifiers: [.command]) {
+                    _ = historyView.performKeyEquivalent(with: cmdZ)
+                }
+                addAreaCounter(
+                    view: historyView, surface: areaSurface,
+                    at: CGPoint(
+                        x: historySelection.minX + 180,
+                        y: historySelection.minY + 130))
+                let areaBranchCount = areaSurface.annotations.count
+                let areaBranchLast = areaSurface.annotations.last
+                if let shiftCmdZ = keyEvent(
+                    "z", modifiers: [.command, .shift]) {
+                    _ = historyView.performKeyEquivalent(with: shiftCmdZ)
+                }
+                let areaBranchCleared = areaBranchCount == 2
+                    && areaSurface.annotations.count == areaBranchCount
+                if let capsCmdZ = keyEvent(
+                    "z", modifiers: [.capsLock, .command]) {
+                    _ = historyView.performKeyEquivalent(with: capsCmdZ)
+                }
+                let areaCapsUndo = areaSurface.annotations.count == 1
+                if let capsShiftCmdZ = keyEvent(
+                    "z", modifiers: [.capsLock, .command, .shift]) {
+                    _ = historyView.performKeyEquivalent(with: capsShiftCmdZ)
+                }
+                let areaCapsRedo = areaSurface.annotations.count == 2
+                    && areaSurface.annotations.last === areaBranchLast
+                if !areaHistoryButtonsReady || !areaButtonRedo
+                    || !areaKeyUndo || !areaKeyRedo || !areaBranchCleared
+                    || !areaCapsUndo || !areaCapsRedo {
+                    hostFailures.append(
+                        "area catalog \(areaCatalog.map { ($0.tag, $0.isEnabled) }) button \(areaButtonRedo) keys \(areaKeyUndo)/\(areaKeyRedo) branch \(areaBranchCleared) caps \(areaCapsUndo)/\(areaCapsRedo)")
+                }
+
+                let areaShortcuts: [(String, OverlayAnnotationTool)] = [
+                    ("l", .line), ("o", .oval), ("h", .highlight),
+                    ("n", .counter), ("b", .blur),
+                ]
+                var areaShortcutsOK = true
+                for (key, tool) in areaShortcuts {
+                    if let event = keyEvent(key) { historyView.keyDown(with: event) }
+                    if areaSurface.tool != tool { areaShortcutsOK = false }
+                }
+                let textWindow = NSWindow(
+                    contentRect: historyView.bounds,
+                    styleMask: [.borderless], backing: .buffered, defer: false)
+                textWindow.contentView = historyView
+                areaSurface.tool = .text
+                historyView.beginTextEntryForTesting(atView: CGPoint(
+                    x: historySelection.midX, y: historySelection.midY))
+                if let event = keyEvent("l") { historyView.keyDown(with: event) }
+                let areaTextGuard = areaSurface.tool == .text
+                    && historyView.textFieldForTesting != nil
+                historyView.commitTextEntryForTesting(text: "")
+                textWindow.contentView = nil
+                if !areaShortcutsOK || !areaTextGuard {
+                    hostFailures.append(
+                        "area shortcuts \(areaShortcutsOK) text \(areaTextGuard)")
+                }
+                _ = historyOverlay.session.phase
+
+                let panelImage = CapturedImage(
+                    cgImage: makeNoiseImage(width: 320, height: 480), scale: 1)
+                var panelSaveDone: (@MainActor (SaveAsOutcome) -> Void)?
+                let panelDeps = CaptureActionRouter.Dependencies(
+                    copyToClipboard: { _ in }, autoSave: { _, _ in },
+                    saveAs: { _, done in panelSaveDone = done },
+                    pin: { _ in }, ocr: { _ in }, openEditor: { _ in },
+                    toast: { _ in }, setLastCapture: { _ in },
+                    setLastAreaRect: { _ in }, logEvent: { _ in })
+                let panel = ScrollResultPanel.show(
+                    image: panelImage,
+                    inputs: OverlaySessionInputs(
+                        afterShow: true, afterCopy: false, afterSave: false),
+                    screen: screen, dependencies: panelDeps)
+                panel.clickToolbarButtonForTesting(
+                    tag: OverlayAnnotationTool.counter.toolbarTag)
+                panel.drawWithRealEventsForTesting(
+                    fromView: CGPoint(x: 40, y: 60),
+                    toView: CGPoint(x: 40, y: 60))
+                panel.drawWithRealEventsForTesting(
+                    fromView: CGPoint(x: 90, y: 120),
+                    toView: CGPoint(x: 90, y: 120))
+                let panelSecond = panel.annotationSurface.annotations.last
+                panel.clickToolbarButtonForTesting(
+                    tag: OverlayAnnotationTool.undoToolbarTag)
+                let panelButtonsAfterUndo = panel.contentView.map {
+                    buttons(in: $0)
+                } ?? []
+                let panelCatalog = panelButtonsAfterUndo.filter {
+                    $0.tag == OverlayAnnotationTool.undoToolbarTag
+                        || $0.tag == redoTag
+                }
+                let panelHistoryButtonsReady = panelCatalog.count == 2
+                    && panelCatalog.allSatisfy(\.isEnabled)
+                panel.clickToolbarButtonForTesting(tag: redoTag)
+                let panelButtonRedo = panel.annotationSurface.annotations.count == 2
+                    && panel.annotationSurface.annotations.last === panelSecond
+                if let cmdZ = keyEvent("z", modifiers: [.command]) {
+                    _ = panel.performKeyEquivalent(with: cmdZ)
+                }
+                let panelKeyUndo = panel.annotationSurface.annotations.count == 1
+                if let shiftCmdZ = keyEvent(
+                    "z", modifiers: [.command, .shift]) {
+                    _ = panel.performKeyEquivalent(with: shiftCmdZ)
+                }
+                let panelKeyRedo = panel.annotationSurface.annotations.count == 2
+                    && panel.annotationSurface.annotations.last === panelSecond
+                if let capsCmdZ = keyEvent(
+                    "z", modifiers: [.capsLock, .command]) {
+                    _ = panel.performKeyEquivalent(with: capsCmdZ)
+                }
+                let panelCapsUndo = panel.annotationSurface.annotations.count == 1
+                if let capsShiftCmdZ = keyEvent(
+                    "z", modifiers: [.capsLock, .command, .shift]) {
+                    _ = panel.performKeyEquivalent(with: capsShiftCmdZ)
+                }
+                let panelCapsRedo = panel.annotationSurface.annotations.count == 2
+                    && panel.annotationSurface.annotations.last === panelSecond
+                if !panelHistoryButtonsReady || !panelButtonRedo
+                    || !panelKeyUndo || !panelKeyRedo
+                    || !panelCapsUndo || !panelCapsRedo {
+                    hostFailures.append(
+                        "panel catalog \(panelCatalog.map { ($0.tag, $0.isEnabled) }) button \(panelButtonRedo) keys \(panelKeyUndo)/\(panelKeyRedo) caps \(panelCapsUndo)/\(panelCapsRedo)")
+                }
+
+                var panelShortcutsOK = true
+                for (key, tool) in areaShortcuts {
+                    if let event = keyEvent(key) { panel.keyDown(with: event) }
+                    if panel.annotationSurface.tool != tool {
+                        panelShortcutsOK = false
+                    }
+                }
+                panel.clickToolbarButtonForTesting(
+                    tag: OverlayAnnotationTool.text.toolbarTag)
+                panel.drawWithRealEventsForTesting(
+                    fromView: CGPoint(x: 120, y: 160),
+                    toView: CGPoint(x: 120, y: 160))
+                if let event = keyEvent("l") { panel.keyDown(with: event) }
+                let panelTextGuard = panel.annotationSurface.tool == .text
+                    && panel.annotationHostForTesting?.textFieldForTesting != nil
+                panel.annotationHostForTesting?.commitActiveTextEntry()
+                if !panelShortcutsOK || !panelTextGuard {
+                    hostFailures.append(
+                        "panel shortcuts \(panelShortcutsOK) text \(panelTextGuard)")
+                }
+
+                if let cmdZ = keyEvent("z", modifiers: [.command]) {
+                    _ = panel.performKeyEquivalent(with: cmdZ)
+                }
+                let panelBeforeSave = panel.annotationSurface.annotations.count
+                let panelRedoBeforeSave = panelBeforeSave == 1
+                let panelLockedLast = panel.annotationSurface.annotations.last
+                panel.annotationSurface.tool = .line
+                panel.performActionForTesting(.save)
+                let lockedButtons = panel.contentView.map { buttons(in: $0) }
+                    ?? []
+                let lockedHistory = lockedButtons.filter {
+                    $0.tag == OverlayAnnotationTool.undoToolbarTag
+                        || $0.tag == redoTag
+                }
+                let panelButtonsLocked = lockedHistory.count == 2
+                    && lockedHistory.allSatisfy { !$0.isEnabled }
+                if let cmdZ = keyEvent("z", modifiers: [.command]) {
+                    _ = panel.performKeyEquivalent(with: cmdZ)
+                }
+                let panelCmdFrozen =
+                    panel.annotationSurface.annotations.count == panelBeforeSave
+                    && panel.annotationSurface.annotations.last === panelLockedLast
+                if let shiftCmdZ = keyEvent(
+                    "z", modifiers: [.command, .shift]) {
+                    _ = panel.performKeyEquivalent(with: shiftCmdZ)
+                }
+                let panelShiftFrozen =
+                    panel.annotationSurface.annotations.count == panelBeforeSave
+                    && panel.annotationSurface.annotations.last === panelLockedLast
+                panel.clickToolbarButtonForTesting(
+                    tag: OverlayAnnotationTool.undoToolbarTag)
+                panel.clickToolbarButtonForTesting(tag: redoTag)
+                if let shortcut = keyEvent("b") { panel.keyDown(with: shortcut) }
+                let panelFrozen = panelSaveDone != nil
+                    && panel.annotationSurface.annotations.count == panelBeforeSave
+                    && panel.annotationSurface.tool == .line
+                    && panelButtonsLocked && panelCmdFrozen && panelShiftFrozen
+                panelSaveDone?(.cancelled)
+                if let shiftCmdZ = keyEvent(
+                    "z", modifiers: [.command, .shift]) {
+                    _ = panel.performKeyEquivalent(with: shiftCmdZ)
+                }
+                let panelUnlockedRedo = panelRedoBeforeSave
+                    && panel.annotationSurface.annotations.count == 2
+                    && panel.annotationSurface.annotations.last === panelSecond
+                if !panelFrozen || !panelUnlockedRedo {
+                    hostFailures.append(
+                        "panel lock \(panelFrozen) unlockRedo \(panelUnlockedRedo)")
+                }
+                panel.clickToolbarButtonForTesting(tag: -1)
+
+                check("overlay11-undo-redo-hosts-s4",
+                      hostFailures.isEmpty,
+                      hostFailures.joined(separator: "; "))
+            }
+
+            // Retina 2x + shrink→re-expand: the SAME edges give the SAME
+            // integral pixelRect — no 1px drift through a resize round trip.
+            let retinaFrozen = CapturedImage(
+                cgImage: makeStripePattern(width: 1600, height: 1200, seed: 0x2E71_4A00),
+                scale: 2)
+            let retinaOverlay = SelectionOverlay(
+                purpose: .areaReview,
+                inputs: OverlaySessionInputs(
+                    afterShow: true, afterCopy: false, afterSave: false),
+                completion: { _ in })
+            retinaOverlay.routerDependenciesOverride = noopDeps()
+            let retinaView = SelectionOverlayView(
+                mode: .area, screen: screen, frozen: retinaFrozen,
+                windowList: [], owner: retinaOverlay)
+            let fractional = CGRect(x: 33.4, y: 47.6, width: 211.3, height: 148.7)
+            retinaView.selectForTesting(rect: fractional)
+            let px1 = retinaOverlay.session.pixelRect
+            retinaView.adjustSelectionForTesting(rect: CGRect(
+                x: 60, y: 60, width: 80, height: 60))
+            retinaView.adjustSelectionForTesting(rect: fractional)
+            let px2 = retinaOverlay.session.pixelRect
+            check("overlay5-retina-reexpand",
+                  px1 == px2 && px1 == px1.integral,
+                  "px1 \(px1) px2 \(px2)")
+
+
+            // Purpose isolation: scroll region and instant OCR hand over the
+            // rect exactly once at mouse-up — no review, no initialCapture
+            // side effects, no second completion.
+            for purpose in [OverlayPurpose.scrollRegion, .instantOCRRegion] {
+                var completions = 0
+                var gotArea = false
+                let overlay = SelectionOverlay(
+                    purpose: purpose,
+                    inputs: OverlaySessionInputs(
+                        afterShow: true, afterCopy: true, afterSave: true),
+                    completion: { result in
+                        completions += 1
+                        if case .area = result { gotArea = true }
+                    })
+                var copies = 0
+                var deps = noopDeps()
+                deps.copyToClipboard = { _ in copies += 1 }
+                overlay.routerDependenciesOverride = deps
+                let view = SelectionOverlayView(
+                    mode: .area, screen: screen, frozen: frozenImage,
+                    windowList: [], owner: overlay)
+                view.selectForTesting(rect: CGRect(
+                    x: 50, y: 60, width: 200, height: 150))
+                view.selectForTesting(rect: CGRect(
+                    x: 50, y: 60, width: 200, height: 150)) // late/double
+                check("overlay5-purpose-isolation-\(purpose)",
+                      completions == 1 && gotArea && copies == 0
+                        && overlay.session.phase == .completed
+                        && view.reviewToolbarFrameForTesting == nil,
+                      "completions \(completions) area \(gotArea) copies \(copies)")
+            }
+        }
+
+        // 13. Overlay: flatten fail-closed / allocation / P3 / save-lock ----------
+        MainActor.assumeIsolated {
+            // S3 headless gate of record: the overlay must read the editor's
+            // exact per-tool keys for new marks, and the real scroll host
+            // must port the editor's precise/non-precise width machine. The
+            // in-memory store keeps selftest away from real UserDefaults.
+            do {
+                var widths: [String: CGFloat] = [
+                    EditorTool.pen.rawValue: 7,
+                    EditorTool.arrow.rawValue: 4,
+                    EditorTool.line.rawValue: 5,
+                    EditorTool.rect.rawValue: 6,
+                    EditorTool.oval.rawValue: 8,
+                    EditorTool.highlight.rawValue: 11,
+                ]
+                var reads: [String] = []
+                var writes: [(key: String, value: CGFloat)] = []
+                AnnotationSurface.strokeWidthStoreOverrideForTesting =
+                    OverlayStrokeWidthStore(
+                        read: { key in
+                            reads.append(key)
+                            return widths[key] ?? 3
+                        },
+                        write: { value, key in
+                            widths[key] = value
+                            writes.append((key, value))
+                        })
+                defer {
+                    AnnotationSurface.strokeWidthStoreOverrideForTesting = nil
+                }
+
+                let creationCases: [(OverlayAnnotationTool, String, CGFloat)] = [
+                    (.pen, EditorTool.pen.rawValue, 7),
+                    (.arrow, EditorTool.arrow.rawValue, 4),
+                    (.line, EditorTool.line.rawValue, 5),
+                    (.rect, EditorTool.rect.rawValue, 6),
+                    (.oval, EditorTool.oval.rawValue, 8),
+                ]
+                var creationOK = true
+                for (tool, key, expected) in creationCases {
+                    let surface = AnnotationSurface(pixelScale: 2)
+                    surface.tool = tool
+                    _ = surface.beginDrag(atPixel: CGPoint(x: 10, y: 10))
+                    surface.continueDrag(toPixel: CGPoint(x: 80, y: 60))
+                    surface.endDrag()
+                    let width: CGFloat?
+                    if let pen = surface.annotations.last as? PenAnnotation {
+                        width = pen.strokeWidthPt
+                    } else if let shape = surface.annotations.last
+                        as? ShapeAnnotation {
+                        width = shape.strokeWidthPt
+                    } else {
+                        width = nil
+                    }
+                    if width != expected || !reads.contains(key) {
+                        creationOK = false
+                    }
+                }
+                widths.removeValue(forKey: EditorTool.line.rawValue)
+                let defaultSurface = AnnotationSurface(pixelScale: 1)
+                defaultSurface.tool = .line
+                _ = defaultSurface.beginDrag(atPixel: CGPoint(x: 2, y: 2))
+                defaultSurface.continueDrag(toPixel: CGPoint(x: 20, y: 20))
+                defaultSurface.endDrag()
+                let defaultOK = (defaultSurface.annotations.last
+                    as? ShapeAnnotation)?.strokeWidthPt == 3
+                func strokeScrollEvent(
+                    units: CGScrollEventUnit, delta: Int32,
+                    flags: CGEventFlags = []
+                ) -> NSEvent? {
+                    guard let cg = CGEvent(
+                        scrollWheelEvent2Source: nil, units: units,
+                        wheelCount: 1, wheel1: delta,
+                        wheel2: 0, wheel3: 0)
+                    else { return nil }
+                    cg.flags = flags
+                    return NSEvent(cgEvent: cg)
+                }
+                let hostSurface = AnnotationSurface(pixelScale: 1)
+                hostSurface.tool = .pen
+                let host = AnnotationHostView(
+                    frame: CGRect(x: 0, y: 0, width: 160, height: 120),
+                    surface: hostSurface,
+                    baseImage: makeNoiseImage(width: 160, height: 120),
+                    pixelsPerPoint: 1)
+                var eligibleScrollOK = true
+                for (tool, key, _) in creationCases {
+                    widths[key] = 10
+                    hostSurface.tool = tool
+                    let writesBefore = writes.count
+                    if let lineUp = strokeScrollEvent(units: .line, delta: 1) {
+                        host.scrollWheel(with: lineUp)
+                    }
+                    if widths[key] != 10.5
+                        || writes.count != writesBefore + 1
+                        || writes.last?.key != key {
+                        eligibleScrollOK = false
+                    }
+                }
+                widths[EditorTool.pen.rawValue] = 7
+                hostSurface.tool = .pen
+                let writesBeforePrecise = writes.count
+                if let precise9 = strokeScrollEvent(units: .pixel, delta: 9) {
+                    host.scrollWheel(with: precise9)
+                    host.scrollWheel(with: precise9)
+                }
+                let preciseOK = widths[EditorTool.pen.rawValue] == 7.5
+                    && writes.count == writesBeforePrecise + 1
+                let hud = host.subviews.compactMap {
+                    $0 as? StrokePreviewView
+                }.last
+                let hudOK = hud?.isHidden == false
+                    && hud?.strokeWidth == 7.5
+                    && hud?.color == hostSurface.color
+
+                _ = hostSurface.beginDrag(atPixel: CGPoint(x: 5, y: 5))
+                hostSurface.continueDrag(toPixel: CGPoint(x: 50, y: 40))
+                hostSurface.endDrag()
+                let persistedModelOK =
+                    (hostSurface.annotations.last as? PenAnnotation)?
+                        .strokeWidthPt == 7.5
+
+                var nonStrokeIgnored = true
+                for tool in [
+                    OverlayAnnotationTool.highlight, .text, .counter, .blur,
+                    .select,
+                ] {
+                    hud?.isHidden = true
+                    hostSurface.tool = tool
+                    let writesBefore = writes.count
+                    if let lineUp = strokeScrollEvent(units: .line, delta: 1) {
+                        host.scrollWheel(with: lineUp)
+                    }
+                    if writes.count != writesBefore || hud?.isHidden == false {
+                        nonStrokeIgnored = false
+                    }
+                }
+
+                hostSurface.tool = .arrow
+                let writesBeforeModified = writes.count
+                for flags in [
+                    CGEventFlags.maskShift, .maskCommand, .maskControl,
+                ] {
+                    if let modified = strokeScrollEvent(
+                        units: .line, delta: 1, flags: flags) {
+                        host.scrollWheel(with: modified)
+                    }
+                }
+                let modifierIgnored = writes.count == writesBeforeModified
+
+                let penBeforeArrow = widths[EditorTool.pen.rawValue]
+                widths[EditorTool.arrow.rawValue] = 10
+                let writesBeforeNegative = writes.count
+                if let lineDown = strokeScrollEvent(units: .line, delta: -1) {
+                    host.scrollWheel(with: lineDown)
+                }
+                let negativeStepOK = widths[EditorTool.arrow.rawValue] == 9.5
+                    && writes.count == writesBeforeNegative + 1
+                    && writes.last?.key == EditorTool.arrow.rawValue
+                    && writes.last?.value == 9.5
+                widths[EditorTool.arrow.rawValue] = 20
+                let writesBeforeUpper = writes.count
+                if let lineUp = strokeScrollEvent(units: .line, delta: 1) {
+                    host.scrollWheel(with: lineUp)
+                }
+                let upperClampOK = widths[EditorTool.arrow.rawValue] == 20
+                    && writes.count == writesBeforeUpper + 1
+                widths[EditorTool.arrow.rawValue] = 1
+                let writesBeforeLower = writes.count
+                if let lineDown = strokeScrollEvent(units: .line, delta: -1) {
+                    host.scrollWheel(with: lineDown)
+                }
+                let lowerClampOK = widths[EditorTool.arrow.rawValue] == 1
+                    && writes.count == writesBeforeLower + 1
+                let perToolIsolationOK =
+                    widths[EditorTool.pen.rawValue] == penBeforeArrow
+
+                check("overlay10-stroke-width-core-s3",
+                      creationOK && defaultOK && eligibleScrollOK
+                        && preciseOK && hudOK && persistedModelOK
+                        && nonStrokeIgnored && modifierIgnored
+                        && negativeStepOK
+                        && upperClampOK && lowerClampOK
+                        && perToolIsolationOK,
+                      "create \(creationOK) default \(defaultOK) eligible \(eligibleScrollOK) precise \(preciseOK) hud \(hudOK) model \(persistedModelOK) nonStroke \(nonStrokeIgnored) modifiers \(modifierIgnored) negative \(negativeStepOK) clamp \(lowerClampOK)/\(upperClampOK) isolated \(perToolIsolationOK) reads \(reads) writes \(writes)")
+            }
+
+            // S4 headless gate of record: a real second history stack must
+            // restore the exact annotation object, and any new mutation after
+            // undo must invalidate that branch. The shortcut catalog is also
+            // shared here so the two UI hosts cannot silently drift.
+            do {
+                @MainActor func addCounter(
+                    _ surface: AnnotationSurface, at point: CGPoint
+                ) {
+                    surface.tool = .counter
+                    _ = surface.beginDrag(atPixel: point)
+                    surface.endDrag()
+                }
+
+                let history = AnnotationSurface(pixelScale: 1)
+                addCounter(history, at: CGPoint(x: 10, y: 10))
+                addCounter(history, at: CGPoint(x: 20, y: 20))
+                addCounter(history, at: CGPoint(x: 30, y: 30))
+                let first = history.annotations.first
+                let second = history.annotations[1]
+                let third = history.annotations.last
+                let historyProbe: any S4RedoProbe = history
+                let undoOK = history.undo() && history.undo()
+                    && history.annotations.count == 1
+                    && history.annotations.first === first
+                    && historyProbe.canRedo
+                let firstRedo = historyProbe.redo()
+                    && history.annotations.count == 2
+                    && history.annotations.first === first
+                    && history.annotations.last === second
+                    && historyProbe.canRedo
+                let secondRedo = historyProbe.redo()
+                    && history.annotations.count == 3
+                    && history.annotations.first === first
+                    && history.annotations[1] === second
+                    && history.annotations.last === third
+                    && !historyProbe.canRedo
+
+                let branch = AnnotationSurface(pixelScale: 1)
+                addCounter(branch, at: CGPoint(x: 30, y: 30))
+                addCounter(branch, at: CGPoint(x: 40, y: 40))
+                let removed = branch.annotations.last
+                let branchProbe: any S4RedoProbe = branch
+                let branchUndo = branch.undo()
+                    && branchProbe.canRedo
+                    && branch.annotations.count == 1
+                addCounter(branch, at: CGPoint(x: 50, y: 50))
+                let branchCleared = !branchProbe.canRedo
+                    && !branchProbe.redo()
+                    && branch.annotations.count == 2
+                    && branch.annotations.last !== removed
+
+                let textBranch = AnnotationSurface(pixelScale: 1)
+                addCounter(textBranch, at: CGPoint(x: 60, y: 60))
+                addCounter(textBranch, at: CGPoint(x: 70, y: 70))
+                let textProbe: any S4RedoProbe = textBranch
+                let textUndo = textBranch.undo() && textProbe.canRedo
+                textBranch.addText("C", atPixel: CGPoint(x: 80, y: 80))
+                let textCleared = textUndo && !textProbe.canRedo
+                    && !textProbe.redo()
+                    && textBranch.annotations.count == 2
+                    && textBranch.annotations.last is TextAnnotation
+
+                let blurNoop = AnnotationSurface(pixelScale: 1)
+                addCounter(blurNoop, at: CGPoint(x: 90, y: 90))
+                addCounter(blurNoop, at: CGPoint(x: 100, y: 100))
+                let blurRemoved = blurNoop.annotations.last
+                let blurProbe: any S4RedoProbe = blurNoop
+                let blurUndo = blurNoop.undo() && blurProbe.canRedo
+                blurNoop.tool = .blur
+                _ = blurNoop.beginDrag(atPixel: CGPoint(x: 110, y: 110))
+                blurNoop.endDrag()
+                let emptyBlurPreserved = blurUndo && blurProbe.canRedo
+                    && blurProbe.redo()
+                    && blurNoop.annotations.last === blurRemoved
+
+                let validBlur = AnnotationSurface(pixelScale: 1)
+                addCounter(validBlur, at: CGPoint(x: 120, y: 120))
+                addCounter(validBlur, at: CGPoint(x: 130, y: 130))
+                let validBlurProbe: any S4RedoProbe = validBlur
+                let validBlurUndo = validBlur.undo()
+                    && validBlurProbe.canRedo
+                validBlur.tool = .blur
+                _ = validBlur.beginDrag(
+                    atPixel: CGPoint(x: 140, y: 140))
+                validBlur.continueDrag(
+                    toPixel: CGPoint(x: 180, y: 175))
+                validBlur.endDrag()
+                let validBlurCleared = validBlurUndo
+                    && !validBlurProbe.canRedo
+                    && !validBlurProbe.redo()
+                    && validBlur.annotations.last is BlurAnnotation
+
+                check("overlay11-undo-redo-core-s4",
+                      undoOK && firstRedo && secondRedo
+                        && branchUndo && branchCleared
+                        && textCleared && emptyBlurPreserved
+                        && validBlurCleared,
+                      "undo \(undoOK) redo \(firstRedo)/\(secondRedo) branch \(branchUndo)/\(branchCleared) text \(textCleared) blur \(emptyBlurPreserved)/\(validBlurCleared)")
+            }
+
+            // S2 regional pixelation must allocate only the requested blur
+            // region, preserve pixels outside it (including the Y-mirrored
+            // wrong region), and fail closed if Core Image cannot render.
+            let pixelBase = makeNoiseImage(width: 320, height: 240)
+            let pixelSurface = AnnotationSurface(pixelScale: 1)
+            let blurRect = CGRect(x: 149, y: 60, width: 53, height: 25)
+            pixelSurface.addBlurForTesting(rect: blurRect)
+            let clickOnlySurface = AnnotationSurface(pixelScale: 1)
+            clickOnlySurface.tool = .blur
+            _ = clickOnlySurface.beginDrag(atPixel: CGPoint(x: 20, y: 20))
+            clickOnlySurface.endDrag()
+            let clickOnlyRemoved = clickOnlySurface.isEmpty
+            func equalCrops(_ a: CGImage, _ b: CGImage, _ rect: CGRect) -> Bool {
+                guard let ac = a.cropping(to: rect),
+                      let bc = b.cropping(to: rect) else { return false }
+                return imagesEqual(ac, bc)
+            }
+            let previewCtx = ctx(pixelBase.width, pixelBase.height)
+            previewCtx.draw(
+                pixelBase,
+                in: CGRect(
+                    x: 0, y: 0,
+                    width: pixelBase.width, height: pixelBase.height))
+            AnnotationSurface.regionalPixelateAllocationsForTesting = 0
+            AnnotationSurface.lastRegionalPixelateRectForTesting = nil
+            AnnotationSurface.lastRegionalPixelateBaseSizeForTesting = nil
+            let previewRendered = pixelSurface.drawForPreview(
+                in: previewCtx, base: pixelBase)
+            let pixelPreview = previewCtx.makeImage()
+            let previewBlurTL = CGRect(
+                x: blurRect.minX,
+                y: CGFloat(pixelBase.height) - blurRect.maxY,
+                width: blurRect.width, height: blurRect.height)
+            let previewMirrorTL = CGRect(
+                x: blurRect.minX, y: blurRect.minY,
+                width: blurRect.width, height: blurRect.height)
+            let previewPixelsOK = previewRendered
+                && pixelPreview.map {
+                    !equalCrops(pixelBase, $0, previewBlurTL)
+                        && equalCrops(pixelBase, $0, previewMirrorTL)
+                } == true
+                && AnnotationSurface.regionalPixelateAllocationsForTesting == 1
+                && AnnotationSurface.lastRegionalPixelateRectForTesting
+                    == blurRect.integral
+                && AnnotationSurface.lastRegionalPixelateBaseSizeForTesting
+                    == CGSize(width: pixelBase.width, height: pixelBase.height)
+
+            AnnotationSurface.regionalPixelateAllocationsForTesting = 0
+            AnnotationSurface.lastRegionalPixelateRectForTesting = nil
+            AnnotationSurface.lastRegionalPixelateBaseSizeForTesting = nil
+            let pixelDestBefore = AnnotationSurface.flattenAllocationsForTesting
+            let pixelCrop = CGRect(x: 80, y: 40, width: 180, height: 150)
+            let plainPixelCrop = pixelBase.cropping(to: pixelCrop)!
+            let pixelFlat = pixelSurface.flattened(
+                base: pixelBase, cropPixels: pixelCrop)
+            let visibleBLMinY = CGFloat(pixelBase.height) - pixelCrop.maxY
+            let blurTL = CGRect(
+                x: blurRect.minX - pixelCrop.minX,
+                y: pixelCrop.height
+                    - (blurRect.maxY - visibleBLMinY),
+                width: blurRect.width, height: blurRect.height)
+            let mirroredTL = CGRect(
+                x: blurRect.minX - pixelCrop.minX,
+                y: blurRect.minY - visibleBLMinY,
+                width: blurRect.width, height: blurRect.height)
+            var regionalPixelsOK = false
+            if let pixelFlat {
+                regionalPixelsOK = !equalCrops(
+                        plainPixelCrop, pixelFlat, blurTL)
+                    && equalCrops(
+                        plainPixelCrop, pixelFlat,
+                        CGRect(x: 0, y: 0, width: 24, height: 24))
+                    && equalCrops(plainPixelCrop, pixelFlat, mirroredTL)
+            }
+            let regionalAllocOK =
+                AnnotationSurface.regionalPixelateAllocationsForTesting == 1
+                && AnnotationSurface.lastRegionalPixelateRectForTesting
+                    == blurRect.integral
+                && AnnotationSurface.lastRegionalPixelateBaseSizeForTesting
+                    == CGSize(width: pixelBase.width, height: pixelBase.height)
+                && blurRect.width * blurRect.height
+                    < CGFloat(pixelBase.width * pixelBase.height) / 10
+                && AnnotationSurface.flattenAllocationsForTesting
+                    == pixelDestBefore + 1
+            pixelSurface.forceRegionalPixelateFailureForTesting = true
+            let regionalFailed = pixelSurface.flattened(
+                base: pixelBase, cropPixels: pixelCrop) == nil
+            pixelSurface.forceRegionalPixelateFailureForTesting = false
+            check("overlay9-pixelate-regional-s2",
+                  previewPixelsOK && regionalPixelsOK
+                    && regionalAllocOK && regionalFailed
+                    && pixelSurface.annotations.count == 1
+                    && clickOnlyRemoved,
+                  "preview \(previewPixelsOK) export \(regionalPixelsOK) alloc \(regionalAllocOK) failClosed \(regionalFailed) count \(pixelSurface.annotations.count) clickOnlyRemoved \(clickOnlyRemoved) region \(String(describing: AnnotationSurface.lastRegionalPixelateRectForTesting))")
+
+            // allocation spy: exactly one destination buffer, zero
+            // materialized copies, on a large flatten with annotations
+            let big = makeStripePattern(width: 720, height: 4000, seed: 0x000B_16F1)
+            let surface = AnnotationSurface(pixelScale: 1)
+            let bigBlur = CGRect(x: 100, y: 500, width: 80, height: 96)
+            surface.addBlurForTesting(rect: bigBlur)
+            let allocBefore = AnnotationSurface.flattenAllocationsForTesting
+            AnnotationSurface.regionalPixelateAllocationsForTesting = 0
+            AnnotationSurface.lastRegionalPixelateRectForTesting = nil
+            AnnotationSurface.lastRegionalPixelateBaseSizeForTesting = nil
+            let matBefore = MaterializeSpy.count
+            let flat = surface.flattened(
+                base: big,
+                cropPixels: CGRect(x: 0, y: 0, width: 720, height: 4000))
+            check("overlay6-flatten-single-buffer",
+                  flat != nil
+                    && AnnotationSurface.flattenAllocationsForTesting == allocBefore + 1
+                    && AnnotationSurface.regionalPixelateAllocationsForTesting == 1
+                    && AnnotationSurface.lastRegionalPixelateRectForTesting
+                        == bigBlur
+                    && AnnotationSurface.lastRegionalPixelateBaseSizeForTesting
+                        == CGSize(width: big.width, height: big.height)
+                    && bigBlur.width * bigBlur.height
+                        < CGFloat(big.width * big.height) / 100
+                    && MaterializeSpy.count == matBefore,
+                  "destΔ \(AnnotationSurface.flattenAllocationsForTesting - allocBefore) regionΔ \(AnnotationSurface.regionalPixelateAllocationsForTesting) region \(String(describing: AnnotationSurface.lastRegionalPixelateRectForTesting)) base \(String(describing: AnnotationSurface.lastRegionalPixelateBaseSizeForTesting)) matΔ \(MaterializeSpy.count - matBefore)")
+
+            // fail-closed: forced allocation failure returns nil — never a
+            // silent un-annotated fallback
+            surface.forceRenderFailureForTesting = true
+            let failed = surface.flattened(
+                base: big,
+                cropPixels: CGRect(x: 0, y: 0, width: 720, height: 4000))
+            surface.forceRenderFailureForTesting = false
+            check("overlay6-flatten-fail-closed", failed == nil,
+                  "got \(String(describing: failed))")
+
+            // P3 base keeps its color space through the annotated flatten
+            if let p3Space = CGColorSpace(name: CGColorSpace.displayP3),
+               let p3Ctx = CGContext(
+                data: nil, width: 64, height: 64, bitsPerComponent: 8,
+                bytesPerRow: 0, space: p3Space,
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) {
+                p3Ctx.setFillColor(CGColor(
+                    colorSpace: p3Space, components: [1, 0.2, 0.1, 1])
+                    ?? NSColor.systemRed.cgColor)
+                p3Ctx.fill(CGRect(x: 0, y: 0, width: 64, height: 64))
+                if let p3Base = p3Ctx.makeImage() {
+                    let s2 = AnnotationSurface(pixelScale: 1)
+                    s2.tool = .rect
+                    _ = s2.beginDrag(atPixel: CGPoint(x: 8, y: 8))
+                    s2.continueDrag(toPixel: CGPoint(x: 40, y: 40))
+                    s2.endDrag()
+                    let p3Flat = s2.flattened(
+                        base: p3Base,
+                        cropPixels: CGRect(x: 0, y: 0, width: 64, height: 64))
+                    check("overlay6-flatten-p3",
+                          p3Flat?.colorSpace?.name == p3Space.name,
+                          "space \(String(describing: p3Flat?.colorSpace?.name))")
+                } else {
+                    check("overlay6-flatten-p3-base", false)
+                }
+            } else {
+                check("overlay6-flatten-p3-env", true)
+            }
+
+            // save-lock invariance + per-tool double-click on the area view
+            guard let screen = NSScreen.main ?? NSScreen.screens.first else {
+                print("SKIP overlay6-ui — no display attached; MUST re-run on an unlocked session")
+                return
+            }
+            let frozenImage = CapturedImage(
+                cgImage: makeStripePattern(
+                    width: max(8, Int(screen.frame.width)),
+                    height: max(8, Int(screen.frame.height)),
+                    seed: 0x10CC_10CC),
+                scale: 1)
+            final class Spy6 {
+                var copies = 0
+                var saveDone: (@MainActor (SaveAsOutcome) -> Void)?
+                var completions = 0
+            }
+            let spy = Spy6()
+            let overlay = SelectionOverlay(
+                purpose: .areaReview,
+                inputs: OverlaySessionInputs(
+                    afterShow: true, afterCopy: false, afterSave: false),
+                completion: { _ in spy.completions += 1 })
+            overlay.routerDependenciesOverride = CaptureActionRouter.Dependencies(
+                copyToClipboard: { _ in spy.copies += 1 },
+                autoSave: { _, _ in },
+                saveAs: { _, done in spy.saveDone = done },
+                pin: { _ in }, ocr: { _ in }, openEditor: { _ in },
+                toast: { _ in }, setLastCapture: { _ in },
+                setLastAreaRect: { _ in }, logEvent: { _ in })
+            let view = SelectionOverlayView(
+                mode: .area, screen: screen, frozen: frozenImage,
+                windowList: [], owner: overlay)
+            view.selectForTesting(rect: CGRect(x: 60, y: 60, width: 240, height: 180))
+            guard let surface6 = view.annotationSurface else {
+                check("overlay6-ui-surface", false)
+                return
+            }
+            @MainActor func appendPen6(_ start: CGPoint, _ end: CGPoint) {
+                surface6.tool = .pen
+                _ = surface6.beginDrag(atPixel: start)
+                surface6.continueDrag(toPixel: end)
+                surface6.endDrag()
+            }
+            appendPen6(
+                CGPoint(x: 90, y: 90), CGPoint(x: 130, y: 130))
+            appendPen6(
+                CGPoint(x: 110, y: 100), CGPoint(x: 155, y: 145))
+            let redoAnnotation6 = surface6.annotations.last
+            let preparedRedo6 = surface6.undo()
+                && surface6.annotations.count == 1
+            let annotationsBeforeSave = surface6.annotations.count
+            surface6.tool = .select
+            view.performReviewActionForTesting(.save)
+            // Save in flight: REAL mouse drags with a drawing tool and a
+            // REAL Cmd-Z must leave the annotation set untouched. (Removing
+            // either production guard turns this gate red.)
+            surface6.tool = .pen
+            @MainActor func mouse(
+                _ type: NSEvent.EventType, _ p: CGPoint, clicks: Int = 1
+            ) -> NSEvent? {
+                NSEvent.mouseEvent(
+                    with: type, location: p, modifierFlags: [],
+                    timestamp: 0, windowNumber: 0, context: nil,
+                    eventNumber: 0, clickCount: clicks, pressure: 1)
+            }
+            let inside = CGPoint(x: 120, y: 120)
+            @MainActor func sendDrag(to end: CGPoint) {
+                if let down = mouse(.leftMouseDown, inside) { view.mouseDown(with: down) }
+                if let drag = mouse(.leftMouseDragged, end) { view.mouseDragged(with: drag) }
+                if let up = mouse(.leftMouseUp, end) { view.mouseUp(with: up) }
+            }
+            @MainActor func sendCmdZ() {
+                if let cmdZ = NSEvent.keyEvent(
+                    with: .keyDown, location: .zero, modifierFlags: [.command],
+                    timestamp: 0, windowNumber: 0, context: nil,
+                    characters: "z", charactersIgnoringModifiers: "z",
+                    isARepeat: false, keyCode: 6) {
+                    _ = view.performKeyEquivalent(with: cmdZ)
+                }
+            }
+            @MainActor func sendShiftCmdZ() {
+                if let redo = NSEvent.keyEvent(
+                    with: .keyDown, location: .zero,
+                    modifierFlags: [.command, .shift],
+                    timestamp: 0, windowNumber: 0, context: nil,
+                    characters: "z", charactersIgnoringModifiers: "z",
+                    isARepeat: false, keyCode: 6) {
+                    _ = view.performKeyEquivalent(with: redo)
+                }
+            }
+            @MainActor func buttons6(in root: NSView) -> [NSButton] {
+                root.subviews.flatMap { child -> [NSButton] in
+                    let own = (child as? NSButton).map { [$0] } ?? []
+                    return own + buttons6(in: child)
+                }
+            }
+            let historyButtons6 = buttons6(in: view).filter {
+                $0.tag == OverlayAnnotationTool.undoToolbarTag || $0.tag == 202
+            }
+            let historyButtonsLocked6 = historyButtons6.count == 2
+                && historyButtons6.allSatisfy { !$0.isEnabled }
+            // STEP-WISE asserts: a drag(+1) cancelled by an undo(−1) must not
+            // be able to hide two missing guards behind an unchanged total.
+            sendDrag(to: CGPoint(x: 160, y: 160))
+            let invariantAfterDrag =
+                surface6.annotations.count == annotationsBeforeSave
+            sendCmdZ()
+            let invariantAfterUndo =
+                surface6.annotations.count == annotationsBeforeSave
+            sendShiftCmdZ()
+            let invariantAfterRedo =
+                surface6.annotations.count == annotationsBeforeSave
+            view.clickReviewToolbarButtonForTesting(
+                tag: OverlayAnnotationTool.undoToolbarTag)
+            let invariantAfterUndoButton =
+                surface6.annotations.count == annotationsBeforeSave
+            view.clickReviewToolbarButtonForTesting(tag: 202)
+            let invariantAfterRedoButton =
+                surface6.annotations.count == annotationsBeforeSave
+            let stillSaving = overlay.session.phase == .saving
+            spy.saveDone?(.cancelled)
+            let backToReview = overlay.session.phase == .reviewing
+                && surface6.annotations.count == annotationsBeforeSave
+            // after cancel: the exact redo object returns; undo it, then a
+            // new mark forks history and Shift-Cmd-Z must become a no-op.
+            sendShiftCmdZ()
+            let redoAfterCancel = surface6.annotations.count == 2
+                && surface6.annotations.last === redoAnnotation6
+            sendCmdZ()
+            let undoBeforeBranch = surface6.annotations.count == 1
+            sendDrag(to: CGPoint(x: 170, y: 150))
+            let drawsAfterCancel =
+                surface6.annotations.count == annotationsBeforeSave + 1
+            sendShiftCmdZ()
+            let redoClearedAfterDraw =
+                surface6.annotations.count == annotationsBeforeSave + 1
+            sendCmdZ()
+            let undoAfterCancel =
+                surface6.annotations.count == annotationsBeforeSave
+            check("overlay6-save-lock-annotations",
+                  preparedRedo6 && historyButtonsLocked6
+                    && invariantAfterDrag && invariantAfterUndo
+                    && invariantAfterRedo && invariantAfterUndoButton
+                    && invariantAfterRedoButton && stillSaving
+                    && backToReview && redoAfterCancel && undoBeforeBranch
+                    && drawsAfterCancel && redoClearedAfterDraw
+                    && undoAfterCancel,
+                  "prepared \(preparedRedo6) buttons \(historyButtonsLocked6) drag \(invariantAfterDrag) undo/redo \(invariantAfterUndo)/\(invariantAfterRedo) click \(invariantAfterUndoButton)/\(invariantAfterRedoButton) saving \(stillSaving) back \(backToReview) postRedo \(redoAfterCancel) branch \(undoBeforeBranch)/\(drawsAfterCancel)/\(redoClearedAfterDraw) reundo \(undoAfterCancel)")
+
+            // Area flatten failure: 0 actions, 1 toast, review + drawings
+            // intact (fail-closed parity with the panel).
+            let spyF = Spy6()
+            var failToasts = 0
+            let overlayF = SelectionOverlay(
+                purpose: .areaReview,
+                inputs: OverlaySessionInputs(
+                    afterShow: true, afterCopy: false, afterSave: false),
+                completion: { _ in spyF.completions += 1 })
+            overlayF.routerDependenciesOverride = CaptureActionRouter.Dependencies(
+                copyToClipboard: { _ in spyF.copies += 1 },
+                autoSave: { _, _ in }, saveAs: { _, _ in },
+                pin: { _ in }, ocr: { _ in }, openEditor: { _ in },
+                toast: { _ in failToasts += 1 },
+                setLastCapture: { _ in },
+                setLastAreaRect: { _ in }, logEvent: { _ in })
+            let viewF = SelectionOverlayView(
+                mode: .area, screen: screen, frozen: frozenImage,
+                windowList: [], owner: overlayF)
+            viewF.selectForTesting(rect: CGRect(x: 60, y: 60, width: 240, height: 180))
+            viewF.annotationSurface?.tool = .rect
+            _ = viewF.annotationSurface?.beginDrag(atPixel: CGPoint(x: 100, y: 100))
+            viewF.annotationSurface?.continueDrag(toPixel: CGPoint(x: 180, y: 160))
+            viewF.annotationSurface?.endDrag()
+            viewF.annotationSurface?.tool = .select
+            viewF.annotationSurface?.forceRenderFailureForTesting = true
+            let annotationsBeforeFail = viewF.annotationSurface?.annotations.count ?? -1
+            viewF.performReviewActionForTesting(.copy)
+            check("overlay6-area-flatten-fail-closed",
+                  spyF.copies == 0 && spyF.completions == 0 && failToasts == 1
+                    && overlayF.session.phase == .reviewing
+                    && viewF.annotationSurface?.annotations.count == annotationsBeforeFail,
+                  "copies \(spyF.copies) toasts \(failToasts) phase \(overlayF.session.phase)")
+
+            // double-click terminal wins over EVERY drawing tool
+            var toolsOK = true
+            for tool in [OverlayAnnotationTool.pen, .arrow, .rect, .text] {
+                let spyT = Spy6()
+                let overlayT = SelectionOverlay(
+                    purpose: .areaReview,
+                    inputs: OverlaySessionInputs(
+                        afterShow: true, afterCopy: false, afterSave: false),
+                    completion: { _ in spyT.completions += 1 })
+                overlayT.routerDependenciesOverride = CaptureActionRouter.Dependencies(
+                    copyToClipboard: { _ in spyT.copies += 1 },
+                    autoSave: { _, _ in }, saveAs: { _, _ in },
+                    pin: { _ in }, ocr: { _ in }, openEditor: { _ in },
+                    toast: { _ in }, setLastCapture: { _ in },
+                    setLastAreaRect: { _ in }, logEvent: { _ in })
+                let viewT = SelectionOverlayView(
+                    mode: .area, screen: screen, frozen: frozenImage,
+                    windowList: [], owner: overlayT)
+                let rectT = CGRect(x: 60, y: 60, width: 240, height: 180)
+                viewT.selectForTesting(rect: rectT)
+                viewT.annotationSurface?.tool = tool
+                if let dbl = NSEvent.mouseEvent(
+                    with: .leftMouseDown,
+                    location: CGPoint(x: rectT.midX, y: rectT.midY),
+                    modifierFlags: [], timestamp: 0, windowNumber: 0,
+                    context: nil, eventNumber: 0, clickCount: 2, pressure: 1) {
+                    viewT.mouseDown(with: dbl)
+                }
+                if spyT.copies != 1 || spyT.completions != 1
+                    || overlayT.session.phase != .completed {
+                    toolsOK = false
+                    print("  double-click failed for \(tool): copies \(spyT.copies) completions \(spyT.completions) phase \(overlayT.session.phase)")
+                }
+            }
+            check("overlay6-doubleclick-over-tools", toolsOK, "see above")
+        }
 
         print(failures == 0 ? "ALL TESTS PASSED" : "\(failures) TEST(S) FAILED")
         print("Artifacts: \(outputDir)")
@@ -639,6 +6174,46 @@ enum SelfTest {
         )!
         c.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
         return buf
+    }
+
+    static func imagesEqualForTesting(_ a: CGImage, _ b: CGImage) -> Bool {
+        imagesEqual(a, b)
+    }
+
+    /// Returns non-nil when EVERY probe point (bottom-left pixel coords) has
+    /// reddish ink within `pixelRadius`; nil when any probe area is clean.
+    static func redInkNearForTesting(
+        _ image: CGImage, points: [CGPoint], pixelRadius: Int
+    ) -> Bool? {
+        var bytes = [UInt8](repeating: 0, count: image.width * image.height * 4)
+        guard let ctx = CGContext(
+            data: &bytes, width: image.width, height: image.height,
+            bitsPerComponent: 8, bytesPerRow: image.width * 4,
+            space: CGColorSpace(name: CGColorSpace.sRGB)!,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else { return nil }
+        ctx.interpolationQuality = .none
+        ctx.draw(image, in: CGRect(
+            x: 0, y: 0, width: image.width, height: image.height))
+        for p in points {
+            // convert bottom-left pixel coords to buffer rows (top-down)
+            let cx = Int(p.x), cyBL = Int(p.y)
+            let cy = image.height - 1 - cyBL
+            var found = false
+            for dy in -pixelRadius...pixelRadius where !found {
+                for dx in -pixelRadius...pixelRadius {
+                    let x = cx + dx, y = cy + dy
+                    guard x >= 0, x < image.width, y >= 0, y < image.height
+                    else { continue }
+                    let i = (y * image.width + x) * 4
+                    let r = Int(bytes[i]), g = Int(bytes[i + 1])
+                    let b = Int(bytes[i + 2])
+                    if r > 150, g < 110, b < 110 { found = true; break }
+                }
+            }
+            if !found { return nil }
+        }
+        return true
     }
 
     private static func imagesEqual(_ a: CGImage, _ b: CGImage) -> Bool {

@@ -391,8 +391,9 @@ sealed class ScrollPreviewControl : Control
 }
 
 /// Vertical stitcher (GDI+, top-left origin). Frames that can't be matched
-/// confidently are rejected rather than guessed. Mirrors the macOS
-/// VerticalStitcher constant-for-constant (Windows runs at scale 1).
+/// confidently are rejected rather than guessed. It shares the conservative
+/// signature/uniqueness/footer gates with macOS; macOS additionally has
+/// platform-specific recovery for fractional Core Animation rasterization.
 sealed class WinStitcher : IDisposable
 {
     readonly List<Bitmap> _slices = new();
@@ -522,8 +523,8 @@ sealed class WinStitcher : IDisposable
         _lastSig = null;
     }
 
-    /// Safeguards mirror the macOS matcher: 4-band row signatures, detail
-    /// weighting, static-bottom (sticky footer) detection, and a two-pass
+    /// Shared safeguards: 4-band row signatures, detail weighting,
+    /// static-bottom (sticky footer) detection, and a two-pass
     /// uniqueness margin (the old single-pass second-best tracking was
     /// order-dependent: a chain of small improvements could swallow a real
     /// alias and accept a wrong offset on periodic content).
