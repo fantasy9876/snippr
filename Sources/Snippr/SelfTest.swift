@@ -584,7 +584,10 @@ enum SelfTest {
         // (flick to unseen content) shares no captured rows and still
         // re-anchors through the pending path — covered by 2b fixtures above.
         do {
-            let doc = makeStripePattern(width: 400, height: 5200, seed: 0xB0B0_57AF)
+            // textured rows: real pages carry horizontal detail (text,
+            // borders); the revisit ledger deliberately ignores flat rows,
+            // so a solid-stripe fixture could never exercise it.
+            let doc = makeTexturedStripePattern(width: 400, height: 5200, seed: 0xB0B0_57AF)
             let vp = 500
             if let first = doc.cropping(to: CGRect(
                 x: 0, y: 0, width: 400, height: vp)) {
@@ -4549,6 +4552,35 @@ enum SelfTest {
             c.setFillColor(CGColor(srgbRed: r, green: g, blue: b, alpha: 1))
             c.fill(CGRect(x: 0, y: y, width: width, height: 1))
         }
+        return c.makeImage()!
+    }
+
+    /// Like `makeStripePattern` but every row also carries deterministic
+    /// per-pixel texture (±24 around the row colour), so rows have real
+    /// horizontal-gradient energy like text/UI content while staying unique
+    /// per row.
+    private static func makeTexturedStripePattern(width: Int, height: Int, seed: UInt64) -> CGImage {
+        var buf = [UInt8](repeating: 0, count: width * height * 4)
+        var seed = seed
+        for y in 0..<height {
+            seed = seed &* 6364136223846793005 &+ 1442695040888963407
+            let base = [Int((seed >> 33) & 0xFF), Int((seed >> 41) & 0xFF), Int((seed >> 49) & 0xFF)]
+            var px = seed ^ 0x9E37_79B9_7F4A_7C15
+            for x in 0..<width {
+                px = px &* 6364136223846793005 &+ 1442695040888963407
+                let noise = Int((px >> 40) & 0x3F) - 32   // -32...31
+                let i = (y * width + x) * 4
+                for ch in 0..<3 {
+                    buf[i + ch] = UInt8(min(255, max(0, base[ch] + noise)))
+                }
+                buf[i + 3] = 255
+            }
+        }
+        let c = CGContext(
+            data: &buf, width: width, height: height, bitsPerComponent: 8, bytesPerRow: width * 4,
+            space: CGColorSpace(name: CGColorSpace.sRGB)!,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        )!
         return c.makeImage()!
     }
 
