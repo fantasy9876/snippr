@@ -692,6 +692,7 @@ final class SegmentedVerticalStitcher {
         width = first.width
         viewportHeight = first.height
         self.scale = max(1, scale)
+        ledgerSeed(first, gapRows: 0)
     }
 
     var lastSlice: CGImage? { currentSegment.lastSlice }
@@ -720,6 +721,7 @@ final class SegmentedVerticalStitcher {
             }
             consecutiveRejects = 0
             pendingSegment = nil
+            ledgerRecordAccepted(result)
             switch result {
             case let .appended(rows): return .appended(rows)
             case let .prepended(rows): return .prepended(rows)
@@ -728,6 +730,19 @@ final class SegmentedVerticalStitcher {
         }
 
         consecutiveRejects += 1
+        // Revisited content must NEVER seed a pending segment. When the page
+        // jumps back to an already-captured region (rubber-band, Home key,
+        // anchor link), those frames fail the edge matcher, then verify
+        // against EACH OTHER — and four ticks later the promotion path would
+        // append old content behind a separator. That is the duplicated-block
+        // + phantom-stripe capture users report. The ledger recognizes the
+        // frame as already-captured content and reports a retrace instead.
+        if let sig = VerticalStitcher.rowSignatures(frame),
+           ledgerRecognizesRevisit(sig, height: frame.height) {
+            pendingSegment = nil
+            consecutiveRejects = 0
+            return .moved
+        }
         if let pending = pendingSegment {
             if !pending.append(frame).isAccepted {
                 // This candidate did not form a contiguous strip either.
@@ -745,6 +760,7 @@ final class SegmentedVerticalStitcher {
               let outcome = promotePendingSegment() else {
             return .rejected(consecutive: consecutiveRejects)
         }
+        ledgerRecordPromotedFrame(frame)
         return outcome
     }
 
@@ -760,6 +776,13 @@ final class SegmentedVerticalStitcher {
         guard frame.width == width, frame.height == viewportHeight else {
             return .rejected(consecutive: 0)
         }
+        // The same revisit rule as append(): a backend transition landing on
+        // already-captured content must not relegitimize it as a new segment.
+        if let sig = VerticalStitcher.rowSignatures(frame),
+           ledgerRecognizesRevisit(sig, height: frame.height) {
+            pendingSegment = nil
+            return .moved
+        }
         if let pending = pendingSegment {
             if !pending.append(frame).isAccepted {
                 pendingSegment = VerticalStitcher(first: frame, scale: scale)
@@ -767,13 +790,120 @@ final class SegmentedVerticalStitcher {
         } else {
             pendingSegment = VerticalStitcher(first: frame, scale: scale)
         }
-        return promotePendingSegment()
-            ?? .rejected(consecutive: 0)
+        guard let outcome = promotePendingSegment() else {
+            return .rejected(consecutive: 0)
+        }
+        ledgerRecordPromotedFrame(frame)
+        return outcome
     }
 
     func discardPendingSegment() {
         pendingSegment = nil
         consecutiveRejects = 0
+    }
+
+    // MARK: revisit ledger
+
+    /// Quantized per-row hashes of content already accepted into the output,
+    /// with the output row positions they were seen at. Rows vote with the
+    /// positions they hit; a frame whose rows agree on ONE consistent offset
+    /// is a re-view of captured content, not new page content.
+    private var ledgerIndex: [UInt64: [Int]] = [:]
+    /// Next ledger position below the captured content (grows on appends).
+    private var ledgerNextRow = 0
+    /// Smallest ledger position above the captured content (grows negative
+    /// on prepends, so earlier entries never need rewriting).
+    private var ledgerTopRow = 0
+
+    /// A hash shared by more positions than this carries no position
+    /// information (blank rows, strictly periodic patterns) — skip it.
+    private static let ledgerMaxPositionsPerHash = 48
+    /// Rows with less horizontal gradient than this are near-uniform and
+    /// would match everywhere.
+    private static let ledgerMinEnergy = 1.5
+
+    private func ledgerHash(
+        _ sig: VerticalStitcher.RowSig, row: Int
+    ) -> UInt64? {
+        guard sig.energy[row] >= Self.ledgerMinEnergy else { return nil }
+        var hash: UInt64 = 0xcbf29ce484222325
+        for band in 0..<4 {
+            // 2-gray-level quantization tolerates capture noise while keeping
+            // rows discriminative.
+            let q = UInt64(min(255, max(0, Int(sig.bands[row * 4 + band] / 2 + 0.5))))
+            hash = (hash ^ q) &* 0x100000001b3
+        }
+        return hash
+    }
+
+    private func ledgerAdd(
+        sig: VerticalStitcher.RowSig, sigRows: Range<Int>, startPosition: Int
+    ) {
+        for (i, row) in sigRows.enumerated() {
+            guard let hash = ledgerHash(sig, row: row) else { continue }
+            ledgerIndex[hash, default: []].append(startPosition + i)
+        }
+    }
+
+    /// Called with every ACCEPTED edge-matcher outcome: the new rows enter
+    /// the ledger at their output positions (appends below, prepends above).
+    private func ledgerRecordAccepted(_ result: VerticalStitcher.AppendResult) {
+        guard let sig = currentSegment.lastAcceptedSigForLedger else { return }
+        switch result {
+        case let .appended(rows):
+            ledgerAdd(
+                sig: sig, sigRows: (viewportHeight - rows)..<viewportHeight,
+                startPosition: ledgerNextRow)
+            ledgerNextRow += rows
+        case let .prepended(rows):
+            ledgerTopRow -= rows
+            ledgerAdd(sig: sig, sigRows: 0..<rows, startPosition: ledgerTopRow)
+        case .moved, .rejected:
+            break
+        }
+    }
+
+    /// Seeds the ledger for the first frame (init) and for the frame whose
+    /// pending promotion just became the new current segment. Promotion
+    /// coverage is deliberately partial (only the promoting frame): later
+    /// accepted appends fill the rest in as they arrive.
+    private func ledgerSeed(_ frame: CGImage, gapRows: Int) {
+        guard let sig = VerticalStitcher.rowSignatures(frame) else { return }
+        ledgerNextRow += gapRows
+        ledgerAdd(
+            sig: sig, sigRows: 0..<frame.height, startPosition: ledgerNextRow)
+        ledgerNextRow += frame.height
+    }
+
+    private func ledgerRecordPromotedFrame(_ frame: CGImage) {
+        ledgerSeed(frame, gapRows: separatorRows)
+    }
+
+    /// True when the frame's discriminative rows overwhelmingly agree on one
+    /// position offset into already-captured content. Runs only AFTER the
+    /// edge matcher failed, so it can never mask a legitimate append/prepend
+    /// — and a frame past a REAL gap shares no captured content, collects no
+    /// votes, and still re-anchors through the pending path.
+    private func ledgerRecognizesRevisit(
+        _ sig: VerticalStitcher.RowSig, height: Int
+    ) -> Bool {
+        var votes: [Int: Int] = [:]
+        var discriminative = 0
+        for row in 0..<height {
+            guard let hash = ledgerHash(sig, row: row) else { continue }
+            discriminative += 1
+            guard let positions = ledgerIndex[hash],
+                  positions.count <= Self.ledgerMaxPositionsPerHash
+            else { continue }
+            for position in positions {
+                votes[position - row, default: 0] += 1
+            }
+        }
+        // A mostly-blank frame proves nothing either way — let the pending
+        // path handle it with its own evidence rules.
+        guard discriminative >= height / 4,
+              let best = votes.values.max() else { return false }
+        return best >= max(discriminative * 3 / 5, height / 3)
     }
 
     /// Pending evidence is backend-specific. Call exactly when capture changes
@@ -1178,6 +1308,10 @@ final class VerticalStitcher {
 
     /// The most recently appended slice — used for the live preview.
     private(set) var lastSlice: CGImage?
+
+    /// The accepted frame's cached signature — lets the segment owner feed
+    /// its revisit ledger without a second full-frame signature pass.
+    var lastAcceptedSigForLedger: RowSig? { lastSig }
 
     /// Non-mutating transition probe used when capture falls back from
     /// sourceRect to a full-display crop. Equal dimensions alone are not proof
