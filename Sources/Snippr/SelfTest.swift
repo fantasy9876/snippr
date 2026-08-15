@@ -36,33 +36,255 @@ enum SelfTest {
         }
 
         // 0. Updater detached-shell regression ----------------------------------
+        let uppercaseHash = String(repeating: "AB", count: 32)
+        let normalizedUppercase = UpdateChecker.normalizedSHA256(uppercaseHash)
+        check("updater13-manifest-sha-required",
+              UpdateChecker.normalizedSHA256(nil) == nil
+                && UpdateChecker.normalizedSHA256("") == nil
+                && UpdateChecker.normalizedSHA256(String(repeating: "a", count: 63)) == nil
+                && UpdateChecker.normalizedSHA256(String(repeating: "g", count: 64)) == nil
+                && normalizedUppercase == uppercaseHash.lowercased(),
+              "normalized \(normalizedUppercase ?? "nil")")
+        check("updater13-update-server-url-policy",
+              UpdateChecker.isAllowedUpdateServerURL(
+                  URL(string: "https://snippr.pages.dev/version.json"))
+                && UpdateChecker.isAllowedUpdateServerURL(
+                    URL(string: "https://snippr.pages.dev:443/Snippr.dmg"))
+                && !UpdateChecker.isAllowedUpdateServerURL(nil)
+                && !UpdateChecker.isAllowedUpdateServerURL(
+                    URL(string: "http://snippr.pages.dev/version.json"))
+                && !UpdateChecker.isAllowedUpdateServerURL(
+                    URL(string: "https://evil.snippr.pages.dev/version.json"))
+                && !UpdateChecker.isAllowedUpdateServerURL(
+                    URL(string: "https://snippr.pages.dev.evil.test/version.json"))
+                && !UpdateChecker.isAllowedUpdateServerURL(
+                    URL(string: "https://attacker@snippr.pages.dev/version.json"))
+                && !UpdateChecker.isAllowedUpdateServerURL(
+                    URL(string: "https://snippr.pages.dev:444/version.json")))
+
+        let latchOK = MainActor.assumeIsolated { () -> Bool in
+            UpdateChecker.releaseUpdateAttempt()
+            let first = UpdateChecker.claimUpdateAttempt()
+            let second = UpdateChecker.claimUpdateAttempt()
+            UpdateChecker.finishUpdateAttempt(didHandoff: false)
+            let afterFailure = UpdateChecker.claimUpdateAttempt()
+            UpdateChecker.finishUpdateAttempt(didHandoff: true)
+            let afterHandoff = UpdateChecker.claimUpdateAttempt()
+            UpdateChecker.releaseUpdateAttempt()
+            return first && !second && afterFailure && !afterHandoff
+        }
+        check("updater13-single-attempt-latch", latchOK)
+
+        do {
+            let base = URL(fileURLWithPath: outputDir)
+            let first = try UpdateChecker.createUpdateAttemptDirectory(in: base)
+            let second = try UpdateChecker.createUpdateAttemptDirectory(in: base)
+            defer {
+                try? FileManager.default.removeItem(at: first)
+                try? FileManager.default.removeItem(at: second)
+            }
+            let firstMode = (try FileManager.default.attributesOfItem(
+                atPath: first.path)[.posixPermissions] as? NSNumber)?.intValue ?? 0
+            let secondMode = (try FileManager.default.attributesOfItem(
+                atPath: second.path)[.posixPermissions] as? NSNumber)?.intValue ?? 0
+            check("updater13-private-unique-attempt-paths",
+                  first != second && first.lastPathComponent.hasPrefix("SnipprUpdate-")
+                    && second.lastPathComponent.hasPrefix("SnipprUpdate-")
+                    && firstMode & 0o777 == 0o700 && secondMode & 0o777 == 0o700,
+                  "first \(first.lastPathComponent) \(String(firstMode, radix: 8)) second \(second.lastPathComponent) \(String(secondMode, radix: 8))")
+        } catch {
+            check("updater13-private-unique-attempt-paths", false,
+                  "fixture error \(error)")
+        }
+        check("updater13-exit-wait-exceeds-save-failsafe",
+              UpdateChecker.installerExitWaitSeconds > 10,
+              "wait \(UpdateChecker.installerExitWaitSeconds)")
+
+        do {
+            let tempDownload = URL(fileURLWithPath: outputDir)
+                .appendingPathComponent("owned-download-\(UUID().uuidString)")
+            try Data("download".utf8).write(to: tempDownload)
+            var existedInsideScope = false
+            MainActor.assumeIsolated {
+                UpdateChecker.consumeTemporaryDownload(tempDownload) { ownedURL in
+                    existedInsideScope = FileManager.default.fileExists(
+                        atPath: ownedURL.path)
+                }
+            }
+            check("updater13-temporary-download-scope-cleans-up",
+                  existedInsideScope
+                    && !FileManager.default.fileExists(atPath: tempDownload.path))
+        } catch {
+            check("updater13-temporary-download-scope-cleans-up", false,
+                  "fixture error \(error)")
+        }
+
         // Exercise the exact production shell against a real ad-hoc signed app
-        // in a disposable DMG. The RED verifier contains an unsupported
-        // `codesign --quiet`, so the valid candidate aborts and leaves "old".
+        // in a disposable DMG. A live sentinel models AppDelegate's delayed
+        // termination: no mount/swap may start until the old PID is gone.
         do {
             let root = URL(fileURLWithPath: outputDir)
                 .appendingPathComponent("updater-valid-\(UUID().uuidString)")
             defer { try? FileManager.default.removeItem(at: root) }
             let installed = root.appendingPathComponent("installed/Snippr.app")
             try makeUpdaterInstalledFixture(at: installed, marker: "old")
-            if let dmg = makeUpdaterDMGFixture(at: root, tamperAfterSigning: false) {
-                let result = runCommand(
-                    "/bin/sh",
-                    ["-c", UpdateChecker.detachedInstallerScript(),
-                     "snippr-updater-selftest", dmg.path, installed.path, "0", "0"])
+            if var fixture = makeUpdaterDMGFixture(at: root, tamperAfterSigning: false) {
+                let attemptDirectory = root.appendingPathComponent("private-attempt")
+                try FileManager.default.createDirectory(
+                    at: attemptDirectory, withIntermediateDirectories: false,
+                    attributes: [.posixPermissions: 0o700])
+                let privateDMG = attemptDirectory.appendingPathComponent("SnipprUpdate.dmg")
+                try FileManager.default.moveItem(at: fixture.url, to: privateDMG)
+                fixture = UpdaterDMGFixture(
+                    url: privateDMG, volumeName: fixture.volumeName)
+                defer { cleanupUpdaterDMGFixture(fixture) }
+                let log = root.appendingPathComponent("update.log")
+                let sentinel = Process()
+                sentinel.executableURL = URL(fileURLWithPath: "/bin/sleep")
+                sentinel.arguments = ["2"]
+                try sentinel.run()
+                let activationStub = root.appendingPathComponent("activation-after-old-exit.sh")
+                try makeUpdaterExecutable(
+                    at: activationStub,
+                    contents: "#!/bin/sh\nif /bin/kill -0 \(sentinel.processIdentifier) 2>/dev/null; then exit 74; fi\nexec /bin/mv \"$1\" \"$2\"\n")
+                defer {
+                    if sentinel.isRunning { sentinel.terminate() }
+                    sentinel.waitUntilExit()
+                }
+                let started = Date()
+                let result = runUpdaterInstaller(
+                    fixture, installed: installed, log: log,
+                    oldPID: sentinel.processIdentifier, waitTimeout: 5,
+                    activationTool: activationStub.path,
+                    attemptDirectory: attemptDirectory.path)
+                let elapsed = Date().timeIntervalSince(started)
+                let waitedForOldProcess = !sentinel.isRunning && elapsed >= 1.5
                 let marker = updaterFixtureMarker(at: installed) ?? "missing"
-                let cleanSwap = !FileManager.default.fileExists(atPath: installed.path + ".new")
-                    && !FileManager.default.fileExists(atPath: installed.path + ".old")
-                    && !FileManager.default.fileExists(atPath: dmg.path)
+                let logText = (try? String(contentsOf: log, encoding: .utf8)) ?? ""
+                let cleanSwap = updaterFixtureIsClean(fixture, installed: installed)
                 check("updater13-valid-signed-candidate-installs",
-                      result.status == 0 && marker == "new" && cleanSwap,
-                      "status \(result.status) marker \(marker) clean \(cleanSwap) output \(result.output)")
+                      result.status == 0 && marker == "new" && cleanSwap
+                        && waitedForOldProcess
+                        && !FileManager.default.fileExists(atPath: attemptDirectory.path)
+                        && logText.contains("WAIT stage=old-process")
+                        && logText.contains("READY stage=old-process")
+                        && logText.contains("SUCCESS version=1.2.3"),
+                      "status \(result.status) marker \(marker) clean \(cleanSwap) waited \(waitedForOldProcess) elapsed \(elapsed) log \(logText) output \(result.output)")
             } else {
                 check("updater13-valid-signed-candidate-installs", false,
                       "could not create signed DMG fixture")
             }
         } catch {
             check("updater13-valid-signed-candidate-installs", false,
+                  "fixture error \(error)")
+        }
+
+        // A persistent log is best-effort diagnostics. An unwritable log path
+        // must not suppress hash/signature/swap/relaunch commands.
+        do {
+            let root = URL(fileURLWithPath: outputDir)
+                .appendingPathComponent("updater-no-log-\(UUID().uuidString)")
+            defer { try? FileManager.default.removeItem(at: root) }
+            let installed = root.appendingPathComponent("installed/Snippr.app")
+            try makeUpdaterInstalledFixture(at: installed, marker: "old")
+            let logDirectory = root.appendingPathComponent("unwritable-log")
+            try FileManager.default.createDirectory(
+                at: logDirectory, withIntermediateDirectories: true)
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o500], ofItemAtPath: logDirectory.path)
+            defer {
+                try? FileManager.default.setAttributes(
+                    [.posixPermissions: 0o700], ofItemAtPath: logDirectory.path)
+            }
+            let openStub = root.appendingPathComponent("open-succeeds.sh")
+            try makeUpdaterExecutable(
+                at: openStub,
+                contents: "#!/bin/sh\nSCRIPT_DIR=\"${0%/*}\"\n/usr/bin/touch \"$SCRIPT_DIR/opened\"\n")
+            if let fixture = makeUpdaterDMGFixture(at: root, tamperAfterSigning: false) {
+                defer { cleanupUpdaterDMGFixture(fixture) }
+                let log = logDirectory.appendingPathComponent("update.log")
+                let result = runUpdaterInstaller(
+                    fixture, installed: installed, log: log,
+                    relaunch: true, openTool: openStub.path)
+                let marker = updaterFixtureMarker(at: installed) ?? "missing"
+                let opened = FileManager.default.fileExists(
+                    atPath: root.appendingPathComponent("opened").path)
+                check("updater13-unwritable-log-does-not-block-install",
+                      result.status == 0 && marker == "new" && opened
+                        && updaterFixtureIsClean(fixture, installed: installed),
+                      "status \(result.status) marker \(marker) opened \(opened) output \(result.output)")
+            } else {
+                check("updater13-unwritable-log-does-not-block-install", false,
+                      "could not create signed DMG fixture")
+            }
+        } catch {
+            check("updater13-unwritable-log-does-not-block-install", false,
+                  "fixture error \(error)")
+        }
+
+        // A still-running old process past the bounded wait must abort before
+        // attaching the DMG or moving either installed-app path.
+        do {
+            let root = URL(fileURLWithPath: outputDir)
+                .appendingPathComponent("updater-wait-timeout-\(UUID().uuidString)")
+            defer { try? FileManager.default.removeItem(at: root) }
+            let installed = root.appendingPathComponent("installed/Snippr.app")
+            try makeUpdaterInstalledFixture(at: installed, marker: "old")
+            if let fixture = makeUpdaterDMGFixture(at: root, tamperAfterSigning: false) {
+                defer { cleanupUpdaterDMGFixture(fixture) }
+                let log = root.appendingPathComponent("update.log")
+                let sentinel = Process()
+                sentinel.executableURL = URL(fileURLWithPath: "/bin/sleep")
+                sentinel.arguments = ["5"]
+                try sentinel.run()
+                let result = runUpdaterInstaller(
+                    fixture, installed: installed, log: log,
+                    oldPID: sentinel.processIdentifier, waitTimeout: 1)
+                if sentinel.isRunning { sentinel.terminate() }
+                sentinel.waitUntilExit()
+                let marker = updaterFixtureMarker(at: installed) ?? "missing"
+                let logText = (try? String(contentsOf: log, encoding: .utf8)) ?? ""
+                check("updater13-old-process-timeout-preserves-old",
+                      result.status != 0 && marker == "old"
+                        && updaterFixtureIsClean(fixture, installed: installed)
+                        && logText.contains("FAIL stage=wait-old-process"),
+                      "status \(result.status) marker \(marker) log \(logText)")
+            } else {
+                check("updater13-old-process-timeout-preserves-old", false,
+                      "could not create signed DMG fixture")
+            }
+        } catch {
+            check("updater13-old-process-timeout-preserves-old", false,
+                  "fixture error \(error)")
+        }
+
+        // The detached shell re-hashes the exact DMG it will mount. A wrong
+        // expected digest must therefore fail even if all bundle checks pass.
+        do {
+            let root = URL(fileURLWithPath: outputDir)
+                .appendingPathComponent("updater-hash-\(UUID().uuidString)")
+            defer { try? FileManager.default.removeItem(at: root) }
+            let installed = root.appendingPathComponent("installed/Snippr.app")
+            try makeUpdaterInstalledFixture(at: installed, marker: "old")
+            if let fixture = makeUpdaterDMGFixture(at: root, tamperAfterSigning: false) {
+                defer { cleanupUpdaterDMGFixture(fixture) }
+                let log = root.appendingPathComponent("update.log")
+                let result = runUpdaterInstaller(
+                    fixture, installed: installed, log: log,
+                    expectedSHA: String(repeating: "0", count: 64))
+                let marker = updaterFixtureMarker(at: installed) ?? "missing"
+                let logText = (try? String(contentsOf: log, encoding: .utf8)) ?? ""
+                check("updater13-dmg-hash-mismatch-preserves-old",
+                      result.status != 0 && marker == "old"
+                        && updaterFixtureIsClean(fixture, installed: installed)
+                        && logText.contains("FAIL stage=hash"),
+                      "status \(result.status) marker \(marker) log \(logText)")
+            } else {
+                check("updater13-dmg-hash-mismatch-preserves-old", false,
+                      "could not create signed DMG fixture")
+            }
+        } catch {
+            check("updater13-dmg-hash-mismatch-preserves-old", false,
                   "fixture error \(error)")
         }
 
@@ -73,25 +295,243 @@ enum SelfTest {
             defer { try? FileManager.default.removeItem(at: root) }
             let installed = root.appendingPathComponent("installed/Snippr.app")
             try makeUpdaterInstalledFixture(at: installed, marker: "old")
-            if let dmg = makeUpdaterDMGFixture(at: root, tamperAfterSigning: true) {
-                let result = runCommand(
-                    "/bin/sh",
-                    ["-c", UpdateChecker.detachedInstallerScript(),
-                     "snippr-updater-selftest", dmg.path, installed.path, "0", "0"])
+            if let fixture = makeUpdaterDMGFixture(at: root, tamperAfterSigning: true) {
+                defer { cleanupUpdaterDMGFixture(fixture) }
+                let log = root.appendingPathComponent("update.log")
+                let result = runUpdaterInstaller(fixture, installed: installed, log: log)
                 let marker = updaterFixtureMarker(at: installed) ?? "missing"
+                let logText = (try? String(contentsOf: log, encoding: .utf8)) ?? ""
                 let preserved = result.status != 0 && marker == "old"
-                    && !FileManager.default.fileExists(atPath: installed.path + ".new")
-                    && !FileManager.default.fileExists(atPath: installed.path + ".old")
-                    && !FileManager.default.fileExists(atPath: dmg.path)
+                    && updaterFixtureIsClean(fixture, installed: installed)
+                    && logText.contains("FAIL stage=verify-staged-copy")
                 check("updater13-tampered-candidate-preserves-old",
                       preserved,
-                      "status \(result.status) marker \(marker) output \(result.output)")
+                      "status \(result.status) marker \(marker) log \(logText) output \(result.output)")
             } else {
                 check("updater13-tampered-candidate-preserves-old", false,
                       "could not create tampered DMG fixture")
             }
         } catch {
             check("updater13-tampered-candidate-preserves-old", false,
+                  "fixture error \(error)")
+        }
+
+        // A structurally valid ad-hoc signature is not sufficient: the bundle
+        // must also carry Snippr's exact identifier requirement.
+        do {
+            let root = URL(fileURLWithPath: outputDir)
+                .appendingPathComponent("updater-wrong-id-\(UUID().uuidString)")
+            defer { try? FileManager.default.removeItem(at: root) }
+            let installed = root.appendingPathComponent("installed/Snippr.app")
+            try makeUpdaterInstalledFixture(at: installed, marker: "old")
+            if let fixture = makeUpdaterDMGFixture(
+                at: root,
+                tamperAfterSigning: false,
+                bundleIdentifier: "com.example.not-snippr"
+            ) {
+                defer { cleanupUpdaterDMGFixture(fixture) }
+                let log = root.appendingPathComponent("update.log")
+                let result = runUpdaterInstaller(fixture, installed: installed, log: log)
+                let marker = updaterFixtureMarker(at: installed) ?? "missing"
+                let logText = (try? String(contentsOf: log, encoding: .utf8)) ?? ""
+                check("updater13-wrong-bundle-identifier-preserves-old",
+                      result.status != 0 && marker == "old"
+                        && updaterFixtureIsClean(fixture, installed: installed)
+                        && logText.contains("FAIL stage=verify-staged-copy"),
+                      "status \(result.status) marker \(marker) log \(logText)")
+            } else {
+                check("updater13-wrong-bundle-identifier-preserves-old", false,
+                      "could not create wrong-identifier DMG fixture")
+            }
+        } catch {
+            check("updater13-wrong-bundle-identifier-preserves-old", false,
+                  "fixture error \(error)")
+        }
+
+        // A validly signed bundle with the wrong marketing version is a
+        // release-packaging error and must fail before replacing the old app.
+        do {
+            let root = URL(fileURLWithPath: outputDir)
+                .appendingPathComponent("updater-version-\(UUID().uuidString)")
+            defer { try? FileManager.default.removeItem(at: root) }
+            let installed = root.appendingPathComponent("installed/Snippr.app")
+            try makeUpdaterInstalledFixture(at: installed, marker: "old")
+            if let fixture = makeUpdaterDMGFixture(at: root, tamperAfterSigning: false) {
+                defer { cleanupUpdaterDMGFixture(fixture) }
+                let log = root.appendingPathComponent("update.log")
+                let result = runUpdaterInstaller(
+                    fixture, installed: installed, log: log,
+                    expectedVersion: "9.9.9")
+                let marker = updaterFixtureMarker(at: installed) ?? "missing"
+                let logText = (try? String(contentsOf: log, encoding: .utf8)) ?? ""
+                check("updater13-version-mismatch-preserves-old",
+                      result.status != 0 && marker == "old"
+                        && updaterFixtureIsClean(fixture, installed: installed)
+                        && logText.contains("FAIL stage=version"),
+                      "status \(result.status) marker \(marker) log \(logText)")
+            } else {
+                check("updater13-version-mismatch-preserves-old", false,
+                      "could not create version-mismatch fixture")
+            }
+        } catch {
+            check("updater13-version-mismatch-preserves-old", false,
+                  "fixture error \(error)")
+        }
+
+        // If a prior interruption left only APP.old, recover it before any
+        // cleanup. A forced post-backup activation failure must restore it.
+        do {
+            let root = URL(fileURLWithPath: outputDir)
+                .appendingPathComponent("updater-activation-\(UUID().uuidString)")
+            defer { try? FileManager.default.removeItem(at: root) }
+            let installed = root.appendingPathComponent("installed/Snippr.app")
+            let staleBackup = URL(fileURLWithPath: installed.path + ".old")
+            try makeUpdaterInstalledFixture(at: staleBackup, marker: "old")
+            let activationStub = root.appendingPathComponent("activation-fails.sh")
+            try makeUpdaterExecutable(
+                at: activationStub,
+                contents: "#!/bin/sh\nexit 71\n")
+            if let fixture = makeUpdaterDMGFixture(at: root, tamperAfterSigning: false) {
+                defer { cleanupUpdaterDMGFixture(fixture) }
+                let log = root.appendingPathComponent("update.log")
+                let result = runUpdaterInstaller(
+                    fixture, installed: installed, log: log,
+                    activationTool: activationStub.path)
+                let marker = updaterFixtureMarker(at: installed) ?? "missing"
+                let logText = (try? String(contentsOf: log, encoding: .utf8)) ?? ""
+                check("updater13-activation-failure-restores-stale-backup",
+                      result.status != 0 && marker == "old"
+                        && updaterFixtureIsClean(fixture, installed: installed)
+                        && logText.contains("FAIL stage=activate"),
+                      "status \(result.status) marker \(marker) log \(logText)")
+            } else {
+                check("updater13-activation-failure-restores-stale-backup", false,
+                      "could not create signed DMG fixture")
+            }
+        } catch {
+            check("updater13-activation-failure-restores-stale-backup", false,
+                  "fixture error \(error)")
+        }
+
+        // A termination signal delivered after APP was journaled to APP.old
+        // must run the same rollback path rather than leave the canonical app
+        // missing. The activation stub signals its parent shell deterministically.
+        do {
+            let root = URL(fileURLWithPath: outputDir)
+                .appendingPathComponent("updater-signal-\(UUID().uuidString)")
+            defer { try? FileManager.default.removeItem(at: root) }
+            let installed = root.appendingPathComponent("installed/Snippr.app")
+            try makeUpdaterInstalledFixture(at: installed, marker: "old")
+            let activationStub = root.appendingPathComponent("activation-signals.sh")
+            try makeUpdaterExecutable(
+                at: activationStub,
+                contents: "#!/bin/sh\n/bin/mv \"$1\" \"$2\" || exit 72\n/bin/kill -TERM \"$PPID\"\n/bin/sleep 1\nexit 0\n")
+            if let fixture = makeUpdaterDMGFixture(at: root, tamperAfterSigning: false) {
+                defer { cleanupUpdaterDMGFixture(fixture) }
+                let log = root.appendingPathComponent("update.log")
+                let result = runUpdaterInstaller(
+                    fixture, installed: installed, log: log,
+                    activationTool: activationStub.path)
+                let marker = updaterFixtureMarker(at: installed) ?? "missing"
+                let logText = (try? String(contentsOf: log, encoding: .utf8)) ?? ""
+                check("updater13-signal-after-backup-restores-old",
+                      result.status != 0 && marker == "old"
+                        && updaterFixtureIsClean(fixture, installed: installed)
+                        && logText.contains("FAIL stage=signal-term"),
+                      "status \(result.status) marker \(marker) log \(logText)")
+            } else {
+                check("updater13-signal-after-backup-restores-old", false,
+                      "could not create signed DMG fixture")
+            }
+        } catch {
+            check("updater13-signal-after-backup-restores-old", false,
+                  "fixture error \(error)")
+        }
+
+        // LaunchServices refusal is a failed update outcome: it must not be
+        // logged as SUCCESS, and the journaled old app must be restored.
+        do {
+            let root = URL(fileURLWithPath: outputDir)
+                .appendingPathComponent("updater-relaunch-\(UUID().uuidString)")
+            defer { try? FileManager.default.removeItem(at: root) }
+            let installed = root.appendingPathComponent("installed/Snippr.app")
+            try makeUpdaterInstalledFixture(at: installed, marker: "old")
+            let openStub = root.appendingPathComponent("open-fails.sh")
+            try makeUpdaterExecutable(
+                at: openStub,
+                contents: "#!/bin/sh\necho relaunch-stub-error >&2\nexit 23\n")
+            if let fixture = makeUpdaterDMGFixture(at: root, tamperAfterSigning: false) {
+                defer { cleanupUpdaterDMGFixture(fixture) }
+                let log = root.appendingPathComponent("update.log")
+                let result = runUpdaterInstaller(
+                    fixture, installed: installed, log: log,
+                    relaunch: true, openTool: openStub.path)
+                let marker = updaterFixtureMarker(at: installed) ?? "missing"
+                let logText = (try? String(contentsOf: log, encoding: .utf8)) ?? ""
+                check("updater13-relaunch-failure-rolls-back",
+                      result.status != 0 && marker == "old"
+                        && updaterFixtureIsClean(fixture, installed: installed)
+                        && logText.contains("relaunch-stub-error")
+                        && logText.contains("FAIL stage=relaunch")
+                        && !logText.contains("SUCCESS"),
+                      "status \(result.status) marker \(marker) log \(logText)")
+            } else {
+                check("updater13-relaunch-failure-rolls-back", false,
+                      "could not create signed DMG fixture")
+            }
+        } catch {
+            check("updater13-relaunch-failure-rolls-back", false,
+                  "fixture error \(error)")
+        }
+
+        // If an activated candidate cannot be removed, never move APP.old into
+        // the still-existing bundle and falsely report rollback success.
+        do {
+            let root = URL(fileURLWithPath: outputDir)
+                .appendingPathComponent("updater-restore-rm-\(UUID().uuidString)")
+            defer { try? FileManager.default.removeItem(at: root) }
+            let installed = root.appendingPathComponent("installed/Snippr.app")
+            try makeUpdaterInstalledFixture(at: installed, marker: "old")
+            defer {
+                _ = runCommand("/usr/bin/chflags", ["-R", "nouchg", installed.path])
+                _ = runCommand(
+                    "/usr/bin/chflags", ["-R", "nouchg", installed.path + ".old"])
+            }
+            let activationStub = root.appendingPathComponent("activation-immutable.sh")
+            try makeUpdaterExecutable(
+                at: activationStub,
+                contents: "#!/bin/sh\n/bin/mv \"$1\" \"$2\" || exit 72\n/usr/bin/chflags -R uchg \"$2\" || exit 73\n")
+            let openStub = root.appendingPathComponent("open-fails.sh")
+            try makeUpdaterExecutable(at: openStub, contents: "#!/bin/sh\nexit 23\n")
+            if let fixture = makeUpdaterDMGFixture(at: root, tamperAfterSigning: false) {
+                defer { cleanupUpdaterDMGFixture(fixture) }
+                let log = root.appendingPathComponent("update.log")
+                let result = runUpdaterInstaller(
+                    fixture, installed: installed, log: log,
+                    relaunch: true, openTool: openStub.path,
+                    activationTool: activationStub.path)
+                let newMarker = updaterFixtureMarker(at: installed) ?? "missing"
+                let oldMarker = updaterFixtureMarker(
+                    at: URL(fileURLWithPath: installed.path + ".old")) ?? "missing"
+                let nestedBackup = installed.appendingPathComponent("Snippr.app.old")
+                let logText = (try? String(contentsOf: log, encoding: .utf8)) ?? ""
+                let detachedAndDownloadedClean = !FileManager.default.fileExists(
+                    atPath: fixture.url.path)
+                    && !FileManager.default.fileExists(
+                        atPath: "/Volumes/\(fixture.volumeName)")
+                    && !FileManager.default.fileExists(atPath: installed.path + ".new")
+                check("updater13-restore-removal-failure-keeps-journal",
+                      result.status != 0 && newMarker == "new" && oldMarker == "old"
+                        && !FileManager.default.fileExists(atPath: nestedBackup.path)
+                        && detachedAndDownloadedClean
+                        && logText.contains("FATAL stage=restore"),
+                      "status \(result.status) new \(newMarker) old \(oldMarker) clean \(detachedAndDownloadedClean) log \(logText)")
+            } else {
+                check("updater13-restore-removal-failure-keeps-journal", false,
+                      "could not create signed DMG fixture")
+            }
+        } catch {
+            check("updater13-restore-removal-failure-keeps-journal", false,
                   "fixture error \(error)")
         }
 
@@ -6200,6 +6640,11 @@ enum SelfTest {
         let output: String
     }
 
+    private struct UpdaterDMGFixture {
+        let url: URL
+        let volumeName: String
+    }
+
     private static func runCommand(_ executable: String, _ arguments: [String]) -> CommandResult {
         let process = Process()
         let pipe = Pipe()
@@ -6232,9 +6677,64 @@ enum SelfTest {
         return String(data: data, encoding: .utf8)
     }
 
+    private static func updaterFixtureSHA256(_ fixture: UpdaterDMGFixture) -> String? {
+        let result = runCommand("/usr/bin/shasum", ["-a", "256", fixture.url.path])
+        guard result.status == 0 else { return nil }
+        return result.output.split(whereSeparator: { $0.isWhitespace }).first.map(String.init)
+    }
+
+    private static func runUpdaterInstaller(
+        _ fixture: UpdaterDMGFixture,
+        installed: URL,
+        log: URL,
+        expectedVersion: String = "1.2.3",
+        expectedSHA: String? = nil,
+        oldPID: Int32 = 0,
+        waitTimeout: Int = 15,
+        relaunch: Bool = false,
+        openTool: String = "/usr/bin/open",
+        activationTool: String = "/bin/mv",
+        attemptDirectory: String = ""
+    ) -> CommandResult {
+        let digest = expectedSHA ?? updaterFixtureSHA256(fixture) ?? ""
+        return runCommand(
+            "/bin/sh",
+            ["-c", UpdateChecker.detachedInstallerScript(),
+             "snippr-updater-selftest", fixture.url.path, installed.path, "0",
+             relaunch ? "1" : "0", expectedVersion, log.path, digest,
+             String(oldPID), String(waitTimeout), openTool, activationTool,
+             attemptDirectory])
+    }
+
+    private static func updaterFixtureIsClean(
+        _ fixture: UpdaterDMGFixture,
+        installed: URL
+    ) -> Bool {
+        !FileManager.default.fileExists(atPath: installed.path + ".new")
+            && !FileManager.default.fileExists(atPath: installed.path + ".old")
+            && !FileManager.default.fileExists(atPath: fixture.url.path)
+            && !FileManager.default.fileExists(
+                atPath: "/Volumes/\(fixture.volumeName)")
+    }
+
+    private static func cleanupUpdaterDMGFixture(_ fixture: UpdaterDMGFixture) {
+        let mount = "/Volumes/\(fixture.volumeName)"
+        if FileManager.default.fileExists(atPath: mount) {
+            _ = runCommand("/usr/bin/hdiutil", ["detach", "-force", mount])
+        }
+    }
+
+    private static func makeUpdaterExecutable(at url: URL, contents: String) throws {
+        try Data(contents.utf8).write(to: url)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755], ofItemAtPath: url.path)
+    }
+
     private static func makeUpdaterDMGFixture(
-        at root: URL, tamperAfterSigning: Bool
-    ) -> URL? {
+        at root: URL,
+        tamperAfterSigning: Bool,
+        bundleIdentifier: String = "com.manhhoang.snippr"
+    ) -> UpdaterDMGFixture? {
         let source = root.appendingPathComponent("dmg-source")
         let app = source.appendingPathComponent("Snippr.app")
         let contents = app.appendingPathComponent("Contents")
@@ -6249,7 +6749,7 @@ enum SelfTest {
                 to: macOS.appendingPathComponent("Snippr"))
             let plist: [String: Any] = [
                 "CFBundleExecutable": "Snippr",
-                "CFBundleIdentifier": "com.manhhoang.snippr",
+                "CFBundleIdentifier": bundleIdentifier,
                 "CFBundleName": "Snippr",
                 "CFBundlePackageType": "APPL",
                 "CFBundleShortVersionString": "1.2.3",
@@ -6263,7 +6763,7 @@ enum SelfTest {
             let sign = runCommand(
                 "/usr/bin/codesign",
                 ["--force", "--sign", "-", "--identifier",
-                 "com.manhhoang.snippr", app.path])
+                 bundleIdentifier, app.path])
             guard sign.status == 0 else {
                 print("  updater fixture signing failed: \(sign.output)")
                 return nil
@@ -6281,7 +6781,7 @@ enum SelfTest {
                 print("  updater fixture DMG failed: \(create.output)")
                 return nil
             }
-            return dmg
+            return UpdaterDMGFixture(url: dmg, volumeName: volumeName)
         } catch {
             print("  updater fixture error: \(error)")
             return nil
