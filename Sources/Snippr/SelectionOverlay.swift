@@ -664,7 +664,7 @@ final class SelectionOverlayView: NSView {
                 snapshot, source: .areaReview, intent: intent,
                 inputs: inputs, finalGlobalRect: global,
                 dependencies: baseDependencies)
-        case .initialCapture, .scrollFinished:
+        case .translate, .initialCapture, .scrollFinished:
             break
         }
     }

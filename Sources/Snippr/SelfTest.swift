@@ -3371,6 +3371,7 @@ enum SelfTest {
             final class Spy {
                 var copies = 0, autoSaves = 0, saveAsCalls = 0
                 var pins = 0, ocrs = 0, editors = 0
+                var ocrModes: [Bool] = []
                 var toasts: [String] = []
                 var lastCaptures = 0
                 var areaRects: [CGRect] = []
@@ -3386,7 +3387,10 @@ enum SelfTest {
                     saveAs: { _, done in
                         spy.saveAsCalls += 1; spy.saveAsDone = done },
                     pin: { _ in spy.pins += 1 },
-                    ocr: { _ in spy.ocrs += 1 },
+                    ocrWithMode: { _, autoTranslate in
+                        spy.ocrs += 1
+                        spy.ocrModes.append(autoTranslate)
+                    },
                     openEditor: { _ in spy.editors += 1 },
                     toast: { spy.toasts.append($0) },
                     setLastCapture: { _ in spy.lastCaptures += 1 },
@@ -3587,6 +3591,38 @@ enum SelfTest {
                     && s7.copies == 0 && s7.autoSaves == 0
                     && s7.saveAsCalls == 0,
                   "pins \(s7.pins) ocrs \(s7.ocrs) editors \(s7.editors)")
+
+            // S5 fail-first gate of record. Normal OCR must remain offline
+            // (`false`); explicit Translate must route exactly one `true`
+            // presentation, preserve area-rect authority, and never replay
+            // the initial capture's copy/save settings.
+            let s12OCR = Spy()
+            let o12OCR = CaptureActionRouter.commit(
+                snapshotImage, source: .areaReview, intent: .ocr,
+                inputs: .init(afterShow: true, afterCopy: true, afterSave: true),
+                finalGlobalRect: rect, dependencies: deps(s12OCR))
+            let s12Area = Spy()
+            let o12Area = CaptureActionRouter.commit(
+                snapshotImage, source: .areaReview, intent: .translate,
+                inputs: .init(afterShow: true, afterCopy: true, afterSave: true),
+                finalGlobalRect: rect, dependencies: deps(s12Area))
+            let s12Scroll = Spy()
+            let o12Scroll = CaptureActionRouter.commit(
+                snapshotImage, source: .scrollResult, intent: .translate,
+                inputs: .init(afterShow: true, afterCopy: true, afterSave: true),
+                finalGlobalRect: rect, dependencies: deps(s12Scroll))
+            let translateRouterOK = o12OCR == .completed
+                && s12OCR.ocrModes == [false]
+                && o12Area == .completed && s12Area.ocrModes == [true]
+                && s12Area.lastCaptures == 1 && s12Area.areaRects == [rect]
+                && s12Area.copies == 0 && s12Area.autoSaves == 0
+                && s12Area.saveAsCalls == 0
+                && o12Scroll == .completed && s12Scroll.ocrModes == [true]
+                && s12Scroll.lastCaptures == 1 && s12Scroll.areaRects.isEmpty
+                && s12Scroll.copies == 0 && s12Scroll.autoSaves == 0
+                && s12Scroll.saveAsCalls == 0
+            check("overlay12-translate-router-s5", translateRouterOK,
+                  "ocr \(o12OCR)/\(s12OCR.ocrModes) area \(o12Area)/\(s12Area.ocrModes) last/rect \(s12Area.lastCaptures)/\(s12Area.areaRects) replay \(s12Area.copies)/\(s12Area.autoSaves)/\(s12Area.saveAsCalls) scroll \(o12Scroll)/\(s12Scroll.ocrModes) rect \(s12Scroll.areaRects)")
 
             // Source enforcement: finalGlobalRect from any non-areaReview
             // source is IGNORED by the router itself.
@@ -4284,6 +4320,282 @@ enum SelfTest {
                   movePixelsLive && movePixelsNoJump
                     && resizePixelsLive && resizePixelsNoJump,
                   "moveLive \(movePixelsLive) moveNoJump \(movePixelsNoJump) resizeLive \(resizePixelsLive) resizeNoJump \(resizePixelsNoJump)")
+
+            // S5 fail-first: Translate is a real shared toolbar action and
+            // both terminal hosts claim it BEFORE the dependency can
+            // synchronously re-enter. The dependency observes teardown,
+            // preventing duplicate OCR tasks/windows/network requests.
+            @MainActor func allButtons12(in root: NSView) -> [NSButton] {
+                root.subviews.flatMap { child -> [NSButton] in
+                    let own = (child as? NSButton).map { [$0] } ?? []
+                    return own + allButtons12(in: child)
+                }
+            }
+            @MainActor func actionCatalog12(in root: NSView)
+                -> [(Int, String)] {
+                allButtons12(in: root)
+                    .filter { $0.tag >= 0 && $0.tag < 100 }
+                    .map { ($0.tag, $0.toolTip ?? "") }
+                    .sorted { $0.0 < $1.0 }
+            }
+
+            var areaTranslateCalls = 0
+            var areaTranslateModes: [Bool] = []
+            var areaCompletion = 0
+            var areaPhaseDuring: OverlaySessionPhase?
+            var areaCompletionDuring = -1
+            var areaTranslateRects: [CGRect] = []
+            weak var areaTranslateView: SelectionOverlayView?
+            let areaTranslateOverlay = SelectionOverlay(
+                purpose: .areaReview,
+                inputs: OverlaySessionInputs(
+                    afterShow: true, afterCopy: true, afterSave: true),
+                completion: { _ in areaCompletion += 1 })
+            areaTranslateOverlay.routerDependenciesOverride =
+                CaptureActionRouter.Dependencies(
+                    copyToClipboard: { _ in }, autoSave: { _, _ in },
+                    saveAs: { _, _ in }, pin: { _ in },
+                    ocrWithMode: { _, autoTranslate in
+                        areaTranslateCalls += 1
+                        areaTranslateModes.append(autoTranslate)
+                        areaPhaseDuring = areaTranslateOverlay.session.phase
+                        areaCompletionDuring = areaCompletion
+                        if areaTranslateCalls == 1 {
+                            areaTranslateView?.performReviewActionForTesting(
+                                .translate)
+                        }
+                    },
+                    openEditor: { _ in }, toast: { _ in },
+                    setLastCapture: { _ in },
+                    setLastAreaRect: { areaTranslateRects.append($0) },
+                    logEvent: { _ in })
+            let areaTranslateHost = SelectionOverlayView(
+                mode: .area, screen: screen, frozen: frozenImage,
+                windowList: [], owner: areaTranslateOverlay)
+            areaTranslateView = areaTranslateHost
+            let areaTranslateSelection = CGRect(
+                x: max(80, b.width / 2 - 120),
+                y: max(100, b.height / 2 - 80),
+                width: 240, height: 160)
+            areaTranslateHost.selectForTesting(rect: areaTranslateSelection)
+            let areaTranslateButtons = allButtons12(in: areaTranslateHost)
+                .filter { $0.toolTip == "OCR + Translate" }
+            areaTranslateButtons.first?.performClick(nil)
+
+            var panelTranslateCalls = 0
+            var panelTranslateModes: [Bool] = []
+            var panelDetachedDuring = false
+            var panelAreaRects = 0
+            weak var panelTranslateProbe: ScrollResultPanel?
+            let panelTranslateDeps = CaptureActionRouter.Dependencies(
+                copyToClipboard: { _ in }, autoSave: { _, _ in },
+                saveAs: { _, _ in }, pin: { _ in },
+                ocrWithMode: { _, autoTranslate in
+                    panelTranslateCalls += 1
+                    panelTranslateModes.append(autoTranslate)
+                    panelDetachedDuring = ScrollResultPanel.current == nil
+                    if panelTranslateCalls == 1 {
+                        panelTranslateProbe?.performActionForTesting(.translate)
+                    }
+                },
+                openEditor: { _ in }, toast: { _ in },
+                setLastCapture: { _ in },
+                setLastAreaRect: { _ in panelAreaRects += 1 },
+                logEvent: { _ in })
+            let panelTranslate = ScrollResultPanel.show(
+                image: CapturedImage(
+                    cgImage: makeStripePattern(
+                        width: 96, height: 900, seed: 0x5125_7001),
+                    scale: 1),
+                inputs: OverlaySessionInputs(
+                    afterShow: true, afterCopy: true, afterSave: true),
+                screen: screen, dependencies: panelTranslateDeps)
+            panelTranslateProbe = panelTranslate
+            let panelRoot12 = panelTranslate.contentView ?? NSView()
+            let panelTranslateButtons = allButtons12(in: panelRoot12)
+                .filter { $0.toolTip == "OCR + Translate" }
+            let areaCatalog12 = actionCatalog12(in: areaTranslateHost)
+            let panelCatalog12 = actionCatalog12(in: panelRoot12)
+            panelTranslateButtons.first?.performClick(nil)
+            let catalogsMatch12 = areaCatalog12.count == panelCatalog12.count
+                && zip(areaCatalog12, panelCatalog12).allSatisfy {
+                    $0.0.0 == $0.1.0 && $0.0.1 == $0.1.1
+                }
+            let translateHostsOK = areaTranslateButtons.count == 1
+                && panelTranslateButtons.count == 1
+                && areaCatalog12.count == 6
+                && catalogsMatch12
+                && Set(areaCatalog12.map(\.0)).count == 6
+                && areaTranslateCalls == 1
+                && areaTranslateModes == [true]
+                && areaTranslateOverlay.session.phase == .completed
+                && areaCompletion == 1
+                && areaPhaseDuring == .completed
+                && areaCompletionDuring == 1
+                && areaTranslateRects.count == 1
+                && panelTranslateCalls == 1
+                && panelTranslateModes == [true]
+                && panelDetachedDuring && panelAreaRects == 0
+            check("overlay12-translate-hosts-s5", translateHostsOK,
+                  "buttons \(areaTranslateButtons.count)/\(panelTranslateButtons.count) catalog \(areaCatalog12)/\(panelCatalog12) calls \(areaTranslateCalls)/\(panelTranslateCalls) modes \(areaTranslateModes)/\(panelTranslateModes) area phase/completion \(areaTranslateOverlay.session.phase)/\(areaCompletion) observed \(String(describing: areaPhaseDuring))/\(areaCompletionDuring) rects \(areaTranslateRects.count)/\(panelAreaRects) detached \(panelDetachedDuring)")
+            // RED cleanup: if no Translate button existed, close the retained
+            // panel through an existing terminal route.
+            if ScrollResultPanel.current === panelTranslate {
+                panelTranslate.performActionForTesting(.copy)
+            }
+
+            // S5 layout contract. Editing chrome is a vertical rail beside
+            // the selection; terminal actions are a horizontal strip below
+            // it. Both flip at screen edges and wrap under constrained
+            // geometry. Assertions use REAL button frames, not a synthetic
+            // geometry helper, so host wiring cannot be vacuous.
+            @MainActor func buttonFrame12(
+                _ button: NSButton, in root: NSView
+            ) -> CGRect {
+                button.convert(button.bounds, to: root)
+            }
+            @MainActor func union12(_ frames: [CGRect]) -> CGRect? {
+                guard var result = frames.first else { return nil }
+                for frame in frames.dropFirst() { result = result.union(frame) }
+                return result
+            }
+            @MainActor func distinct12(_ values: [CGFloat]) -> Int {
+                Set(values.map { Int(($0 * 10).rounded()) }).count
+            }
+            @MainActor func inspectAreaLayout12(
+                view: SelectionOverlayView, selection: CGRect,
+                expectToolSide: String?, expectActionSide: String?,
+                requireWrap: Bool
+            ) -> [String] {
+                let buttons = allButtons12(in: view)
+                let editing = buttons.filter { $0.tag >= 100 }
+                let actions = buttons.filter { $0.tag < 100 }
+                let editingFrames = editing.map { buttonFrame12($0, in: view) }
+                let actionFrames = actions.map { buttonFrame12($0, in: view) }
+                let allFrames = editingFrames + actionFrames
+                var failures: [String] = []
+                if editing.count != OverlayAnnotationTool.allCases.count + 3 {
+                    failures.append("editing count \(editing.count)")
+                }
+                if actions.count != 7 { failures.append("action count \(actions.count)") }
+                if let frame = union12(editingFrames), let side = expectToolSide {
+                    if side == "right", frame.minX < selection.maxX {
+                        failures.append("tools not right \(frame)")
+                    }
+                    if side == "left", frame.maxX > selection.minX {
+                        failures.append("tools not left \(frame)")
+                    }
+                } else if editingFrames.isEmpty { failures.append("no tool frames") }
+                if let frame = union12(actionFrames), let side = expectActionSide {
+                    if side == "below", frame.maxY > selection.minY {
+                        failures.append("actions not below \(frame)")
+                    }
+                    if side == "above", frame.minY < selection.maxY {
+                        failures.append("actions not above \(frame)")
+                    }
+                } else if actionFrames.isEmpty { failures.append("no action frames") }
+                for (i, frame) in allFrames.enumerated() {
+                    if !view.bounds.contains(frame) {
+                        failures.append("button \(i) outside \(frame)")
+                    }
+                    for j in (i + 1)..<allFrames.count
+                        where frame.intersects(allFrames[j]) {
+                        failures.append("buttons \(i)/\(j) overlap")
+                    }
+                    for (handle, handleRect) in EditableSelectionGeometry
+                        .handleRects(for: selection, size: 18)
+                        where frame.intersects(handleRect) {
+                        failures.append("button \(i) hits \(handle)")
+                    }
+                }
+                if requireWrap {
+                    if distinct12(editingFrames.map(\.minX)) <= 1 {
+                        failures.append("tools did not wrap columns")
+                    }
+                    if distinct12(actionFrames.map(\.minY)) <= 1 {
+                        failures.append("actions did not wrap rows")
+                    }
+                }
+                return failures
+            }
+
+            var layout12Failures: [String] = []
+            let normalSelection = CGRect(
+                x: max(80, b.width / 2 - 100),
+                y: max(120, b.height / 2 - 70),
+                width: 200, height: 140)
+            let (normalLayoutOverlay, normalLayoutView) = reviewView()
+            _ = normalLayoutOverlay
+            normalLayoutView.selectForTesting(rect: normalSelection)
+            layout12Failures += inspectAreaLayout12(
+                view: normalLayoutView, selection: normalSelection,
+                expectToolSide: "right", expectActionSide: "below",
+                requireWrap: false).map { "normal \($0)" }
+
+            let rightSelection = CGRect(
+                x: b.width - 164, y: max(120, b.height / 2 - 50),
+                width: 160, height: 100)
+            let (rightLayoutOverlay, rightLayoutView) = reviewView()
+            _ = rightLayoutOverlay
+            rightLayoutView.selectForTesting(rect: rightSelection)
+            layout12Failures += inspectAreaLayout12(
+                view: rightLayoutView, selection: rightSelection,
+                expectToolSide: "left", expectActionSide: nil,
+                requireWrap: false).map { "right \($0)" }
+
+            let bottomSelection = CGRect(
+                x: max(80, b.width / 2 - 80), y: 4,
+                width: 160, height: 100)
+            let (bottomLayoutOverlay, bottomLayoutView) = reviewView()
+            _ = bottomLayoutOverlay
+            bottomLayoutView.selectForTesting(rect: bottomSelection)
+            layout12Failures += inspectAreaLayout12(
+                view: bottomLayoutView, selection: bottomSelection,
+                expectToolSide: nil, expectActionSide: "above",
+                requireWrap: false).map { "bottom \($0)" }
+
+            let (tinyLayoutOverlay, tinyLayoutView) = reviewView()
+            _ = tinyLayoutOverlay
+            tinyLayoutView.frame = CGRect(x: 0, y: 0, width: 300, height: 260)
+            let tinySelection = CGRect(x: 130, y: 110, width: 40, height: 40)
+            tinyLayoutView.selectForTesting(rect: tinySelection)
+            layout12Failures += inspectAreaLayout12(
+                view: tinyLayoutView, selection: tinySelection,
+                expectToolSide: nil, expectActionSide: nil,
+                requireWrap: true).map { "tiny \($0)" }
+
+            let layoutPanel = ScrollResultPanel.show(
+                image: CapturedImage(
+                    cgImage: makeStripePattern(
+                        width: 64, height: 800, seed: 0x5125_7002),
+                    scale: 1),
+                inputs: OverlaySessionInputs(
+                    afterShow: true, afterCopy: false, afterSave: false),
+                screen: screen, dependencies: noopDeps())
+            if let bar = layoutPanel.toolbarFrameForTesting {
+                let frames = layoutPanel.toolbarButtonFramesForTesting
+                let rowCount = distinct12(frames.map(\.minY))
+                if rowCount <= 1 { layout12Failures.append("panel did not wrap") }
+                let barBounds = CGRect(origin: .zero, size: bar.size)
+                for (i, frame) in frames.enumerated() {
+                    if !barBounds.contains(frame) {
+                        layout12Failures.append("panel button \(i) outside")
+                    }
+                    for j in (i + 1)..<frames.count
+                        where frame.intersects(frames[j]) {
+                        layout12Failures.append("panel buttons \(i)/\(j) overlap")
+                    }
+                }
+                if layoutPanel.frame.width > screen.visibleFrame.width * 0.9 + 1
+                    || layoutPanel.frame.height > screen.visibleFrame.height * 0.9 + 1 {
+                    layout12Failures.append("panel exceeds 90% \(layoutPanel.frame)")
+                }
+            } else {
+                layout12Failures.append("panel has no toolbar")
+            }
+            layoutPanel.performActionForTesting(.copy)
+            check("overlay12-layout-s5", layout12Failures.isEmpty,
+                  layout12Failures.joined(separator: "; "))
 
             // Full-toolbar S1 fail-first gate. It compiles against the old
             // five-tool enum, but stays red until Line/Oval/Highlighter and

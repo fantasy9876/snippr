@@ -467,7 +467,7 @@ final class ScrollResultPanel: NSPanel {
                 image, source: .scrollResult, intent: intent,
                 inputs: inputs, finalGlobalRect: nil,
                 dependencies: dependencies)
-        case .initialCapture, .scrollFinished:
+        case .translate, .initialCapture, .scrollFinished:
             break
         }
     }

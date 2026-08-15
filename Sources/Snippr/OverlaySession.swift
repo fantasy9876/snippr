@@ -147,6 +147,8 @@ enum CaptureIntent: Equatable {
     case save
     case pin
     case ocr
+    /// Structural S5 RED seam. Routing remains fail-closed until GREEN.
+    case translate
     case openEditor
 }
 
@@ -184,12 +186,69 @@ struct CaptureActionRouter {
         /// Interactive Save-As panel (the toolbar's Save intent).
         var saveAs: @MainActor (CapturedImage, @escaping @MainActor (SaveAsOutcome) -> Void) -> Void
         var pin: @MainActor (CapturedImage) -> Void
-        var ocr: @MainActor (CapturedImage) -> Void
+        var ocr: @MainActor (CapturedImage, Bool) -> Void
         var openEditor: @MainActor (CapturedImage) -> Void
         var toast: @MainActor (String) -> Void
         var setLastCapture: @MainActor (CapturedImage) -> Void
         var setLastAreaRect: @MainActor (CGRect) -> Void
         var logEvent: @MainActor (String) -> Void
+
+        init(
+            copyToClipboard: @escaping @MainActor (CapturedImage) -> Void,
+            autoSave: @escaping @MainActor (
+                CapturedImage, @escaping @MainActor (URL?) -> Void
+            ) -> Void,
+            saveAs: @escaping @MainActor (
+                CapturedImage, @escaping @MainActor (SaveAsOutcome) -> Void
+            ) -> Void,
+            pin: @escaping @MainActor (CapturedImage) -> Void,
+            ocr: @escaping @MainActor (CapturedImage) -> Void,
+            openEditor: @escaping @MainActor (CapturedImage) -> Void,
+            toast: @escaping @MainActor (String) -> Void,
+            setLastCapture: @escaping @MainActor (CapturedImage) -> Void,
+            setLastAreaRect: @escaping @MainActor (CGRect) -> Void,
+            logEvent: @escaping @MainActor (String) -> Void
+        ) {
+            self.init(
+                copyToClipboard: copyToClipboard,
+                autoSave: autoSave,
+                saveAs: saveAs,
+                pin: pin,
+                ocrWithMode: { image, _ in ocr(image) },
+                openEditor: openEditor,
+                toast: toast,
+                setLastCapture: setLastCapture,
+                setLastAreaRect: setLastAreaRect,
+                logEvent: logEvent)
+        }
+
+        init(
+            copyToClipboard: @escaping @MainActor (CapturedImage) -> Void,
+            autoSave: @escaping @MainActor (
+                CapturedImage, @escaping @MainActor (URL?) -> Void
+            ) -> Void,
+            saveAs: @escaping @MainActor (
+                CapturedImage, @escaping @MainActor (SaveAsOutcome) -> Void
+            ) -> Void,
+            pin: @escaping @MainActor (CapturedImage) -> Void,
+            ocrWithMode: @escaping @MainActor (CapturedImage, Bool) -> Void,
+            openEditor: @escaping @MainActor (CapturedImage) -> Void,
+            toast: @escaping @MainActor (String) -> Void,
+            setLastCapture: @escaping @MainActor (CapturedImage) -> Void,
+            setLastAreaRect: @escaping @MainActor (CGRect) -> Void,
+            logEvent: @escaping @MainActor (String) -> Void
+        ) {
+            self.copyToClipboard = copyToClipboard
+            self.autoSave = autoSave
+            self.saveAs = saveAs
+            self.pin = pin
+            self.ocr = ocrWithMode
+            self.openEditor = openEditor
+            self.toast = toast
+            self.setLastCapture = setLastCapture
+            self.setLastAreaRect = setLastAreaRect
+            self.logEvent = logEvent
+        }
 
         static var live: Dependencies {
             Dependencies(
@@ -197,7 +256,7 @@ struct CaptureActionRouter {
                 autoSave: { image, done in SaveService.shared.save(image) { done($0) } },
                 saveAs: { image, done in SaveService.shared.saveAs(image, completion: done) },
                 pin: { PinWindow.pin($0) },
-                ocr: { image in
+                ocrWithMode: { image, autoTranslate in
                     Task {
                         let result = await OCRService.shared.recognize(image.cgImage)
                         await MainActor.run {
@@ -206,7 +265,9 @@ struct CaptureActionRouter {
                                 ToastHUD.show("No text found", symbol: "text.magnifyingglass")
                             } else {
                                 SaveService.copyText(text)
-                                TextResultWindow.show(text: text, autoTranslate: false)
+                                TextResultWindow.show(
+                                    text: text,
+                                    autoTranslate: autoTranslate)
                             }
                         }
                     }
@@ -341,9 +402,13 @@ struct CaptureActionRouter {
 
         case .ocr:
             deps.setLastCapture(snapshot)
-            deps.ocr(snapshot)
+            deps.ocr(snapshot, false)
             recordAreaRect()
             return .completed
+
+        case .translate:
+            // S5 RED: the public intent compiles, but no effect is routed.
+            return .failed
 
         case .openEditor:
             deps.setLastCapture(snapshot)
