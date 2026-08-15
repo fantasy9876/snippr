@@ -259,6 +259,8 @@ final class ScrollResultPanel: NSPanel {
                 button.contentTintColor =
                     button.tag == sender.tag ? .controlAccentColor : .labelColor
             }
+            // leaving the Text tool commits the in-flight entry (area parity)
+            if tool != .text { annotationHost?.commitActiveTextEntry() }
             return
         }
         if sender.tag == 200 {
@@ -277,6 +279,12 @@ final class ScrollResultPanel: NSPanel {
 
     func performActionForTesting(_ intent: CaptureIntent) {
         perform(intent: intent)
+    }
+
+    /// Clicks the REAL toolbar button (production target/action), so gates
+    /// exercise the same path a user's click takes.
+    func clickToolbarButtonForTesting(tag: Int) {
+        toolbarButtons.first { $0.tag == tag }?.performClick(nil)
     }
 
     override func keyDown(with event: NSEvent) {
@@ -363,6 +371,10 @@ final class ScrollResultPanel: NSPanel {
     /// Repeat-Area memory is never touched.
     private func perform(intent: CaptureIntent) {
         guard !saving else { return }
+        // A terminal click must never race the in-flight text entry: commit
+        // the active field BEFORE exportSnapshot reads the surface (same
+        // contract as the area review — no Return required first).
+        annotationHost?.commitActiveTextEntry()
         guard let image = exportSnapshot else {
             // fail-closed: keep the panel (and the drawings) alive
             if let toast = dependencies?.toast {
@@ -440,6 +452,15 @@ final class AnnotationHostView: NSView {
         surface.addText(text, atPixel: pixelPoint(p))
         needsDisplay = true
     }
+
+    /// Terminal actions and tool switches call this before reading the
+    /// surface: the in-flight text entry commits atomically so typed text
+    /// cannot be lost to a snapshot race.
+    func commitActiveTextEntry() {
+        hostEndTextEntry(commit: true)
+    }
+
+    var textFieldForTesting: NSTextField? { textField }
 
     override func mouseDown(with event: NSEvent) {
         if isLocked() { return }

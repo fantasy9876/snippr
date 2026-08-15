@@ -65,6 +65,7 @@ enum UITest {
             // no-op dependencies: the harness must never touch the user's
             // clipboard, files or settings
             var editorPresents = 0
+            var lastEditorImage: CapturedImage?
             let noopDeps = CaptureActionRouter.Dependencies(
                 copyToClipboard: { _ in },
                 autoSave: { _, _ in },
@@ -72,6 +73,7 @@ enum UITest {
                 pin: { _ in }, ocr: { _ in },
                 openEditor: { image in
                     editorPresents += 1
+                    lastEditorImage = image
                     EditorWindowController.open(with: image)
                 },
                 toast: { _ in },
@@ -135,15 +137,38 @@ enum UITest {
                         && view.textFieldForTesting != nil
                 }
                 view.commitTextEntryForTesting(text: "hello")
-                view.annotationSurface?.tool = .select
+                // Terminal-vs-typing race: an ACTIVE entry (typed, NO
+                // Return) must be committed by the terminal itself and
+                // appear in the exported image — here through the escape
+                // hatch, which shares performReviewAction with every
+                // terminal button.
+                view.annotationSurface?.tool = .text
+                view.beginTextEntryForTesting(atView: CGPoint(x: 300, y: 250))
+                view.textFieldForTesting?.stringValue = "typed"
+                let annBeforeTerminal =
+                    view.annotationSurface?.annotations.count ?? -1
                 // escape hatch: exactly one editor presented AFTER teardown
                 view.performReviewActionForTesting(.openEditor)
+                let terminalCommittedText =
+                    view.annotationSurface?.annotations.count
+                        == annBeforeTerminal + 1
+                    && view.textFieldForTesting == nil
+                // "typed" origin: view (300, 238) → crop-relative (180, 98)
+                // in the 360×240 export (selection 120,140,360,240, scale 1)
+                let typedInkOK = lastEditorImage.map {
+                    $0.cgImage.width == 360 && $0.cgImage.height == 240
+                        && SelfTest.redInkNearForTesting(
+                            $0.cgImage,
+                            points: [CGPoint(x: 185, y: 105)],
+                            pixelRadius: 30) != nil
+                } ?? false
                 let editorsAfter = NSApp.windows.filter { $0.windowController is EditorWindowController }.count
                 overlayReviewOK = reviewing && toolbarInside
                     && SelectionOverlay.current == nil
                     && editorsAfter == editorsBefore + 1
                     && editorPresents == 1
                     && annotated && precedenceOK && textOutsideClickOK
+                    && terminalCommittedText && typedInkOK
             }
         }
 
@@ -377,6 +402,98 @@ enum UITest {
                 && panelAnnotated && panelFailOK && panelSaveLockOK
         }
 
+        // Terminal-vs-typing race on the panel: for EVERY terminal button,
+        // an ACTIVE text entry (typed, NO Return) must be committed by the
+        // terminal itself and carry red ink into the routed image. All
+        // interaction is real: Text tool button click, production mouse
+        // click placing the field, terminal button click. A tool switch
+        // away from Text commits too (area parity).
+        var panelTextTerminalsOK = false
+        if let screen = NSScreen.main {
+            var terminalsOK = true
+            let stitch = CapturedImage(
+                cgImage: SelfTest.makeTestImage(width: 400, height: 8000),
+                scale: 2)
+            let inputs = OverlaySessionInputs(
+                afterShow: true, afterCopy: false, afterSave: false)
+            // Self.items order: 0 copy, 1 save, 2 pin, 3 ocr, 4 openEditor
+            for tag in 0...4 {
+                var routed: CapturedImage?
+                let deps = CaptureActionRouter.Dependencies(
+                    copyToClipboard: { routed = $0 },
+                    autoSave: { _, _ in },
+                    saveAs: { image, done in
+                        routed = image
+                        done(.cancelled)
+                    },
+                    pin: { routed = $0 }, ocr: { routed = $0 },
+                    openEditor: { routed = $0 },
+                    toast: { _ in },
+                    setLastCapture: { _ in },
+                    setLastAreaRect: { _ in }, logEvent: { _ in })
+                let p = ScrollResultPanel.show(
+                    image: stitch, inputs: inputs, screen: screen,
+                    dependencies: deps)
+                guard let host = p.annotationHostForTesting else {
+                    terminalsOK = false
+                    break
+                }
+                p.annotationSurface.color = .systemRed
+                p.clickToolbarButtonForTesting(tag: 100 + 4) // Text tool
+                let fieldPoint = CGPoint(
+                    x: host.bounds.width / 2, y: host.bounds.height / 2)
+                p.drawWithRealEventsForTesting(
+                    fromView: fieldPoint, toView: fieldPoint)
+                guard let field = host.textFieldForTesting else {
+                    terminalsOK = false
+                    break
+                }
+                field.stringValue = "Gk" // typed, no Return
+                let annBefore = p.annotationSurface.annotations.count
+                p.clickToolbarButtonForTesting(tag: tag)
+                let committed =
+                    p.annotationSurface.annotations.count == annBefore + 1
+                    && host.textFieldForTesting == nil
+                let ppx = CGFloat(stitch.cgImage.width) / host.bounds.width
+                let inkOK = routed.map {
+                    SelfTest.redInkNearForTesting(
+                        $0.cgImage,
+                        points: [CGPoint(
+                            x: fieldPoint.x * ppx,
+                            y: (fieldPoint.y - 12 + 9) * ppx)],
+                        pixelRadius: Int(20 * ppx)) != nil
+                } ?? false
+                if !(committed && inkOK) { terminalsOK = false }
+                if ScrollResultPanel.current === p { // save stays open
+                    p.clickToolbarButtonForTesting(tag: -1)
+                }
+            }
+            // tool switch away from Text commits the entry (real clicks)
+            let p2 = ScrollResultPanel.show(
+                image: stitch, inputs: inputs, screen: screen,
+                dependencies: CaptureActionRouter.Dependencies(
+                    copyToClipboard: { _ in }, autoSave: { _, _ in },
+                    saveAs: { _, _ in }, pin: { _ in }, ocr: { _ in },
+                    openEditor: { _ in }, toast: { _ in },
+                    setLastCapture: { _ in }, setLastAreaRect: { _ in },
+                    logEvent: { _ in }))
+            var toolSwitchCommitOK = false
+            if let host2 = p2.annotationHostForTesting {
+                p2.clickToolbarButtonForTesting(tag: 100 + 4) // Text tool
+                let mid = CGPoint(
+                    x: host2.bounds.width / 2, y: host2.bounds.height / 2)
+                p2.drawWithRealEventsForTesting(fromView: mid, toView: mid)
+                host2.textFieldForTesting?.stringValue = "Sw"
+                let before2 = p2.annotationSurface.annotations.count
+                p2.clickToolbarButtonForTesting(tag: 100 + 1) // Pen tool
+                toolSwitchCommitOK =
+                    p2.annotationSurface.annotations.count == before2 + 1
+                    && host2.textFieldForTesting == nil
+            }
+            p2.clickToolbarButtonForTesting(tag: -1)
+            panelTextTerminalsOK = terminalsOK && toolSwitchCommitOK
+        }
+
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
             let fitOK = fittedEditor.imageFitsViewportForTesting()
                 && smallEditor.imageFitsViewportForTesting()
@@ -387,6 +504,7 @@ enum UITest {
             print("UITEST overlay-review \(overlayReviewOK ? "PASS" : "FAIL")")
             print("UITEST scroll-panel \(scrollPanelOK ? "PASS" : "FAIL")")
             print("UITEST scroll-panel-preview \(panelPreviewOK ? "PASS" : "FAIL")")
+            print("UITEST panel-text-terminals \(panelTextTerminalsOK ? "PASS" : "FAIL")")
             var index = 0
             for window in NSApp.windows where window.isVisible {
                 guard let view = window.contentView, view.bounds.width > 10 else { continue }
@@ -400,7 +518,8 @@ enum UITest {
             }
             print("UITEST captured \(index) windows → \(outDir)")
             exit(index >= 3 && fitOK && tallCropControlsOK && overlayReviewOK
-                 && scrollPanelOK && panelPreviewOK ? 0 : 1)
+                 && scrollPanelOK && panelPreviewOK
+                 && panelTextTerminalsOK ? 0 : 1)
         }
     }
 }

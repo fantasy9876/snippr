@@ -554,6 +554,10 @@ final class SelectionOverlayView: NSView {
               selection.width >= 4, selection.height >= 4,
               frozen != nil
         else { return }
+        // A terminal click must never race the in-flight text entry: commit
+        // the active field BEFORE the snapshot/phase change, or the typed
+        // text silently misses the export (no Return required first).
+        endTextEntry(commit: true)
         syncSessionPixelRect()
         guard let snapshot = snapshotFromSessionPixelRect() else {
             // fail-closed like the panel: keep review + drawings, tell the
