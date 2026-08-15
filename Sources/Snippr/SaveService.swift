@@ -189,4 +189,59 @@ final class SaveService {
         pb.clearContents()
         pb.setString(text, forType: .string)
     }
+
+    /// Interactive Save-As with a TYPED outcome: user cancel and write
+    /// failure are different states for the overlay reducer (both return to
+    /// review; neither is a completed action). Mirrors the editor's panel
+    /// (EditorWindow.swift saveImage): encode + write run off the main
+    /// thread and are tracked so quitting mid-write can't truncate the file.
+    @MainActor
+    func saveAs(
+        _ image: CapturedImage,
+        for window: NSWindow? = nil,
+        completion: @escaping @MainActor (SaveAsOutcome) -> Void
+    ) {
+        var flat = image
+        if Settings.shared.downscaleRetina {
+            flat = flat.downscaledTo1x()
+        }
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = Self.suggestedFileName(ext: "png")
+        panel.directoryURL = Settings.shared.screenshotsFolder
+        panel.allowedContentTypes = [.png, .jpeg]
+        panel.canCreateDirectories = true
+        let prepared = flat
+        let handle: @MainActor (NSApplication.ModalResponse) -> Void = { response in
+            guard response == .OK, let url = panel.url else {
+                completion(.cancelled)
+                return
+            }
+            let ext = url.pathExtension.lowercased()
+            let format: ImageFileFormat = (ext == "jpg" || ext == "jpeg") ? .jpeg : .png
+            Self.beginBackgroundWrite()
+            Task.detached(priority: .userInitiated) {
+                let data = Self.data(for: prepared.cgImage, format: format)
+                var ok = false
+                if let data {
+                    do {
+                        try data.write(to: url)
+                        ok = true
+                    } catch {}
+                }
+                let succeeded = ok
+                await MainActor.run {
+                    // reducer/cleanup state must land BEFORE the write-guard
+                    // releases (a quit racing endBackgroundWrite would
+                    // otherwise observe completed I/O with stale UI state)
+                    completion(succeeded ? .saved(url) : .failed)
+                    Self.endBackgroundWrite()
+                }
+            }
+        }
+        if let window {
+            panel.beginSheetModal(for: window, completionHandler: handle)
+        } else {
+            panel.begin(completionHandler: handle)
+        }
+    }
 }

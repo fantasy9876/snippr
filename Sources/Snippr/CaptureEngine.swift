@@ -2,6 +2,7 @@ import AppKit
 import CoreImage
 import CoreMedia
 import ScreenCaptureKit
+import os
 
 enum CaptureError: Error {
     case noDisplay
@@ -567,6 +568,36 @@ extension CGRect {
     var area: CGFloat { isNull || isEmpty ? 0 : width * height }
 }
 
+/// Test spy: the live-preview refresh path must never copy pixel buffers.
+/// Self-tests snapshot these counters around preview calls. Lock-protected:
+/// `materialized()` also runs off the main actor in production, and an
+/// unsynchronized read-modify-write would be a data race (the lock costs
+/// nothing next to the pixel copy it counts).
+enum MaterializeSpy {
+    private static let state = OSAllocatedUnfairLock(initialState: 0)
+    static var count: Int { state.withLock { $0 } }
+    static func increment() { state.withLock { $0 += 1 } }
+}
+
+/// Test spy counting SOURCE-width canvas allocations (the separator raster).
+/// After the per-session cache is warm, a preview refresh must not create
+/// another one.
+enum SourceCanvasSpy {
+    private static let state = OSAllocatedUnfairLock(initialState: 0)
+    static var count: Int { state.withLock { $0 } }
+    static func increment() { state.withLock { $0 += 1 } }
+}
+
+/// Test spy counting full-strip composes GLOBALLY (across all stitcher
+/// instances, unlike the per-instance counter that moves away with a
+/// completed segment). A promotion must compose exactly the OLD segment —
+/// never the pending/new one.
+enum FullComposeSpy {
+    private static let state = OSAllocatedUnfairLock(initialState: 0)
+    static var count: Int { state.withLock { $0 } }
+    static func increment() { state.withLock { $0 += 1 } }
+}
+
 extension CGImage {
     /// Redraws this image into its own exactly-sized buffer. Crops made with
     /// `CGImage.cropping(to:)` share the parent's backing store; copying breaks
@@ -575,6 +606,7 @@ extension CGImage {
     /// The copy keeps the source's RGB color space — forcing sRGB here would
     /// clamp Display P3 screenshots and visibly desaturate area shots.
     func materialized() -> CGImage? {
+        MaterializeSpy.increment()
         let space = (colorSpace?.model == .rgb ? colorSpace : nil)
             ?? CGColorSpace(name: CGColorSpace.sRGB)!
         guard let ctx = CGContext(

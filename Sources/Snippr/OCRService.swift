@@ -70,7 +70,7 @@ final class OCRService {
     /// Full instant-OCR flow: select area → recognize → clipboard + toast.
     @MainActor
     func instantOCRFlow() {
-        SelectionOverlay.begin(mode: .area) { result in
+        SelectionOverlay.begin(purpose: .instantOCRRegion) { result in
             guard case let .area(_, frozen, rect) = result,
                   let cropped = frozen.cropping(toViewRect: rect) else { return }
             Task {
