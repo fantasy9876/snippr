@@ -967,7 +967,17 @@ final class SelectionOverlayView: NSView {
         beginTextEntry(atView: p)
     }
     func commitTextEntryForTesting(text: String) {
-        textField?.stringValue = text
+        // write through the ACTIVE field editor: endTextEntry reads
+        // stringValue, whose getter validateEditing()s the (otherwise empty)
+        // editor text back over a value set directly on the cell
+        if let editor = textField?.currentEditor() as? NSTextView {
+            editor.insertText(
+                text,
+                replacementRange: NSRange(
+                    location: 0, length: (editor.string as NSString).length))
+        } else {
+            textField?.stringValue = text
+        }
         endTextEntry(commit: true)
     }
     var textFieldForTesting: NSTextField? { textField }

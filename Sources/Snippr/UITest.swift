@@ -12,6 +12,22 @@ enum UITest {
         return args.count > idx + 1 ? args[idx + 1] : NSTemporaryDirectory() + "snippr-uitest"
     }
 
+    /// Types through the ACTIVE field editor. Setting `stringValue` while a
+    /// field editor is live is silently clobbered: the commit path reads
+    /// `stringValue`, whose getter runs `validateEditing()` — syncing the
+    /// (still-empty) editor text back over the cell. insertText goes through
+    /// the real typing machinery instead.
+    private static func typeIntoField(_ field: NSTextField, _ text: String) {
+        if let editor = field.currentEditor() as? NSTextView {
+            editor.insertText(
+                text,
+                replacementRange: NSRange(
+                    location: 0, length: (editor.string as NSString).length))
+        } else {
+            field.stringValue = text
+        }
+    }
+
     static func runIfRequested() {
         guard let outDir = requestedOutputDir else { return }
         try? FileManager.default.createDirectory(atPath: outDir, withIntermediateDirectories: true)
@@ -149,7 +165,9 @@ enum UITest {
                 // terminal button.
                 view.annotationSurface?.tool = .text
                 view.beginTextEntryForTesting(atView: CGPoint(x: 300, y: 250))
-                view.textFieldForTesting?.stringValue = "typed"
+                if let typedField = view.textFieldForTesting {
+                    typeIntoField(typedField, "typed")
+                }
                 let annBeforeTerminal =
                     view.annotationSurface?.annotations.count ?? -1
                 // escape hatch: exactly one editor presented AFTER teardown
@@ -457,7 +475,7 @@ enum UITest {
                     terminalsOK = false
                     break
                 }
-                field.stringValue = "Gk" // typed, no Return
+                typeIntoField(field, "Gk") // typed for real, no Return
                 let annBefore = p.annotationSurface.annotations.count
                 p.clickToolbarButtonForTesting(tag: tag)
                 let committed =
@@ -492,7 +510,9 @@ enum UITest {
                 let mid = CGPoint(
                     x: host2.bounds.width / 2, y: host2.bounds.height / 2)
                 p2.drawWithRealEventsForTesting(fromView: mid, toView: mid)
-                host2.textFieldForTesting?.stringValue = "Sw"
+                if let switchField = host2.textFieldForTesting {
+                    typeIntoField(switchField, "Sw")
+                }
                 let before2 = p2.annotationSurface.annotations.count
                 p2.clickToolbarButtonForTesting(tag: 100 + 1) // Pen tool
                 toolSwitchCommitOK =
