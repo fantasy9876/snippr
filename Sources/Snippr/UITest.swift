@@ -215,6 +215,10 @@ enum UITest {
             let visible = screen.visibleFrame
             let fits = panel.frame.width <= visible.width * 0.9 + 1
                 && panel.frame.height <= visible.height * 0.9 + 1
+            // must be able to join another app's native-fullscreen Space:
+            // the router already suppressed the rescue copy for this panel
+            let spacesOK = panel.collectionBehavior.contains(.canJoinAllSpaces)
+                && panel.collectionBehavior.contains(.fullScreenAuxiliary)
             // toolbar layout is REAL: every button (Close included) inside
             // the bar, no pairwise overlap, and each hit-tests to itself
             var toolbarVisible = panel.toolbarFrameForTesting != nil
@@ -395,7 +399,7 @@ enum UITest {
             panel.performActionForTesting(.openEditor)
             let editorsAfter = NSApp.windows
                 .filter { $0.windowController is EditorWindowController }.count
-            scrollPanelOK = fits && toolbarVisible
+            scrollPanelOK = fits && spacesOK && toolbarVisible
                 && ScrollResultPanel.current == nil
                 && editorsAfter == editorsBefore + 1
                 && panelEditorPresents == 1

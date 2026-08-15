@@ -119,6 +119,12 @@ final class ScrollResultPanel: NSPanel {
         backgroundColor = .clear
         hasShadow = true
         isMovableByWindowBackground = true
+        // A scroll capture can finish while another app owns a NATIVE
+        // fullscreen Space (Safari/Chrome). Without these behaviors the
+        // panel lands on a different Space — invisible — while the router
+        // already suppressed the rescue copy because afterShow promised a
+        // visible panel. Same pairing as the overlay/HUD windows.
+        collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
 
         let content = NSView(frame: CGRect(origin: .zero, size: contentSize))
         content.wantsLayer = true
