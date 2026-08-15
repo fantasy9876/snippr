@@ -574,6 +574,63 @@ enum SelfTest {
             }
         }
 
+        // 2c-bounce-revisit. Scroll-back-to-top must never re-enter the output ----
+        // The rubber-band / Home-key ending: after a long downward capture the
+        // page jumps back to the top. Those frames fail the edge matcher,
+        // then verify against EACH OTHER — and the pending promotion used to
+        // append the page top AGAIN behind a separator (the duplicated-block
+        // + phantom-stripe capture from the field report). Revisited content
+        // must resolve as a retrace: no growth, no new segment. A real gap
+        // (flick to unseen content) shares no captured rows and still
+        // re-anchors through the pending path — covered by 2b fixtures above.
+        do {
+            let doc = makeStripePattern(width: 400, height: 5200, seed: 0xB0B0_57AF)
+            let vp = 500
+            if let first = doc.cropping(to: CGRect(
+                x: 0, y: 0, width: 400, height: vp)) {
+                let segmented = SegmentedVerticalStitcher(first: first)
+                var walkOK = true
+                var off = 0
+                for step in [300, 250, 300, 250, 300, 250, 300, 250,
+                             300, 250, 300, 250, 300, 250, 300, 250] {
+                    off += step
+                    guard let frame = doc.cropping(to: CGRect(
+                            x: 0, y: off, width: 400, height: vp)),
+                          case .appended = segmented.append(frame) else {
+                        walkOK = false
+                        break
+                    }
+                }
+                let heightBefore = segmented.totalHeight
+                let segmentsBefore = segmented.segmentCount
+                var badOutcome = false
+                // the bounce: settle near the top, then small drifts — enough
+                // ticks to cross the re-anchor threshold twice over
+                for bounceOff in [40, 40, 60, 80, 100, 120, 140, 160] {
+                    guard let frame = doc.cropping(to: CGRect(
+                        x: 0, y: bounceOff, width: 400, height: vp)) else {
+                        badOutcome = true
+                        break
+                    }
+                    switch segmented.append(frame) {
+                    case .appended, .prepended, .startedSegment:
+                        badOutcome = true
+                    case .moved, .rejected:
+                        break
+                    }
+                }
+                check("scroll7-bounce-revisit",
+                      walkOK && !badOutcome
+                        && segmented.totalHeight == heightBefore
+                        && segmented.segmentCount == segmentsBefore,
+                      "walk \(walkOK) bad \(badOutcome) "
+                        + "height \(segmented.totalHeight)/\(heightBefore) "
+                        + "segments \(segmented.segmentCount)/\(segmentsBefore)")
+            } else {
+                check("scroll7-bounce-revisit", false, "crop fail")
+            }
+        }
+
         // 2b-window-materialize. Preview refresh copies no pixel buffers -----------
         // A 5K source with sticky chrome and prepends used to materialize the
         // trimmed first viewport (~54 MiB) on every preview rebuild. The
