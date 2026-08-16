@@ -9309,8 +9309,23 @@ enum SelfTest {
                     // fixture that bailed before drawing would otherwise stall
                     // ten seconds on a signal nobody will send.
                     guard entered else {
-                        workerContained = true
-                        return true
+                        // Enqueued but not yet in the closure: the background
+                        // block looks the recognizer up when it runs, so
+                        // restoring now would send it into the real one. Wait
+                        // for the slot to come back instead.
+                        if slots() > 0 {
+                            let queued = Date().addingTimeInterval(10)
+                            while slots() > 0, Date() < queued {
+                                RunLoop.current.run(
+                                    until: Date().addingTimeInterval(0.02))
+                            }
+                        }
+                        workerContained = slots() == 0
+                        if !workerContained {
+                            lockStageFailures.append(
+                                "queued-worker \(slots())")
+                        }
+                        return workerContained
                     }
                     release.signal()
                     // Wait for OUR worker to return, then let the main queue
@@ -9378,9 +9393,18 @@ enum SelfTest {
                     // rather than entering the recognizer that comes back —
                     // leaving a blocking closure installed would instead hang
                     // the next gate that used the seam.
-                    _ = releaseAndDrain()
+                    // The scope ends first so the closure stops blocking,
+                    // then the worker is drained. The seam goes back ONLY once
+                    // the slot has returned: a job still queued would look the
+                    // recognizer up when it finally runs, and restoring early
+                    // would send it into the real one. Keeping this closure
+                    // installed is safe now that it no longer blocks.
                     endScope()
-                    SliceBOCR.recognizerForTesting = previousRecognizer
+                    if releaseAndDrain() {
+                        SliceBOCR.recognizerForTesting = previousRecognizer
+                    } else {
+                        lockStageFailures.append("seam-held")
+                    }
                 }
 
                 final class LockSpy {
@@ -9587,8 +9611,12 @@ enum SelfTest {
                     if panel.annotationHostForTesting?.isLocked() != true {
                         spy.inCallback.append("retry-unlocked")
                     }
+                    // +1: every save calls cancelRedactionJobs, and
+                    // cancelling bumps a blur's generation whether or not the
+                    // registry still holds it. The repaint does NOT repeat,
+                    // because the mask is already full.
                     if blur.redactionState != .fallbackFull
-                        || blur.redactionGeneration != retryGeneration
+                        || blur.redactionGeneration != retryGeneration + 1
                         || host.repaints != retryRepaints
                         || surface.redactionJobCountForTesting != 0
                         || owners() != ownerBase || slots() != slotBase + 1
