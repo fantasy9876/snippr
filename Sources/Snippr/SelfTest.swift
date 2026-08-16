@@ -11209,6 +11209,12 @@ enum SelfTest {
                 if writes.count != beforeControl + 1 {
                     wheelFailures.append("area:control")
                 }
+                // The positives changed the width — they must not ALSO have
+                // been forwarded. Only the one modified idle event ever may.
+                if viewSpy.forwarded != 1 {
+                    wheelFailures.append(
+                        "area:positive-forwarded \(viewSpy.forwarded)")
+                }
                 // The drag owns EVERY wheel, modified included — in a drag of
                 // its own, so it cannot reset the accumulator the precise
                 // sequence above depends on.
@@ -11217,6 +11223,12 @@ enum SelfTest {
                 view.annotationDragForTesting(
                     from: CGPoint(x: 110, y: 110), to: CGPoint(x: 175, y: 155)
                 ) {
+                    // The premise: a drag really is live. A regression that
+                    // left the host finished or locked would also consume the
+                    // wheel and keep every count intact.
+                    if !surface.isDragging {
+                        wheelFailures.append("area:modified-drag-premise")
+                    }
                     if let event = wheel(view, deltaY: 3, precise: false,
                                          modified: true) {
                         view.scrollWheel(with: event)
@@ -11351,12 +11363,19 @@ enum SelfTest {
                 if writes.count != beforePanelControl + 1 {
                     wheelFailures.append("panel:control")
                 }
+                if hostSpy.forwarded != 1 {
+                    wheelFailures.append(
+                        "panel:positive-forwarded \(hostSpy.forwarded)")
+                }
                 let panelModifiedWrites = writes.count
                 let panelModifiedForwards = hostSpy.forwarded
                 panel.drawWithRealEventsForTesting(
                     fromView: CGPoint(x: 80, y: 80),
                     toView: CGPoint(x: 155, y: 135)
                 ) {
+                    if !host.isAnnotationDragging {
+                        wheelFailures.append("panel:modified-drag-premise")
+                    }
                     if let event = wheel(host, deltaY: 3, precise: false,
                                          modified: true) {
                         host.scrollWheel(with: event)
