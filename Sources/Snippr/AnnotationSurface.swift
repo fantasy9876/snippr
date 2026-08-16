@@ -234,6 +234,10 @@ final class AnnotationSurface: RedactionHost, RedactionJobObserver {
     /// not use this helper because it must preserve the remaining redo stack.
     private func appendNewAnnotation(_ annotation: Annotation) {
         redoAnnotations.removeAll()
+        // Forking the branch with ANY mark abandons the redo spotlights, so
+        // their replacement records must go too or they keep strong references
+        // to history nobody can reach.
+        pruneSpotlightReplacements()
         annotations.append(annotation)
         historyDidChange?()
     }
@@ -422,10 +426,26 @@ final class AnnotationSurface: RedactionHost, RedactionJobObserver {
     /// A record is only meaningful while its spotlight can still be reached by
     /// undo or redo; anything else is abandoned history.
     private func pruneSpotlightReplacements() {
-        let live = annotations + redoAnnotations
-        spotlightReplacements.removeAll { record in
-            !live.contains { $0 === record.new }
+        // Keep the whole TRANSITIVE chain. With S0 -> S1 -> S2, the record for
+        // S1 -> S0 must survive even though S1 is now only a prior: dropping it
+        // makes the second undo delete the spotlight instead of restoring S0.
+        var reachable: [SpotlightAnnotation] = (annotations + redoAnnotations)
+            .compactMap { $0 as? SpotlightAnnotation }
+        var kept: [SpotlightReplacement] = []
+        var changed = true
+        while changed {
+            changed = false
+            for record in spotlightReplacements
+            where !kept.contains(where: { $0.new === record.new })
+                && reachable.contains(where: { $0 === record.new }) {
+                kept.append(record)
+                if !reachable.contains(where: { $0 === record.prior }) {
+                    reachable.append(record.prior)
+                }
+                changed = true
+            }
         }
+        spotlightReplacements = kept
     }
 
     /// Full SOURCE pixel bounds; hosts set this so a spotlight dims the whole
