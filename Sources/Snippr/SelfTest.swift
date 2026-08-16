@@ -9278,8 +9278,9 @@ enum SelfTest {
                 let ownerBase = owners()
                 // A dirty baseline makes every later slot claim relative to
                 // someone else's worker, so the gate refuses to guess.
-                if slotBase != 0 {
-                    lockStageFailures.append("dirty-slot-baseline \(slotBase)")
+                if slotBase != 0 || ownerBase != 0 {
+                    lockStageFailures.append(
+                        "dirty-baseline \(slotBase)/\(ownerBase)")
                     return
                 }
                 // Declared BEFORE the drain that waits on them.
@@ -9295,10 +9296,22 @@ enum SelfTest {
                 }
                 var released = false
                 var workerContained = false
+                var workerEntered = false
+                let entryLock = NSLock()
                 @discardableResult
                 func releaseAndDrain() -> Bool {
                     guard !released else { return workerContained }
                     released = true
+                    entryLock.lock()
+                    let entered = workerEntered
+                    entryLock.unlock()
+                    // Nothing to wait for if no worker ever entered — a
+                    // fixture that bailed before drawing would otherwise stall
+                    // ten seconds on a signal nobody will send.
+                    guard entered else {
+                        workerContained = true
+                        return true
+                    }
                     release.signal()
                     // Wait for OUR worker to return, then let the main queue
                     // deliver its result so the slot is actually given back.
@@ -9329,6 +9342,9 @@ enum SelfTest {
                 // closure stops blocking entirely, so a straggler cannot park
                 // in it and cannot reach real Vision either.
                 SliceBOCR.recognizerForTesting = { _ in
+                    entryLock.lock()
+                    workerEntered = true
+                    entryLock.unlock()
                     started.signal()
                     scopeLock.lock()
                     let ended = scopeEnded
@@ -9347,23 +9363,24 @@ enum SelfTest {
                     // returned. If it has not, leaving the blocking recognizer
                     // installed is the containment: a stale worker then wakes
                     // in this closure rather than in real Vision.
-                    // End the scope FIRST: from here the closure no longer
-                    // blocks, so restoring is safe even if a straggler is
-                    // still queued — it will pass straight through this
-                    // closure rather than entering the recognizer that comes
-                    // back. Leaving a blocking closure installed instead would
-                    // hang the next gate that used it.
-                    _ = releaseAndDrain()
-                    endScope()
-                    SliceBOCR.recognizerForTesting = previousRecognizer
-                    // Every early exit closes the panel. Either condition is
-                    // enough: a regression that clears `current` but forgets
-                    // to order the window out would otherwise leak it.
+                    // Panel FIRST, so a late result cannot land on a live
+                    // surface while the worker is being released. Either
+                    // condition closes it: a regression that clears `current`
+                    // but forgets to order the window out would leak it.
                     if let panelToClean,
                        panelToClean.isVisible
                         || ScrollResultPanel.current === panelToClean {
                         panelToClean.dismissForTesting()
                     }
+                    // Then release and drain OUR worker, and only then put the
+                    // seam back. Ending the scope first makes the closure stop
+                    // blocking, so a straggler passes straight through it
+                    // rather than entering the recognizer that comes back —
+                    // leaving a blocking closure installed would instead hang
+                    // the next gate that used the seam.
+                    _ = releaseAndDrain()
+                    endScope()
+                    SliceBOCR.recognizerForTesting = previousRecognizer
                 }
 
                 final class LockSpy {
@@ -9558,14 +9575,43 @@ enum SelfTest {
                     lockStageFailures.append(
                         "cancel-moved \(spy.saveAsCalls)")
                 }
-                // Positive retry on the SAME fixture: the unlock is real.
+                // Positive retry on the SAME fixture: the unlock is real —
+                // and the SECOND handoff has to lock too. Without inspecting
+                // it, an implementation that locked the first time and handed
+                // off unlocked on retry would pass.
+                let retryGeneration = blur.redactionGeneration
+                let retryRepaints = host.repaints
+                spy.inCallback = []
+                spy.observations = 0
+                spy.observe = {
+                    if panel.annotationHostForTesting?.isLocked() != true {
+                        spy.inCallback.append("retry-unlocked")
+                    }
+                    if blur.redactionState != .fallbackFull
+                        || blur.redactionGeneration != retryGeneration
+                        || host.repaints != retryRepaints
+                        || surface.redactionJobCountForTesting != 0
+                        || owners() != ownerBase || slots() != slotBase + 1
+                        || ScrollResultPanel.current !== panel
+                        || !panel.isVisible {
+                        spy.inCallback.append(
+                            "retry-state "
+                            + String(describing: blur.redactionState))
+                    }
+                }
                 panel.performActionForTesting(.save)
-                if spy.saveAsCalls != 2 || spy.saveDone == nil
+                spy.observe = nil
+                if spy.saveAsCalls != 2 || spy.observations != 1
+                    || spy.saveDone == nil
                     || ScrollResultPanel.current !== panel
                     || !panel.isVisible {
                     lockStageFailures.append(
-                        "retry \(spy.saveAsCalls) "
+                        "retry \(spy.saveAsCalls)/\(spy.observations) "
                         + "done \(spy.saveDone != nil)")
+                }
+                if !spy.inCallback.isEmpty {
+                    lockStageFailures.append(
+                        "retry-lock " + spy.inCallback.joined(separator: ","))
                 }
 
                 // Stage 4 — a completed save closes the panel by itself.
