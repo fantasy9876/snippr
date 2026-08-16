@@ -1901,6 +1901,21 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
             return
         }
         if handleSliceAKey(event, flags: flags, chars: chars) { return }
+        // Shift-only B selects text redaction, checked BEFORE the plain-key
+        // map so B on its own still means Pixelate.
+        if flags == .shift, chars == "b" {
+            (window?.windowController as? EditorWindowController)?
+                .selectTool(.pixelateText)
+            return
+        }
+        // 1-9 set the selected spotlight's darkness, through undo.
+        if flags.isEmpty, let digit = Int(chars), (1...9).contains(digit),
+           let spot = selected as? SpotlightAnnotation {
+            registerUndoSnapshot()
+            spot.dimFraction = CGFloat(digit) / 10
+            needsDisplay = true
+            return
+        }
         if flags.isEmpty, let tool = SliceAHotkeys.editorToolKeys[chars] {
             (window?.windowController as? EditorWindowController)?.selectTool(tool)
             return
