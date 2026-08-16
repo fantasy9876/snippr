@@ -568,7 +568,11 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
     /// behavior cannot drift between the two surfaces.
     @objc func saveImage() {
         guard let window else { return }
+        // A failed render must change nothing, so the cancel happens only once
+        // the flatten has actually succeeded — and before the panel opens, so
+        // what is saved is exactly what the user saw.
         guard let flat = flattenedOrWarn() else { return }
+        canvas.cancelRedactionJobsForSaveLock()
         terminalDependencies.saveAs(flat, window) { outcome in
             switch outcome {
             case let .saved(url):
@@ -642,10 +646,10 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
     func windowWillClose(_ notification: Notification) {
         // Closing supersedes every OCR job in flight: a late result must not
         // touch annotations belonging to a window that is gone.
-        canvas.redactionRegistry.cancelAll()
         for blur in canvas.annotations.compactMap({ $0 as? BlurAnnotation }) {
-            blur.bumpRedactionGeneration()
+            canvas.redactionRegistry.cancel(for: blur)
         }
+        canvas.redactionRegistry.cancelAll()
         NotificationCenter.default.removeObserver(self)
         PixelSamplerCache.release(canvas.image.cgImage)
         EditorWindowController.controllers.removeAll { $0 === self }
@@ -1002,10 +1006,13 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
         // Any structural edit (delete, crop, resize, undo, redo) supersedes
         // every OCR job in flight: a late result must not narrow a mask on an
         // annotation the user has already changed.
-        redactionRegistry.cancelAll()
+        // Per annotation FIRST: cancel(for:) is what turns a pending mask into
+        // the full mask and bumps its generation. Bumping first would make the
+        // cancel a no-op and lose the repaint. cancelAll only sweeps orphans.
         for blur in annotations.compactMap({ $0 as? BlurAnnotation }) {
-            blur.bumpRedactionGeneration()
+            redactionRegistry.cancel(for: blur)
         }
+        redactionRegistry.cancelAll()
         let snap = snapshot()
         undoManager?.registerUndo(withTarget: self) { canvas in
             // Symmetric: registrations made during undo land on the redo stack
@@ -1305,6 +1312,15 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
             window?.invalidateCursorRects(for: self)
         }
         isMovingSelection = false
+    }
+
+    /// Save-lock: freeze the document by cancelling work in flight. Called
+    /// only after a successful flatten.
+    func cancelRedactionJobsForSaveLock() {
+        for blur in annotations.compactMap({ $0 as? BlurAnnotation }) {
+            redactionRegistry.cancel(for: blur)
+        }
+        redactionRegistry.cancelAll()
     }
 
     /// Bounded OCR for one text redaction: the mask is already FULL, the job
