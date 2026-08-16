@@ -9286,6 +9286,13 @@ enum SelfTest {
                         RunLoop.current.run(
                             until: Date().addingTimeInterval(0.02))
                     }
+                    // A worker still holding a slot here would wake inside
+                    // whatever recognizer is restored next, so this is a
+                    // failure rather than something to pass over quietly.
+                    if slots() > slotBase {
+                        lockStageFailures.append(
+                            "drain-timeout \(slots())")
+                    }
                 }
                 SliceBOCR.recognizerForTesting = { _ in
                     started.signal()
@@ -9296,15 +9303,25 @@ enum SelfTest {
                             confidence: 0.9),
                     ])
                 }
+                var panelToClean: ScrollResultPanel?
                 defer {
                     releaseAndDrain()
                     SliceBOCR.recognizerForTesting = previousRecognizer
+                    // Every early exit closes the panel: a live one left in
+                    // ScrollResultPanel.current poisons the next fixture.
+                    if let panelToClean, ScrollResultPanel.current === panelToClean {
+                        panelToClean.dismissForTesting()
+                    }
                 }
 
                 final class LockSpy {
                     var saveDone: (@MainActor (SaveAsOutcome) -> Void)?
                     var saveAsCalls = 0
                     var inCallback: [String] = []
+                    /// Runs INSIDE saveAs. Checking after the action returns
+                    /// would say nothing about the order at the boundary.
+                    var observe: (() -> Void)?
+                    var observations = 0
                 }
                 let spy = LockSpy()
                 let panelImage = CapturedImage(
@@ -9320,10 +9337,13 @@ enum SelfTest {
                         saveAs: { _, done in
                             spy.saveAsCalls += 1
                             spy.saveDone = done
+                            spy.observations += 1
+                            spy.observe?()
                         },
                         pin: { _ in }, ocr: { _ in }, openEditor: { _ in },
                         toast: { _ in }, setLastCapture: { _ in },
                         setLastAreaRect: { _ in }, logEvent: { _ in }))
+                panelToClean = panel
                 let surface = panel.annotationSurface
                 let host = ForwardingRepaintDelegate(
                     wrapping: surface.redactionDelegate)
@@ -9361,7 +9381,12 @@ enum SelfTest {
 
                 // Stage 1 — a FAILED render leaves the job alive and untouched.
                 let repaintsBeforeFail = host.repaints
-                ForcedOuterComposeFailure.scoped {
+                // The panel exports through the surface renderer, which has
+                // no backdrop compose in it — the outer seam would not fail
+                // anything, the save would succeed, and this stage would be
+                // asserting against a document that had already been handed
+                // off.
+                AnnotationRenderer.withForcedRegionalFailure {
                     panel.performActionForTesting(.save)
                 }
                 if spy.saveAsCalls != 0 {
@@ -9385,7 +9410,8 @@ enum SelfTest {
                 let repaintsBeforeSave = host.repaints
                 spy.saveDone = nil
                 spy.inCallback = []
-                let inspect: () -> Void = {
+                spy.observations = 0
+                spy.observe = {
                     if blur.redactionState != .fallbackFull {
                         spy.inCallback.append(
                             "state " + String(describing: blur.redactionState))
@@ -9412,9 +9438,10 @@ enum SelfTest {
                     }
                 }
                 panel.performActionForTesting(.save)
-                inspect()
-                if spy.saveAsCalls != 1 {
-                    lockStageFailures.append("handoff \(spy.saveAsCalls)")
+                spy.observe = nil
+                if spy.saveAsCalls != 1 || spy.observations != 1 {
+                    lockStageFailures.append(
+                        "handoff \(spy.saveAsCalls)/\(spy.observations)")
                 }
                 if !spy.inCallback.isEmpty {
                     lockStageFailures.append(
@@ -9467,9 +9494,6 @@ enum SelfTest {
                         "late-result "
                         + String(describing: blur.redactionState)
                         + " repaints \(host.repaints - repaintsAfterClose)")
-                }
-                if ScrollResultPanel.current === panel {
-                    panel.dismissForTesting()
                 }
             }
             runSaveLockStages()
