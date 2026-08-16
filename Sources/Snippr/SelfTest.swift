@@ -9929,6 +9929,152 @@ enum SelfTest {
                 if ScrollResultPanel.current === panel {
                     panel.dismissForTesting()
                 }
+
+                // --- area overlay: a separate implementation of the same
+                // shortcut, so it gets the same questions on its own host.
+                var areaCopies = 0
+                final class AreaDigitSpy {
+                    var saveDone: (@MainActor (SaveAsOutcome) -> Void)?
+                }
+                let areaSpy = AreaDigitSpy()
+                let overlay = SelectionOverlay(
+                    purpose: .areaReview,
+                    inputs: OverlaySessionInputs(
+                        afterShow: true, afterCopy: false, afterSave: false),
+                    completion: { _ in })
+                overlay.routerDependenciesOverride =
+                    CaptureActionRouter.Dependencies(
+                        copyToClipboard: { _ in areaCopies += 1 },
+                        autoSave: { _, _ in },
+                        saveAs: { _, done in areaSpy.saveDone = done },
+                        pin: { _ in }, ocr: { _ in }, openEditor: { _ in },
+                        toast: { _ in }, setLastCapture: { _ in },
+                        setLastAreaRect: { _ in }, logEvent: { _ in })
+                let view = SelectionOverlayView(
+                    mode: .area, screen: screen,
+                    frozen: CapturedImage(
+                        cgImage: makeSolidImage(
+                            width: Int(screen.frame.width * 2),
+                            height: Int(screen.frame.height * 2),
+                            color: NSColor.white.cgColor),
+                        scale: 2),
+                    windowList: [], owner: overlay)
+                view.selectForTesting(
+                    rect: CGRect(x: 60, y: 60, width: 240, height: 180))
+                guard let areaSurface = view.annotationSurface else {
+                    digitFailures.append("area:no-surface")
+                    return
+                }
+                var areaHistory = 0
+                let areaProduction = areaSurface.historyDidChange
+                areaSurface.historyDidChange = {
+                    areaHistory += 1
+                    areaProduction?()
+                }
+                // No spotlight yet.
+                let areaBeforeNoSpot = areaHistory
+                if let event = digitEvent("5") { view.keyDown(with: event) }
+                if !areaSurface.annotations.isEmpty
+                    || areaHistory != areaBeforeNoSpot {
+                    digitFailures.append("area:no-spot-mutated")
+                }
+                view.clickReviewToolbarButtonForTesting(
+                    tag: OverlayAnnotationTool.spotlight.toolbarTag)
+                if areaSurface.tool != .spotlight {
+                    digitFailures.append("area:tool \(areaSurface.tool)")
+                }
+                view.annotationDragForTesting(
+                    from: CGPoint(x: 100, y: 100),
+                    to: CGPoint(x: 200, y: 170))
+                guard let areaFirst = areaSurface.annotations
+                    .compactMap({ $0 as? SpotlightAnnotation }).last else {
+                    digitFailures.append("area:no-spotlight")
+                    return
+                }
+                var areaSteps: [SpotlightAnnotation] = []
+                for (digit, expected) in digitSteps {
+                    let before = areaHistory
+                    let toolBefore = areaSurface.tool
+                    if let event = digitEvent(digit) {
+                        view.keyDown(with: event)
+                    }
+                    let spots = areaSurface.annotations
+                        .compactMap { $0 as? SpotlightAnnotation }
+                    guard spots.count == 1, let current = spots.first else {
+                        digitFailures.append(
+                            "area:\(digit)-count \(spots.count)")
+                        continue
+                    }
+                    if abs(current.dimFraction - expected) > 0.0001
+                        || areaHistory != before + 1
+                        || areaSurface.tool != toolBefore
+                        || current === areaSteps.last {
+                        digitFailures.append(
+                            "area:\(digit) \(current.dimFraction)")
+                    }
+                    areaSteps.append(current)
+                }
+                // Undo and redo through the overlay's own buttons.
+                func areaUndo() {
+                    view.clickReviewToolbarButtonForTesting(
+                        tag: OverlayAnnotationTool.undoToolbarTag)
+                }
+                func areaRedo() {
+                    view.clickReviewToolbarButtonForTesting(
+                        tag: OverlayAnnotationTool.redoToolbarTag)
+                }
+                let areaBackwards: [SpotlightAnnotation] =
+                    areaSteps.count == 3
+                        ? [areaSteps[1], areaSteps[0], areaFirst] : []
+                if areaBackwards.isEmpty {
+                    digitFailures.append("area:steps \(areaSteps.count)")
+                }
+                for (index, expected) in areaBackwards.enumerated() {
+                    let before = areaHistory
+                    areaUndo()
+                    if areaSurface.annotations.count != 1
+                        || areaSurface.annotations.first !== expected
+                        || !areaSurface.canRedo
+                        || areaHistory != before + 1 {
+                        digitFailures.append("area:undo\(index + 1)")
+                    }
+                }
+                for (index, expected) in areaSteps.enumerated() {
+                    let before = areaHistory
+                    areaRedo()
+                    let last = index == areaSteps.count - 1
+                    if areaSurface.annotations.count != 1
+                        || areaSurface.annotations.first !== expected
+                        || areaHistory != before + 1
+                        || areaSurface.canRedo == last {
+                        digitFailures.append("area:redo\(index + 1)")
+                    }
+                }
+                // Saving blocks the shortcut; cancelling unlocks it.
+                view.performReviewActionForTesting(.save)
+                let saving = areaSurface.annotations
+                    .compactMap { $0 as? SpotlightAnnotation }.first
+                let savingDim = saving?.dimFraction ?? 0
+                let beforeSaving = areaHistory
+                if let event = digitEvent("2") { view.keyDown(with: event) }
+                if saving?.dimFraction != savingDim
+                    || areaHistory != beforeSaving {
+                    digitFailures.append("area:saving-mutated")
+                }
+                MainActor.assumeIsolated { areaSpy.saveDone?(.cancelled) }
+                // ...and the SAME fixture works again once unlocked, which is
+                // what makes the negative above mean "blocked" rather than
+                // "this document could never change".
+                let beforeUnlocked = areaHistory
+                if let event = digitEvent("2") { view.keyDown(with: event) }
+                let unlocked = areaSurface.annotations
+                    .compactMap { $0 as? SpotlightAnnotation }.first
+                if abs((unlocked?.dimFraction ?? 0) - 0.2) > 0.0001
+                    || areaHistory != beforeUnlocked + 1 {
+                    digitFailures.append(
+                        "area:unlocked \(unlocked?.dimFraction ?? -1)")
+                }
+                _ = areaCopies
             }
             runDigits()
             check("sliceB-digits-idle",
