@@ -8574,11 +8574,22 @@ enum SelfTest {
                 ]
                 // TWO history mutations, then one undo: undo AND redo both
                 // non-empty. Selection is set AFTER the restore, which clears it.
+                // Two SEPARATE undo groups. NSUndoManager coalesces by event
+                // by default, so explicit groups would still nest inside one
+                // event group and a single undo would remove both.
+                let previousGroupsByEvent =
+                    canvas.undoManager?.groupsByEvent ?? true
+                canvas.undoManager?.groupsByEvent = false
+                canvas.undoManager?.beginUndoGrouping()
                 canvas.registerUndoSnapshot()
                 canvas.annotations.append(CounterAnnotation(uiScale: 1))
+                canvas.undoManager?.endUndoGrouping()
+                canvas.undoManager?.beginUndoGrouping()
                 canvas.registerUndoSnapshot()
                 canvas.annotations.append(CounterAnnotation(uiScale: 1))
+                canvas.undoManager?.endUndoGrouping()
                 canvas.undoManager?.undo()
+                canvas.undoManager?.groupsByEvent = previousGroupsByEvent
                 canvas.selectForTesting(canvas.annotations.first)
                 if seedEditing {
                     // A ruler transient needs a live pointer; Esc would consume
@@ -9025,8 +9036,10 @@ enum SelfTest {
             let ordered = dupWords.sorted { $0.minX < $1.minX }
             let threeOrdered = dupWords.count == 3
                 && ordered == dupWords
-                && ordered[0].maxX <= ordered[1].minX + 2
-                && ordered[1].maxX <= ordered[2].minX + 2
+                // Each box is outset by wordOutset on both sides, so adjacent
+                // boxes legitimately overlap by up to twice that.
+                && ordered[0].maxX <= ordered[1].minX + 2 * SliceBRedaction.wordOutset
+                && ordered[1].maxX <= ordered[2].minX + 2 * SliceBRedaction.wordOutset
                 && abs(ordered[0].width - ordered[1].width) < 6
             // Second occurrence must NOT be the first one repeated.
             let distinctOccurrences = dupWords.count == 3
@@ -9397,8 +9410,14 @@ enum SelfTest {
                 check("sliceB-hosts-failclosed", false, "no screen")
                 return 1
             }
+            // The overlay paints the frozen capture across the WHOLE screen, so
+            // annotation pixels only line up with view points when the fixture
+            // is screen-sized. A 240x180 fixture made every coordinate wrong.
             let hostFrozen = CapturedImage(
-                cgImage: makeNoiseImage(width: 240, height: 180), scale: 1)
+                cgImage: makeNoiseImage(
+                    width: Int(hostScreen.frame.width),
+                    height: Int(hostScreen.frame.height)),
+                scale: 1)
             // Asymmetric in Y (20 + 110 != 180 - 20) so a top-left/bottom-left
             // mix-up cannot survive the dimension and pixel checks.
             let hostSelection = CGRect(x: 20, y: 30, width: 200, height: 110)
