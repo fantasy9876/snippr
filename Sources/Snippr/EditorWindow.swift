@@ -325,6 +325,7 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
     @objc private func scrollGeometryDidChange(_ notification: Notification) {
         refreshLabels()
         canvas.magnificationDidChange()
+        canvas.invalidatePointerAfterScroll()
     }
 
     /// UI-test hook: checks geometry rather than `NSScroller.isHidden`, whose
@@ -427,7 +428,7 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
         alert.window.initialFirstResponder = field
         guard alert.runModal() == .alertFirstButtonReturn else { return }
         let percent = field.doubleValue
-        guard percent > 0 else { return }
+        guard percent.isFinite, percent > 0 else { return }
         applyResizeFactor(CGFloat(percent / 100))
     }
 
@@ -619,6 +620,10 @@ final class EditorCanvasView: NSView {
     private var isMovingSelection = false
     private var cropRect: CGRect?
     private var lastMousePixel: CGPoint?
+    /// True only after enter/move/down. Cleared on exit so Tab cannot reuse
+    /// a pixel from a previous visit. Scroll clears the cached pixel but
+    /// keeps this flag so the next pick recomputes under the live cursor.
+    private var pointerInsideView = false
     private enum TransientOverlay {
         case ruler(EdgeRuler.Span)
         case guide(axis: MeasureAxis, position: CGFloat)
@@ -647,7 +652,10 @@ final class EditorCanvasView: NSView {
         wantsLayer = true
         addTrackingArea(NSTrackingArea(
             rect: .zero,
-            options: [.mouseMoved, .activeInKeyWindow, .inVisibleRect],
+            options: [
+                .mouseMoved, .mouseEnteredAndExited,
+                .activeInKeyWindow, .inVisibleRect,
+            ],
             owner: self, userInfo: nil))
     }
 
@@ -828,11 +836,33 @@ final class EditorCanvasView: NSView {
 
     // MARK: mouse
 
+    private func updatePointer(from event: NSEvent) {
+        let vp = convert(event.locationInWindow, from: nil)
+        lastMousePixel = toPixel(vp)
+        pointerInsideView = true
+    }
+
+    func invalidatePointerAfterScroll() {
+        lastMousePixel = nil
+        if pointerInsideView {
+            refreshTransient()
+        }
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        updatePointer(from: event)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        lastMousePixel = nil
+        pointerInsideView = false
+    }
+
     override func mouseDown(with event: NSEvent) {
         commitTextEditing()
+        updatePointer(from: event)
         let vp = convert(event.locationInWindow, from: nil)
         let pp = toPixel(vp)
-        lastMousePixel = pp
         if imprintTransient(at: pp) { return }
         dragStartPoint = pp
 
@@ -914,15 +944,14 @@ final class EditorCanvasView: NSView {
     }
 
     override func mouseMoved(with event: NSEvent) {
-        let vp = convert(event.locationInWindow, from: nil)
-        lastMousePixel = toPixel(vp)
+        updatePointer(from: event)
         refreshTransient()
     }
 
     override func mouseDragged(with event: NSEvent) {
+        updatePointer(from: event)
         let vp = convert(event.locationInWindow, from: nil)
         let pp = toPixel(vp)
-        lastMousePixel = pp
 
         switch currentTool {
         case .select:
@@ -1143,12 +1172,37 @@ final class EditorCanvasView: NSView {
         return true
     }
 
-    private func pixelUnderMouse() -> CGPoint? {
-        if let last = lastMousePixel { return last }
+    private func pixelIfInImage(_ pixel: CGPoint) -> CGPoint? {
+        let x = pixel.x.rounded()
+        let y = pixel.y.rounded()
+        guard x >= 0, y >= 0,
+              x < CGFloat(image.cgImage.width),
+              y < CGFloat(image.cgImage.height)
+        else { return nil }
+        return pixel
+    }
+
+    private func livePointerPixel() -> CGPoint? {
         guard let window else { return nil }
         let screenPt = NSEvent.mouseLocation
         let winPt = window.convertPoint(fromScreen: screenPt)
         return toPixel(convert(winPt, from: nil))
+    }
+
+    private func pixelUnderMouse() -> CGPoint? {
+        // Exit must not fall back to the live cursor: tests synthesize
+        // mouseExited without moving the real pointer.
+        guard pointerInsideView else { return nil }
+        if let last = lastMousePixel {
+            return pixelIfInImage(last)
+        }
+        // Scroll cleared the cache while the pointer is still inside —
+        // recompute from the live cursor so picker/ruler/guide follow.
+        if let live = livePointerPixel(), let ok = pixelIfInImage(live) {
+            lastMousePixel = live
+            return ok
+        }
+        return nil
     }
 
     func pickColor(darkest: Bool) {
@@ -1181,7 +1235,7 @@ final class EditorCanvasView: NSView {
     }
 
     private func refreshTransient() {
-        guard let pixel = lastMousePixel, transient != nil else { return }
+        guard transient != nil, let pixel = pixelUnderMouse() else { return }
         switch transient {
         case .ruler(let span):
             if let next = EdgeRuler.measure(
@@ -1254,10 +1308,29 @@ final class EditorCanvasView: NSView {
 
     func pickColorHexForTesting(at pixel: CGPoint, darkest: Bool) -> String? {
         lastMousePixel = pixel
+        pointerInsideView = true
         let color = darkest
             ? PixelColorSampler.darkest(image: image.cgImage, around: pixel)
             : PixelColorSampler.sample(image: image.cgImage, at: pixel)
         return color.map(PixelColorSampler.hexString(from:))
+    }
+
+    var pointerPixelForTesting: CGPoint? { lastMousePixel }
+    var pointerInsideForTesting: Bool { pointerInsideView }
+    func pixelUnderMouseForTesting() -> CGPoint? { pixelUnderMouse() }
+
+    func invalidatePointerAfterScrollForTesting() {
+        invalidatePointerAfterScroll()
+    }
+
+    func mouseExitedForTesting() {
+        lastMousePixel = nil
+        pointerInsideView = false
+    }
+
+    func notePointerForTesting(_ pixel: CGPoint) {
+        lastMousePixel = pixel
+        pointerInsideView = true
     }
 
     var transientKindForTesting: String? {

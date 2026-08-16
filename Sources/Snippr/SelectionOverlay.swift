@@ -1037,7 +1037,12 @@ final class SelectionOverlayView: NSView {
         }
         let pickFlags = event.modifierFlags.intersection(
             [.command, .shift, .control, .option])
-        if isReviewing, handleColorPickKey(event, flags: pickFlags) {
+        // `.saving` is part of `isReviewing` but must reject picker mutation.
+        if owner?.session.phase == .reviewing,
+           handleColorPickKey(event, flags: pickFlags) {
+            return true
+        }
+        if isSaving, isColorPickKey(event, flags: pickFlags) {
             return true
         }
         if isReviewing,
@@ -1059,24 +1064,25 @@ final class SelectionOverlayView: NSView {
         return super.performKeyEquivalent(with: event)
     }
 
+    private func isColorPickKey(
+        _ event: NSEvent, flags: NSEvent.ModifierFlags
+    ) -> Bool {
+        guard event.keyCode == 48 else { return false } // Tab
+        return flags.isEmpty || flags == .shift
+    }
+
     @discardableResult
     private func handleColorPickKey(
         _ event: NSEvent, flags: NSEvent.ModifierFlags
     ) -> Bool {
-        guard event.keyCode == 48 else { return false } // Tab
-        let onlyShift = flags == .shift
-        let plain = flags.isEmpty
-        guard onlyShift || plain else { return false }
-        pickColorAtMouse(darkest: onlyShift)
+        guard isColorPickKey(event, flags: flags) else { return false }
+        pickColorAtMouse(darkest: flags == .shift)
         return true
     }
 
     private func pickColorAtMouse(darkest: Bool) {
-        guard let frozen else { return }
-        let screenPt = NSEvent.mouseLocation
-        let winPt = window?.convertPoint(fromScreen: screenPt) ?? .zero
-        let viewPt = convert(winPt, from: nil)
-        let pixel = pixelPoint(fromView: viewPt)
+        guard let frozen, !isSaving else { return }
+        let pixel = pixelPoint(fromView: mousePos)
         let color = darkest
             ? PixelColorSampler.darkest(image: frozen.cgImage, around: pixel)
             : PixelColorSampler.sample(image: frozen.cgImage, at: pixel)

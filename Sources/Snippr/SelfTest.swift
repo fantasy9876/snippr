@@ -7514,6 +7514,239 @@ enum SelfTest {
                     && after.scale == 2
                     && hexOK && rulerOn && guideOn,
                   "badge \(badge) size \(after.cgImage.width) hex \(hex ?? "nil") ruler \(rulerOn) guide \(guideOn)")
+
+            func sliceAKey(
+                _ keyCode: UInt16,
+                characters: String,
+                modifiers: NSEvent.ModifierFlags = []
+            ) -> NSEvent? {
+                NSEvent.keyEvent(
+                    with: .keyDown, location: .zero,
+                    modifierFlags: modifiers, timestamp: 0,
+                    windowNumber: 0, context: nil,
+                    characters: characters,
+                    charactersIgnoringModifiers: characters,
+                    isARepeat: false, keyCode: keyCode)
+            }
+            func sliceAMouse(
+                _ type: NSEvent.EventType, in view: NSView, at viewPoint: CGPoint
+            ) -> NSEvent? {
+                NSEvent.mouseEvent(
+                    with: type, location: view.convert(viewPoint, to: nil),
+                    modifierFlags: [], timestamp: 0, windowNumber: 0,
+                    context: nil, eventNumber: 1, clickCount: 1, pressure: 1)
+            }
+
+            let tiny = makeSolidImage(
+                width: 20, height: 20, color: NSColor.white.cgColor)
+            let oobFar = PixelColorSampler.darkest(
+                image: tiny, around: CGPoint(x: -200, y: -200), radius: 10)
+            let oobHigh = PixelColorSampler.darkest(
+                image: tiny, around: CGPoint(x: 8_000, y: 8_000), radius: 10)
+            let oobEdge = PixelColorSampler.darkest(
+                image: tiny, around: CGPoint(x: 2, y: 2), radius: 10)
+            check("sliceA-color-darkest-oob",
+                  oobFar == nil && oobHigh == nil && oobEdge != nil,
+                  "far \(oobFar != nil) high \(oobHigh != nil) edge \(oobEdge != nil)")
+
+            let srcR = CapturedImage(
+                cgImage: makeSolidImage(
+                    width: 512, height: 512, color: NSColor.blue.cgColor),
+                scale: 1)
+            let nanS = ImageResizer.scale(srcR, by: .nan)
+            let infS = ImageResizer.scale(srcR, by: .infinity)
+            let negS = ImageResizer.scale(srcR, by: -2)
+            let zeroS = ImageResizer.scale(srcR, by: 0)
+            let hugeDim = ImageResizer.scale(srcR, by: 100)
+            let hugePix = ImageResizer.scale(srcR, by: 40)
+            let halfS = ImageResizer.scale(srcR, by: 0.5)
+            wc.applyResizeFactor(.infinity)
+            wc.applyResizeFactor(-3)
+            check("sliceA-resize-invalid",
+                  nanS == nil && infS == nil && negS == nil && zeroS == nil
+                    && hugeDim == nil && hugePix == nil
+                    && halfS?.cgImage.width == 256
+                    && wc.canvasForTesting.image.cgImage.width == 80,
+                  "nan \(nanS != nil) inf \(infS != nil) dim \(hugeDim != nil) pix \(hugePix != nil) half \(halfS?.cgImage.width ?? -1)")
+
+            PixelSamplerCache.resetForTesting()
+            let tall = makeSolidImage(
+                width: 64, height: 4096, color: NSColor.white.cgColor)
+            let wcTall = EditorWindowController.open(
+                with: CapturedImage(cgImage: tall, scale: 1),
+                forceFitForTesting: true)
+            let cTall = wcTall.canvasForTesting
+            if let moved = sliceAMouse(.mouseMoved, in: cTall, at: CGPoint(x: 20, y: 40)) {
+                cTall.mouseMoved(with: moved)
+            }
+            cTall.beginRuler(.vertical)
+            let rebuildAfterBegin = PixelSamplerCache.rebuildCount
+            for y in [80, 160, 240, 320, 400] {
+                if let moved = sliceAMouse(
+                    .mouseMoved, in: cTall, at: CGPoint(x: 20, y: CGFloat(y)))
+                {
+                    cTall.mouseMoved(with: moved)
+                }
+            }
+            let rebuildAfterMoves = PixelSamplerCache.rebuildCount
+            wcTall.window?.close()
+            check("sliceA-sampler-cache-tall",
+                  rebuildAfterBegin == 1 && rebuildAfterMoves == 1,
+                  "begin \(rebuildAfterBegin) afterMoves \(rebuildAfterMoves)")
+
+            let redCap = CapturedImage(
+                cgImage: makeSolidImage(
+                    width: 80, height: 60, color: NSColor.red.cgColor),
+                scale: 1)
+            let wcTab = EditorWindowController.open(
+                with: redCap, forceFitForTesting: true)
+            let cTab = wcTab.canvasForTesting
+            if let moved = sliceAMouse(
+                .mouseMoved, in: cTab, at: CGPoint(x: 20, y: 20))
+            {
+                cTab.mouseMoved(with: moved)
+            }
+            let pb = NSPasteboard.general
+            pb.clearContents()
+            pb.setString("SENTINEL-SLICE-A", forType: .string)
+            if let tab = sliceAKey(48, characters: "\t") {
+                _ = cTab.performKeyEquivalent(with: tab)
+            }
+            let tabHex = pb.string(forType: .string)
+            pb.clearContents()
+            pb.setString("SENTINEL-OOB", forType: .string)
+            cTab.notePointerForTesting(CGPoint(x: -500, y: -500))
+            if let shiftTab = sliceAKey(48, characters: "\t", modifiers: [.shift]) {
+                _ = cTab.performKeyEquivalent(with: shiftTab)
+            }
+            let oobClip = pb.string(forType: .string)
+            cTab.notePointerForTesting(CGPoint(x: 20, y: 20))
+            cTab.mouseExitedForTesting()
+            let afterExit = cTab.pixelUnderMouseForTesting()
+            pb.clearContents()
+            pb.setString("SENTINEL-EXIT", forType: .string)
+            if let tab = sliceAKey(48, characters: "\t") {
+                _ = cTab.performKeyEquivalent(with: tab)
+            }
+            let exitClip = pb.string(forType: .string)
+            cTab.notePointerForTesting(CGPoint(x: 20, y: 20))
+            let beforeScroll = cTab.pointerPixelForTesting
+            cTab.invalidatePointerAfterScrollForTesting()
+            let afterScrollCache = cTab.pointerPixelForTesting
+            wcTab.window?.close()
+            check("sliceA-production-tab",
+                  tabHex == "#FF0000",
+                  "clip \(tabHex ?? "nil")")
+            check("sliceA-pointer-stale",
+                  oobClip == "SENTINEL-OOB"
+                    && afterExit == nil
+                    && exitClip == "SENTINEL-EXIT"
+                    && beforeScroll == CGPoint(x: 20, y: 20)
+                    && afterScrollCache != CGPoint(x: 20, y: 20),
+                  "oob \(oobClip ?? "nil") exitPix \(String(describing: afterExit)) exitClip \(exitClip ?? "nil") before \(String(describing: beforeScroll)) after \(String(describing: afterScrollCache))")
+
+            let barBase = ctx(200, 100)
+            barBase.setFillColor(NSColor.white.cgColor)
+            barBase.fill(CGRect(x: 0, y: 0, width: 200, height: 100))
+            barBase.setFillColor(NSColor.red.cgColor)
+            barBase.fill(CGRect(x: 40, y: 20, width: 80, height: 60))
+            let barCG = barBase.makeImage()!
+            let wcBar = EditorWindowController.open(
+                with: CapturedImage(cgImage: barCG, scale: 1),
+                forceFitForTesting: true)
+            let cBar = wcBar.canvasForTesting
+            if let moved = sliceAMouse(
+                .mouseMoved, in: cBar, at: CGPoint(x: 80, y: 50))
+            {
+                cBar.mouseMoved(with: moved)
+            }
+            if let left = sliceAKey(123, characters: "\u{F702}") {
+                cBar.keyDown(with: left)
+            }
+            let previewOn = cBar.transientKindForTesting == "ruler"
+            if let down = sliceAMouse(
+                .leftMouseDown, in: cBar, at: CGPoint(x: 80, y: 50))
+            {
+                cBar.mouseDown(with: down)
+            }
+            let imprinted = cBar.annotations.contains { $0 is RulerAnnotation }
+                && cBar.transientKindForTesting == nil
+            let exported = cBar.flattened().cgImage
+            let exportChanged = !imagesEqual(barCG, exported)
+            let canUndo = cBar.undoManager?.canUndo == true
+            if let cmdZ = sliceAKey(6, characters: "z", modifiers: [.command]) {
+                _ = cBar.performKeyEquivalent(with: cmdZ)
+            }
+            let undone = cBar.annotations.isEmpty
+            let exportRestored = imagesEqual(barCG, cBar.flattened().cgImage)
+            wcBar.window?.close()
+            check("sliceA-ruler-imprint-undo-export",
+                  previewOn && imprinted && exportChanged && canUndo
+                    && undone && exportRestored,
+                  "preview \(previewOn) imprint \(imprinted) export \(exportChanged) undo \(canUndo) empty \(undone) restored \(exportRestored)")
+
+            MainActor.assumeIsolated {
+                guard let screen = NSScreen.main ?? NSScreen.screens.first else {
+                    check("sliceA-overlay-production-tab", false, "no display")
+                    check("sliceA-overlay-saving-lock", false, "no display")
+                    return
+                }
+                let frozen = CapturedImage(
+                    cgImage: makeSolidImage(
+                        width: 200, height: 150, color: NSColor.red.cgColor),
+                    scale: 1)
+                let overlay = SelectionOverlay(
+                    purpose: .areaReview,
+                    inputs: OverlaySessionInputs(
+                        afterShow: true, afterCopy: false, afterSave: false),
+                    completion: { _ in })
+                overlay.routerDependenciesOverride =
+                    CaptureActionRouter.Dependencies(
+                        copyToClipboard: { _ in },
+                        autoSave: { _, _ in },
+                        saveAs: { _, _ in },
+                        pin: { _ in },
+                        ocr: { _ in },
+                        openEditor: { _ in },
+                        toast: { _ in },
+                        setLastCapture: { _ in },
+                        setLastAreaRect: { _ in },
+                        logEvent: { _ in })
+                let view = SelectionOverlayView(
+                    mode: .area, screen: screen, frozen: frozen,
+                    windowList: [], owner: overlay)
+                view.selectForTesting(rect: CGRect(x: 10, y: 10, width: 120, height: 90))
+                if let moved = NSEvent.mouseEvent(
+                    with: .mouseMoved, location: CGPoint(x: 40, y: 40),
+                    modifierFlags: [], timestamp: 0, windowNumber: 0,
+                    context: nil, eventNumber: 1, clickCount: 0, pressure: 0)
+                {
+                    view.mouseMoved(with: moved)
+                }
+                pb.clearContents()
+                pb.setString("SENTINEL-OV", forType: .string)
+                if let tab = sliceAKey(48, characters: "\t") {
+                    _ = view.performKeyEquivalent(with: tab)
+                }
+                check("sliceA-overlay-production-tab",
+                      overlay.session.phase == .reviewing
+                        && pb.string(forType: .string) == "#FF0000",
+                      "phase \(overlay.session.phase) clip \(pb.string(forType: .string) ?? "nil")")
+
+                pb.clearContents()
+                pb.setString("SENTINEL-SAVE", forType: .string)
+                let enteredSaving = overlay.session.transition(to: .saving)
+                if let tab = sliceAKey(48, characters: "\t") {
+                    let consumed = view.performKeyEquivalent(with: tab)
+                    _ = consumed
+                }
+                check("sliceA-overlay-saving-lock",
+                      enteredSaving
+                        && overlay.session.phase == .saving
+                        && pb.string(forType: .string) == "SENTINEL-SAVE",
+                      "phase \(overlay.session.phase) clip \(pb.string(forType: .string) ?? "nil")")
+                _ = overlay.session.transition(to: .reviewing)
+            }
         }
 
         print(failures == 0 ? "ALL TESTS PASSED" : "\(failures) TEST(S) FAILED")
