@@ -1384,7 +1384,7 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
         guard !magnifiersClearedDuringDrag.isEmpty else { return }
         let ids = magnifiersClearedDuringDrag
         magnifiersClearedDuringDrag.removeAll()
-        let redactions = annotations.compactMap { $0 as? BlurAnnotation }
+        let redactions = liveRedactions
         for mag in annotations.compactMap({ $0 as? MagnifierAnnotation })
         where ids.contains(ObjectIdentifier(mag)) {
             mag.snapshot = SliceBCompositor.magnifierSnapshot(
@@ -1394,8 +1394,20 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
         needsDisplay = true
     }
 
+    /// Every redaction that is currently covering pixels — including the one
+    /// being drawn right now. A rebuild that saw only committed annotations
+    /// would restore raw pixels underneath an active draft.
+    private var liveRedactions: [BlurAnnotation] {
+        var result = annotations.compactMap { $0 as? BlurAnnotation }
+        if let draft = drafting as? BlurAnnotation,
+           !result.contains(where: { $0 === draft }) {
+            result.append(draft)
+        }
+        return result
+    }
+
     func refreshMagnifierSnapshotsAfterDocumentChange(force: Bool = true) {
-        let redactions = annotations.compactMap { $0 as? BlurAnnotation }
+        let redactions = liveRedactions
         let magnifiers = annotations.compactMap { $0 as? MagnifierAnnotation }
         guard !magnifiers.isEmpty else { return }
         for mag in magnifiers {

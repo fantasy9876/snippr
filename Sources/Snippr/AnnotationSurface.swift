@@ -153,8 +153,16 @@ final class AnnotationSurface: RedactionHost, RedactionJobObserver {
     /// The spotlight a drag is about to replace, held so a click can put it
     /// back and so undo can restore it.
     private var replacedSpotlight: (spot: SpotlightAnnotation, index: Int)?
-    private var spotlightReplacedBy:
-        [ObjectIdentifier: (spot: SpotlightAnnotation, index: Int)] = [:]
+    /// Replacement records hold STRONG references and are matched with `===`.
+    /// An ObjectIdentifier key alone can be reused by a later allocation, so a
+    /// new spotlight could inherit a stale prior. Records are pruned whenever
+    /// the redo branch is dropped.
+    private struct SpotlightReplacement {
+        let new: SpotlightAnnotation
+        let prior: SpotlightAnnotation
+        let priorIndex: Int
+    }
+    private var spotlightReplacements: [SpotlightReplacement] = []
     private var strokeTrackpadAccum: CGFloat = 0
     private var redoAnnotations: [Annotation] = []
     /// Hosts install weak-owner callbacks so Undo/Redo enabled state follows
@@ -345,6 +353,7 @@ final class AnnotationSurface: RedactionHost, RedactionJobObserver {
                 annotations.removeLast()
             } else {
                 redoAnnotations.removeAll()
+                pruneSpotlightReplacements()
                 // Exactly one enqueue per completed text redaction; the host
                 // starts it because only the host holds the base image.
                 if blur.redactionState == .pendingFull {
@@ -365,15 +374,30 @@ final class AnnotationSurface: RedactionHost, RedactionJobObserver {
             } else {
                 // ONE transaction: undo pops this spotlight and restores the
                 // one it replaced, rather than leaving none behind.
+                // Drop any stale record for this object first, then record the
+                // replacement only when there really was one.
+                spotlightReplacements.removeAll { $0.new === spot }
                 if let replaced = replacedSpotlight {
-                    spotlightReplacedBy[ObjectIdentifier(spot)] = replaced
+                    spotlightReplacements.append(SpotlightReplacement(
+                        new: spot, prior: replaced.spot,
+                        priorIndex: replaced.index))
                 }
                 redoAnnotations.removeAll()
+                pruneSpotlightReplacements()
             }
             replacedSpotlight = nil
             historyDidChange?()
         }
         clearActiveDraft()
+    }
+
+    /// A record is only meaningful while its spotlight can still be reached by
+    /// undo or redo; anything else is abandoned history.
+    private func pruneSpotlightReplacements() {
+        let live = annotations + redoAnnotations
+        spotlightReplacements.removeAll { record in
+            !live.contains { $0 === record.new }
+        }
     }
 
     /// Full SOURCE pixel bounds; hosts set this so a spotlight dims the whole
@@ -479,9 +503,9 @@ final class AnnotationSurface: RedactionHost, RedactionJobObserver {
         // A spotlight that replaced another undoes to that other one, so the
         // single action reverses as a single action.
         if let spot = annotation as? SpotlightAnnotation,
-           let replaced = spotlightReplacedBy[ObjectIdentifier(spot)] {
+           let replaced = spotlightReplacements.last(where: { $0.new === spot }) {
             annotations.insert(
-                replaced.spot, at: min(replaced.index, annotations.count))
+                replaced.prior, at: min(replaced.priorIndex, annotations.count))
         }
         redoAnnotations.append(annotation)
         clearActiveDraft()
@@ -495,8 +519,8 @@ final class AnnotationSurface: RedactionHost, RedactionJobObserver {
         // Redo restores a NORMALIZED state: never an orphan pending mask.
         cancelRedactionJob(for: annotation)
         if let spot = annotation as? SpotlightAnnotation,
-           let replaced = spotlightReplacedBy[ObjectIdentifier(spot)] {
-            annotations.removeAll { $0 === replaced.spot }
+           let replaced = spotlightReplacements.last(where: { $0.new === spot }) {
+            annotations.removeAll { $0 === replaced.prior }
         }
         annotations.append(annotation)
         clearActiveDraft()
