@@ -9522,10 +9522,17 @@ enum SelfTest {
                 }) {
                     hostFailures.append("area:fail-attribution")
                 }
-                if let attempt = attempts.first,
-                   !(hostMask.contains(attempt.rect)
-                     && attempt.host == "area" && attempt.path == "export") {
-                    hostFailures.append("area:attempt \(attempt)")
+                // Exact payload, not merely containment.
+                let expectedRegion = hostMask.standardized.integral
+                if let attempt = attempts.first, attempt.rect != expectedRegion {
+                    hostFailures.append("area:attempt-rect \(attempt.rect)")
+                }
+                if let destination = failEvents.first(where: {
+                    $0.kind == "destination"
+                }), destination.destination
+                    != "\(Int(hostSelection.width))x\(Int(hostSelection.height))" {
+                    hostFailures.append(
+                        "area:fail-dest \(destination.destination)")
                 }
 
                 // -- healthy run: exactly one materialization inside the mask
@@ -9543,8 +9550,11 @@ enum SelfTest {
                     hostFailures.append("area:materialized \(materialized.count)")
                 }
                 if let event = materialized.first,
-                   !hostMask.contains(event.rect) {
-                    hostFailures.append("area:region \(event.rect)")
+                   event.rect != expectedRegion
+                    || event.destination
+                        != "\(Int(expectedRegion.width))x\(Int(expectedRegion.height))" {
+                    hostFailures.append(
+                        "area:materialized-payload \(event.rect) \(event.destination)")
                 }
                 if okEvents.filter({ $0.kind == "destination" }).count != 1 {
                     hostFailures.append("area:destinations")
@@ -9553,6 +9563,10 @@ enum SelfTest {
                 if okAttempts.count != 1
                     || !(okAttempts.first.map { hostMask.contains($0.rect) } ?? false) {
                     hostFailures.append("area:ok-attempt \(okAttempts.count)")
+                }
+                let okDeps = deps.filter { $0.value != 0 }
+                if !okDeps.isEmpty {
+                    hostFailures.append("area:ok-deps \(okDeps)")
                 }
                 let okShape = okEvents.map { "\($0.host)/\($0.path)/\($0.kind)" }
                 if okShape != [
@@ -9812,9 +9826,22 @@ enum SelfTest {
                 drain(to: 1, label: "first")
                 release[order[1]].signal()
                 drain(to: 0, label: "second")
+                // Expected value must come from the REAL policy: the
+                // recognizer speaks patch-local coordinates, and production
+                // maps by the patch origin and expands by the outset. A raw
+                // rect here could never match, so the gate would have been red
+                // for the wrong reason.
+                SliceBOCR.recognizerForTesting = { _ in
+                    .success([RecognizedWord(rect: newWord, confidence: 0.9)])
+                }
+                let expectedWords = SliceBOCR.wordRects(
+                    base: isoBase, region: raceBlur.rect)
                 SliceBOCR.recognizerForTesting = nil
+                if expectedWords.isEmpty {
+                    orderFailures.append("\(oldFirst):no-expected")
+                }
                 // Whoever finished first, only the CURRENT owner's answer counts.
-                if raceBlur.redactionState != .words([newWord]) {
+                if raceBlur.redactionState != .words(expectedWords) {
                     orderFailures.append(
                         "\(oldFirst):state \(raceBlur.redactionState)")
                 }

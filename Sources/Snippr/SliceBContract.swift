@@ -464,20 +464,21 @@ enum SliceBCompositor {
         }
 
         let w = Int(region.width), h = Int(region.height)
+        // Crop FIRST, allocate second. Ordering the fallible step before the
+        // allocation removes a whole class of accounting bug: there can be no
+        // "allocated but then failed" state to mis-record.
+        let topLeft = CGRect(
+            x: region.minX, y: CGFloat(base.height) - region.maxY,
+            width: region.width, height: region.height)
+        guard let crop = base.cropping(to: topLeft) else { return nil }
         guard let ctx = CGContext(
             data: nil, width: w, height: h, bitsPerComponent: 8,
             bytesPerRow: 0,
             space: base.colorSpace ?? CGColorSpace(name: CGColorSpace.sRGB)!,
             bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
         else { return nil }
-        // Recorded here, not after the fallible crop below: the buffer is
-        // already allocated, and a later nil must not erase that fact.
         RenderTrace.record(
             kind: "destination", destination: "\(w)x\(h)", rect: region)
-        let topLeft = CGRect(
-            x: region.minX, y: CGFloat(base.height) - region.maxY,
-            width: region.width, height: region.height)
-        guard let crop = base.cropping(to: topLeft) else { return nil }
         ctx.draw(crop, in: CGRect(x: 0, y: 0, width: w, height: h))
         // Draw the overlapping redactions in the patch's own space.
         ctx.translateBy(x: -region.minX, y: -region.minY)
