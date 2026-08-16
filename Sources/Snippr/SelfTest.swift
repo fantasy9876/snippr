@@ -9606,7 +9606,8 @@ enum SelfTest {
                     hostFailures.append("area:no-view-shot")
                     return
                 }
-                let backing = CGFloat(viewShot.width) / view.bounds.width
+                let backingX = CGFloat(viewShot.width) / view.bounds.width
+                let backingY = CGFloat(viewShot.height) / view.bounds.height
                 let viewBytes = rgba(viewShot)
                 let baseBytes = baselineShot.map { rgba($0) }
                 let cover: [UInt8] = [31, 31, 31, 255]
@@ -9614,21 +9615,30 @@ enum SelfTest {
                 var bleeding = 0
                 for py in 0..<viewShot.height {
                     for px in 0..<viewShot.width {
-                        // pixel CENTRE in points: half-open raster rule, so
-                        // every pixel lands in exactly one class.
-                        let point = CGPoint(
-                            x: (CGFloat(px) + 0.5) / backing,
-                            y: (CGFloat(viewShot.height - 1 - py) + 0.5) / backing)
+                        // The CELL this backing pixel covers, in points; the
+                        // two axes round independently.
+                        let cell = CGRect(
+                            x: CGFloat(px) / backingX,
+                            y: CGFloat(viewShot.height - 1 - py) / backingY,
+                            width: 1 / backingX, height: 1 / backingY)
                         let i = (py * viewShot.width + px) * 4
                         let value = Array(viewBytes[i..<(i + 4)])
-                        if hostMask.contains(point) {
+                        if hostMask.contains(cell) {
                             if value != cover { uncovered += 1 }
-                        } else if let baseBytes,
-                                  i + 4 <= baseBytes.count,
-                                  Array(baseBytes[i..<(i + 4)]) != value {
+                        } else if !hostMask.intersects(cell) {
                             // Outside the mask the view must be byte-identical
                             // to the baseline taken moments earlier.
-                            bleeding += 1
+                            if let baseBytes, i + 4 <= baseBytes.count,
+                               Array(baseBytes[i..<(i + 4)]) != value {
+                                bleeding += 1
+                            }
+                        } else if let baseBytes, i + 4 <= baseBytes.count {
+                            // Edge cell: antialiasing is legal, but it must
+                            // have been painted and must differ from baseline.
+                            if value[3] == 0
+                                || Array(baseBytes[i..<(i + 4)]) == value {
+                                bleeding += 1
+                            }
                         }
                     }
                 }
@@ -10191,16 +10201,19 @@ enum SelfTest {
                     return rep.cgImage
                 }
                 if let shot, let panelBaseline, host.bounds.width > 0 {
-                    let backing = CGFloat(shot.width) / host.bounds.width
+                    // The cached rep rounds each axis independently, so the
+                    // two ratios can differ on a fitted fractional size.
+                    let backingX = CGFloat(shot.width) / host.bounds.width
+                    let backingY = CGFloat(shot.height) / host.bounds.height
                     let bytes = rgba(shot), baseBytes = rgba(panelBaseline)
                     var holes = 0, changed = 0, edgeWrong = 0
                     for py in 0..<shot.height {
                         for px in 0..<shot.width {
                             // The CELL this backing pixel covers, in points.
                             let cell = CGRect(
-                                x: CGFloat(px) / backing,
-                                y: CGFloat(shot.height - 1 - py) / backing,
-                                width: 1 / backing, height: 1 / backing)
+                                x: CGFloat(px) / backingX,
+                                y: CGFloat(shot.height - 1 - py) / backingY,
+                                width: 1 / backingX, height: 1 / backingY)
                             let i = (py * shot.width + px) * 4
                             guard i + 4 <= bytes.count,
                                   i + 4 <= baseBytes.count else { continue }
