@@ -284,14 +284,22 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
 
         let stack = NSStackView(views: [actionRow, toolRow])
         stack.orientation = .vertical
-        // A vertical stack centres its rows by default, so each row would be
-        // only as wide as its own content — the tool row's trailing spacer and
-        // the action row's right-hand chrome both assume the full bar width.
-        stack.alignment = .width
         stack.distribution = .fillEqually
         stack.spacing = 0
         stack.translatesAutoresizingMaskIntoConstraints = false
         bar.addSubview(stack)
+
+        // A vertical stack offers only leading/centre/trailing alignment, so
+        // neither of those makes a row fill the bar — and both rows need to:
+        // the tool row ends in a flexible spacer, and the action row puts its
+        // chrome against the right edge. Explicit constraints, which take
+        // precedence over the stack's own alignment.
+        NSLayoutConstraint.activate([
+            actionRow.leadingAnchor.constraint(equalTo: stack.leadingAnchor),
+            actionRow.trailingAnchor.constraint(equalTo: stack.trailingAnchor),
+            toolRow.leadingAnchor.constraint(equalTo: stack.leadingAnchor),
+            toolRow.trailingAnchor.constraint(equalTo: stack.trailingAnchor),
+        ])
 
         let cropActions = NSStackView(views: [cropApply, cropCancel])
         cropActions.orientation = .horizontal

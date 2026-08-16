@@ -9265,13 +9265,29 @@ enum SelfTest {
                         toolbarFailures.append("\(phase):rows-collide")
                     }
                     let rowsUnion = toolRow.frame.union(actionRow.frame)
+                    // The shared edge directly, not just a union and a sum:
+                    // two independent tolerances could each absorb half a gap.
+                    let lower = toolRow.frame.minY < actionRow.frame.minY
+                        ? toolRow.frame : actionRow.frame
+                    let upper = lower == toolRow.frame
+                        ? actionRow.frame : toolRow.frame
                     if !near(rowsUnion.minY, stack.bounds.minY)
                         || !near(rowsUnion.maxY, stack.bounds.maxY)
-                        || !near(toolRow.frame.height
-                                 + actionRow.frame.height,
-                                 stack.bounds.height) {
+                        || !near(lower.maxY, upper.minY, 0.01) {
                         toolbarFailures.append(
                             "\(phase):rows-do-not-tile \(rowsUnion)")
+                    }
+                    // Nothing actionable in either row that this gate has not
+                    // accounted for; spacers and separators are not controls
+                    // and are ignored by design.
+                    let known = Set(members.map { ObjectIdentifier($0.1) })
+                    for row in [toolRow, actionRow] {
+                        for view in row.arrangedSubviews
+                        where view is NSControl
+                            && !known.contains(ObjectIdentifier(view)) {
+                            toolbarFailures.append(
+                                "\(phase):unexpected-control")
+                        }
                     }
                     // Disjoint WITHIN each row.
                     for row in [toolRow, actionRow] {
