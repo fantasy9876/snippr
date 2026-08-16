@@ -11713,6 +11713,156 @@ enum SelfTest {
                     }
                 }
             }
+            // O. While a text field owns the keyboard, the shortcuts must
+            //    not fire: typing "5" into a caption is text, not a darkness
+            //    change. Both hosts route keys themselves.
+            var textKeyFailures: [String] = []
+            let runTextKeys = {
+                guard let screen = NSScreen.screens.first else {
+                    textKeyFailures.append("no-screen")
+                    return
+                }
+                func digit(_ chars: String) -> NSEvent? {
+                    NSEvent.keyEvent(
+                        with: .keyDown, location: .zero, modifierFlags: [],
+                        timestamp: 0, windowNumber: 0, context: nil,
+                        characters: chars, charactersIgnoringModifiers: chars,
+                        isARepeat: false, keyCode: 0)
+                }
+                let inertDependencies = CaptureActionRouter.Dependencies(
+                    copyToClipboard: { _ in }, autoSave: { _, _ in },
+                    saveAs: { _, _ in }, pin: { _ in }, ocr: { _ in },
+                    openEditor: { _ in }, toast: { _ in },
+                    setLastCapture: { _ in }, setLastAreaRect: { _ in },
+                    logEvent: { _ in })
+
+                // --- area
+                let overlay = SelectionOverlay(
+                    purpose: .areaReview,
+                    inputs: OverlaySessionInputs(
+                        afterShow: true, afterCopy: false, afterSave: false),
+                    completion: { _ in })
+                overlay.routerDependenciesOverride = inertDependencies
+                let view = SelectionOverlayView(
+                    mode: .area, screen: screen,
+                    frozen: CapturedImage(
+                        cgImage: makeSolidImage(
+                            width: Int(screen.frame.width * 2),
+                            height: Int(screen.frame.height * 2),
+                            color: NSColor.white.cgColor),
+                        scale: 2),
+                    windowList: [], owner: overlay)
+                view.selectForTesting(
+                    rect: CGRect(x: 60, y: 60, width: 240, height: 180))
+                defer { overlay.finish(.cancelled) }
+                guard let surface = view.annotationSurface else {
+                    textKeyFailures.append("area:no-surface")
+                    return
+                }
+                view.clickReviewToolbarButtonForTesting(
+                    tag: OverlayAnnotationTool.spotlight.toolbarTag)
+                view.annotationDragForTesting(
+                    from: CGPoint(x: 100, y: 100), to: CGPoint(x: 200, y: 170))
+                guard let spot = surface.annotations
+                    .compactMap({ $0 as? SpotlightAnnotation }).last else {
+                    textKeyFailures.append("area:no-spotlight")
+                    return
+                }
+                var areaEvents = 0
+                let areaProduction = surface.historyDidChange
+                surface.historyDidChange = {
+                    areaEvents += 1
+                    areaProduction?()
+                }
+                view.beginTextEntryForTesting(
+                    atView: CGPoint(x: 120, y: 120))
+                let dimBefore = spot.dimFraction
+                let toolBefore = surface.tool
+                let eventsBefore = areaEvents
+                if let event = digit("5") { view.keyDown(with: event) }
+                if let event = digit("l") { view.keyDown(with: event) }
+                if spot.dimFraction != dimBefore
+                    || surface.tool != toolBefore
+                    || areaEvents != eventsBefore
+                    || surface.annotations
+                        .compactMap({ $0 as? SpotlightAnnotation }).count != 1 {
+                    textKeyFailures.append(
+                        "area:keys-leaked \(spot.dimFraction) \(surface.tool)")
+                }
+                // Once the field is gone the same key works again, so the
+                // block above means "the field had it", not "digits are dead".
+                view.commitTextEntryForTesting(text: "caption")
+                if let event = digit("5") { view.keyDown(with: event) }
+                let areaAfter = surface.annotations
+                    .compactMap { $0 as? SpotlightAnnotation }.last
+                if abs((areaAfter?.dimFraction ?? 0) - 0.5) > 0.0001 {
+                    textKeyFailures.append(
+                        "area:control \(areaAfter?.dimFraction ?? -1)")
+                }
+
+                // --- panel
+                let panel = ScrollResultPanel.show(
+                    image: CapturedImage(
+                        cgImage: makeSolidImage(
+                            width: 600, height: 400,
+                            color: NSColor.white.cgColor),
+                        scale: 1),
+                    inputs: OverlaySessionInputs(
+                        afterShow: true, afterCopy: false, afterSave: false),
+                    screen: screen, dependencies: inertDependencies)
+                defer {
+                    if panel.isVisible || ScrollResultPanel.current === panel {
+                        panel.dismissForTesting()
+                    }
+                }
+                let panelSurface = panel.annotationSurface
+                panel.clickToolbarButtonForTesting(
+                    tag: OverlayAnnotationTool.spotlight.toolbarTag)
+                panel.drawWithRealEventsForTesting(
+                    fromView: CGPoint(x: 60, y: 60),
+                    toView: CGPoint(x: 200, y: 160))
+                guard let panelSpot = panelSurface.annotations
+                    .compactMap({ $0 as? SpotlightAnnotation }).last,
+                      let host = panel.annotationHostForTesting else {
+                    textKeyFailures.append("panel:no-spotlight")
+                    return
+                }
+                // Text entry the way a user starts it: the tool, then a click.
+                panel.clickToolbarButtonForTesting(
+                    tag: OverlayAnnotationTool.text.toolbarTag)
+                panel.drawWithRealEventsForTesting(
+                    fromView: CGPoint(x: 120, y: 120),
+                    toView: CGPoint(x: 120, y: 120))
+                if !host.textEditingActive {
+                    textKeyFailures.append("panel:no-field")
+                }
+                let panelDimBefore = panelSpot.dimFraction
+                let panelToolBefore = panelSurface.tool
+                if let event = digit("5") { panel.keyDown(with: event) }
+                if let event = digit("l") { panel.keyDown(with: event) }
+                if panelSpot.dimFraction != panelDimBefore
+                    || panelSurface.tool != panelToolBefore
+                    || panelSurface.annotations
+                        .compactMap({ $0 as? SpotlightAnnotation }).count != 1 {
+                    textKeyFailures.append(
+                        "panel:keys-leaked \(panelSpot.dimFraction)")
+                }
+                host.commitActiveTextEntry()
+                panel.clickToolbarButtonForTesting(
+                    tag: OverlayAnnotationTool.spotlight.toolbarTag)
+                if let event = digit("5") { panel.keyDown(with: event) }
+                let panelAfter = panelSurface.annotations
+                    .compactMap { $0 as? SpotlightAnnotation }.last
+                if abs((panelAfter?.dimFraction ?? 0) - 0.5) > 0.0001 {
+                    textKeyFailures.append(
+                        "panel:control \(panelAfter?.dimFraction ?? -1)")
+                }
+            }
+            runTextKeys()
+            check("sliceB-text-field-owns-keys",
+                  textKeyFailures.isEmpty,
+                  textKeyFailures.joined(separator: " | "))
+
             check("sliceB-drag-lifecycle-ordinary-branch",
                   branchFailures.isEmpty,
                   branchFailures.joined(separator: " | "))
