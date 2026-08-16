@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Snippr — chụp màn hình cho Mac & Windows</title>
-<meta name="description" content="Snippr: app chụp màn hình miễn phí cho Mac (Apple Silicon & Intel) và Windows. Chụp vùng chọn, cửa sổ, cuộn trang, OCR tiếng Việt, chú thích ảnh — mọi thứ ở lại máy bạn.">
+<meta name="description" content="Snippr: app chụp màn hình miễn phí cho Mac (Apple Silicon & Intel) và Windows. Chụp vùng chọn, cửa sổ, cuộn trang, OCR tiếng Việt và chú thích ảnh; chỉ tính năng Dịch gửi văn bản khi bạn chủ động bấm.">
 <link rel="icon" href="icon.png">
 <style>
   :root {
@@ -71,16 +71,16 @@
 <header>
   <img src="icon.png" alt="Snippr icon">
   <h1>Snippr</h1>
-  <p class="tagline">Chụp màn hình nhanh, gọn cho <b>Mac</b> và <b>Windows</b>.<br>Chú thích · OCR tiếng Việt · Chụp cuộn trang — mọi thứ ở lại máy bạn.</p>
+  <p class="tagline">Chụp màn hình nhanh, gọn cho <b>Mac</b> và <b>Windows</b>.<br>Chú thích · OCR tiếng Việt · Chụp cuộn trang — ảnh luôn ở lại máy bạn.</p>
   <div class="cta">
-    <a class="btn" href="Snippr-1.2.2.dmg" download> Mac Apple Silicon<small>v1.2.2 · M1–M5 · DMG</small></a>
-    <a class="btn" href="Snippr-1.2.2-intel.dmg" download> Mac Intel<small>v1.2.2 · x86_64 · DMG</small></a>
-    <a class="btn" href="https://github.com/fantasy9876/snippr/releases/download/v1.2.7/SnipprSetup-1.2.7-win-x64.exe">🪟 Windows Installer<small>v1.2.7 · x64 · Setup.exe</small></a>
+    <a class="btn" href="Snippr-1.2.4.dmg" download> Mac Apple Silicon<small>v1.2.4 · M1–M5 · DMG</small></a>
+    <a class="btn" href="Snippr-1.2.4-intel.dmg" download> Mac Intel<small>v1.2.4 · x86_64 · DMG</small></a>
+    <a class="btn" href="https://github.com/fantasy9876/snippr/releases/download/v1.2.8/SnipprSetup-1.2.8-win-x64.exe">🪟 Windows Installer<small>v1.2.8 · x64 · Setup.exe</small></a>
   </div>
   <p class="sub">
     macOS 14+ · Windows 10/11 64-bit · miễn phí, mã nguồn mở (MIT) ·
     <a href="https://github.com/fantasy9876/snippr">GitHub</a> ·
-    <a href="https://github.com/fantasy9876/snippr/releases/download/v1.2.7/Snippr-portable-win-x64.zip">bản Windows portable (ZIP)</a>
+    <a href="https://github.com/fantasy9876/snippr/releases/download/v1.2.8/Snippr-portable-win-x64.zip">bản Windows portable (ZIP)</a>
   </p>
 </header>
 
@@ -110,7 +110,7 @@
   <div class="note" style="margin-top:0">
     ⚡ <b>Cách nhanh nhất — không gặp cảnh báo "malware":</b> mở <b>Terminal</b> (⌘+Space, gõ Terminal), dán lệnh này rồi Enter:<br>
     <code style="display:block;margin-top:8px;padding:10px 14px;font-size:14px;user-select:all">curl -fsSL https://snippr.pages.dev/install.sh | sh</code>
-    <span style="color:var(--muted);font-size:13px">Lệnh tự chọn đúng bản Apple Silicon/Intel, cài vào Applications và mở app. Vì tải bằng curl nên macOS không gắn cờ kiểm dịch — không hiện hộp thoại cảnh báo nào cả. (Script chỉ ~30 dòng, xem được tại <a href="install.sh" style="color:var(--accent)">install.sh</a>.)</span>
+    <span style="color:var(--muted);font-size:13px">Lệnh tự chọn đúng bản Apple Silicon/Intel, kiểm SHA-256 và chữ ký Snippr, cài có rollback vào Applications rồi mở app. Vì tải bằng curl nên macOS không gắn cờ kiểm dịch. Bạn có thể xem toàn bộ script tại <a href="install.sh" style="color:var(--accent)">install.sh</a>.</span>
   </div>
   <p style="margin:16px 0 8px;color:var(--muted)">Hoặc cài thủ công bằng DMG:</p>
   <ol>
@@ -122,11 +122,11 @@
 
   <h2 style="margin-top:32px">Cài đặt trên Windows</h2>
   <ol>
-    <li>Tải <b>Windows Installer</b>, chạy file <code>SnipprSetup-1.2.7-win-x64.exe</code>.</li>
-    <li>Nếu SmartScreen cảnh báo (app chưa mua chứng chỉ ký số): bấm <b>More info → Run anyway</b>.</li>
+    <li>Tải <b>Windows Installer</b>, chạy file <code>SnipprSetup-1.2.8-win-x64.exe</code>.</li>
+    <li>Bản Windows 1.2.8 chưa ký số; nếu SmartScreen cảnh báo, kiểm SHA-256 trên GitHub rồi bấm <b>More info → Run anyway</b>.</li>
     <li>Installer cho <b>chọn thư mục cài đặt</b>, tạo shortcut Start Menu và mục gỡ trong "Add or remove programs". Xong bấm <b>Finish</b> là Snippr chạy luôn ở khay hệ thống.</li>
   </ol>
-  <div class="note">💡 Không thích cài đặt? Dùng <a href="https://github.com/fantasy9876/snippr/releases/download/v1.2.7/Snippr-portable-win-x64.zip" style="color:var(--accent)">bản portable (ZIP)</a> — giải nén là chạy, xóa thư mục là gỡ xong.</div>
+  <div class="note">💡 Không thích cài đặt? Dùng <a href="https://github.com/fantasy9876/snippr/releases/download/v1.2.8/Snippr-portable-win-x64.zip" style="color:var(--accent)">bản portable (ZIP)</a> — giải nén là chạy, xóa thư mục là gỡ xong.</div>
 </section>
 
 <section>
@@ -144,7 +144,7 @@
 <section>
   <h2>Câu hỏi thường gặp</h2>
   <p><b>Mac Intel dùng được không?</b> Được! Từ v1.0.2 có bản Intel (x86_64) riêng — tải nút "Mac Intel" ở trên.</p>
-  <p style="margin-top:10px"><b>Sao hệ điều hành cảnh báo app "không xác minh"?</b> App ký ad-hoc / chưa mua chứng chỉ ($99–$400/năm). Mã nguồn công khai trên GitHub, bạn có thể tự build nếu muốn chắc chắn.</p>
+  <p style="margin-top:10px"><b>Sao hệ điều hành cảnh báo app "không xác minh"?</b> Bản Mac dùng chữ ký Snippr ổn định để giữ quyền Screen Recording qua cập nhật, nhưng chưa được Apple notarize. Bản Windows 1.2.8 chưa ký Authenticode. Mã nguồn và SHA-256 đều công khai trên GitHub để bạn kiểm tra.</p>
   <p style="margin-top:10px"><b>Đổi phím tắt kiểu gì?</b> Mac: menu 📷 → Settings → tab Hotkeys, bấm vào ô rồi gõ tổ hợp mới. Windows: chuột phải icon khay → Settings, bấm vào ô hotkey rồi gõ tổ hợp mới (Esc để tắt phím tắt đó).</p>
   <p style="margin-top:10px"><b>Ảnh lưu ở đâu?</b> Mặc định ở Desktop, đổi được trong Settings. Định dạng Auto tự chọn PNG cho ảnh UI, JPEG cho ảnh nhiều màu.</p>
 </section>
@@ -152,7 +152,7 @@
 <footer>
   <p>Snippr — mã nguồn mở theo giấy phép MIT · <a href="https://github.com/fantasy9876/snippr">github.com/fantasy9876/snippr</a></p>
   <p style="margin-top:6px">Lấy cảm hứng từ Shottr · Made with <a href="https://claude.com/claude-code">Claude Code</a> 🤖</p>
-  <p style="margin-top:6px">Free code signing for Windows provided by <a href="https://signpath.io">SignPath.io</a> — certificate by <a href="https://signpath.org">SignPath Foundation</a></p>
+  <p style="margin-top:6px">Bản Windows 1.2.8 chưa ký số; hãy đối chiếu SHA-256 trên GitHub trước khi chạy.</p>
 </footer>
 
 </div>

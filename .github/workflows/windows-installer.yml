@@ -473,6 +473,7 @@ jobs:
       - name: Upload to release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         shell: pwsh
         run: |
           $tag = $env:RELEASE_TAG.Trim()

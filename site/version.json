@@ -1,10 +1,10 @@
 {
-  "mac": "1.2.2",
-  "macUrlArm": "https://snippr.pages.dev/Snippr-1.2.2.dmg",
-  "macUrlIntel": "https://snippr.pages.dev/Snippr-1.2.2-intel.dmg",
-  "macSha256Arm": "3c0324fe7c0fe08809a9c5f7d10121ddb1b5cbf8e3272e77f7a4189b4ed23b9f",
-  "macSha256Intel": "55f73a1a229eda093dce2909d1b0955d97646bf291420b4b0888cf8f0139eb53",
-  "win": "1.2.7",
-  "winUrl": "https://github.com/fantasy9876/snippr/releases/download/v1.2.7/SnipprSetup-1.2.7-win-x64.exe",
-  "winSha256": "1a6a7f2211b9b08ff5e0693cde5a9ac2f09901e1c28bbd1a236678552886fdb4"
+  "mac": "1.2.4",
+  "macUrlArm": "https://snippr.pages.dev/Snippr-1.2.4.dmg",
+  "macUrlIntel": "https://snippr.pages.dev/Snippr-1.2.4-intel.dmg",
+  "macSha256Arm": "b2f0a4c5ca48d69dd3354b8d54b85c38c9b7797eaf35c799a4438d38db258eda",
+  "macSha256Intel": "1e78f4ed5924583991a3631781f308d281566893052a763678ede94cbb2d7468",
+  "win": "1.2.8",
+  "winUrl": "https://github.com/fantasy9876/snippr/releases/download/v1.2.8/SnipprSetup-1.2.8-win-x64.exe",
+  "winSha256": "25542b45abd8232a97bdde68bf5566f30189346017ca0da56ea358b9966a6ddd"
 }
