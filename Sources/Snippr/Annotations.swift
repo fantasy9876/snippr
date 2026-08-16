@@ -657,9 +657,16 @@ enum AnnotationRenderer {
     /// Regional output for in-place overlays. Core Image remains lazy over
     /// the base descriptor and materializes only `rect`, preserving the
     /// original image-space pixel grid without a 5K×40K RGBA cache.
+    /// The ONE seam a gate injects failure at. Both surfaces and the editor
+    /// reach pixelation through here, so a forced failure exercises the real
+    /// fail-closed path instead of a host-level shortcut that draws its own
+    /// cover.
+    nonisolated(unsafe) static var forceRegionalPixelateFailureForTesting = false
+
     static func pixellateRegion(
         _ image: CGImage, rect: CGRect, scale: CGFloat
     ) -> CGImage? {
+        if forceRegionalPixelateFailureForTesting { return nil }
         let bounds = CGRect(
             x: 0, y: 0, width: image.width, height: image.height)
         let region = rect.standardized.integral.intersection(bounds)

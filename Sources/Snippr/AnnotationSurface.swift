@@ -399,25 +399,6 @@ final class AnnotationSurface: RedactionHost {
     ) -> Bool {
         // One renderer for every surface: phases, regional pixelation and the
         // opaque fail-closed cover all live in SliceBCompositor.
-        guard !forceRegionalPixelateFailureForTesting else {
-            let baseBounds = CGRect(
-                x: 0, y: 0, width: base.width, height: base.height)
-            for annotation in SliceBCompositor.phaseOrder(annotations) {
-                guard let blur = annotation as? BlurAnnotation else {
-                    annotation.draw(in: ctx, pixellated: nil)
-                    continue
-                }
-                let masks = SliceBRedaction.maskRects(
-                    state: blur.redactionState, rect: blur.rect)
-                    .map {
-                        $0.standardized.intersection(visiblePixels)
-                            .intersection(baseBounds)
-                    }
-                    .filter { $0.width > 1 && $0.height > 1 }
-                SliceBCompositor.drawFailedRedaction(masks, in: ctx)
-            }
-            return false
-        }
         return SliceBCompositor.draw(
             annotations, in: ctx, base: base, visiblePixels: visiblePixels,
             pixelScale: pixelScale)
@@ -436,8 +417,13 @@ final class AnnotationSurface: RedactionHost {
     nonisolated(unsafe) static var lastRegionalPixelateBaseSizeForTesting: CGSize?
     /// Test hook: simulates destination-allocation failure.
     var forceRenderFailureForTesting = false
-    /// Test hook: regional pixelation must fail closed during export.
-    var forceRegionalPixelateFailureForTesting = false
+    /// Test hook kept for the S2 gates: it now drives the SHARED low-level
+    /// seam, so preview and export take the same fail-closed path production
+    /// would take if Core Image really failed.
+    var forceRegionalPixelateFailureForTesting: Bool {
+        get { AnnotationRenderer.forceRegionalPixelateFailureForTesting }
+        set { AnnotationRenderer.forceRegionalPixelateFailureForTesting = newValue }
+    }
 
     /// Slice B seam: lets a gate seed any annotation model (a text-mode
     /// redaction, a spotlight) through the real history path before the

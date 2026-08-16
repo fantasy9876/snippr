@@ -501,7 +501,26 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
             SaveService.shared.save(image, completion: done)
         }
         var pin: @MainActor (CapturedImage) -> Void = { PinWindow.pin($0) }
-        var recognize: @MainActor (CapturedImage, Bool) -> Void = { _, _ in }
+        /// Performs the ENTIRE recognize operation. Overriding it must replace
+        /// the work, not observe it — an observer plus a hardcoded call would
+        /// make a spy that counts zero prove nothing.
+        var recognize: @MainActor (CapturedImage, Bool) -> Void = {
+            image, autoTranslate in
+            Task {
+                let result = await OCRService.shared.recognize(image.cgImage)
+                await MainActor.run {
+                    let text = result.clipboardText
+                    if text.isEmpty {
+                        ToastHUD.show(
+                            "No text found", symbol: "text.magnifyingglass")
+                    } else {
+                        SaveService.copyText(text)
+                        TextResultWindow.show(
+                            text: text, autoTranslate: autoTranslate)
+                    }
+                }
+            }
+        }
 
         /// Explicit init: a nested struct of main-actor closures does not get a
         /// usable memberwise initializer, and gates need to override one field
@@ -579,18 +598,6 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
     private func recognizeText(autoTranslate: Bool) {
         guard let flat = flattenedOrWarn() else { return }
         terminalDependencies.recognize(flat, autoTranslate)
-        Task {
-            let result = await OCRService.shared.recognize(flat.cgImage)
-            await MainActor.run {
-                let text = result.clipboardText
-                if text.isEmpty {
-                    ToastHUD.show("No text found", symbol: "text.magnifyingglass")
-                } else {
-                    SaveService.copyText(text)
-                    TextResultWindow.show(text: text, autoTranslate: autoTranslate)
-                }
-            }
-        }
     }
 
     func escPressed() {
@@ -765,10 +772,13 @@ final class EditorCanvasView: NSView {
         CGPoint(x: (frame.minX + 2) * scale, y: (frame.minY + 4) * scale)
     }
 
-    /// Slice B seam: simulates a pixelation/render failure so the gates can
-    /// prove the editor fails CLOSED (no clean base on screen, no export, no
-    /// close) instead of quietly dropping the redaction.
-    nonisolated(unsafe) static var forcePixellateFailureForTesting = false
+    /// Slice B seam: drives the SHARED regional-pixelation failure so the
+    /// editor takes production's fail-closed path (no clean base on screen, no
+    /// export, no close) rather than a canvas-only shortcut.
+    static var forcePixellateFailureForTesting: Bool {
+        get { AnnotationRenderer.forceRegionalPixelateFailureForTesting }
+        set { AnnotationRenderer.forceRegionalPixelateFailureForTesting = newValue }
+    }
 
     private var pixellated: CGImage? {
         if Self.forcePixellateFailureForTesting { return nil }
@@ -833,9 +843,7 @@ final class EditorCanvasView: NSView {
             croppedBase = owned
         }
 
-        let injected = Self.forcePixellateFailureForTesting
-            && marks.contains { $0 is BlurAnnotation }
-        guard !injected, let cg = SliceBExport.checkedRender(
+        guard let cg = SliceBExport.checkedRender(
             base: base, annotations: marks, pixellated: nil,
             budgetBytes: SliceBExport.defaultBudgetBytes, pixelScale: pxScale)
         else { return nil }
@@ -875,24 +883,13 @@ final class EditorCanvasView: NSView {
         // pixelation, and an opaque cover when a redaction cannot render.
         var previewAnnotations = annotations
         if let drafting { previewAnnotations.append(drafting) }
-        if needsPixellated, Self.forcePixellateFailureForTesting {
-            let rects = previewAnnotations.compactMap { $0 as? BlurAnnotation }
-                .flatMap {
-                    SliceBRedaction.maskRects(
-                        state: $0.redactionState, rect: $0.rect)
-                }
-            for a in previewAnnotations where !(a is BlurAnnotation) {
-                a.draw(in: ctx, pixellated: nil)
-            }
-            SliceBCompositor.drawFailedRedaction(rects, in: ctx)
-        } else {
-            SliceBCompositor.draw(
-                previewAnnotations, in: ctx, base: image.cgImage,
-                visiblePixels: CGRect(
-                    x: 0, y: 0,
-                    width: image.cgImage.width, height: image.cgImage.height),
-                pixelScale: pxScale)
-        }
+        _ = needsPixellated
+        SliceBCompositor.draw(
+            previewAnnotations, in: ctx, base: image.cgImage,
+            visiblePixels: CGRect(
+                x: 0, y: 0,
+                width: image.cgImage.width, height: image.cgImage.height),
+            pixelScale: pxScale)
 
         if let sel = selected {
             drawSelectionChrome(around: sel.bounds, in: ctx)
@@ -1514,6 +1511,12 @@ final class EditorCanvasView: NSView {
         needsDisplay = true
     }
 
+    /// Puts a real value in the live text field so a fingerprint can prove a
+    /// failed export did not swallow or commit it.
+    func setPendingTextForTesting(_ value: String) {
+        textField?.stringValue = value
+    }
+
     func beginTextEditingForTesting(at pixel: CGPoint) {
         beginTextEditing(
             atViewPoint: CGPoint(x: pixel.x / pxScale, y: pixel.y / pxScale),
@@ -1527,22 +1530,56 @@ final class EditorCanvasView: NSView {
     }
 
     /// Everything a terminal action must leave untouched when export fails.
+    /// Deliberately deep: payload and ORDER of every mark, the identity of the
+    /// selected one, the exact crop, the pending text's value/frame/style, the
+    /// image's pixel hash and scale, and the full history/transient state.
     var documentFingerprintForTesting: String {
-        let marks = annotations.map {
-            "\(type(of: $0))@\($0.bounds.integral)"
-        }.joined(separator: ",")
-        let generations = annotations.compactMap { $0 as? BlurAnnotation }
-            .map { "\($0.redactionGeneration)/\($0.redactionState)" }
-            .joined(separator: ",")
+        func describe(_ a: Annotation) -> String {
+            var parts = [
+                "\(type(of: a))",
+                "b=\(a.bounds)",
+                "c=\(a.color.usingColorSpace(.sRGB).map { "\($0.redComponent),\($0.greenComponent),\($0.blueComponent)" } ?? "?")",
+                "w=\(a.strokeWidthPt)",
+            ]
+            switch a {
+            case let shape as ShapeAnnotation:
+                parts.append("s=\(shape.start) e=\(shape.end)")
+            case let text as TextAnnotation:
+                parts.append("t=\(text.text) o=\(text.origin) f=\(text.fontSizePt)")
+            case let counter as CounterAnnotation:
+                parts.append("n=\(counter.number) c=\(counter.center)")
+            case let pen as PenAnnotation:
+                parts.append("p=\(pen.points.count):\(pen.points.first.map { "\($0)" } ?? "-")")
+            case let blur as BlurAnnotation:
+                parts.append("r=\(blur.rect) st=\(blur.redactionState) g=\(blur.redactionGeneration)")
+            case let spot as SpotlightAnnotation:
+                parts.append("r=\(spot.rect) d=\(spot.dimFraction) bb=\(spot.baseBounds)")
+            case let mag as MagnifierAnnotation:
+                parts.append("src=\(mag.sourceRect) out=\(mag.calloutRect) snap=\(mag.snapshot != nil)")
+            default:
+                break
+            }
+            return parts.joined(separator: " ")
+        }
+        let marks = annotations.map(describe).joined(separator: " || ")
+        let selectedIndex = selected.flatMap { sel in
+            annotations.firstIndex { $0 === sel }
+        }
+        let pendingText = textField.map {
+            "value=\($0.stringValue) frame=\($0.frame) font=\($0.font?.pointSize ?? -1)"
+        } ?? "none"
         return [
-            "size=\(image.cgImage.width)x\(image.cgImage.height)",
+            "px=\(SelfTest.imageHashForTesting(image.cgImage))",
+            "size=\(image.cgImage.width)x\(image.cgImage.height)@\(image.scale)",
             "tool=\(currentTool.rawValue)",
-            "crop=\(cropRect.map { "\($0.integral)" } ?? "nil")",
-            "text=\(textField != nil)",
-            "sel=\(selected.map { "\(type(of: $0))" } ?? "nil")",
+            "crop=\(cropRect.map { "\($0)" } ?? "nil")",
+            "cropValid=\(hasValidCropSelection)",
+            "text=[\(pendingText)]",
+            "selIdx=\(selectedIndex.map(String.init) ?? "nil")",
             "undo=\(undoManager?.canUndo == true)",
+            "redo=\(undoManager?.canRedo == true)",
+            "transient=\(transientKindForTesting ?? "none")",
             "marks=[\(marks)]",
-            "gen=[\(generations)]",
         ].joined(separator: " ")
     }
 

@@ -8491,28 +8491,23 @@ enum SelfTest {
             //    Dependencies are injected and COUNTED: "nothing exported" is
             //    proven per dependency, not inferred from the clipboard.
             final class TerminalSpy {
-                var copies = 0, saveAs = 0, autoSaves = 0, pins = 0, ocr = 0
-                var total: Int { copies + saveAs + autoSaves + pins + ocr }
+                var copies = 0, saveAs = 0, autoSaves = 0, pins = 0
+                var ocr = 0, translate = 0
+                var total: Int {
+                    copies + saveAs + autoSaves + pins + ocr + translate
+                }
                 var description: String {
-                    "copy=\(copies) saveAs=\(saveAs) autoSave=\(autoSaves) pin=\(pins) ocr=\(ocr)"
+                    "copy=\(copies) saveAs=\(saveAs) autoSave=\(autoSaves) pin=\(pins) ocr=\(ocr) tr=\(translate)"
                 }
             }
             let termBase = makeNoiseImage(width: 200, height: 160)
             var termFailures: [String] = []
-            let actions: [(String, (EditorWindowController) -> Void)] = [
-                ("copy", { $0.copyImage() }),
-                ("save", { $0.saveImage() }),
-                ("saveAs", { $0.saveImageAs() }),
-                ("pin", { $0.pinImage() }),
-                ("ocr", { $0.runOCR() }),
-                ("translate", { $0.runTranslate() }),
-                ("esc", { $0.escPressed() }),
-            ]
             let escCopyBefore = Settings.shared.escCopy
             let escSaveBefore = Settings.shared.escSave
-            func seedEditor(
-                _ spy: TerminalSpy
-            ) -> (EditorWindowController, EditorCanvasView, BlurAnnotation) {
+
+            func makeSpiedEditor(
+                _ spy: TerminalSpy, seedEditing: Bool
+            ) -> (EditorWindowController, EditorCanvasView) {
                 let wc = EditorWindowController.open(
                     with: CapturedImage(cgImage: termBase, scale: 1),
                     forceFitForTesting: true)
@@ -8525,7 +8520,9 @@ enum SelfTest {
                             done(nil)
                         },
                         pin: { _ in spy.pins += 1 },
-                        recognize: { _, _ in spy.ocr += 1 })
+                        recognize: { _, translate in
+                            if translate { spy.translate += 1 } else { spy.ocr += 1 }
+                        })
                 let canvas = wc.canvasForTesting
                 let blur = BlurAnnotation(uiScale: 1)
                 blur.rect = CGRect(x: 20, y: 20, width: 60, height: 40)
@@ -8534,45 +8531,75 @@ enum SelfTest {
                     end: CGPoint(x: 150, y: 150), uiScale: 1)
                 canvas.annotations = [blur, arrow]
                 canvas.selectForTesting(arrow)
-                wc.selectTool(.crop)
-                canvas.setCropSelectionForTesting(
-                    CGRect(x: 10, y: 10, width: 80, height: 60))
-                canvas.beginTextEditingForTesting(at: CGPoint(x: 40, y: 120))
-                return (wc, canvas, blur)
+                if seedEditing {
+                    wc.selectTool(.crop)
+                    canvas.setCropSelectionForTesting(
+                        CGRect(x: 10, y: 10, width: 80, height: 60))
+                    canvas.beginTextEditingForTesting(at: CGPoint(x: 40, y: 120))
+                    canvas.setPendingTextForTesting("pending value")
+                }
+                return (wc, canvas)
             }
-            for (name, action) in actions {
-                // esc exercises copy+save together, the worst case
-                Settings.shared.escCopy = true
-                Settings.shared.escSave = true
+
+            /// Esc goes through the REAL key path, not a direct call.
+            func pressEscape(_ wc: EditorWindowController) {
+                let canvas = wc.canvasForTesting
+                guard let event = NSEvent.keyEvent(
+                    with: .keyDown, location: .zero, modifierFlags: [],
+                    timestamp: 0, windowNumber: wc.window?.windowNumber ?? 0,
+                    context: nil, characters: "\u{1b}",
+                    charactersIgnoringModifiers: "\u{1b}", isARepeat: false,
+                    keyCode: 53)
+                else { return }
+                canvas.keyDown(with: event)
+            }
+
+            let routes: [(String, Bool, Bool, (EditorWindowController) -> Void,
+                          (TerminalSpy) -> Int)] = [
+                ("copy", false, false, { $0.copyImage() }, { $0.copies }),
+                ("save", false, false, { $0.saveImage() }, { $0.saveAs }),
+                ("saveAs", false, false, { $0.saveImageAs() }, { $0.saveAs }),
+                ("pin", false, false, { $0.pinImage() }, { $0.pins }),
+                ("ocr", false, false, { $0.runOCR() }, { $0.ocr }),
+                ("translate", false, false, { $0.runTranslate() }, { $0.translate }),
+                ("esc-copy", true, false, pressEscape, { $0.copies }),
+                ("esc-save", false, true, pressEscape, { $0.autoSaves }),
+                ("esc-both", true, true, pressEscape, { $0.copies }),
+            ]
+            for (name, escCopy, escSave, action, counter) in routes {
+                Settings.shared.escCopy = escCopy
+                Settings.shared.escSave = escSave
+                // Esc must be exercised on a canvas with no active text/crop:
+                // those are separate cancel routes, not terminal actions.
+                let seedEditing = !name.hasPrefix("esc")
                 let spy = TerminalSpy()
-                let (wc, canvas, _) = seedEditor(spy)
+                let (wc, canvas) = makeSpiedEditor(spy, seedEditing: seedEditing)
                 let before = canvas.documentFingerprintForTesting
-                let beforePixels = imageHashForTesting(canvas.image.cgImage)
-                EditorCanvasView.forcePixellateFailureForTesting = true
+                AnnotationRenderer.forceRegionalPixelateFailureForTesting = true
                 action(wc)
-                EditorCanvasView.forcePixellateFailureForTesting = false
+                AnnotationRenderer.forceRegionalPixelateFailureForTesting = false
                 if spy.total != 0 {
                     termFailures.append(name + ":deps " + spy.description)
                 }
-                if wc.window?.isVisible != true { termFailures.append(name + ":closed") }
-                if canvas.documentFingerprintForTesting != before {
-                    termFailures.append(
-                        name + ":state " + canvas.documentFingerprintForTesting)
+                if wc.window?.isVisible != true {
+                    termFailures.append(name + ":closed")
                 }
-                if imageHashForTesting(canvas.image.cgImage) != beforePixels {
-                    termFailures.append(name + ":pixels")
+                if canvas.documentFingerprintForTesting != before {
+                    termFailures.append(name + ":state")
                 }
                 wc.window?.close()
+
+                // Healthy positive for the SAME route: the dependency must fire
+                // exactly once, so a zero above means blocked, not unwired.
+                let liveSpy = TerminalSpy()
+                let (liveWC, _) = makeSpiedEditor(liveSpy, seedEditing: false)
+                action(liveWC)
+                if counter(liveSpy) != 1 {
+                    termFailures.append(
+                        name + ":live " + liveSpy.description)
+                }
+                liveWC.window?.close()
             }
-            // Non-vacuous: with rendering healthy the same route DOES call its
-            // dependency, so a zero above means "blocked", not "never wired".
-            let liveSpy = TerminalSpy()
-            let (liveWC, _, _) = seedEditor(liveSpy)
-            liveWC.copyImage()
-            if liveSpy.copies != 1 {
-                termFailures.append("live-copy:" + liveSpy.description)
-            }
-            liveWC.window?.close()
             Settings.shared.escCopy = escCopyBefore
             Settings.shared.escSave = escSaveBefore
             check("sliceB-terminal-actions-transactional",
@@ -8726,8 +8753,10 @@ enum SelfTest {
                   newCovered && !oldCovered,
                   "new \(newCovered) old \(oldCovered) state \(glyphBlur.redactionState)")
 
-            // E. Partial OCR mapping is fail-closed; duplicates map to their
-            //    own occurrence.
+            // E. Duplicates map to their OWN occurrence: "mail mail 42" must
+            //    come back as exactly three boxes, left to right, with the two
+            //    "mail" boxes at different x. A first-occurrence bug would put
+            //    them on top of each other.
             let dupCtx = ctx(320, 120)
             dupCtx.setFillColor(NSColor.white.cgColor)
             dupCtx.fill(CGRect(x: 0, y: 0, width: 320, height: 120))
@@ -8743,22 +8772,20 @@ enum SelfTest {
             NSGraphicsContext.restoreGraphicsState()
             let dupImage = dupCtx.makeImage()!
             let dupWords = SliceBOCR.wordRects(
-                base: dupImage, region: CGRect(x: 10, y: 30, width: 300, height: 60))
-            let distinctX = Set(dupWords.map { Int($0.minX / 5) }).count
-            let dupOK = dupWords.count >= 2 && distinctX >= 2
-            let partial = MainActor.assumeIsolated { () -> RedactionState in
-                SliceBOCR.recognizerForTesting = { _ in .success([]) }
-                defer { SliceBOCR.recognizerForTesting = nil }
-                let blur = BlurAnnotation(uiScale: 1)
-                blur.rect = CGRect(x: 10, y: 10, width: 60, height: 30)
-                let job = SliceBRedactionJob.pendingForTesting(blur: blur)
-                job.deliver(SliceBOCR.wordRects(
-                    base: dupImage, region: blur.rect))
-                return blur.redactionState
-            }
-            check("sliceB-ocr-partial-failclosed",
-                  dupOK && partial == .fallbackFull,
-                  "dupWords \(dupWords.count) distinct \(distinctX) partial \(partial)")
+                base: dupImage,
+                region: CGRect(x: 10, y: 30, width: 300, height: 60))
+            let ordered = dupWords.sorted { $0.minX < $1.minX }
+            let threeOrdered = dupWords.count == 3
+                && ordered == dupWords
+                && ordered[0].maxX <= ordered[1].minX + 2
+                && ordered[1].maxX <= ordered[2].minX + 2
+                && abs(ordered[0].width - ordered[1].width) < 6
+            // Second occurrence must NOT be the first one repeated.
+            let distinctOccurrences = dupWords.count == 3
+                && ordered[1].minX - ordered[0].minX > 10
+            check("sliceB-ocr-duplicate-words",
+                  threeOrdered && distinctOccurrences,
+                  "boxes \(dupWords.map { Int($0.minX) }) count \(dupWords.count)")
 
             // E2. All-or-nothing matrix, driven through the REAL policy
             //     (SliceBOCR.resolve) with injected confidences and a forced
@@ -9019,6 +9046,53 @@ enum SelfTest {
             check("sliceB-preview-grid-allocation",
                   gridFailures.isEmpty,
                   gridFailures.prefix(6).joined(separator: " | "))
+
+            // E5. The surface's own job registry empties itself on every
+            //     terminal path, and the surface can then deallocate.
+            var registryFailures: [String] = []
+            weak var weakSurface: AnnotationSurface?
+            let registryBase = makeSolidImage(
+                width: 90, height: 70, color: NSColor.white.cgColor)
+            MainActor.assumeIsolated {
+                var surface: AnnotationSurface? = AnnotationSurface(pixelScale: 1)
+                weakSurface = surface
+                let blur = BlurAnnotation(uiScale: 1)
+                blur.rect = CGRect(x: 5, y: 5, width: 40, height: 25)
+                surface?.addAnnotationForTesting(blur)
+                // completion path
+                if let job = SliceBRedactionJob.pendingForTesting(
+                    blur: blur, host: surface) as SliceBRedactionJob? {
+                    surface?.registerRedactionJob(job, for: blur)
+                    if surface?.redactionJobCountForTesting != 1 {
+                        registryFailures.append("register")
+                    }
+                    job.deliver([CGRect(x: 8, y: 8, width: 20, height: 12)])
+                    if surface?.redactionJobCountForTesting != 0 {
+                        registryFailures.append("complete-not-removed")
+                    }
+                }
+                // cancel path
+                let second = SliceBRedactionJob.pendingForTesting(
+                    blur: blur, host: surface)
+                surface?.registerRedactionJob(second, for: blur)
+                second.cancel()
+                if surface?.redactionJobCountForTesting != 0 {
+                    registryFailures.append("cancel-not-removed")
+                }
+                // cancelAll sweeps whatever is left
+                let third = SliceBRedactionJob.pendingForTesting(
+                    blur: blur, host: surface)
+                surface?.registerRedactionJob(third, for: blur)
+                surface?.cancelAllRedactionJobs()
+                if surface?.redactionJobCountForTesting != 0 {
+                    registryFailures.append("cancelAll-not-removed")
+                }
+                surface = nil
+            }
+            if weakSurface != nil { registryFailures.append("surface-retained") }
+            check("sliceB-surface-registry",
+                  registryFailures.isEmpty,
+                  registryFailures.joined(separator: " | "))
 
             // F. Tall images never allocate a full-size pixelated intermediate,
             //    in the editor or in a magnifier patch.
