@@ -11393,6 +11393,105 @@ enum SelfTest {
                 }
             }
             runWheelGate()
+            // M. The panel's canvas must not double as a window-drag handle
+            //    — asked through the WINDOW, since calling the host's mouse
+            //    methods directly is exactly what hid this.
+            var dispatchFailures: [String] = []
+            let runWindowDispatch = {
+                guard let screen = NSScreen.screens.first else {
+                    dispatchFailures.append("no-screen")
+                    return
+                }
+                let panel = ScrollResultPanel.show(
+                    image: CapturedImage(
+                        cgImage: makeSolidImage(
+                            width: 600, height: 400,
+                            color: NSColor.white.cgColor),
+                        scale: 1),
+                    inputs: OverlaySessionInputs(
+                        afterShow: true, afterCopy: false, afterSave: false),
+                    screen: screen,
+                    dependencies: CaptureActionRouter.Dependencies(
+                        copyToClipboard: { _ in }, autoSave: { _, _ in },
+                        saveAs: { _, _ in }, pin: { _ in }, ocr: { _ in },
+                        openEditor: { _ in }, toast: { _ in },
+                        setLastCapture: { _ in }, setLastAreaRect: { _ in },
+                        logEvent: { _ in }))
+                defer {
+                    if panel.isVisible || ScrollResultPanel.current === panel {
+                        panel.dismissForTesting()
+                    }
+                }
+                guard let host = panel.annotationHostForTesting,
+                      let content = panel.contentView else {
+                    dispatchFailures.append("no-host")
+                    return
+                }
+                let surface = panel.annotationSurface
+                let centre = CGPoint(x: host.bounds.midX, y: host.bounds.midY)
+                let inContent = host.convert(centre, to: content)
+                func send(_ type: NSEvent.EventType, _ p: CGPoint) {
+                    guard let event = NSEvent.mouseEvent(
+                        with: type, location: p, modifierFlags: [],
+                        timestamp: 0, windowNumber: panel.windowNumber,
+                        context: nil, eventNumber: 0, clickCount: 1,
+                        pressure: 1) else { return }
+                    // Through the window, not into the view: the window is
+                    // where background-dragging is decided.
+                    panel.sendEvent(event)
+                }
+
+                // --- Pen: the canvas owns the gesture
+                panel.clickToolbarButtonForTesting(
+                    tag: OverlayAnnotationTool.pen.toolbarTag)
+                if surface.tool != .pen {
+                    dispatchFailures.append("pen:tool \(surface.tool)")
+                }
+                if content.hitTest(inContent) !== host {
+                    dispatchFailures.append("pen:hit")
+                }
+                if host.mouseDownCanMoveWindow {
+                    dispatchFailures.append("pen:drag-handle")
+                }
+                let frameBefore = panel.frame
+                let marksBefore = surface.annotations.count
+                send(.leftMouseDown, inContent)
+                send(.leftMouseDragged,
+                     CGPoint(x: inContent.x + 60, y: inContent.y + 40))
+                send(.leftMouseUp,
+                     CGPoint(x: inContent.x + 60, y: inContent.y + 40))
+                if surface.annotations.count != marksBefore + 1 {
+                    dispatchFailures.append(
+                        "pen:no-mark \(surface.annotations.count)")
+                }
+                if panel.frame != frameBefore {
+                    dispatchFailures.append("pen:window-moved \(panel.frame)")
+                }
+
+                // --- Select: the gesture belongs to whatever is underneath,
+                //     and that view must actually be draggable. `hitTest`
+                //     returning nil for the host proves nothing on its own —
+                //     the next responder down may be an image view with its
+                //     own answer.
+                panel.clickToolbarButtonForTesting(
+                    tag: OverlayAnnotationTool.select.toolbarTag)
+                if surface.tool != .select {
+                    dispatchFailures.append("select:tool \(surface.tool)")
+                }
+                let selectHit = content.hitTest(inContent)
+                if selectHit === host {
+                    dispatchFailures.append("select:still-host")
+                } else if selectHit?.mouseDownCanMoveWindow != true {
+                    dispatchFailures.append(
+                        "select:not-draggable "
+                        + "\(String(describing: type(of: selectHit)))")
+                }
+            }
+            runWindowDispatch()
+            check("sliceB-panel-window-dispatch",
+                  dispatchFailures.isEmpty,
+                  dispatchFailures.joined(separator: " | "))
+
             check("sliceB-wheel-blocked-mid-drag",
                   wheelFailures.isEmpty, wheelFailures.joined(separator: " | "))
 
