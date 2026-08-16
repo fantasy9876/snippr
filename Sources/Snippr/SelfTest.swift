@@ -9109,11 +9109,10 @@ enum SelfTest {
                 }.messages
                 let redactionToast =
                     "Couldn't render the redaction — nothing was exported"
-                // esc-both attempts two exports, so it reports twice; every
-                // other route reports exactly once and says only this.
-                let expectedInner = name == "esc-both" ? 2 : 1
-                if innerToasts != Array(
-                    repeating: redactionToast, count: expectedInner) {
+                // EXACTLY once, for every route including esc-both: that path
+                // flattens a single time and shares the snapshot between copy
+                // and save, so one failure is one report.
+                if innerToasts != [redactionToast] {
                     termFailures.append(name + ":toast\(innerToasts)")
                 }
                 if vector(spy) != zeroVector {
@@ -9218,15 +9217,13 @@ enum SelfTest {
                     || canvas.editingTextRefForTesting !== beforeEditing {
                     outerFailures.append(name + ":identity")
                 }
-                // EXACTLY the backdrop message, exactly as often as an export
-                // was attempted. "Contains backdrop" would also accept the
-                // redaction text with a word appended, and a last-message-only
-                // check would hide a wrong first toast.
+                // EXACTLY the backdrop message, exactly once. "Contains
+                // backdrop" would also accept the redaction text with a word
+                // appended, and a last-message-only check would hide a wrong
+                // first toast. esc-both flattens once too, so it reports once.
                 let backdropToast =
                     "Couldn't render the backdrop — nothing was exported"
-                let expectedOuter = name == "esc-both" ? 2 : 1
-                if outerToasts != Array(
-                    repeating: backdropToast, count: expectedOuter) {
+                if outerToasts != [backdropToast] {
                     outerFailures.append(name + ":toast\(outerToasts)")
                 }
                 if pending.redactionGeneration != pendingGeneration
