@@ -9512,12 +9512,18 @@ enum SelfTest {
                         setLastCapture: { _ in deps["setLastCapture"]! += 1 },
                         setLastAreaRect: { _ in deps["setLastAreaRect"]! += 1 },
                         logEvent: { _ in deps["logEvent"]! += 1 }),
-                    completion: { _ in }),
-                      let view = overlay.activeReviewViewForTesting else {
+                    completion: { _ in }) else {
                     hostFailures.append("area:no-overlay")
                     return
                 }
+                // Placed BEFORE the view lookup: binding both in one guard let
+                // the failure path return with the overlay and its window
+                // still alive as SelectionOverlay.current.
                 defer { overlay.dismissForTesting() }
+                guard let view = overlay.activeReviewViewForTesting else {
+                    hostFailures.append("area:no-review-view")
+                    return
+                }
                 // Window ownership is real, and the assumptions the scan makes
                 // about geometry actually hold.
                 if view.window == nil { hostFailures.append("area:no-window") }
@@ -10592,8 +10598,7 @@ enum SelfTest {
                             openEditor: { _ in }, toast: { _ in },
                             setLastCapture: { _ in },
                             setLastAreaRect: { _ in }, logEvent: { _ in }),
-                        completion: { _ in }),
-                          let view = overlay.activeReviewViewForTesting else {
+                        completion: { _ in }) else {
                         lifecycleFailures.append("area:no-overlay")
                         return
                     }
@@ -10602,6 +10607,10 @@ enum SelfTest {
                     // `current` and poisons every later gate.
                     var areaTornDown = false
                     defer { if !areaTornDown { overlay.dismissForTesting() } }
+                    guard let view = overlay.activeReviewViewForTesting else {
+                        lifecycleFailures.append("area:no-review-view")
+                        return
+                    }
                     view.selectForTesting(
                         rect: CGRect(x: 20, y: 20, width: 200, height: 140))
                     view.clickReviewToolbarButtonForTesting(
