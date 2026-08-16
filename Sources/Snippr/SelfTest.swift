@@ -11038,6 +11038,17 @@ enum SelfTest {
                 creatingView.annotationDragForTesting(
                     from: CGPoint(x: 40, y: 40), to: CGPoint(x: 160, y: 140)
                 ) {
+                    // The state this probe assumes: still selecting, no
+                    // surface, a crop under way. Without it, a mouse-down that
+                    // regressed into `finish` would also consume the wheel and
+                    // the responder oracle would pass for the wrong reason.
+                    if creatingOverlay.session.phase != .selecting
+                        || creatingView.annotationSurface != nil
+                        || !creatingView.hasAreaSelectionForTesting {
+                        wheelFailures.append(
+                            "area:creating-state "
+                            + "\(creatingOverlay.session.phase)")
+                    }
                     for precise in [false, true] {
                         if let event = wheel(
                             creatingView, deltaY: 3, precise: precise) {
@@ -11076,21 +11087,25 @@ enum SelfTest {
                     return
                 }
                 surface.tool = .pen
-                // Prime the accumulator so the precise branch is not starting
-                // from zero: implementation RESETS it on the blocked path, so
-                // "unchanged" would be the wrong claim and a precise scroll
-                // from zero writes nothing even without the guard.
-                if let event = wheel(view, deltaY: 1, precise: true) {
+                // The precise branch accumulates to 18 before it steps, and
+                // the blocked path RESETS the accumulator. Half the threshold
+                // is primed here so the sequence after the drag can tell a
+                // reset from a mere block: 9 idle, 9 blocked, then 9 must
+                // still be short, and only the next 9 may write.
+                if let event = wheel(view, deltaY: 9, precise: true) {
                     view.scrollWheel(with: event)
                 }
                 let primedWrites = writes.count
+                if primedWrites != 0 {
+                    wheelFailures.append("area:prime-wrote \(primedWrites)")
+                }
                 var midDragWrites = 0
                 view.annotationDragForTesting(
                     from: CGPoint(x: 100, y: 100),
                     to: CGPoint(x: 180, y: 160)
                 ) {
                     for precise in [false, true] {
-                        if let event = wheel(view, deltaY: 3, precise: precise) {
+                        if let event = wheel(view, deltaY: 9, precise: precise) {
                             view.scrollWheel(with: event)
                         }
                     }
@@ -11109,23 +11124,32 @@ enum SelfTest {
                         "area:width \(drawnPen?.strokeWidthPt ?? -1)")
                 }
                 // POSITIVE CONTROL: the same wheel, once the drag is over.
-                let beforeControl = writes.count
-                // Line first, then enough precise delta to cross the step
-                // threshold: both branches must work again after the drag.
+                // Precise first, while the accumulator still carries whatever
+                // the blocked path left: one 9 must be short of the threshold
+                // — which is only true if the block RESET it — and the next 9
+                // must write exactly once.
+                var beforeControl = writes.count
+                if let event = wheel(view, deltaY: 9, precise: true) {
+                    view.scrollWheel(with: event)
+                }
+                if writes.count != beforeControl {
+                    wheelFailures.append("area:accumulator-not-reset")
+                }
+                if let event = wheel(view, deltaY: 9, precise: true) {
+                    view.scrollWheel(with: event)
+                }
+                if writes.count != beforeControl + 1 {
+                    wheelFailures.append(
+                        "area:precise-control \(writes.count - beforeControl)")
+                }
+                // The line branch on its own, so it cannot disturb the state
+                // the precise sequence depends on.
+                beforeControl = writes.count
                 if let event = wheel(view, deltaY: 3, precise: false) {
                     view.scrollWheel(with: event)
                 }
-                if writes.count == beforeControl {
+                if writes.count != beforeControl + 1 {
                     wheelFailures.append("area:control")
-                }
-                let beforePreciseControl = writes.count
-                for _ in 0..<12 {
-                    if let event = wheel(view, deltaY: 3, precise: true) {
-                        view.scrollWheel(with: event)
-                    }
-                }
-                if writes.count == beforePreciseControl {
-                    wheelFailures.append("area:precise-control")
                 }
                 overlay.finish(.cancelled)
 
@@ -11158,14 +11182,20 @@ enum SelfTest {
                 if host.mouseDownCanMoveWindow {
                     wheelFailures.append("panel:drag-handle")
                 }
+                if let event = wheel(host, deltaY: 9, precise: true) {
+                    host.scrollWheel(with: event)
+                }
                 var panelMidWrites = 0
                 let panelBeforeDrag = writes.count
+                if panelBeforeDrag != writes.count {
+                    wheelFailures.append("panel:prime-wrote")
+                }
                 panel.drawWithRealEventsForTesting(
                     fromView: CGPoint(x: 60, y: 60),
                     toView: CGPoint(x: 160, y: 140)
                 ) {
                     for precise in [false, true] {
-                        if let event = wheel(host, deltaY: 3, precise: precise) {
+                        if let event = wheel(host, deltaY: 9, precise: precise) {
                             host.scrollWheel(with: event)
                         }
                     }
@@ -11181,11 +11211,26 @@ enum SelfTest {
                 if panelPen == nil {
                     wheelFailures.append("panel:no-stroke")
                 }
-                let beforePanelControl = writes.count
+                var beforePanelControl = writes.count
+                if let event = wheel(host, deltaY: 9, precise: true) {
+                    host.scrollWheel(with: event)
+                }
+                if writes.count != beforePanelControl {
+                    wheelFailures.append("panel:accumulator-not-reset")
+                }
+                if let event = wheel(host, deltaY: 9, precise: true) {
+                    host.scrollWheel(with: event)
+                }
+                if writes.count != beforePanelControl + 1 {
+                    wheelFailures.append(
+                        "panel:precise-control "
+                        + "\(writes.count - beforePanelControl)")
+                }
+                beforePanelControl = writes.count
                 if let event = wheel(host, deltaY: 3, precise: false) {
                     host.scrollWheel(with: event)
                 }
-                if writes.count == beforePanelControl {
+                if writes.count != beforePanelControl + 1 {
                     wheelFailures.append("panel:control")
                 }
                 if panel.isVisible || ScrollResultPanel.current === panel {
