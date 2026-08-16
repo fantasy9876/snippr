@@ -9512,6 +9512,20 @@ enum SelfTest {
                 surface.addAnnotationForTesting(blur)
 
                 // -- forced failure through the REAL action wrapper
+                // Baseline of the LIVE reviewing view, captured before any
+                // action: comparing after the healthy copy would compare
+                // against a completed session.
+                view.needsDisplay = true
+                view.display()
+                let baselineShot: CGImage? = view
+                    .bitmapImageRepForCachingDisplay(in: view.bounds)
+                    .flatMap { rep -> CGImage? in
+                        view.cacheDisplay(in: view.bounds, to: rep)
+                        return rep.cgImage
+                    }
+                if baselineShot == nil {
+                    hostFailures.append("area:no-baseline")
+                }
                 let toastsBeforeFail = toasts
                 let (_, failEvents) = RenderTrace.capture(
                     host: "area", path: "export"
@@ -9703,6 +9717,7 @@ enum SelfTest {
                 }
                 let backing = CGFloat(viewShot.width) / view.bounds.width
                 let viewBytes = rgba(viewShot)
+                let baseBytes = baselineShot.map { rgba($0) }
                 let cover: [UInt8] = [31, 31, 31, 255]
                 var uncovered = 0
                 var bleeding = 0
@@ -9715,10 +9730,13 @@ enum SelfTest {
                         let value = Array(viewBytes[i..<(i + 4)])
                         if hostMask.insetBy(dx: 1, dy: 1).contains(point) {
                             if value != cover { uncovered += 1 }
-                        } else if !hostMask.insetBy(dx: -2, dy: -2).contains(point),
-                                  value == cover {
-                            // the opaque cover must not extend past the mask
-                            bleeding += 1
+                        } else if !hostMask.insetBy(dx: -2, dy: -2).contains(point) {
+                            // Outside the mask the view must be byte-identical
+                            // to the baseline taken moments earlier.
+                            if let baseBytes,
+                               Array(baseBytes[i..<(i + 4)]) != value {
+                                bleeding += 1
+                            }
                         }
                     }
                 }
@@ -9726,7 +9744,7 @@ enum SelfTest {
                     hostFailures.append("area:view-uncovered \(uncovered)")
                 }
                 if bleeding != 0 {
-                    hostFailures.append("area:view-bleed \(bleeding)")
+                    hostFailures.append("area:view-outside-changed \(bleeding)")
                 }
             }
             check("sliceB-hosts-failclosed",
@@ -10140,11 +10158,18 @@ enum SelfTest {
                     }
                     if holes != 0 { panelFailures.append("panel:holes \(holes)") }
                 }
+                // A blocked export must not latch the panel: a healthy action
+                // right after has to go through.
+                panel.performActionForTesting(.copy)
+                if panelExport == nil {
+                    panelFailures.append("panel:latched-after-fail")
+                }
                 // Production teardown, not just ordering the window out.
                 panel.dismissForTesting()
                 if ScrollResultPanel.current != nil {
                     panelFailures.append("panel:current-leak")
                 }
+                if panel.isVisible { panelFailures.append("panel:still-visible") }
             }
             check("sliceB-scroll-host-failclosed",
                   panelFailures.isEmpty,
@@ -10234,10 +10259,78 @@ enum SelfTest {
                     lifecycleFailures.append("editor:owner-leak")
                 }
             }
-            if overlayTextTool != nil {
-                // The area overlay and the scroll panel must route the tool the
-                // same way; catalogue presence is not wiring.
-                lifecycleFailures.append("area-scroll:not-driven")
+            // Area and scroll are DRIVEN when the tool exists, so a correct
+            // GREEN2 turns this gate green instead of tripping on a hard-coded
+            // failure. Only the absence of wiring keeps it red.
+            if let overlayTextTool {
+                MainActor.assumeIsolated {
+                    let frozen = CapturedImage(
+                        cgImage: makeNoiseImage(width: 240, height: 180),
+                        scale: 1)
+                    let overlay = SelectionOverlay(
+                        purpose: .areaReview,
+                        inputs: OverlaySessionInputs(
+                            afterShow: true, afterCopy: false, afterSave: false),
+                        completion: { _ in })
+                    overlay.routerDependenciesOverride =
+                        CaptureActionRouter.Dependencies(
+                            copyToClipboard: { _ in }, autoSave: { _, _ in },
+                            saveAs: { _, _ in }, pin: { _ in }, ocr: { _ in },
+                            openEditor: { _ in }, toast: { _ in },
+                            setLastCapture: { _ in },
+                            setLastAreaRect: { _ in }, logEvent: { _ in })
+                    let view = SelectionOverlayView(
+                        mode: .area, screen: hostScreen, frozen: frozen,
+                        windowList: [], owner: overlay)
+                    view.selectForTesting(
+                        rect: CGRect(x: 20, y: 20, width: 200, height: 140))
+                    view.clickReviewToolbarButtonForTesting(
+                        tag: overlayTextTool.toolbarTag)
+                    view.annotationDragForTesting(
+                        from: CGPoint(x: 40, y: 40), to: CGPoint(x: 110, y: 90))
+                    guard let blur = view.annotationSurface?.annotations
+                        .compactMap({ $0 as? BlurAnnotation }).last else {
+                        lifecycleFailures.append("area:no-redaction")
+                        return
+                    }
+                    if blur.redactionState != .pendingFull {
+                        lifecycleFailures.append(
+                            "area:not-pending \(blur.redactionState)")
+                    }
+                    if view.annotationSurface?.redactionJobCountForTesting != 1 {
+                        lifecycleFailures.append("area:not-registered")
+                    }
+                    view.annotationSurface?.cancelAllRedactionJobs()
+                }
+                MainActor.assumeIsolated {
+                    let panel = ScrollResultPanel.show(
+                        image: CapturedImage(
+                            cgImage: makeNoiseImage(width: 200, height: 400),
+                            scale: 1),
+                        inputs: OverlaySessionInputs(
+                            afterShow: true, afterCopy: false, afterSave: false),
+                        screen: hostScreen)
+                    panel.clickToolbarButtonForTesting(
+                        tag: overlayTextTool.toolbarTag)
+                    panel.drawWithRealEventsForTesting(
+                        fromView: CGPoint(x: 30, y: 40),
+                        toView: CGPoint(x: 90, y: 90))
+                    if let blur = panel.annotationSurface.annotations
+                        .compactMap({ $0 as? BlurAnnotation }).last {
+                        if blur.redactionState != .pendingFull {
+                            lifecycleFailures.append(
+                                "scroll:not-pending \(blur.redactionState)")
+                        }
+                        if panel.annotationSurface
+                            .redactionJobCountForTesting != 1 {
+                            lifecycleFailures.append("scroll:not-registered")
+                        }
+                    } else {
+                        lifecycleFailures.append("scroll:no-redaction")
+                    }
+                    panel.annotationSurface.cancelAllRedactionJobs()
+                    panel.dismissForTesting()
+                }
             }
             check("sliceB-text-redaction-lifecycle-wiring",
                   lifecycleFailures.isEmpty,

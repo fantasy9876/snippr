@@ -405,6 +405,20 @@ final class SelectionOverlayView: NSView {
     var reviewToolbarButtonFramesForTesting: [CGRect] {
         toolbarButtons.map { $0.convert($0.bounds, to: self) }
     }
+    /// Drives a real drag through the production mouse handlers of this view,
+    /// so a gate can create an annotation the way a user does.
+    func annotationDragForTesting(from a: CGPoint, to b: CGPoint) {
+        func event(_ type: NSEvent.EventType, _ p: CGPoint) -> NSEvent? {
+            NSEvent.mouseEvent(
+                with: type, location: convert(p, to: nil), modifierFlags: [],
+                timestamp: 0, windowNumber: window?.windowNumber ?? 0,
+                context: nil, eventNumber: 0, clickCount: 1, pressure: 1)
+        }
+        if let down = event(.leftMouseDown, a) { mouseDown(with: down) }
+        if let drag = event(.leftMouseDragged, b) { mouseDragged(with: drag) }
+        if let up = event(.leftMouseUp, b) { mouseUp(with: up) }
+    }
+
     func clickReviewToolbarButtonForTesting(tag: Int) {
         toolbarButtons.first { $0.tag == tag }?.performClick(nil)
     }
