@@ -23,7 +23,16 @@ enum UpdateChecker {
     /// tampered manifest from pointing the downloader at an arbitrary origin.
     nonisolated static let allowedDownloadHost = "snippr.pages.dev"
     nonisolated static let installerExitWaitSeconds = 15
-    nonisolated static let installerHealthWaitSeconds = 10
+    // A canonical launch may spend up to 15 seconds evicting a stale,
+    // non-canonical Snippr (12 seconds graceful so an in-flight save can
+    // finish, then 3 seconds to force/verify). The installer must keep its
+    // rollback journal until that arbitration and normal startup complete.
+    nonisolated static let installerHealthWaitSeconds = 25
+    // A post-activation failure must never move the old bundle back under a
+    // still-running candidate. Give that exact executable the same graceful
+    // save window as normal instance arbitration, then force and verify.
+    nonisolated static let installerCandidateStopGraceSeconds = 12
+    nonisolated static let installerCandidateStopForceSeconds = 3
 
     /// Public fingerprint of the one release certificate. TCC grants survive
     /// an update only when the bundle identifier AND signing requirement stay
@@ -221,7 +230,10 @@ enum UpdateChecker {
                     String(installerExitWaitSeconds),
                     "/usr/bin/open", "/bin/mv", privateDirectory.path,
                     launchStatusURL.path, String(installerHealthWaitSeconds),
-                    "/bin/rm",
+                    "/bin/rm", "/Applications/Snippr.app/Contents/MacOS/Snippr",
+                    "/bin/kill",
+                    String(installerCandidateStopGraceSeconds),
+                    String(installerCandidateStopForceSeconds),
                 ]
                 try proc.run()
                 handedOff = true
@@ -239,7 +251,9 @@ enum UpdateChecker {
     ///   $7 expected DMG SHA-256, $8 old app PID, $9 PID wait timeout,
     ///   $10 open tool, $11 activation move tool, $12 private attempt directory,
     ///   $13 launch-health breadcrumb, $14 launch-health wait timeout,
-    ///   $15 committed-backup cleanup tool.
+    ///   $15 committed-backup cleanup tool, $16 AppKit termination helper,
+    ///   $17 candidate force-signal tool, $18 graceful candidate-stop timeout,
+    ///   $19 forced-stop verify timeout.
     nonisolated static func detachedInstallerScript(
         signatureRequirement: String = canonicalReleaseDesignatedRequirement
     ) -> String {
@@ -261,6 +275,10 @@ enum UpdateChecker {
             HEALTH_FILE="${13:-$HOME/Library/Application Support/Snippr/status.txt}"
             HEALTH_TIMEOUT="${14:-10}"
             REMOVE_BACKUP_TOOL="${15:-/bin/rm}"
+            GRACEFUL_TERMINATE_TOOL="${16:-$2/Contents/MacOS/Snippr}"
+            CANDIDATE_SIGNAL_TOOL="${17:-/bin/kill}"
+            CANDIDATE_STOP_GRACE="${18:-12}"
+            CANDIDATE_STOP_FORCE="${19:-3}"
             [ -n "$LOG" ] || LOG="$HOME/Library/Logs/Snippr/update.log"
             LOG_DIR="${LOG%/*}"
             [ "$LOG_DIR" = "$LOG" ] && LOG_DIR="."
@@ -278,6 +296,7 @@ enum UpdateChecker {
             STAGE="delay"
             DMG="$1"
             APP="$2"
+            EXPECTED_EXECUTABLE="$APP/Contents/MacOS/Snippr"
             cleanup_download() {
               CLEANUP_STATUS=0
               /bin/rm -f "$DMG" || CLEANUP_STATUS=1
@@ -288,22 +307,23 @@ enum UpdateChecker {
             }
             reopen() {
               [ "$RELAUNCH" = "1" ] || return 0
-              "$OPEN_TOOL" "$APP" >&3 2>&1
+              "$OPEN_TOOL" -n "$APP" >&3 2>&1
             }
             wait_for_health() {
               [ "$RELAUNCH" = "1" ] || return 0
               HEALTH_REMAINING="$HEALTH_TIMEOUT"
-              EXPECTED_EXECUTABLE="$APP/Contents/MacOS/Snippr"
               while [ "$HEALTH_REMAINING" -gt 0 ]; do
                 if [ -f "$HEALTH_FILE" ]; then
                   HEALTH_PID=$(/usr/bin/sed -n 's/^pid=\\([0-9][0-9]*\\)$/\\1/p' "$HEALTH_FILE" | /usr/bin/head -1)
                   HEALTH_VERSION=$(/usr/bin/sed -n 's/^version=\\(.*\\)$/\\1/p' "$HEALTH_FILE" | /usr/bin/head -1)
+                  HEALTH_BUILD=$(/usr/bin/sed -n 's/^build=\\(.*\\)$/\\1/p' "$HEALTH_FILE" | /usr/bin/head -1)
                   HEALTH_EXECUTABLE=$(/usr/bin/sed -n 's/^executable=\\(.*\\)$/\\1/p' "$HEALTH_FILE" | /usr/bin/head -1)
                   if [ -n "$HEALTH_PID" ] && [ "$HEALTH_VERSION" = "$EXPECTED_VERSION" ] \
+                    && [ "$HEALTH_BUILD" = "$CANDIDATE_BUILD" ] \
                     && [ "$HEALTH_EXECUTABLE" = "$EXPECTED_EXECUTABLE" ] \
-                    && /bin/kill -0 "$HEALTH_PID" 2>/dev/null; then
+                    && candidate_pid_matches "$HEALTH_PID"; then
                     /bin/sleep 1
-                    if /bin/kill -0 "$HEALTH_PID" 2>/dev/null; then
+                    if candidate_pid_matches "$HEALTH_PID"; then
                       log "HEALTHY version=$HEALTH_VERSION pid=$HEALTH_PID executable=$HEALTH_EXECUTABLE"
                       return 0
                     fi
@@ -313,6 +333,71 @@ enum UpdateChecker {
                 HEALTH_REMAINING=$((HEALTH_REMAINING - 1))
               done
               return 1
+            }
+            candidate_pid_matches() {
+              CANDIDATE_PID="$1"
+              case "$CANDIDATE_PID" in *[!0-9]*|'') return 1 ;; esac
+              /bin/kill -0 "$CANDIDATE_PID" 2>/dev/null || return 1
+              /usr/sbin/lsof -a -p "$CANDIDATE_PID" -d txt -Fn 2>/dev/null \
+                | /usr/bin/grep -Fqx "n$EXPECTED_EXECUTABLE"
+            }
+            candidate_pids() {
+              /usr/bin/pgrep -f 'Snippr' 2>/dev/null | while IFS= read -r CANDIDATE_PID; do
+                if candidate_pid_matches "$CANDIDATE_PID"; then
+                  /usr/bin/printf '%s\n' "$CANDIDATE_PID"
+                fi
+              done
+            }
+            candidate_alive() {
+              [ -n "$(candidate_pids)" ]
+            }
+            stop_activated_candidate() {
+              [ "$ACTIVATED" = "1" ] || return 0
+              CANDIDATE_PIDS="$(candidate_pids)"
+              [ -n "$CANDIDATE_PIDS" ] || return 0
+              log "STOP stage=activated-candidate pids=$(echo "$CANDIDATE_PIDS" | /usr/bin/tr '\n' ',')"
+              HELPER_PIDS=""
+              for CANDIDATE_PID in $CANDIDATE_PIDS; do
+                if candidate_pid_matches "$CANDIDATE_PID"; then
+                  "$GRACEFUL_TERMINATE_TOOL" --request-terminate-pid "$CANDIDATE_PID" >&3 2>&1 &
+                  HELPER_PIDS="$HELPER_PIDS $!"
+                fi
+              done
+              STOP_REMAINING="$CANDIDATE_STOP_GRACE"
+              while candidate_alive && [ "$STOP_REMAINING" -gt 0 ]; do
+                /bin/sleep 1
+                STOP_REMAINING=$((STOP_REMAINING - 1))
+              done
+              CANDIDATE_PIDS="$(candidate_pids)"
+              if [ -n "$CANDIDATE_PIDS" ]; then
+                log "FORCE stage=activated-candidate pids=$(echo "$CANDIDATE_PIDS" | /usr/bin/tr '\n' ',')"
+                for CANDIDATE_PID in $CANDIDATE_PIDS; do
+                  if candidate_pid_matches "$CANDIDATE_PID"; then
+                    "$CANDIDATE_SIGNAL_TOOL" -KILL "$CANDIDATE_PID" 2>/dev/null || true
+                  fi
+                done
+              fi
+              STOP_REMAINING="$CANDIDATE_STOP_FORCE"
+              while candidate_alive && [ "$STOP_REMAINING" -gt 0 ]; do
+                /bin/sleep 1
+                STOP_REMAINING=$((STOP_REMAINING - 1))
+              done
+              # Reap/stop helper invocations too. In production each helper
+              # is the same exact candidate executable and normally exits
+              # immediately; this explicit bound also covers a helper wedged
+              # before or inside AppKit initialization.
+              for HELPER_PID in $HELPER_PIDS; do
+                if /bin/kill -0 "$HELPER_PID" 2>/dev/null; then
+                  /bin/kill -KILL "$HELPER_PID" 2>/dev/null || true
+                fi
+                wait "$HELPER_PID" 2>/dev/null || true
+              done
+              if candidate_alive; then
+                log "FATAL stage=stop-activated-candidate pids=$(candidate_pids | /usr/bin/tr '\n' ',')"
+                return 1
+              fi
+              log "STOPPED stage=activated-candidate"
+              return 0
             }
             restore_old() {
               if [ "$BACKED_UP" = "1" ] && [ -e "$APP.old" ]; then
@@ -345,6 +430,11 @@ enum UpdateChecker {
               log "FAIL stage=$STAGE exit=$STATUS"
               detach_mount || log "WARN stage=detach mount=$MOUNT"
               /bin/rm -rf "$APP.new"
+              if ! stop_activated_candidate; then
+                cleanup_download || log "WARN stage=cleanup-download dmg=$DMG"
+                [ "$STATUS" -ne 0 ] || STATUS=1
+                exit "$STATUS"
+              fi
               restore_old || log "FATAL stage=restore app_old=$APP.old"
               cleanup_download || log "WARN stage=cleanup-download dmg=$DMG"
               reopen
@@ -367,6 +457,8 @@ enum UpdateChecker {
             case "$OLD_PID" in *[!0-9]*|'') STAGE="arguments"; fail 2 ;; esac
             case "$WAIT_TIMEOUT" in *[!0-9]*|'') STAGE="arguments"; fail 2 ;; esac
             case "$HEALTH_TIMEOUT" in *[!0-9]*|'') STAGE="arguments"; fail 2 ;; esac
+            case "$CANDIDATE_STOP_GRACE" in *[!0-9]*|'') STAGE="arguments"; fail 2 ;; esac
+            case "$CANDIDATE_STOP_FORCE" in *[!0-9]*|'') STAGE="arguments"; fail 2 ;; esac
             [ -n "$DMG" ] && [ -n "$APP" ] && [ -n "$EXPECTED_VERSION" ] \
               && [ -n "$EXPECTED_SHA" ] || { STAGE="arguments"; fail 2; }
 
@@ -404,6 +496,8 @@ enum UpdateChecker {
             STAGE="version"
             CANDIDATE_VERSION=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP.new/Contents/Info.plist" 2>&3) || fail
             [ "$CANDIDATE_VERSION" = "$EXPECTED_VERSION" ] || fail
+            CANDIDATE_BUILD=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$APP.new/Contents/Info.plist" 2>&3) || fail
+            [ -n "$CANDIDATE_BUILD" ] || fail
             STAGE="verify-staged-copy"
             /usr/bin/codesign \(verificationFlags) "$APP.new" >&3 2>&1 || fail
             # The mounted image is no longer needed once the staged copy has

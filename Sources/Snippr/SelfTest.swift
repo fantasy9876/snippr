@@ -321,6 +321,15 @@ enum SelfTest {
             }
             check("integrity-eviction-request-wait-force-verify", evictionOK, evictionDetail)
 
+            check("integrity-updater-health-outlives-eviction",
+                  TimeInterval(UpdateChecker.installerHealthWaitSeconds)
+                    >= BundleIntegrity.evictionMaxDuration + 5
+                    && TimeInterval(
+                        UpdateChecker.installerCandidateStopGraceSeconds
+                            + UpdateChecker.installerCandidateStopForceSeconds)
+                        >= BundleIntegrity.evictionMaxDuration,
+                  "health \(UpdateChecker.installerHealthWaitSeconds)s stop \(UpdateChecker.installerCandidateStopGraceSeconds + UpdateChecker.installerCandidateStopForceSeconds)s eviction \(BundleIntegrity.evictionMaxDuration)s")
+
             let live = BundleIntegrity.discoveredBundles()
             check("integrity-live-discovery-headless",
                   Bundle.main.bundleURL.pathExtension == "app"
@@ -403,6 +412,98 @@ enum SelfTest {
         check("updater13-exit-wait-exceeds-save-failsafe",
               UpdateChecker.installerExitWaitSeconds > 10,
               "wait \(UpdateChecker.installerExitWaitSeconds)")
+
+        // The detached installer requests graceful termination through the
+        // candidate binary itself. Exercise the real NSRunningApplication
+        // path against a child whose AppKit delegate records
+        // applicationShouldTerminate — plain SIGTERM would not create this
+        // marker and therefore cannot satisfy the gate.
+        do {
+            let root = URL(fileURLWithPath: outputDir)
+                .appendingPathComponent("updater-appkit-terminate-\(UUID().uuidString)")
+            try FileManager.default.createDirectory(
+                at: root, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: root) }
+            let ready = root.appendingPathComponent("ready")
+            let terminated = root.appendingPathComponent("terminated")
+            let executable = URL(fileURLWithPath: CommandLine.arguments[0]).standardizedFileURL
+            let probe = Process()
+            probe.executableURL = executable
+            probe.arguments = [
+                "--selftest-termination-probe", ready.path, terminated.path,
+            ]
+            try probe.run()
+            defer {
+                if probe.isRunning { kill(probe.processIdentifier, SIGKILL) }
+                probe.waitUntilExit()
+            }
+            var spins = 100
+            while !FileManager.default.fileExists(atPath: ready.path), spins > 0 {
+                Thread.sleep(forTimeInterval: 0.05)
+                spins -= 1
+            }
+            let request = runCommand(
+                executable.path,
+                ["--request-terminate-pid", String(probe.processIdentifier)])
+            spins = 100
+            while probe.isRunning, spins > 0 {
+                Thread.sleep(forTimeInterval: 0.05)
+                spins -= 1
+            }
+            check("updater15-appkit-terminate-invokes-save-aware-delegate",
+                  request.status == 0 && !probe.isRunning
+                    && FileManager.default.fileExists(atPath: ready.path)
+                    && FileManager.default.fileExists(atPath: terminated.path),
+                  "request \(request.status) running \(probe.isRunning) ready \(FileManager.default.fileExists(atPath: ready.path)) terminated \(FileManager.default.fileExists(atPath: terminated.path)) output \(request.output)")
+        } catch {
+            check("updater15-appkit-terminate-invokes-save-aware-delegate", false,
+                  "fixture error \(error)")
+        }
+
+        // A recycled/foreign PID must not cross the helper boundary merely
+        // because the caller checked it moments earlier. The helper performs
+        // its own executable-identity check before requesting termination.
+        do {
+            let root = URL(fileURLWithPath: outputDir)
+                .appendingPathComponent("updater-appkit-foreign-\(UUID().uuidString)")
+            try FileManager.default.createDirectory(
+                at: root, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: root) }
+            let ready = root.appendingPathComponent("ready")
+            let terminated = root.appendingPathComponent("terminated")
+            let helperExecutable = URL(fileURLWithPath: CommandLine.arguments[0])
+                .standardizedFileURL
+            let foreignExecutable = root.appendingPathComponent("ForeignSnippr")
+            try FileManager.default.copyItem(
+                at: helperExecutable, to: foreignExecutable)
+            let probe = Process()
+            probe.executableURL = foreignExecutable
+            probe.arguments = [
+                "--selftest-termination-probe", ready.path, terminated.path,
+            ]
+            try probe.run()
+            defer {
+                if probe.isRunning { kill(probe.processIdentifier, SIGKILL) }
+                probe.waitUntilExit()
+            }
+            var spins = 100
+            while !FileManager.default.fileExists(atPath: ready.path), spins > 0 {
+                Thread.sleep(forTimeInterval: 0.05)
+                spins -= 1
+            }
+            let request = runCommand(
+                helperExecutable.path,
+                ["--request-terminate-pid", String(probe.processIdentifier)])
+            Thread.sleep(forTimeInterval: 0.2)
+            check("updater15-appkit-terminate-refuses-foreign-executable",
+                  request.status != 0 && probe.isRunning
+                    && FileManager.default.fileExists(atPath: ready.path)
+                    && !FileManager.default.fileExists(atPath: terminated.path),
+                  "request \(request.status) running \(probe.isRunning) ready \(FileManager.default.fileExists(atPath: ready.path)) terminated \(FileManager.default.fileExists(atPath: terminated.path)) output \(request.output)")
+        } catch {
+            check("updater15-appkit-terminate-refuses-foreign-executable", false,
+                  "fixture error \(error)")
+        }
 
         do {
             let tempDownload = URL(fileURLWithPath: outputDir)
@@ -867,6 +968,135 @@ enum SelfTest {
         } catch {
             check("updater14-launch-health-required-before-commit", false,
                   "fixture error \(error)")
+        }
+
+        // Breadcrumb text is not process identity. A foreign live PID with
+        // the right claimed version/build/executable must not commit the swap
+        // or cause that unrelated process to be stopped during rollback.
+        do {
+            let root = URL(fileURLWithPath: outputDir)
+                .appendingPathComponent("updater-forged-health-\(UUID().uuidString)")
+            defer { try? FileManager.default.removeItem(at: root) }
+            let installed = root.appendingPathComponent("installed/Snippr.app")
+            try makeUpdaterInstalledFixture(at: installed, marker: "old")
+            let callFile = root.appendingPathComponent("open-called")
+            let foreignPIDFile = root.appendingPathComponent("foreign.pid")
+            let reopenedFile = root.appendingPathComponent("old-reopened")
+            let healthFile = root.appendingPathComponent("status.txt")
+            let openStub = root.appendingPathComponent("open-forges-health.sh")
+            try makeUpdaterExecutable(
+                at: openStub,
+                contents: """
+                    #!/bin/sh
+                    APP="${2:-$1}"
+                    if [ ! -e "\(callFile.path)" ]; then
+                      /usr/bin/touch "\(callFile.path)"
+                      /bin/sleep 30 &
+                      PID=$!
+                      /usr/bin/printf '%s\n' "$PID" > "\(foreignPIDFile.path)"
+                      /usr/bin/printf 'pid=%s\\nversion=1.2.3\\nbuild=18\\nexecutable=%s\\n' "$PID" "$APP/Contents/MacOS/Snippr" > "\(healthFile.path)"
+                    else
+                      /usr/bin/touch "\(reopenedFile.path)"
+                    fi
+                    exit 0
+                    """)
+            if let fixture = makeUpdaterDMGFixture(
+                at: root, tamperAfterSigning: false) {
+                defer { cleanupUpdaterDMGFixture(fixture) }
+                let log = root.appendingPathComponent("update.log")
+                let result = runUpdaterInstaller(
+                    fixture, installed: installed, log: log,
+                    relaunch: true, openTool: openStub.path,
+                    healthFile: healthFile.path, healthTimeout: 1)
+                let foreignPID = (try? String(
+                    contentsOf: foreignPIDFile, encoding: .utf8))
+                    .flatMap { Int32($0.trimmingCharacters(
+                        in: .whitespacesAndNewlines)) }
+                let foreignAlive = foreignPID.map { kill($0, 0) == 0 } ?? false
+                defer {
+                    if let foreignPID, kill(foreignPID, 0) == 0 {
+                        kill(foreignPID, SIGKILL)
+                    }
+                }
+                let marker = updaterFixtureMarker(at: installed) ?? "missing"
+                let logText = (try? String(
+                    contentsOf: log, encoding: .utf8)) ?? ""
+                check("updater15-forged-health-pid-rejected",
+                      result.status != 0 && marker == "old" && foreignAlive
+                        && FileManager.default.fileExists(atPath: reopenedFile.path)
+                        && updaterFixtureIsClean(fixture, installed: installed)
+                        && logText.contains("FAIL stage=health")
+                        && !logText.contains("SUCCESS"),
+                      "status \(result.status) marker \(marker) foreign \(String(describing: foreignPID))/\(foreignAlive) log \(logText)")
+            } else {
+                check("updater15-forged-health-pid-rejected", false,
+                      "could not create signed DMG fixture")
+            }
+        } catch {
+            check("updater15-forged-health-pid-rejected", false,
+                  "fixture error \(error)")
+        }
+
+        // A candidate can be alive even when its best-effort launch breadcrumb
+        // was never written. Never swap the old bundle back underneath that
+        // process: terminate the exact activated executable first.
+        if let stopped = runUpdaterCandidateStopFixture(
+            in: URL(fileURLWithPath: outputDir), mode: .polite) {
+            check("updater15-live-no-health-stops-before-restore",
+                  stopped.status != 0 && stopped.installedMarker == "old"
+                    && stopped.oldMarker == nil && !stopped.candidateAlive
+                    && stopped.canonicalOpenCount == 2
+                    && stopped.reopenedOld && stopped.transactionClean
+                    && stopped.signalLog.contains("--request-terminate-pid")
+                    && stopped.log.contains("STOP stage=activated-candidate")
+                    && stopped.log.contains("STOPPED stage=activated-candidate")
+                    && !stopped.log.contains("FORCE stage=activated-candidate"),
+                  stopped.detail)
+        } else {
+            check("updater15-live-no-health-stops-before-restore", false,
+                  "could not create polite candidate-stop fixture")
+        }
+
+        // If the AppKit helper itself hangs and the candidate stays alive,
+        // the helper invocation must not defeat the rollback bound. Reap the
+        // helper, force only the verified candidate, then restore.
+        if let forced = runUpdaterCandidateStopFixture(
+            in: URL(fileURLWithPath: outputDir), mode: .force) {
+            check("updater15-stubborn-candidate-forced-before-restore",
+                  forced.status != 0 && forced.installedMarker == "old"
+                    && forced.oldMarker == nil && !forced.candidateAlive
+                    && forced.gracefulHelperStarted
+                    && !forced.gracefulHelperAlive && forced.elapsed < 10
+                    && forced.canonicalOpenCount == 2
+                    && forced.reopenedOld && forced.transactionClean
+                    && forced.signalLog.contains("--request-terminate-pid")
+                    && forced.signalLog.contains("-KILL")
+                    && forced.log.contains("FORCE stage=activated-candidate")
+                    && forced.log.contains("STOPPED stage=activated-candidate"),
+                  forced.detail)
+        } else {
+            check("updater15-stubborn-candidate-forced-before-restore", false,
+                  "could not create forced candidate-stop fixture")
+        }
+
+        // If even the force step cannot stop the process, fail closed: keep
+        // candidate and APP.old side-by-side instead of moving the old bundle
+        // over a live process. The fixture is killed only after observation.
+        if let immortal = runUpdaterCandidateStopFixture(
+            in: URL(fileURLWithPath: outputDir), mode: .immortal) {
+            check("updater15-unstoppable-candidate-keeps-journal",
+                  immortal.status != 0 && immortal.installedMarker == "new"
+                    && immortal.oldMarker == "old" && immortal.candidateAlive
+                    && immortal.canonicalOpenCount == 1
+                    && !immortal.reopenedOld && immortal.downloadClean
+                    && immortal.signalLog.contains("--request-terminate-pid")
+                    && immortal.signalLog.contains("-KILL")
+                    && immortal.log.contains("FATAL stage=stop-activated-candidate")
+                    && !immortal.log.contains("SUCCESS"),
+                  immortal.detail)
+        } else {
+            check("updater15-unstoppable-candidate-keeps-journal", false,
+                  "could not create unstoppable candidate fixture")
         }
 
         // Once launch health commits the new app, failure to delete the old
@@ -7177,6 +7407,34 @@ enum SelfTest {
         let designatedRequirement: String
     }
 
+    private enum UpdaterCandidateStopMode: Equatable {
+        case polite
+        case force
+        case immortal
+    }
+
+    private struct UpdaterCandidateStopResult {
+        let status: Int32
+        let installedMarker: String?
+        let oldMarker: String?
+        let candidateAlive: Bool
+        let gracefulHelperStarted: Bool
+        let gracefulHelperAlive: Bool
+        let elapsed: TimeInterval
+        let canonicalOpenCount: Int
+        let reopenedOld: Bool
+        let transactionClean: Bool
+        let downloadClean: Bool
+        let log: String
+        let signalLog: String
+
+        var detail: String {
+            let installed = installedMarker ?? "nil"
+            let old = oldMarker ?? "nil"
+            return "status \(status) installed \(installed) old \(old) alive \(candidateAlive) helper \(gracefulHelperStarted)/\(gracefulHelperAlive) elapsed \(elapsed) opens \(canonicalOpenCount) reopened \(reopenedOld) clean \(transactionClean)/\(downloadClean) signals \(signalLog) log \(log)"
+        }
+    }
+
     private static func runCommand(_ executable: String, _ arguments: [String]) -> CommandResult {
         let process = Process()
         let pipe = Pipe()
@@ -7230,7 +7488,11 @@ enum SelfTest {
         signatureRequirement: String? = nil,
         healthFile: String? = nil,
         healthTimeout: Int = 3,
-        removalTool: String = "/bin/rm"
+        removalTool: String = "/bin/rm",
+        gracefulTerminateTool: String? = nil,
+        candidateSignalTool: String = "/bin/kill",
+        candidateStopGrace: Int = 2,
+        candidateStopForce: Int = 2
     ) -> CommandResult {
         let digest = expectedSHA ?? updaterFixtureSHA256(fixture) ?? ""
         return runCommand(
@@ -7244,7 +7506,156 @@ enum SelfTest {
              attemptDirectory,
              healthFile ?? log.deletingLastPathComponent()
                 .appendingPathComponent("status.txt").path,
-             String(healthTimeout), removalTool])
+             String(healthTimeout), removalTool,
+             gracefulTerminateTool ?? installed.appendingPathComponent(
+                "Contents/MacOS/Snippr").path,
+             candidateSignalTool,
+             String(candidateStopGrace), String(candidateStopForce)])
+    }
+
+    private static func runUpdaterCandidateStopFixture(
+        in outputRoot: URL,
+        mode: UpdaterCandidateStopMode
+    ) -> UpdaterCandidateStopResult? {
+        let label: String
+        switch mode {
+        case .polite: label = "polite"
+        case .force: label = "force"
+        case .immortal: label = "immortal"
+        }
+        let root = outputRoot.appendingPathComponent(
+            "updater-candidate-stop-\(label)-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let installed = root.appendingPathComponent("installed/Snippr.app")
+        do {
+            try makeUpdaterInstalledFixture(at: installed, marker: "old")
+            guard let fixture = makeUpdaterDMGFixture(
+                at: root, tamperAfterSigning: false, marker: "new") else {
+                return nil
+            }
+            defer { cleanupUpdaterDMGFixture(fixture) }
+
+            let callFile = root.appendingPathComponent("open-called")
+            let pidFile = root.appendingPathComponent("candidate.pid")
+            let reopenedFile = root.appendingPathComponent("old-reopened")
+            let openArgumentsFile = root.appendingPathComponent("open-arguments")
+            let openStub = root.appendingPathComponent("open-live-no-health.sh")
+            try makeUpdaterExecutable(
+                at: openStub,
+                contents: """
+                    #!/bin/sh
+                    APP="${2:-$1}"
+                    /usr/bin/printf '%s\n' "$@" >> "\(openArgumentsFile.path)"
+                    if [ ! -e "\(callFile.path)" ]; then
+                      /usr/bin/touch "\(callFile.path)"
+                      "$APP/Contents/MacOS/Snippr" 30 &
+                      /usr/bin/printf '%s\n' "$!" > "\(pidFile.path)"
+                    else
+                      /usr/bin/touch "\(reopenedFile.path)"
+                    fi
+                    exit 0
+                    """)
+
+            let signalLogFile = root.appendingPathComponent("signals.log")
+            let gracefulPIDFile = root.appendingPathComponent("graceful.pid")
+            let gracefulStub = root.appendingPathComponent("candidate-graceful.sh")
+            let gracefulAction: String
+            switch mode {
+            case .polite:
+                gracefulAction = "exec /bin/kill -TERM \"$2\""
+            case .force:
+                gracefulAction = """
+                    /usr/bin/printf '%s\\n' "$$" > "\(gracefulPIDFile.path)"
+                    exec /bin/sleep 30
+                    """
+            case .immortal:
+                gracefulAction = "exit 0"
+            }
+            try makeUpdaterExecutable(
+                at: gracefulStub,
+                contents: """
+                    #!/bin/sh
+                    /usr/bin/printf '%s %s\n' "$1" "$2" >> "\(signalLogFile.path)"
+                    \(gracefulAction)
+                    """)
+            var signalTool = "/bin/kill"
+            if mode != .polite {
+                let stub = root.appendingPathComponent("candidate-signal.sh")
+                let forceAction = mode == .force
+                    ? "exec /bin/kill -KILL \"$2\""
+                    : "exit 0"
+                try makeUpdaterExecutable(
+                    at: stub,
+                    contents: """
+                        #!/bin/sh
+                        /usr/bin/printf '%s %s\n' "$1" "$2" >> "\(signalLogFile.path)"
+                        case "$1" in
+                          -TERM) exit 0 ;;
+                          -KILL) \(forceAction) ;;
+                          *) exit 64 ;;
+                        esac
+                        """)
+                signalTool = stub.path
+            }
+
+            let logURL = root.appendingPathComponent("update.log")
+            let healthURL = root.appendingPathComponent("status.txt")
+            let started = Date()
+            let result = runUpdaterInstaller(
+                fixture, installed: installed, log: logURL,
+                relaunch: true, openTool: openStub.path,
+                healthFile: healthURL.path, healthTimeout: 1,
+                gracefulTerminateTool: gracefulStub.path,
+                candidateSignalTool: signalTool,
+                candidateStopGrace: 1, candidateStopForce: 1)
+            let elapsed = Date().timeIntervalSince(started)
+            let pid = (try? String(contentsOf: pidFile, encoding: .utf8))
+                .flatMap { Int32($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
+            let alive = pid.map { kill($0, 0) == 0 } ?? false
+            let gracefulPID = (try? String(
+                contentsOf: gracefulPIDFile, encoding: .utf8))
+                .flatMap { Int32($0.trimmingCharacters(
+                    in: .whitespacesAndNewlines)) }
+            let gracefulAlive = gracefulPID.map { kill($0, 0) == 0 } ?? false
+            let log = (try? String(contentsOf: logURL, encoding: .utf8)) ?? ""
+            let signalLog = (try? String(contentsOf: signalLogFile, encoding: .utf8)) ?? ""
+            let openArguments = (try? String(
+                contentsOf: openArgumentsFile, encoding: .utf8)) ?? ""
+            let canonicalOpenNeedle = "-n\n\(installed.path)\n"
+            let canonicalOpenCount = max(
+                0, openArguments.components(separatedBy: canonicalOpenNeedle).count - 1)
+            let oldURL = URL(fileURLWithPath: installed.path + ".old")
+            let downloadClean = !FileManager.default.fileExists(atPath: installed.path + ".new")
+                && !FileManager.default.fileExists(atPath: fixture.url.path)
+                && !FileManager.default.fileExists(atPath: "/Volumes/\(fixture.volumeName)")
+            let transactionClean = downloadClean
+                && !FileManager.default.fileExists(atPath: oldURL.path)
+            let observed = UpdaterCandidateStopResult(
+                status: result.status,
+                installedMarker: updaterFixtureMarker(at: installed),
+                oldMarker: updaterFixtureMarker(at: oldURL),
+                candidateAlive: alive,
+                gracefulHelperStarted: gracefulPID != nil,
+                gracefulHelperAlive: gracefulAlive,
+                elapsed: elapsed,
+                canonicalOpenCount: canonicalOpenCount,
+                reopenedOld: FileManager.default.fileExists(atPath: reopenedFile.path),
+                transactionClean: transactionClean,
+                downloadClean: downloadClean,
+                log: log, signalLog: signalLog)
+            if let pid, alive {
+                _ = kill(pid, SIGKILL)
+                Thread.sleep(forTimeInterval: 0.1)
+            }
+            if let gracefulPID, gracefulAlive {
+                _ = kill(gracefulPID, SIGKILL)
+                Thread.sleep(forTimeInterval: 0.1)
+            }
+            return observed
+        } catch {
+            print("  updater candidate-stop fixture error: \(error)")
+            return nil
+        }
     }
 
     private static func updaterFixtureIsClean(
@@ -7283,10 +7694,10 @@ enum SelfTest {
             at: url,
             contents: """
                 #!/bin/sh
-                APP="$1"
+                APP="${2:-$1}"
                 "$APP/Contents/MacOS/Snippr" 5 &
                 PID=$!
-                /usr/bin/printf 'pid=%s\\nversion=1.2.3\\nexecutable=%s\\n' "$PID" "$APP/Contents/MacOS/Snippr" > "\(healthFile.path)"
+                /usr/bin/printf 'pid=%s\\nversion=1.2.3\\nbuild=18\\nexecutable=%s\\n' "$PID" "$APP/Contents/MacOS/Snippr" > "\(healthFile.path)"
                 \(touch)exit 0
                 """)
     }

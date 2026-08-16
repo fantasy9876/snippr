@@ -1,5 +1,60 @@
 import AppKit
 
+/// Internal updater helper. It runs before settings, single-instance
+/// arbitration, hotkeys, status, or TCC so the detached installer can ask one
+/// exact candidate PID to follow AppKit's save-aware termination path.
+if let idx = CommandLine.arguments.firstIndex(of: "--request-terminate-pid") {
+    guard CommandLine.arguments.count > idx + 1,
+          let pid = pid_t(CommandLine.arguments[idx + 1]) else { exit(64) }
+    let requested = MainActor.assumeIsolated {
+        guard let target = NSWorkspace.shared.runningApplications.first(where: {
+            $0.processIdentifier == pid && !$0.isTerminated
+        }) else { return true }
+        let helperExecutable = URL(fileURLWithPath: CommandLine.arguments[0])
+            .resolvingSymlinksInPath().standardizedFileURL
+        guard target.executableURL?.resolvingSymlinksInPath().standardizedFileURL
+            == helperExecutable else { return false }
+        return target.terminate()
+    }
+    exit(requested ? 0 : 1)
+}
+
+/// AppKit-aware selftest child for the updater helper above. This is handled
+/// before all normal launch side effects and only writes the two supplied
+/// temporary marker files.
+if let idx = CommandLine.arguments.firstIndex(of: "--selftest-termination-probe") {
+    guard CommandLine.arguments.count > idx + 2 else { exit(64) }
+    final class TerminationProbeDelegate: NSObject, NSApplicationDelegate {
+        let ready: URL
+        let terminated: URL
+
+        init(ready: URL, terminated: URL) {
+            self.ready = ready
+            self.terminated = terminated
+        }
+
+        func applicationDidFinishLaunching(_ notification: Notification) {
+            try? Data("ready".utf8).write(to: ready)
+        }
+
+        func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+            try? Data("terminated".utf8).write(to: terminated)
+            return .terminateNow
+        }
+    }
+
+    MainActor.assumeIsolated {
+        let app = NSApplication.shared
+        let delegate = TerminationProbeDelegate(
+            ready: URL(fileURLWithPath: CommandLine.arguments[idx + 1]),
+            terminated: URL(fileURLWithPath: CommandLine.arguments[idx + 2]))
+        app.delegate = delegate
+        app.setActivationPolicy(.prohibited)
+        app.run()
+    }
+    exit(0)
+}
+
 // Entry point. `--selftest [outdir]` runs headless feature tests and exits.
 let arguments = CommandLine.arguments
 if let idx = arguments.firstIndex(of: "--selftest") {

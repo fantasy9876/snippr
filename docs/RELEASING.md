@@ -53,5 +53,7 @@ hợp lệ → chạy; sha lệch → từ chối; không chữ ký + không sha
   `objects.githubusercontent.com` (sửa `AllowedHosts`/`allowedDownloadHost`
   nếu đổi nơi phát hành).
 - Chạy test trước khi phát hành:
-  - macOS: `Snippr --selftest` và `Snippr --test-scrollstitch`
+  - macOS: `Snippr --selftest`, `Snippr --test-scrollstitch`, và
+    `scripts/test-site-installer-transaction.sh` (bắt buộc trước khi deploy
+    `site/install.sh`)
   - Windows: `dotnet build -c Release` (và test tay scroll capture)
