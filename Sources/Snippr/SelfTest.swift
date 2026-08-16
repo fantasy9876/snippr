@@ -10060,7 +10060,12 @@ enum SelfTest {
                     "setLastAreaRect": 0, "logEvent": 0,
                 ]
                 let panelPixels = 4000
-                let panelBase = makeNoiseImage(width: 300, height: panelPixels)
+                // Solid, high-contrast base: the edge rule ("must differ from
+                // the baseline") is only meaningful if the cover colour cannot
+                // coincide with the source.
+                let panelBase = makeSolidImage(
+                    width: 300, height: panelPixels,
+                    color: NSColor.white.cgColor)
                 let panel = ScrollResultPanel.show(
                     image: CapturedImage(cgImage: panelBase, scale: 1),
                     inputs: OverlaySessionInputs(
@@ -10105,40 +10110,15 @@ enum SelfTest {
                     }
                 if panelBaseline == nil { panelFailures.append("panel:no-baseline") }
 
-                // The mask is built in SOURCE pixels first, integral, with
-                // each edge a multiple of srcDim / gcd(srcDim, backingDim).
-                // That makes the same edge land on an integer boundary in BOTH
-                // domains: the compositor takes an integral source rect, and
-                // the scan projects it to whole backing pixels. Snapping the
-                // point rect instead left a fractional source rect, so the
-                // compositor covered an expanded region and the scan saw that
-                // expansion as bleed.
-                let panelBacking = host.window?.backingScaleFactor
-                    ?? hostScreen.backingScaleFactor
-                func gcd(_ a: Int, _ b: Int) -> Int {
-                    var x = abs(a), y = abs(b)
-                    while y != 0 { (x, y) = (y, x % y) }
-                    return max(1, x)
-                }
+                // The mask is an integral SOURCE rect (what the compositor
+                // actually takes). The scan below classifies every backing
+                // pixel by its CELL, so no lattice/gcd alignment is needed and
+                // the gate cannot turn red on a particular display.
                 let srcWidth = 300
                 let srcHeight = panelPixels
-                let backingWidth = max(
-                    1, Int((host.bounds.width * panelBacking).rounded()))
-                let backingHeight = max(
-                    1, Int((host.bounds.height * panelBacking).rounded()))
-                let stepX = max(1, srcWidth / gcd(srcWidth, backingWidth))
-                let stepY = max(1, srcHeight / gcd(srcHeight, backingHeight))
-                func alignedDown(_ value: Int, _ step: Int) -> Int {
-                    max(step, (value / step) * step)
-                }
-                let regionX = alignedDown(srcWidth / 5, stepX)
-                let regionW = alignedDown(srcWidth / 2, stepX)
-                let regionY = alignedDown(srcHeight * 3 / 10, stepY)
-                let regionH = alignedDown(srcHeight / 5, stepY)
                 let expectedRegion = CGRect(
-                    x: CGFloat(regionX), y: CGFloat(regionY),
-                    width: CGFloat(min(regionW, srcWidth - regionX)),
-                    height: CGFloat(min(regionH, srcHeight - regionY)))
+                    x: CGFloat(srcWidth / 5), y: CGFloat(srcHeight * 3 / 10),
+                    width: CGFloat(srcWidth / 2), height: CGFloat(srcHeight / 5))
                 let panelBlur = BlurAnnotation(uiScale: pixelsPerPoint)
                 panelBlur.rect = expectedRegion
                 // The scan works in points: project the SAME rect back.
@@ -10213,29 +10193,40 @@ enum SelfTest {
                 if let shot, let panelBaseline, host.bounds.width > 0 {
                     let backing = CGFloat(shot.width) / host.bounds.width
                     let bytes = rgba(shot), baseBytes = rgba(panelBaseline)
-                    var holes = 0, changed = 0
+                    var holes = 0, changed = 0, edgeWrong = 0
                     for py in 0..<shot.height {
                         for px in 0..<shot.width {
-                            // pixel CENTRE in points: half-open raster rule
-                            let point = CGPoint(
-                                x: (CGFloat(px) + 0.5) / backing,
-                                y: (CGFloat(shot.height - 1 - py) + 0.5) / backing)
+                            // The CELL this backing pixel covers, in points.
+                            let cell = CGRect(
+                                x: CGFloat(px) / backing,
+                                y: CGFloat(shot.height - 1 - py) / backing,
+                                width: 1 / backing, height: 1 / backing)
                             let i = (py * shot.width + px) * 4
+                            guard i + 4 <= bytes.count,
+                                  i + 4 <= baseBytes.count else { continue }
                             let value = Array(bytes[i..<(i + 4)])
-                            // EVERY pixel is classified: its centre either
-                            // falls in the mask (exact cover) or it does not
-                            // (byte-identical baseline). No skipped band.
-                            if maskInPoints.contains(point) {
+                            let base = Array(baseBytes[i..<(i + 4)])
+                            if maskInPoints.contains(cell) {
+                                // fully inside: exactly the opaque cover
                                 if value != [31, 31, 31, 255] { holes += 1 }
-                            } else if i + 4 <= baseBytes.count,
-                                      value != Array(baseBytes[i..<(i + 4)]) {
-                                changed += 1
+                            } else if !maskInPoints.intersects(cell) {
+                                // fully outside: untouched
+                                if value != base { changed += 1 }
+                            } else {
+                                // straddling the edge: antialiasing is allowed,
+                                // but it must be opaque AND it must have moved.
+                                if value[3] != 255 || value == base {
+                                    edgeWrong += 1
+                                }
                             }
                         }
                     }
                     if holes != 0 { panelFailures.append("panel:holes \(holes)") }
                     if changed != 0 {
                         panelFailures.append("panel:outside-changed \(changed)")
+                    }
+                    if edgeWrong != 0 {
+                        panelFailures.append("panel:edge \(edgeWrong)")
                     }
                 } else {
                     panelFailures.append("panel:no-preview")
