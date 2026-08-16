@@ -11108,13 +11108,17 @@ enum SelfTest {
                 let viewPreviousResponder = view.nextResponder
                 view.nextResponder = viewSpy
                 defer { view.nextResponder = viewPreviousResponder }
+                let writesBeforeModified = writes.count
                 if let event = wheel(view, deltaY: 3, precise: false,
                                      modified: true) {
                     view.scrollWheel(with: event)
                 }
-                if viewSpy.forwarded != 1 {
+                // Forwarded AND inert: a mutant that both wrote and forwarded
+                // would otherwise be absorbed by the baseline taken after it.
+                if viewSpy.forwarded != 1 || writes.count != writesBeforeModified {
                     wheelFailures.append(
-                        "area:modified-not-forwarded \(viewSpy.forwarded)")
+                        "area:modified \(viewSpy.forwarded) "
+                        + "\(writes.count - writesBeforeModified)")
                 }
                 let viewForwardedBaseline = viewSpy.forwarded
                 // The precise branch accumulates to 18 before it steps, and
@@ -11138,6 +11142,11 @@ enum SelfTest {
                     // same reset, so sending one first would mask whether the
                     // precise path resets — the whole point of the sequence.
                     if let event = wheel(view, deltaY: 9, precise: true) {
+                        view.scrollWheel(with: event)
+                    }
+                    // The drag owns EVERY wheel, modified included.
+                    if let event = wheel(view, deltaY: 3, precise: false,
+                                         modified: true) {
                         view.scrollWheel(with: event)
                     }
                     midDragWrites = writes.count
@@ -11181,6 +11190,7 @@ enum SelfTest {
                 // The line branch, in a drag of its own so it cannot disturb
                 // the precise state the sequence above depends on.
                 beforeControl = writes.count
+                let viewLineForwardBaseline = viewSpy.forwarded
                 view.annotationDragForTesting(
                     from: CGPoint(x: 100, y: 100), to: CGPoint(x: 170, y: 150)
                 ) {
@@ -11188,9 +11198,11 @@ enum SelfTest {
                         view.scrollWheel(with: event)
                     }
                 }
-                if writes.count != beforeControl {
+                if writes.count != beforeControl
+                    || viewSpy.forwarded != viewLineForwardBaseline {
                     wheelFailures.append(
-                        "area:line-mid-drag \(writes.count - beforeControl)")
+                        "area:line-mid-drag \(writes.count - beforeControl) "
+                        + "\(viewSpy.forwarded - viewLineForwardBaseline)")
                 }
                 if let event = wheel(view, deltaY: 3, precise: false) {
                     view.scrollWheel(with: event)
@@ -11233,13 +11245,16 @@ enum SelfTest {
                 let hostPreviousResponder = host.nextResponder
                 host.nextResponder = hostSpy
                 defer { host.nextResponder = hostPreviousResponder }
+                let hostWritesBeforeModified = writes.count
                 if let event = wheel(host, deltaY: 3, precise: false,
                                      modified: true) {
                     host.scrollWheel(with: event)
                 }
-                if hostSpy.forwarded != 1 {
+                if hostSpy.forwarded != 1
+                    || writes.count != hostWritesBeforeModified {
                     wheelFailures.append(
-                        "panel:modified-not-forwarded \(hostSpy.forwarded)")
+                        "panel:modified \(hostSpy.forwarded) "
+                        + "\(writes.count - hostWritesBeforeModified)")
                 }
                 let hostForwardedBaseline = hostSpy.forwarded
                 let panelBeforePrime = writes.count
@@ -11259,6 +11274,10 @@ enum SelfTest {
                 ) {
                     // Precise only, for the same reason as the area case.
                     if let event = wheel(host, deltaY: 9, precise: true) {
+                        host.scrollWheel(with: event)
+                    }
+                    if let event = wheel(host, deltaY: 3, precise: false,
+                                         modified: true) {
                         host.scrollWheel(with: event)
                     }
                     panelMidWrites = writes.count
@@ -11294,6 +11313,7 @@ enum SelfTest {
                         + "\(writes.count - beforePanelControl)")
                 }
                 beforePanelControl = writes.count
+                let hostLineForwardBaseline = hostSpy.forwarded
                 panel.drawWithRealEventsForTesting(
                     fromView: CGPoint(x: 70, y: 70),
                     toView: CGPoint(x: 150, y: 130)
@@ -11302,10 +11322,12 @@ enum SelfTest {
                         host.scrollWheel(with: event)
                     }
                 }
-                if writes.count != beforePanelControl {
+                if writes.count != beforePanelControl
+                    || hostSpy.forwarded != hostLineForwardBaseline {
                     wheelFailures.append(
                         "panel:line-mid-drag "
-                        + "\(writes.count - beforePanelControl)")
+                        + "\(writes.count - beforePanelControl) "
+                        + "\(hostSpy.forwarded - hostLineForwardBaseline)")
                 }
                 if let event = wheel(host, deltaY: 3, precise: false) {
                     host.scrollWheel(with: event)
