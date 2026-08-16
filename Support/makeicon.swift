@@ -97,8 +97,8 @@ private func validateMaster(_ image: CGImage, data: Data) throws {
         default: partialCount += 1
         }
     }
-    guard transparentCount > 0, partialCount > 0 else {
-        throw IconError.invalidMaster("expected real transparency and antialiased edges")
+    guard transparentCount >= width * height / 4, partialCount >= 1_000 else {
+        throw IconError.invalidMaster("expected a transparent surround and antialiased edges")
     }
 
     let cornerOffsets = [
@@ -109,6 +109,15 @@ private func validateMaster(_ image: CGImage, data: Data) throws {
     ]
     guard cornerOffsets.allSatisfy({ pixels[$0] == 0 }) else {
         throw IconError.invalidMaster("all four corners must be transparent")
+    }
+    let clearBorder = 32
+    for y in 0..<height {
+        for x in 0..<width where x < clearBorder || x >= width - clearBorder || y < clearBorder || y >= height - clearBorder {
+            let alpha = pixels[(y * width + x) * 4 + 3]
+            guard alpha == 0 else {
+                throw IconError.invalidMaster("outer \(clearBorder)-pixel border must be fully transparent")
+            }
+        }
     }
 }
 
@@ -171,6 +180,22 @@ private func makeICNS(pngBySize: [Int: Data]) throws -> Data {
     return result
 }
 
+private func validateICNSConsumer(_ data: Data) throws {
+    guard let image = NSImage(data: data) else {
+        throw IconError.invalidMaster("AppKit cannot decode generated ICNS")
+    }
+    let actual = image.representations.map { representation in
+        "\(representation.pixelsWide)x\(Int(representation.size.width.rounded()))"
+    }.sorted()
+    let expected = [
+        "16x16", "32x16", "32x32", "64x32", "64x64", "128x128",
+        "256x128", "256x256", "512x256", "512x512", "1024x512",
+    ].sorted()
+    guard actual == expected else {
+        throw IconError.invalidMaster("AppKit ICNS representations \(actual), expected \(expected)")
+    }
+}
+
 private func makeICO(pngBySize: [Int: Data]) throws -> Data {
     let sizes = [16, 24, 32, 48, 64, 128, 256]
     var payloads: [Data] = []
@@ -231,7 +256,9 @@ private func generatedAssets(masterData: Data, masterImage: CGImage) throws -> [
         return GeneratedAsset(relativePath: path, data: data)
     }
     guard let png256 = pngBySize[256] else { throw IconError.missingFile("generated 256x256 PNG") }
-    assets.append(GeneratedAsset(relativePath: "Support/AppIcon.icns", data: try makeICNS(pngBySize: pngBySize)))
+    let icns = try makeICNS(pngBySize: pngBySize)
+    try validateICNSConsumer(icns)
+    assets.append(GeneratedAsset(relativePath: "Support/AppIcon.icns", data: icns))
     assets.append(GeneratedAsset(relativePath: "windows/snippr.ico", data: try makeICO(pngBySize: pngBySize)))
     assets.append(GeneratedAsset(relativePath: "site/icon.png", data: png256))
     assets.append(GeneratedAsset(relativePath: "docs/icon-256.png", data: png256))

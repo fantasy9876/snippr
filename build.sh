@@ -9,6 +9,11 @@ case "$ARCH" in
   arm64|x86_64) ;;
   *) echo "❌ unsupported architecture: $ARCH (expected arm64 or x86_64)" >&2; exit 1 ;;
 esac
+
+# Fail before compiling if any platform icon has drifted from the approved,
+# transparent master. This also prevents the stale procedural S logo from
+# returning in a future release.
+swift Support/makeicon.swift --check
 swift build -c "$CONFIG" --arch "$ARCH"
 
 EXPECTED_SIGNER_SHA1="$(/usr/libexec/PlistBuddy -c 'Print :SnipprReleaseSignerSHA1' Support/Info.plist \

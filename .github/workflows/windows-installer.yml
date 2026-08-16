@@ -118,6 +118,116 @@ jobs:
         with:
           dotnet-version: "8.0.x"
 
+      - name: Approved cross-platform icon gate
+        shell: pwsh
+        run: |
+          $approvedMaster = 'c6e6e20df44db307d88b5037b911f4cd5a112daee173a767bc9966560635f106'
+          $masterHash = (Get-FileHash -Algorithm SHA256 Support/icon-1024.png).Hash.ToLower()
+          if ($masterHash -ne $approvedMaster) {
+            throw "icon master mismatch: expected $approvedMaster got $masterHash"
+          }
+
+          $bytes = [IO.File]::ReadAllBytes('windows/snippr.ico')
+          $approvedICO = '8d2005c8f5b0ddc750a00f6c6fe55d197da076d4203023843607c48f04705860'
+          $icoHash = (Get-FileHash -Algorithm SHA256 windows/snippr.ico).Hash.ToLower()
+          if ($icoHash -ne $approvedICO) {
+            throw "ICO hash mismatch: expected $approvedICO got $icoHash"
+          }
+          if ($bytes.Length -lt 6 -or [BitConverter]::ToUInt16($bytes, 0) -ne 0 -or
+              [BitConverter]::ToUInt16($bytes, 2) -ne 1) {
+            throw 'invalid ICO header'
+          }
+          $count = [BitConverter]::ToUInt16($bytes, 4)
+          $expectedSizes = @(16, 24, 32, 48, 64, 128, 256)
+          if ($count -ne $expectedSizes.Count) {
+            throw "ICO frame count mismatch: expected $($expectedSizes.Count) got $count"
+          }
+
+          function Read-BigEndianUInt32([byte[]]$data, [int]$offset) {
+            return ([uint32]$data[$offset] -shl 24) -bor
+              ([uint32]$data[$offset + 1] -shl 16) -bor
+              ([uint32]$data[$offset + 2] -shl 8) -bor
+              [uint32]$data[$offset + 3]
+          }
+          function Get-ByteSHA256([byte[]]$data) {
+            return [Convert]::ToHexString(
+              [Security.Cryptography.SHA256]::HashData($data)
+            ).ToLower()
+          }
+
+          $matchingFiles = @{
+            16 = 'Support/AppIcon.iconset/icon_16x16.png'
+            32 = 'Support/AppIcon.iconset/icon_32x32.png'
+            64 = 'Support/AppIcon.iconset/icon_64x64.png'
+            128 = 'Support/AppIcon.iconset/icon_128x128.png'
+            256 = 'site/icon.png'
+          }
+          $approvedFrameHashes = @{
+            16 = 'e5a47a623fbebbcb03ef1c856101755ce6a0c24b86d41f05552839d6854bc727'
+            24 = '70d2182be393ee6882bc541169ded1479d7176ccf452401b19ba29c785c24d26'
+            32 = '26e921b30057e976012e2bfc9e000ff4443a0662259da0a957923a6bfdec79e4'
+            48 = '31410165a914eb131f16a69f203c0d574d34b49cca4cf27953325dd782f60efb'
+            64 = '180932d25d29501746c6b7c8d060cfdfe9b6b505f4e87e438e4db46153969c4d'
+            128 = 'ffac1d9e81e4d807d080882d3bdac92eea9107207243c3404ef07ac48bd734f7'
+            256 = '08d5b6da85f8cd1a61ad34370844fb2ca0ff03956c2256c4825b5e60135f039c'
+          }
+          $seen = @()
+          $expectedOffset = 6 + $count * 16
+          for ($index = 0; $index -lt $count; $index++) {
+            $entry = 6 + $index * 16
+            $width = [int]$bytes[$entry]
+            $height = [int]$bytes[$entry + 1]
+            if ($width -eq 0) { $width = 256 }
+            if ($height -eq 0) { $height = 256 }
+            if ($width -ne $height) { throw "ICO frame is not square: ${width}x${height}" }
+            if ($bytes[$entry + 2] -ne 0 -or $bytes[$entry + 3] -ne 0) {
+              throw "ICO frame $width has invalid color-count/reserved fields"
+            }
+            if ([BitConverter]::ToUInt16($bytes, $entry + 4) -ne 1 -or
+                [BitConverter]::ToUInt16($bytes, $entry + 6) -ne 32) {
+              throw "ICO frame $width must be one-plane 32bpp"
+            }
+            $length = [BitConverter]::ToUInt32($bytes, $entry + 8)
+            $offset = [BitConverter]::ToUInt32($bytes, $entry + 12)
+            if ($offset -ne $expectedOffset) {
+              throw "ICO frame $width offset is not contiguous: expected $expectedOffset got $offset"
+            }
+            if ($length -lt 24 -or $offset + $length -gt $bytes.Length) {
+              throw "ICO frame $width has invalid bounds"
+            }
+            [byte[]]$payload = $bytes[$offset..($offset + $length - 1)]
+            $pngSignature = @(137, 80, 78, 71, 13, 10, 26, 10)
+            for ($byteIndex = 0; $byteIndex -lt $pngSignature.Count; $byteIndex++) {
+              if ($payload[$byteIndex] -ne $pngSignature[$byteIndex]) {
+                throw "ICO frame $width is not PNG-compressed"
+              }
+            }
+            $pngWidth = Read-BigEndianUInt32 $payload 16
+            $pngHeight = Read-BigEndianUInt32 $payload 20
+            if ($pngWidth -ne $width -or $pngHeight -ne $height) {
+              throw "ICO directory/payload dimension mismatch: ${width}x${height} vs ${pngWidth}x${pngHeight}"
+            }
+            $payloadHash = Get-ByteSHA256 $payload
+            if ($payloadHash -ne $approvedFrameHashes[$width]) {
+              throw "ICO frame $width is not the approved logo derivative"
+            }
+            if ($matchingFiles.ContainsKey($width)) {
+              $sourceHash = (Get-FileHash -Algorithm SHA256 $matchingFiles[$width]).Hash.ToLower()
+              if ($payloadHash -ne $sourceHash) {
+                throw "ICO frame $width differs from $($matchingFiles[$width])"
+              }
+            }
+            $seen += $width
+            $expectedOffset = $offset + $length
+          }
+          if (($seen -join ',') -ne ($expectedSizes -join ',')) {
+            throw "ICO frame sizes/order mismatch: $($seen -join ',')"
+          }
+          if ($expectedOffset -ne $bytes.Length) {
+            throw "ICO has trailing or unreferenced data: expected end $expectedOffset got $($bytes.Length)"
+          }
+          Write-Host "approved icon master + ICO frames PASS: $($seen -join ',')"
+
       - name: Stitcher gate (animated-band + majority fail-closed)
         run: >
           dotnet run --project windows/Snippr.Win.StitcherGate/Snippr.Win.StitcherGate.csproj
@@ -125,6 +235,37 @@ jobs:
 
       - name: Build Win app (Release)
         run: dotnet build windows/Snippr.Win.csproj -c Release
+
+      - name: Verify app executable embeds approved icon
+        shell: pwsh
+        run: |
+          Add-Type -AssemblyName System.Drawing.Common
+          $exe = @(Get-ChildItem windows/bin/Release -Recurse -Filter Snippr.exe |
+            Where-Object { $_.FullName -notlike '*publish*' }) | Select-Object -First 1
+          if (-not $exe) { throw 'built Snippr.exe not found' }
+          $expectedIcon = [Drawing.Icon]::new((Resolve-Path windows/snippr.ico).Path, 32, 32)
+          $actualIcon = [Drawing.Icon]::ExtractAssociatedIcon($exe.FullName)
+          if (-not $actualIcon) { throw "embedded icon missing from $($exe.FullName)" }
+          $expected = $expectedIcon.ToBitmap()
+          $actual = $actualIcon.ToBitmap()
+          try {
+            if ($actual.Width -ne $expected.Width -or $actual.Height -ne $expected.Height) {
+              throw "embedded icon dimensions differ: $($actual.Width)x$($actual.Height)"
+            }
+            for ($y = 0; $y -lt $expected.Height; $y++) {
+              for ($x = 0; $x -lt $expected.Width; $x++) {
+                if ($actual.GetPixel($x, $y).ToArgb() -ne $expected.GetPixel($x, $y).ToArgb()) {
+                  throw "embedded icon pixel mismatch at $x,$y"
+                }
+              }
+            }
+          } finally {
+            $expected.Dispose()
+            $actual.Dispose()
+            $expectedIcon.Dispose()
+            $actualIcon.Dispose()
+          }
+          Write-Host "embedded app icon PASS: $($exe.FullName)"
 
       - name: Publish self-contained exe
         if: inputs.tag != ''
@@ -199,6 +340,33 @@ jobs:
         if: inputs.tag != ''
         shell: pwsh
         run: |
+          Add-Type -AssemblyName System.Drawing.Common
+          function Assert-EmbeddedIcon([string]$path) {
+            if (-not (Test-Path $path)) { throw "missing $path" }
+            $expectedIcon = [Drawing.Icon]::new((Resolve-Path windows/snippr.ico).Path, 32, 32)
+            $actualIcon = [Drawing.Icon]::ExtractAssociatedIcon((Resolve-Path $path).Path)
+            if (-not $actualIcon) { throw "embedded icon missing from $path" }
+            $expected = $expectedIcon.ToBitmap()
+            $actual = $actualIcon.ToBitmap()
+            try {
+              if ($actual.Width -ne $expected.Width -or $actual.Height -ne $expected.Height) {
+                throw "embedded icon dimensions differ for $path"
+              }
+              for ($y = 0; $y -lt $expected.Height; $y++) {
+                for ($x = 0; $x -lt $expected.Width; $x++) {
+                  if ($actual.GetPixel($x, $y).ToArgb() -ne $expected.GetPixel($x, $y).ToArgb()) {
+                    throw "embedded icon mismatch in $path at $x,$y"
+                  }
+                }
+              }
+            } finally {
+              $expected.Dispose()
+              $actual.Dispose()
+              $expectedIcon.Dispose()
+              $actualIcon.Dispose()
+            }
+            Write-Host "embedded icon ok $path"
+          }
           function Get-SetupExe([string]$dir) {
             $setup = @(Get-Item (Join-Path $dir 'SnipprSetup-*.exe') -ErrorAction SilentlyContinue)
             if ($setup.Count -ne 1) {
@@ -287,6 +455,8 @@ jobs:
           $expectSigned = ($env:HAS_SIGNING -eq 'true')
           Assert-Authenticode windows/Snippr.exe $expectSigned
           Assert-Authenticode $setup.FullName $expectSigned
+          Assert-EmbeddedIcon windows/Snippr.exe
+          Assert-EmbeddedIcon $setup.FullName
           if (-not (Test-Path windows/Snippr-portable-win-x64.zip)) {
             throw "missing windows/Snippr-portable-win-x64.zip"
           }

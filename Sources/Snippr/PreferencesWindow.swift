@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 import ServiceManagement
 
@@ -610,11 +611,12 @@ struct AdvancedTab: View {
 struct AboutTab: View {
     var body: some View {
         VStack(spacing: 12) {
-            Image(systemName: "camera.viewfinder")
-                .font(.system(size: 42, weight: .medium))
-                .foregroundStyle(.tint)
+            Image(nsImage: NSApplication.shared.applicationIconImage)
+                .resizable()
+                .interpolation(.high)
+                .frame(width: 64, height: 64)
             Text("Snippr").font(.title).bold()
-            Text("Version 1.2.5 — native for Apple Silicon & Intel")
+            Text("Version 1.2.6 — native for Apple Silicon & Intel")
                 .foregroundStyle(.secondary)
             Divider().frame(width: 300)
             Text("Free for personal use. Screenshot, annotate, OCR,\nscrolling capture — everything stays on your Mac.")
