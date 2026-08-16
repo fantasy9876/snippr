@@ -8895,6 +8895,108 @@ enum SelfTest {
                   ownershipFailures.isEmpty,
                   ownershipFailures.joined(separator: " | "))
 
+            // E4. Preview grid + allocation trace. Every pixel of the mask is
+            //     opaque cover, every pixel outside it is untouched, export is
+            //     nil, and no materialization strays outside the mask.
+            let gridBase = makeNoiseImage(width: 240, height: 160)
+            let gridMask = CGRect(x: 40, y: 40, width: 100, height: 60)
+            var gridFailures: [String] = []
+            func coverProbe(_ image: CGImage, _ x: Int, _ y: Int) -> Bool {
+                let p = probe3(image, x, y)
+                return p.0 >= 0 && p.0 < 60 && p.1 < 60 && p.2 < 60
+            }
+            // -- surface renderer (shared by area overlay and scroll panel)
+            MainActor.assumeIsolated {
+                let surface = AnnotationSurface(pixelScale: 1)
+                let blur = BlurAnnotation(uiScale: 1)
+                blur.rect = gridMask
+                surface.addAnnotationForTesting(blur)
+                surface.forceRegionalPixelateFailureForTesting = true
+                let c = ctx(240, 160)
+                c.draw(gridBase, in: CGRect(x: 0, y: 0, width: 240, height: 160))
+                let ok = surface.drawForPreview(in: c, base: gridBase)
+                let exported = surface.flattened(
+                    base: gridBase,
+                    cropPixels: CGRect(x: 0, y: 0, width: 240, height: 160))
+                surface.forceRegionalPixelateFailureForTesting = false
+                if ok { gridFailures.append("surface:claimed-ok") }
+                if exported != nil { gridFailures.append("surface:exported") }
+                guard let shot = c.makeImage() else {
+                    gridFailures.append("surface:no-shot")
+                    return
+                }
+                for x in stride(from: Int(gridMask.minX) + 2,
+                                to: Int(gridMask.maxX) - 2, by: 7) {
+                    for y in stride(from: Int(gridMask.minY) + 2,
+                                    to: Int(gridMask.maxY) - 2, by: 7)
+                    where !coverProbe(shot, x, y) {
+                        gridFailures.append("surface:hole@\(x),\(y)")
+                    }
+                }
+                for x in stride(from: 4, to: 236, by: 11) {
+                    for y in stride(from: 4, to: 156, by: 11)
+                    where !gridMask.insetBy(dx: -2, dy: -2)
+                        .contains(CGPoint(x: x, y: y)) {
+                        if probe3(shot, x, y) != probe3(gridBase, x, y) {
+                            gridFailures.append("surface:outside@\(x),\(y)")
+                        }
+                    }
+                }
+            }
+            // -- editor canvas
+            let editorGrid = MainActor.assumeIsolated { () -> [String] in
+                var problems: [String] = []
+                let wc = EditorWindowController.open(
+                    with: CapturedImage(cgImage: gridBase, scale: 1),
+                    forceFitForTesting: true)
+                let canvas = wc.canvasForTesting
+                let blur = BlurAnnotation(uiScale: 1)
+                blur.rect = gridMask
+                canvas.annotations = [blur]
+                EditorCanvasView.forcePixellateFailureForTesting = true
+                canvas.display()
+                let shot = viewSnapshot(canvas)
+                let exported = canvas.flattened()
+                EditorCanvasView.forcePixellateFailureForTesting = false
+                if exported != nil { problems.append("editor:exported") }
+                if let shot {
+                    for x in stride(from: Int(gridMask.minX) + 2,
+                                    to: Int(gridMask.maxX) - 2, by: 9) {
+                        for y in stride(from: Int(gridMask.minY) + 2,
+                                        to: Int(gridMask.maxY) - 2, by: 9)
+                        where !coverProbe(shot, x, y) {
+                            problems.append("editor:hole@\(x),\(y)")
+                        }
+                    }
+                } else {
+                    problems.append("editor:no-shot")
+                }
+                wc.window?.close()
+                return problems
+            }
+            gridFailures += editorGrid
+            // -- allocation trace on a tall stitch: nothing outside the mask
+            let traceBase = makeNoiseImage(width: 400, height: 4000)
+            let traceMask = CGRect(x: 50, y: 3800, width: 160, height: 40)
+            let traceWord = CGRect(x: 60, y: 3810, width: 40, height: 14)
+            AnnotationRenderer.fullImagePixellateCallsForTesting = 0
+            AnnotationSurface.allRegionalPixelateRectsForTesting = []
+            let traceBlur = BlurAnnotation(uiScale: 1)
+            traceBlur.rect = traceMask
+            traceBlur.redactionState = .words([traceWord])
+            _ = AnnotationRenderer.render(
+                base: traceBase, annotations: [traceBlur], pixellated: nil)
+            let strayed = AnnotationSurface.allRegionalPixelateRectsForTesting
+                .filter { !traceWord.insetBy(dx: -4, dy: -4).contains($0) }
+            if AnnotationRenderer.fullImagePixellateCallsForTesting != 0 {
+                gridFailures.append(
+                    "trace:full \(AnnotationRenderer.fullImagePixellateCallsForTesting)")
+            }
+            if !strayed.isEmpty { gridFailures.append("trace:stray \(strayed)") }
+            check("sliceB-preview-grid-allocation",
+                  gridFailures.isEmpty,
+                  gridFailures.prefix(6).joined(separator: " | "))
+
             // F. Tall images never allocate a full-size pixelated intermediate,
             //    in the editor or in a magnifier patch.
             let tallEditorBase = makeNoiseImage(width: 400, height: 4000)

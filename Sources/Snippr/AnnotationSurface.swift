@@ -422,6 +422,9 @@ final class AnnotationSurface {
     /// pixelation exists.  Tests use them to reject a hidden full-image cache.
     nonisolated(unsafe) static var regionalPixelateAllocationsForTesting = 0
     nonisolated(unsafe) static var lastRegionalPixelateRectForTesting: CGRect?
+    /// Every region Core Image was actually asked to materialize, so a gate can
+    /// prove no allocation strayed outside the mask.
+    nonisolated(unsafe) static var allRegionalPixelateRectsForTesting: [CGRect] = []
     nonisolated(unsafe) static var lastRegionalPixelateBaseSizeForTesting: CGSize?
     /// Test hook: simulates destination-allocation failure.
     var forceRenderFailureForTesting = false

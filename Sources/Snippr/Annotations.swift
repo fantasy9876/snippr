@@ -671,6 +671,7 @@ enum AnnotationRenderer {
         // actual output materialization call.
         AnnotationSurface.regionalPixelateAllocationsForTesting += 1
         AnnotationSurface.lastRegionalPixelateRectForTesting = region
+        AnnotationSurface.allRegionalPixelateRectsForTesting.append(region)
         AnnotationSurface.lastRegionalPixelateBaseSizeForTesting = CGSize(
             width: image.width, height: image.height)
         return ciContext.createCGImage(out, from: region)
