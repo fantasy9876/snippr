@@ -10971,7 +10971,8 @@ enum SelfTest {
                         previousStore
                 }
                 func wheel(
-                    _ view: NSView, deltaY: CGFloat, precise: Bool
+                    _ view: NSView, deltaY: CGFloat, precise: Bool,
+                    modified: Bool = false
                 ) -> NSEvent? {
                     // A line-based wheel and a precise trackpad scroll take
                     // different branches, so both are exercised.
@@ -10982,20 +10983,24 @@ enum SelfTest {
                                 units: precise ? .pixel : .line,
                                 wheelCount: 1, wheel1: Int32(deltaY),
                                 wheel2: 0, wheel3: 0)!
+                            // A modified wheel is the production path that
+                            // forwards, so it is the positive control for
+                            // "this handler consumes".
+                            if modified { e.flags = .maskCommand }
                             return e
                         }())
                 }
 
-                // --- initial crop creation, on its OWN session: a view with
-                // no selection shares nothing with the review fixture below,
-                // and reusing that owner would send this mouse-down straight
-                // into `finish(.cancelled)`.
                 final class WheelSpy: NSResponder {
                     var forwarded = 0
                     override func scrollWheel(with event: NSEvent) {
                         forwarded += 1
                     }
                 }
+                // --- initial crop creation, on its OWN session: a view with
+                // no selection shares nothing with the review fixture below,
+                // and reusing that owner would send this mouse-down straight
+                // into `finish(.cancelled)`.
                 // No-op dependencies BEFORE any selection or drag: the real
                 // mouse-up runs `.initialCapture`, which with live
                 // dependencies would write lastCapture and the event log of
@@ -11096,6 +11101,22 @@ enum SelfTest {
                     return
                 }
                 surface.tool = .pen
+                // Consume, not merely "did not write": a mutant that resets
+                // the accumulator and STILL calls super keeps every count
+                // above intact. The spy answers that directly.
+                let viewSpy = WheelSpy()
+                let viewPreviousResponder = view.nextResponder
+                view.nextResponder = viewSpy
+                defer { view.nextResponder = viewPreviousResponder }
+                if let event = wheel(view, deltaY: 3, precise: false,
+                                     modified: true) {
+                    view.scrollWheel(with: event)
+                }
+                if viewSpy.forwarded != 1 {
+                    wheelFailures.append(
+                        "area:modified-not-forwarded \(viewSpy.forwarded)")
+                }
+                let viewForwardedBaseline = viewSpy.forwarded
                 // The precise branch accumulates to 18 before it steps, and
                 // the blocked path RESETS the accumulator. Half the threshold
                 // is primed here so the sequence after the drag can tell a
@@ -11125,6 +11146,11 @@ enum SelfTest {
                     wheelFailures.append(
                         "area:mid-drag-writes "
                         + "\(midDragWrites - primedWrites)")
+                }
+                if viewSpy.forwarded != viewForwardedBaseline {
+                    wheelFailures.append(
+                        "area:mid-drag-forwarded "
+                        + "\(viewSpy.forwarded - viewForwardedBaseline)")
                 }
                 // The stroke still finished with the width it started with.
                 let drawnPen = surface.annotations
@@ -11203,6 +11229,19 @@ enum SelfTest {
                 if host.mouseDownCanMoveWindow {
                     wheelFailures.append("panel:drag-handle")
                 }
+                let hostSpy = WheelSpy()
+                let hostPreviousResponder = host.nextResponder
+                host.nextResponder = hostSpy
+                defer { host.nextResponder = hostPreviousResponder }
+                if let event = wheel(host, deltaY: 3, precise: false,
+                                     modified: true) {
+                    host.scrollWheel(with: event)
+                }
+                if hostSpy.forwarded != 1 {
+                    wheelFailures.append(
+                        "panel:modified-not-forwarded \(hostSpy.forwarded)")
+                }
+                let hostForwardedBaseline = hostSpy.forwarded
                 let panelBeforePrime = writes.count
                 if let event = wheel(host, deltaY: 9, precise: true) {
                     host.scrollWheel(with: event)
@@ -11228,6 +11267,11 @@ enum SelfTest {
                     wheelFailures.append(
                         "panel:mid-drag-writes "
                         + "\(panelMidWrites - panelBeforeDrag)")
+                }
+                if hostSpy.forwarded != hostForwardedBaseline {
+                    wheelFailures.append(
+                        "panel:mid-drag-forwarded "
+                        + "\(hostSpy.forwarded - hostForwardedBaseline)")
                 }
                 let panelPen = panelSurface.annotations
                     .compactMap { $0 as? PenAnnotation }.last
