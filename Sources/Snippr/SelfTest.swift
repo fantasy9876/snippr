@@ -9085,6 +9085,37 @@ enum SelfTest {
                 if abs(width - 560) > 0.5 {
                     toolbarFailures.append("min-width \(width)")
                 }
+                func verifyLayout(_ phase: String) {
+                    for (name, view) in [
+                        ("bar", bar), ("stack", stack as NSView),
+                        ("toolRow", toolRow as NSView),
+                        ("actionRow", actionRow as NSView),
+                    ] where view.hasAmbiguousLayout {
+                        toolbarFailures.append("\(phase)-\(name):ambiguous")
+                    }
+                    let frames = buttons.map {
+                        ($0.tool.rawValue, $0.button.convert(
+                            $0.button.bounds, to: toolRow))
+                    }
+                    for i in frames.indices {
+                        let frame = frames[i].1
+                        if frame.minX < -0.5
+                            || frame.maxX > toolRow.bounds.width + 0.5
+                            || frame.minY < -0.5
+                            || frame.maxY > toolRow.bounds.height + 0.5 {
+                            toolbarFailures.append(
+                                "\(phase)-\(frames[i].0):row")
+                        }
+                        for j in frames.indices where j > i {
+                            if frame.intersects(frames[j].1) {
+                                toolbarFailures.append(
+                                    "\(phase)-overlap \(frames[i].0)/"
+                                    + "\(frames[j].0)")
+                            }
+                        }
+                    }
+                }
+
                 // Two rows of equal height inside a 70 pt bar.
                 if abs(toolRow.frame.height - 35) > 0.5
                     || abs(actionRow.frame.height - 35) > 0.5
@@ -9106,7 +9137,17 @@ enum SelfTest {
                         toolbarFailures.append(
                             "\(tool.rawValue):label(\(label))")
                     }
-                    if button.target == nil || button.action == nil {
+                    // Exact wiring, not merely present: the identifier is
+                    // what toolTapped reads back to find the tool, and
+                    // Backdrop deliberately routes elsewhere.
+                    if button.identifier?.rawValue != tool.rawValue {
+                        toolbarFailures.append(
+                            "\(tool.rawValue):identifier")
+                    }
+                    let expectedSelector = tool == .backdrop
+                        ? NSSelectorFromString("showBackdropMenu:")
+                        : NSSelectorFromString("toolTapped:")
+                    if button.target !== wc || button.action != expectedSelector {
                         toolbarFailures.append("\(tool.rawValue):action")
                     }
                     // The centre of every button belongs to that button, asked
@@ -9175,6 +9216,63 @@ enum SelfTest {
                     ("sizeBadge", wc.sizeBadgeForTesting),
                     ("zoom", wc.zoomLabelForTesting),
                 ]
+                if wc.colorWellForTesting.target !== wc
+                    || wc.colorWellForTesting.action
+                        != NSSelectorFromString("colorChanged") {
+                    toolbarFailures.append("colorWell:action")
+                }
+                if wc.sizeBadgeForTesting.target !== wc
+                    || wc.sizeBadgeForTesting.action
+                        != NSSelectorFromString("sizeBadgeClicked") {
+                    toolbarFailures.append("sizeBadge:action")
+                }
+                // Nothing in the bar may be laid out ambiguously: an ambiguous
+                // frame can look right in one run and move in the next.
+                for (name, view) in [
+                    ("bar", bar), ("stack", stack as NSView),
+                    ("toolRow", toolRow as NSView),
+                    ("actionRow", actionRow as NSView),
+                ] where view.hasAmbiguousLayout {
+                    toolbarFailures.append("\(name):ambiguous")
+                }
+                // Action-row members: contained in THEIR row, and disjoint
+                // from each other. The two rows overlap in x by design, so
+                // that is not asked of them.
+                let actionFrames = (actions.map { ($0.name, $0.button as NSView) }
+                    + chrome).map {
+                    ($0.0, $0.1.convert($0.1.bounds, to: actionRow))
+                }
+                for i in actionFrames.indices {
+                    let frame = actionFrames[i].1
+                    if frame.minX < -0.5
+                        || frame.maxX > actionRow.bounds.width + 0.5
+                        || frame.minY < -0.5
+                        || frame.maxY > actionRow.bounds.height + 0.5 {
+                        toolbarFailures.append(
+                            "\(actionFrames[i].0):row-containment")
+                    }
+                    for j in actionFrames.indices where j > i {
+                        if frame.intersects(actionFrames[j].1) {
+                            toolbarFailures.append(
+                                "overlap \(actionFrames[i].0)/"
+                                + "\(actionFrames[j].0)")
+                        }
+                    }
+                }
+                // Tools are contained in the TOOL row specifically.
+                for (tool, button) in buttons {
+                    let inRow = button.convert(button.bounds, to: toolRow)
+                    if inRow.minX < -0.5
+                        || inRow.maxX > toolRow.bounds.width + 0.5
+                        || inRow.minY < -0.5
+                        || inRow.maxY > toolRow.bounds.height + 0.5 {
+                        toolbarFailures.append(
+                            "\(tool.rawValue):row-containment")
+                    }
+                    if button.hasAmbiguousLayout {
+                        toolbarFailures.append("\(tool.rawValue):ambiguous")
+                    }
+                }
                 for (name, view) in actions.map({ ($0.name, $0.button as NSView) })
                     + chrome {
                     if view.isHidden || view.frame.width <= 0
@@ -9234,6 +9332,10 @@ enum SelfTest {
                 // rows, still laid out.
                 window.setContentSize(NSSize(width: 900, height: 600))
                 window.contentView?.layoutSubtreeIfNeeded()
+                // The whole verifier again at the larger size: re-expanding
+                // must not leave anything overlapping, out of its row, or
+                // ambiguously placed either.
+                verifyLayout("wide")
                 let after = wc.toolButtonsForTesting
                 if after.count != buttons.count
                     || !zip(after, buttons).allSatisfy({
