@@ -772,6 +772,13 @@ final class EditorCanvasView: NSView {
         CGPoint(x: (frame.minX + 2) * scale, y: (frame.minY + 4) * scale)
     }
 
+    /// Text-redaction jobs owned by this canvas. GREEN2 wires the tool to it;
+    /// the lifecycle gate asserts on it and stays red until then.
+    let redactionRegistry = RedactionJobRegistry()
+
+    /// Repaint target for a resolved redaction, weak by construction.
+    weak var redactionDelegate: RedactionSurfaceDelegate?
+
     /// Slice B seam: drives the SHARED regional-pixelation failure so the
     /// editor takes production's fail-closed path (no clean base on screen, no
     /// export, no close) rather than a canvas-only shortcut.

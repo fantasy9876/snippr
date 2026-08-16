@@ -534,6 +534,43 @@ enum SliceBCompositor {
     }
 }
 
+/// Jobs owned by one host, keyed by the annotation they answer. The editor and
+/// both overlay surfaces share this so "is the job registered / did it clean
+/// itself up" means the same thing everywhere.
+@MainActor
+final class RedactionJobRegistry: RedactionJobObserver {
+    private var jobs: [ObjectIdentifier: SliceBRedactionJob] = [:]
+
+    var count: Int { jobs.count }
+
+    func register(_ job: SliceBRedactionJob, for annotation: Annotation) {
+        jobs[ObjectIdentifier(annotation)] = job
+        job.setCompletionObserver(self)
+    }
+
+    func cancel(for annotation: Annotation) {
+        if let job = jobs.removeValue(forKey: ObjectIdentifier(annotation)) {
+            job.cancel()
+        }
+        if let blur = annotation as? BlurAnnotation {
+            blur.bumpRedactionGeneration()
+        }
+    }
+
+    func cancelAll() {
+        for (id, job) in jobs {
+            job.cancel()
+            jobs.removeValue(forKey: id)
+        }
+    }
+
+    func redactionJobDidFinish(_ job: SliceBRedactionJob) {
+        for (id, registered) in jobs where registered === job {
+            jobs.removeValue(forKey: id)
+        }
+    }
+}
+
 // MARK: - Fail-closed export
 
 enum SliceBExport {

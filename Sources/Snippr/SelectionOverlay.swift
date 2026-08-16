@@ -180,6 +180,10 @@ final class SelectionOverlay {
     /// actions funnel through here so the session phase and the window
     /// lifecycle can never disagree. Late-view guards read the session phase;
     /// this latch only prevents double teardown/completion.
+    /// Production teardown, exposed so a gate ends the session the way the app
+    /// does instead of poking the surface directly.
+    func dismissForTesting() { finish(.cancelled) }
+
     func finish(_ result: OverlayResult) {
         guard !tornDown else { return }
         tornDown = true

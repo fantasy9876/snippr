@@ -10175,16 +10175,19 @@ enum SelfTest {
                   panelFailures.isEmpty,
                   panelFailures.prefix(4).joined(separator: " | "))
 
-            // E11. INTENTIONAL RED until GREEN2: there is still no production
-            //      caller that creates a text redaction and registers its job.
-            //      Editor, area overlay and scroll panel must each do it.
-            final class RepaintCounter: RedactionSurfaceDelegate {
+            // E11. INTENTIONAL RED until GREEN2: no production caller creates
+            //      a text redaction and registers its job yet. When the tool
+            //      exists the gate drives the REAL host route on all three
+            //      surfaces, so a correct GREEN2 turns it green.
+            final class ForwardingRepaintSpy: RedactionSurfaceDelegate {
                 var repaints = 0
-                func surfaceNeedsRedactionRepaint() { repaints += 1 }
+                weak var wrapped: RedactionSurfaceDelegate?
+                func surfaceNeedsRedactionRepaint() {
+                    repaints += 1
+                    wrapped?.surfaceNeedsRedactionRepaint()
+                }
             }
             var lifecycleFailures: [String] = []
-            var lifecycleAfterRelease:
-                [(String, BlurAnnotation, RepaintCounter, Int)] = []
             let editorTextTool = EditorTool.allCases.first {
                 $0.tooltip.hasPrefix("Pixelate text")
             }
@@ -10193,19 +10196,27 @@ enum SelfTest {
             }
             if editorTextTool == nil { lifecycleFailures.append("editor:no-tool") }
             if overlayTextTool == nil { lifecycleFailures.append("overlay:no-tool") }
-            // When the tool DOES exist, having it in the catalogue proves
-            // nothing: drive the production route and require the whole
-            // lifecycle. A GREEN2 that adds an enum case and a button but never
-            // starts or registers a job must still fail here.
-            // A blocking recognizer makes the assertions deterministic: the
-            // annotation must be pendingFull with a job really in flight, not
-            // a fallbackFull that an implementation which never OCRs would also
-            // produce, and not a race with a fast real recognizer.
-            let lifecycleStarted = DispatchSemaphore(value: 0)
-            let lifecycleRelease = DispatchSemaphore(value: 0)
+
+            // One permit pair PER HOST: a shared semaphore can eat a spare
+            // signal and let a host proceed without its worker running.
+            let hostNames = ["editor", "area", "scroll"]
+            var startedPermits: [String: DispatchSemaphore] = [:]
+            var releasePermits: [String: DispatchSemaphore] = [:]
+            for name in hostNames {
+                startedPermits[name] = DispatchSemaphore(value: 0)
+                releasePermits[name] = DispatchSemaphore(value: 0)
+            }
+            let permitLock = NSLock()
+            var permitOrder: [String] = []
+            var nextPermit = 0
             SliceBOCR.recognizerForTesting = { _ in
-                lifecycleStarted.signal()
-                lifecycleRelease.wait()
+                permitLock.lock()
+                let name = nextPermit < permitOrder.count
+                    ? permitOrder[nextPermit] : "editor"
+                nextPermit += 1
+                permitLock.unlock()
+                startedPermits[name]?.signal()
+                releasePermits[name]?.wait()
                 return .success([
                     RecognizedWord(
                         rect: CGRect(x: 4, y: 4, width: 10, height: 8),
@@ -10213,13 +10224,82 @@ enum SelfTest {
                 ])
             }
             defer {
-                lifecycleRelease.signal()
+                for name in hostNames { releasePermits[name]?.signal() }
                 SliceBOCR.recognizerForTesting = nil
             }
-            if let editorTextTool {
-                let baseline = MainActor.assumeIsolated {
-                    SliceBRedactionJob.inFlight
+
+            // Every host is verified against the SAME initial slot count, and
+            // each one releases and drains before the next starts, so one
+            // host's held slot can never look like another host's leak.
+            let initialSlots = MainActor.assumeIsolated {
+                SliceBRedactionJob.inFlight
+            }
+            @MainActor
+            func runHostLifecycle(
+                name: String, registryCount: @escaping @MainActor () -> Int,
+                installSpy: @escaping @MainActor (ForwardingRepaintSpy) -> Void,
+                blur: BlurAnnotation, teardown: @escaping @MainActor () -> Void
+            ) {
+                let spy = ForwardingRepaintSpy()
+                installSpy(spy)
+                if startedPermits[name]?.wait(timeout: .now() + 10) == .timedOut {
+                    lifecycleFailures.append(name + ":worker-never-started")
                 }
+                if blur.redactionState != .pendingFull {
+                    lifecycleFailures.append(
+                        name + ":not-pending \(blur.redactionState)")
+                }
+                if registryCount() != 1 {
+                    lifecycleFailures.append(name + ":not-registered")
+                }
+                let slotsWhileRunning = SliceBRedactionJob.inFlight
+                if slotsWhileRunning != initialSlots + 1 {
+                    lifecycleFailures.append(name + ":no-slot")
+                }
+                let generationBefore = blur.redactionGeneration
+                // Cancel through the REAL host route, not the surface API.
+                teardown()
+                if blur.redactionState != .fallbackFull {
+                    lifecycleFailures.append(
+                        name + ":not-normalized \(blur.redactionState)")
+                }
+                if blur.redactionGeneration <= generationBefore {
+                    lifecycleFailures.append(name + ":no-generation-bump")
+                }
+                if registryCount() != 0 {
+                    lifecycleFailures.append(name + ":registry-leak")
+                }
+                if SliceBRedactionJob.ownerCountForTesting != 0 {
+                    lifecycleFailures.append(name + ":owner-leak")
+                }
+                if spy.repaints != 1 {
+                    lifecycleFailures.append(name + ":repaints \(spy.repaints)")
+                }
+                // The worker is still running, so the slot is still held.
+                if SliceBRedactionJob.inFlight != slotsWhileRunning {
+                    lifecycleFailures.append(name + ":slot-freed-early")
+                }
+                let stateAfterCancel = blur.redactionState
+                let repaintsAfterCancel = spy.repaints
+                releasePermits[name]?.signal()
+                let deadline = Date().addingTimeInterval(10)
+                while SliceBRedactionJob.inFlight > initialSlots,
+                      Date() < deadline {
+                    RunLoop.current.run(until: Date().addingTimeInterval(0.02))
+                }
+                if SliceBRedactionJob.inFlight != initialSlots {
+                    lifecycleFailures.append(name + ":slot-leak")
+                }
+                if blur.redactionState != stateAfterCancel {
+                    lifecycleFailures.append(name + ":late-mutation")
+                }
+                if spy.repaints != repaintsAfterCancel {
+                    lifecycleFailures.append(name + ":late-repaint")
+                }
+            }
+
+            if let editorTextTool {
+                permitLock.lock(); permitOrder.append("editor"); permitLock.unlock()
                 MainActor.assumeIsolated {
                     let wc = EditorWindowController.open(
                         with: CapturedImage(
@@ -10236,83 +10316,21 @@ enum SelfTest {
                         wc.window?.close()
                         return
                     }
-                    if blur.redactionState != .pendingFull {
-                        lifecycleFailures.append(
-                            "editor:not-pending \(blur.redactionState)")
-                    }
-                    if SliceBRedactionJob.inFlight != baseline + 1 {
-                        lifecycleFailures.append("editor:no-job")
-                    }
-                    // Closing must invalidate: after the worker is released the
-                    // late result may neither apply nor leave a slot behind.
-                    wc.window?.close()
+                    // The blur, the spy and the registry are held here, so they
+                    // outlive the close — exactly when a late result would land.
+                    runHostLifecycle(
+                        name: "editor",
+                        registryCount: { canvas.redactionRegistry.count },
+                        installSpy: { spy in
+                            spy.wrapped = canvas.redactionDelegate
+                            canvas.redactionDelegate = spy
+                        },
+                        blur: blur,
+                        teardown: { wc.window?.close() })
                 }
-                lifecycleRelease.signal()
-                let deadline = Date().addingTimeInterval(10)
-                while MainActor.assumeIsolated({
-                    SliceBRedactionJob.inFlight
-                }) > baseline, Date() < deadline {
-                    RunLoop.current.run(until: Date().addingTimeInterval(0.02))
-                }
-                if MainActor.assumeIsolated({
-                    SliceBRedactionJob.inFlight
-                }) != baseline {
-                    lifecycleFailures.append("editor:slot-leak")
-                }
-                if MainActor.assumeIsolated({
-                    SliceBRedactionJob.ownerCountForTesting
-                }) != 0 {
-                    lifecycleFailures.append("editor:owner-leak")
-                }
-            }
-            // Area and scroll are DRIVEN when the tool exists, so a correct
-            // GREEN2 turns this gate green instead of tripping on a hard-coded
-            // failure. Only the absence of wiring keeps it red.
-            @MainActor
-            func assertJobLifecycle(
-                surface: AnnotationSurface, blur: BlurAnnotation,
-                label: String, baseline: Int
-            ) {
-                let counter = RepaintCounter()
-                surface.redactionDelegate = counter
-                if blur.redactionState != .pendingFull {
-                    lifecycleFailures.append(
-                        label + ":not-pending \(blur.redactionState)")
-                }
-                if surface.redactionJobCountForTesting != 1 {
-                    lifecycleFailures.append(label + ":not-registered")
-                }
-                if SliceBRedactionJob.inFlight != baseline + 1 {
-                    lifecycleFailures.append(label + ":no-slot")
-                }
-                let generationBefore = blur.redactionGeneration
-                surface.cancelRedactionJob(for: blur)
-                // BEFORE the worker is released: the mask is normalized, the
-                // registry and owner map are empty, the repaint happened once,
-                // and the physical slot is still held by the running worker.
-                if blur.redactionState != .fallbackFull {
-                    lifecycleFailures.append(
-                        label + ":not-normalized \(blur.redactionState)")
-                }
-                if blur.redactionGeneration <= generationBefore {
-                    lifecycleFailures.append(label + ":no-generation-bump")
-                }
-                if surface.redactionJobCountForTesting != 0 {
-                    lifecycleFailures.append(label + ":registry-leak")
-                }
-                if SliceBRedactionJob.ownerCountForTesting != 0 {
-                    lifecycleFailures.append(label + ":owner-leak")
-                }
-                if counter.repaints != 1 {
-                    lifecycleFailures.append(
-                        label + ":repaints \(counter.repaints)")
-                }
-                if SliceBRedactionJob.inFlight != baseline + 1 {
-                    lifecycleFailures.append(label + ":slot-freed-early")
-                }
-                lifecycleAfterRelease.append((label, blur, counter, baseline))
             }
             if let overlayTextTool {
+                permitLock.lock(); permitOrder.append("area"); permitLock.unlock()
                 MainActor.assumeIsolated {
                     let frozen = CapturedImage(
                         cgImage: makeNoiseImage(width: 240, height: 180),
@@ -10334,7 +10352,6 @@ enum SelfTest {
                         windowList: [], owner: overlay)
                     view.selectForTesting(
                         rect: CGRect(x: 20, y: 20, width: 200, height: 140))
-                    let baseline = SliceBRedactionJob.inFlight
                     view.clickReviewToolbarButtonForTesting(
                         tag: overlayTextTool.toolbarTag)
                     view.annotationDragForTesting(
@@ -10345,17 +10362,21 @@ enum SelfTest {
                         lifecycleFailures.append("area:no-redaction")
                         return
                     }
-                    if lifecycleStarted.wait(timeout: .now() + 10) == .timedOut {
-                        lifecycleFailures.append("area:worker-never-started")
-                    }
-                    assertJobLifecycle(
-                        surface: surface, blur: blur, label: "area",
-                        baseline: baseline)
+                    runHostLifecycle(
+                        name: "area",
+                        registryCount: { surface.redactionJobCountForTesting },
+                        installSpy: { spy in
+                            spy.wrapped = surface.redactionDelegate
+                            surface.redactionDelegate = spy
+                        },
+                        blur: blur,
+                        teardown: { overlay.dismissForTesting() })
                 }
+                permitLock.lock(); permitOrder.append("scroll"); permitLock.unlock()
                 MainActor.assumeIsolated {
-                    // A deliberately TALL stitch so the panel must fit it at a
-                    // scale other than 1:1 — a 1:1 fixture would never exercise
-                    // the point/pixel conversion.
+                    // A deliberately TALL stitch: the panel must fit it at a
+                    // scale other than 1:1, which is the only way the
+                    // point/pixel conversion is exercised.
                     let panel = ScrollResultPanel.show(
                         image: CapturedImage(
                             cgImage: makeNoiseImage(width: 300, height: 4000),
@@ -10363,59 +10384,61 @@ enum SelfTest {
                         inputs: OverlaySessionInputs(
                             afterShow: true, afterCopy: false, afterSave: false),
                         screen: hostScreen)
-                    if let host = panel.annotationHostForTesting,
-                       abs(host.bounds.height - 4000) < 1 {
+                    guard let host = panel.annotationHostForTesting,
+                          host.bounds.width > 8, host.bounds.height > 8 else {
+                        lifecycleFailures.append("scroll:no-host")
+                        panel.dismissForTesting()
+                        return
+                    }
+                    if abs(host.bounds.height - 4000) < 1 {
                         lifecycleFailures.append("scroll:fixture-is-1to1")
                     }
-                    let baseline = SliceBRedactionJob.inFlight
+                    // Drag derived from the ACTUAL fitted bounds, never fixed
+                    // point coordinates that may be off the view entirely.
+                    let from = CGPoint(
+                        x: host.bounds.width * 0.2,
+                        y: host.bounds.height * 0.2)
+                    let to = CGPoint(
+                        x: host.bounds.width * 0.6,
+                        y: host.bounds.height * 0.5)
                     panel.clickToolbarButtonForTesting(
                         tag: overlayTextTool.toolbarTag)
-                    panel.drawWithRealEventsForTesting(
-                        fromView: CGPoint(x: 30, y: 40),
-                        toView: CGPoint(x: 90, y: 90))
+                    panel.drawWithRealEventsForTesting(fromView: from, toView: to)
                     guard let blur = panel.annotationSurface.annotations
                         .compactMap({ $0 as? BlurAnnotation }).last else {
                         lifecycleFailures.append("scroll:no-redaction")
                         panel.dismissForTesting()
                         return
                     }
-                    if lifecycleStarted.wait(timeout: .now() + 10) == .timedOut {
-                        lifecycleFailures.append("scroll:worker-never-started")
+                    // point -> pixel: the mark must land where the drag did.
+                    let pixelsPerPoint = 4000 / host.bounds.height
+                    let expected = CGRect(
+                        x: min(from.x, to.x) * pixelsPerPoint,
+                        y: min(from.y, to.y) * pixelsPerPoint,
+                        width: abs(to.x - from.x) * pixelsPerPoint,
+                        height: abs(to.y - from.y) * pixelsPerPoint)
+                    if abs(blur.rect.width - expected.width) > 2
+                        || abs(blur.rect.height - expected.height) > 2 {
+                        lifecycleFailures.append(
+                            "scroll:mapping \(blur.rect) vs \(expected)")
                     }
-                    assertJobLifecycle(
-                        surface: panel.annotationSurface, blur: blur,
-                        label: "scroll", baseline: baseline)
-                    panel.dismissForTesting()
-                }
-            }
-            // AFTER releasing the workers: a cancelled job may not mutate the
-            // annotation again, may not repaint, and must give its slot back.
-            lifecycleRelease.signal()
-            lifecycleRelease.signal()
-            for (label, blur, counter, baseline) in lifecycleAfterRelease {
-                let stateBefore = blur.redactionState
-                let repaintsBefore = counter.repaints
-                let deadline = Date().addingTimeInterval(10)
-                while MainActor.assumeIsolated({
-                    SliceBRedactionJob.inFlight
-                }) > baseline, Date() < deadline {
-                    RunLoop.current.run(until: Date().addingTimeInterval(0.02))
-                }
-                if MainActor.assumeIsolated({
-                    SliceBRedactionJob.inFlight
-                }) != baseline {
-                    lifecycleFailures.append(label + ":slot-leak")
-                }
-                if blur.redactionState != stateBefore {
-                    lifecycleFailures.append(label + ":late-mutation")
-                }
-                if counter.repaints != repaintsBefore {
-                    lifecycleFailures.append(label + ":late-repaint")
+                    runHostLifecycle(
+                        name: "scroll",
+                        registryCount: {
+                            panel.annotationSurface.redactionJobCountForTesting
+                        },
+                        installSpy: { spy in
+                            spy.wrapped = panel.annotationSurface.redactionDelegate
+                            panel.annotationSurface.redactionDelegate = spy
+                        },
+                        blur: blur,
+                        teardown: { panel.dismissForTesting() })
                 }
             }
             check("sliceB-text-redaction-lifecycle-wiring",
                   lifecycleFailures.isEmpty,
-                  "GREEN2 wiring pending: " + lifecycleFailures.joined(separator: " | "))
+                  "GREEN2 wiring pending: "
+                    + lifecycleFailures.prefix(6).joined(separator: " | "))
 
             // F. Tall images never allocate a full-size pixelated intermediate,
             //    in the editor or in a magnifier patch.
