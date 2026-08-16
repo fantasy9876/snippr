@@ -62,17 +62,53 @@ enum BundleIntegrity {
 
     /// Every bundle with our identifier that LaunchServices knows about, plus
     /// the running bundle itself. Empty when not running from an .app bundle.
+    /// Well-known drag-install locations probed DIRECTLY (LaunchServices /
+    /// Spotlight are index-dependent and may be stale or empty).
+    static var knownCopyLocations: [URL] {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        return [
+            canonicalURL,
+            home.appendingPathComponent("Applications/Snippr.app"),
+            home.appendingPathComponent("Downloads/Snippr.app"),
+            home.appendingPathComponent("Desktop/Snippr.app"),
+        ]
+    }
+
+    /// True when `url` is an existing bundle whose Info.plist carries OUR
+    /// identifier (a stale LaunchServices row for a deleted or renamed app
+    /// must not be reported as a duplicate).
+    static func isSnipprBundle(at url: URL) -> Bool {
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory),
+              isDirectory.boolValue,
+              let bundle = Bundle(url: url)
+        else { return false }
+        return bundle.bundleIdentifier == bundleIdentifier
+    }
+
     static func discoveredBundles() -> [URL] {
         guard Bundle.main.bundleURL.pathExtension == "app" else { return [] }
-        var urls: [URL] = [Bundle.main.bundleURL]
-        if let found = LSCopyApplicationURLsForBundleIdentifier(
-            bundleIdentifier as CFString, nil)?.takeRetainedValue() as? [URL] {
-            urls.append(contentsOf: found)
-        }
-        // A copy LaunchServices has not registered yet can still be opened by
-        // the user; the canonical path is always worth a look.
-        if FileManager.default.fileExists(atPath: canonicalURL.path) {
-            urls.append(canonicalURL)
+        let registered = (LSCopyApplicationURLsForBundleIdentifier(
+            bundleIdentifier as CFString, nil)?.takeRetainedValue() as? [URL]) ?? []
+        return discoveredBundles(
+            running: Bundle.main.bundleURL, registered: registered,
+            knownLocations: knownCopyLocations)
+    }
+
+    /// Discovery over injectable inputs: the running bundle, whatever
+    /// LaunchServices reports (filtered — stale rows for deleted/renamed
+    /// apps are dropped) and the well-known locations probed DIRECTLY
+    /// (index-independent). De-duplicated by normalized path.
+    static func discoveredBundles(
+        running: URL, registered: [URL], knownLocations: [URL]
+    ) -> [URL] {
+        var seen: Set<String> = [normalizedPath(running)]
+        var urls: [URL] = [running]
+        for url in registered + knownLocations where isSnipprBundle(at: url) {
+            let key = normalizedPath(url)
+            guard !seen.contains(key) else { continue }
+            seen.insert(key)
+            urls.append(url)
         }
         return urls
     }
@@ -81,6 +117,112 @@ enum BundleIntegrity {
     static func currentVerdict() -> Verdict? {
         guard Bundle.main.bundleURL.pathExtension == "app" else { return nil }
         return evaluate(running: Bundle.main.bundleURL, discovered: discoveredBundles())
+    }
+
+    /// Single-instance arbitration (main.swift), canonical-aware. The stale
+    /// wrong copy must never win against the installed app: if a canonical
+    /// process starts while a wrong copy runs, the canonical evicts it and
+    /// proceeds; a wrong copy never blocks a canonical one.
+    enum InstanceArbitration: Equatable {
+        /// No other instance — run.
+        case proceed
+        /// Another instance owns the role — this process exits quietly.
+        case exitOtherRunning
+        /// This is the canonical app and the others are wrong copies: ask
+        /// them to terminate (bounded wait), then run.
+        case evictThenProceed(pids: [pid_t])
+    }
+
+    static func instanceArbitration(
+        selfIsCanonical: Bool, others: [(pid: pid_t, url: URL?)],
+        canonical: URL = canonicalURL
+    ) -> InstanceArbitration {
+        guard !others.isEmpty else { return .proceed }
+        guard selfIsCanonical else { return .exitOtherRunning }
+        let canonicalOthers = others.filter {
+            $0.url.map { isCanonical($0, canonical: canonical) } ?? false
+        }
+        // Another CANONICAL instance (double launch) keeps the role.
+        guard canonicalOthers.isEmpty else { return .exitOtherRunning }
+        return .evictThenProceed(pids: others.map(\.pid))
+    }
+
+    /// Eviction budget: a wrong copy may be inside its save failsafe (up to
+    /// 10 s in AppDelegate), so the graceful request gets MORE than that
+    /// before force is even considered; force gets its own verification
+    /// window. Anything still alive afterwards means the canonical app must
+    /// NOT proceed (two instances would race hotkeys and TCC). Total worst
+    /// case = gracefulTimeout + forceTimeout = 15 s.
+    static let evictionGracefulTimeout: TimeInterval = 12
+    static let evictionForceTimeout: TimeInterval = 3
+    static var evictionMaxDuration: TimeInterval { evictionGracefulTimeout + evictionForceTimeout }
+
+    enum EvictionOutcome: Equatable {
+        case evicted(forced: [pid_t])
+        case stillAlive([pid_t])
+    }
+
+    /// Executor with injectable process primitives so the fail-closed order
+    /// (request → wait ≥ save failsafe → force → verify → abort if alive) is
+    /// provable against real child processes.
+    static func evictInstances(
+        _ pids: [pid_t],
+        gracefulTimeout: TimeInterval = evictionGracefulTimeout,
+        forceTimeout: TimeInterval = evictionForceTimeout,
+        requestTerminate: (pid_t) -> Void,
+        forceTerminate: (pid_t) -> Void,
+        isAlive: (pid_t) -> Bool,
+        wait: (TimeInterval) -> Void
+    ) -> EvictionOutcome {
+        func waitUntilGone(_ candidates: [pid_t], budget: TimeInterval) -> [pid_t] {
+            let deadline = Date().addingTimeInterval(budget)
+            var alive = candidates.filter(isAlive)
+            while !alive.isEmpty, Date() < deadline {
+                wait(0.1)
+                alive = alive.filter(isAlive)
+            }
+            return alive
+        }
+        pids.forEach(requestTerminate)
+        let survivors = waitUntilGone(pids, budget: gracefulTimeout)
+        guard !survivors.isEmpty else { return .evicted(forced: []) }
+        survivors.forEach(forceTerminate)
+        let immortal = waitUntilGone(survivors, budget: forceTimeout)
+        guard immortal.isEmpty else { return .stillAlive(immortal) }
+        return .evicted(forced: survivors)
+    }
+
+    /// Launch order for AppDelegate, as data so it can be proven headlessly.
+    /// The wrong-copy branch touches nothing; the canonical branch writes the
+    /// launch status / health breadcrumb and finishes initialisation BEFORE
+    /// any duplicates warning may block the main thread (the updater waits
+    /// for that breadcrumb and would otherwise roll a healthy app back).
+    enum LaunchStep: Equatable {
+        case presentWrongCopyAlertAndExit
+        case setupStatusItem
+        case writeLaunchStatus
+        case startHotkeys
+        case requestScreenCapture
+        case warnDuplicatesDeferred([URL])
+    }
+
+    static func launchPlan(
+        for disposition: LaunchDisposition, isDevTool: Bool, needsCaptureServices: Bool
+    ) -> [LaunchStep] {
+        switch disposition {
+        case .blockWrongCopy:
+            return [.presentWrongCopyAlertAndExit]
+        case let .proceed(warnDuplicates):
+            var steps: [LaunchStep] = []
+            if !isDevTool {
+                steps += [.setupStatusItem, .writeLaunchStatus, .startHotkeys]
+            }
+            if needsCaptureServices { steps.append(.requestScreenCapture) }
+            if !isDevTool, !warnDuplicates.isEmpty {
+                steps.append(.warnDuplicatesDeferred(warnDuplicates))
+            }
+            return steps
+        }
     }
 
     /// What the app process may do at launch, decided BEFORE any status item,
@@ -133,7 +275,7 @@ enum BundleIntegrity {
         alert.addButton(withTitle: "Thoát")
         let response = alert.runModal()
         if canonicalExists, response == .alertFirstButtonReturn {
-            handoffToCanonicalAndExit()
+            handoffToCanonicalOrStayBlocked()
         }
     }
 
@@ -141,32 +283,61 @@ enum BundleIntegrity {
     /// point: the canonical app's single-instance guard (main.swift) exits if
     /// ANY process with our bundle id is alive, so the wrong copy must be
     /// gone before `open` runs — otherwise the canonical quits and no Snippr
-    /// is left. The helper polls our pid (bounded), then `open -n` (a fresh
-    /// instance — never "activate whatever copy is running").
+    /// is left. The helper polls our pid (bounded); if the pid is STILL alive
+    /// after the timeout it exits non-zero WITHOUT opening anything (fail
+    /// closed — never launch a second instance next to a live wrong copy);
+    /// otherwise `open -n` (a fresh instance — never "activate whatever copy
+    /// is running").
     static func handoffCommand(
         canonical: URL, waitForPID: pid_t, timeoutSeconds: Int = 10,
         openTool: String = "/usr/bin/open"
     ) -> [String] {
         let quotedPath = "'" + canonical.path.replacingOccurrences(of: "'", with: "'\\''") + "'"
         let quotedTool = "'" + openTool.replacingOccurrences(of: "'", with: "'\\''") + "'"
-        let script = "i=0; while /bin/kill -0 \(waitForPID) 2>/dev/null && [ $i -lt \(timeoutSeconds * 10) ]; do /bin/sleep 0.1; i=$((i+1)); done; exec \(quotedTool) -n \(quotedPath)"
+        let script = "i=0; while /bin/kill -0 \(waitForPID) 2>/dev/null && [ $i -lt \(timeoutSeconds * 10) ]; do /bin/sleep 0.1; i=$((i+1)); done; "
+            + "if /bin/kill -0 \(waitForPID) 2>/dev/null; then exit 75; fi; "
+            + "exec \(quotedTool) -n \(quotedPath)"
         return ["/bin/sh", "-c", script]
     }
 
-    /// Spawns the detached helper and ends THIS process immediately (before
-    /// any status item / hotkey / TCC prompt could exist — the caller only
-    /// reaches here from the launch disposition switch).
-    static func handoffToCanonicalAndExit() -> Never {
-        let argv = handoffCommand(
-            canonical: canonicalURL,
-            waitForPID: ProcessInfo.processInfo.processIdentifier)
+    /// Spawns the detached helper; returns true only when the helper process
+    /// actually started. The caller exits THIS process only on success — a
+    /// spawn failure must never end the wrong copy (there would be no Snippr
+    /// at all) and must never let it continue into TCC/hotkey setup either.
+    @discardableResult
+    static func spawnHandoffHelper(
+        canonical: URL = canonicalURL,
+        waitForPID: pid_t = ProcessInfo.processInfo.processIdentifier
+    ) -> Bool {
+        let argv = handoffCommand(canonical: canonical, waitForPID: waitForPID)
         let helper = Process()
         helper.executableURL = URL(fileURLWithPath: argv[0])
         helper.arguments = Array(argv.dropFirst())
         helper.standardOutput = FileHandle.nullDevice
         helper.standardError = FileHandle.nullDevice
-        try? helper.run()
-        exit(0)
+        do {
+            try helper.run()
+            return helper.isRunning || helper.terminationStatus == 0
+        } catch {
+            return false
+        }
+    }
+
+    /// Wrong copy chose "open the installed app": spawn the helper, then end
+    /// this process. If the helper cannot be spawned, say so and stay
+    /// blocked (the caller loops back to the alert) — never proceed.
+    @MainActor
+    static func handoffToCanonicalOrStayBlocked() {
+        if spawnHandoffHelper() {
+            exit(0)
+        }
+        let alert = NSAlert()
+        alert.alertStyle = .critical
+        alert.messageText = "Không mở được bản trong /Applications"
+        alert.informativeText = "Snippr không khởi động được trình trợ giúp. Hãy tự mở /Applications/Snippr.app; bản này sẽ thoát."
+        alert.addButton(withTitle: "Thoát")
+        alert.runModal()
+        exit(1)
     }
 
     /// Canonical copy with duplicates: warning naming every path.

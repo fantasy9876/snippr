@@ -32,14 +32,47 @@ MainActor.assumeIsolated {
     // Single instance: a stray copy (e.g. a dev/test build) silently steals
     // the global hotkeys from the real one — never allow two Snipprs.
     // Dev tool flags bypass the guard because those runs exit by themselves.
+    // Canonical-aware: the installed /Applications/Snippr.app must never lose
+    // to a stale copy that happens to be running (that is exactly how the
+    // wrong signature ends up asking for Screen Recording again) — it evicts
+    // the wrong copy and proceeds; a wrong copy never blocks the canonical.
     if !isDevTool {
         let mine = ProcessInfo.processInfo.processIdentifier
         let bundleID = Bundle.main.bundleIdentifier ?? "com.manhhoang.snippr"
-        let others = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID)
+        let running = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID)
             .filter { $0.processIdentifier != mine }
-        if !others.isEmpty {
-            NSLog("Snippr: another instance is already running (pid \(others[0].processIdentifier)) — exiting")
+        let arbitration = BundleIntegrity.instanceArbitration(
+            selfIsCanonical: BundleIntegrity.isCanonical(Bundle.main.bundleURL),
+            others: running.map { ($0.processIdentifier, $0.bundleURL) })
+        switch arbitration {
+        case .proceed:
+            break
+        case .exitOtherRunning:
+            NSLog("Snippr: another instance is already running (pid \(running[0].processIdentifier)) — exiting")
             exit(0)
+        case let .evictThenProceed(pids):
+            NSLog("Snippr: canonical app evicting non-canonical instance(s) \(pids)")
+            func app(_ pid: pid_t) -> NSRunningApplication? {
+                running.first { $0.processIdentifier == pid }
+            }
+            let outcome = BundleIntegrity.evictInstances(
+                pids,
+                requestTerminate: { app($0)?.terminate() },
+                forceTerminate: { app($0)?.forceTerminate() },
+                isAlive: { pid in
+                    guard let a = app(pid) else { return false }
+                    return !a.isTerminated && kill(pid, 0) == 0
+                },
+                wait: { RunLoop.current.run(until: Date().addingTimeInterval($0)) })
+            switch outcome {
+            case let .evicted(forced):
+                if !forced.isEmpty { NSLog("Snippr: force-terminated \(forced)") }
+            case let .stillAlive(alive):
+                // Fail closed: never run two Snipprs. Nothing has been set up
+                // (no hotkeys, no TCC, no launch status) — just leave.
+                NSLog("Snippr: non-canonical instance(s) \(alive) still alive after \(BundleIntegrity.evictionMaxDuration)s — exiting")
+                exit(0)
+            }
         }
     }
 

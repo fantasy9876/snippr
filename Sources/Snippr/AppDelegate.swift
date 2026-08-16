@@ -56,38 +56,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // create a status item, register hotkeys, write launch status or
         // prompt TCC — every one of those would bind state to the wrong
         // signature. Dev tools and SNIPPR_ALLOW_NONCANONICAL=1 may proceed.
+        // The order below is BundleIntegrity.launchPlan (gated headlessly):
+        // status/health first, duplicates warning deferred to the next
+        // main-loop turn so the updater's health breadcrumb is never delayed.
         let disposition = BundleIntegrity.launchDisposition(
             for: BundleIntegrity.currentVerdict(),
             allowNonCanonical: isDevTool || BundleIntegrity.debugOverrideRequested)
-        switch disposition {
-        case let .blockWrongCopy(running, canonicalExists):
-            // Nothing has been initialised yet (no status item, hotkeys,
-            // launch status, TCC prompt). The alert either hands off to the
-            // canonical app (helper waits for THIS pid to die, then opens a
-            // fresh instance) or the process simply ends.
-            BundleIntegrity.presentWrongCopyAlert(
-                running: running, canonicalExists: canonicalExists)
-            exit(0)
-        case let .proceed(warnDuplicates):
-            if !isDevTool { BundleIntegrity.presentDuplicatesWarning(warnDuplicates) }
-        }
-
-        // Dev harnesses must not change global hotkeys or write launch state.
-        // Only capture-specific harnesses opt into Screen Recording and SCK.
-        if !isDevTool {
-            setupStatusItem()
-            writeLaunchStatus()
-            HotkeyManager.shared.handler = { [weak self] action in
-                self?.perform(hotkey: action)
+        for step in BundleIntegrity.launchPlan(
+            for: disposition, isDevTool: isDevTool,
+            needsCaptureServices: needsCaptureServices) {
+            switch step {
+            case .presentWrongCopyAlertAndExit:
+                guard case let .blockWrongCopy(running, canonicalExists) = disposition
+                else { continue }
+                BundleIntegrity.presentWrongCopyAlert(
+                    running: running, canonicalExists: canonicalExists)
+                exit(0)
+            case .setupStatusItem:
+                setupStatusItem()
+            case .writeLaunchStatus:
+                writeLaunchStatus()
+            case .startHotkeys:
+                HotkeyManager.shared.handler = { [weak self] action in
+                    self?.perform(hotkey: action)
+                }
+                HotkeyManager.shared.start()
+                NotificationCenter.default.addObserver(
+                    self, selector: #selector(defaultsChanged),
+                    name: UserDefaults.didChangeNotification, object: nil
+                )
+            case .requestScreenCapture:
+                if !CGPreflightScreenCaptureAccess() {
+                    CGRequestScreenCaptureAccess()
+                }
+            case let .warnDuplicatesDeferred(duplicates):
+                DispatchQueue.main.async {
+                    BundleIntegrity.presentDuplicatesWarning(duplicates)
+                }
             }
-            HotkeyManager.shared.start()
-            NotificationCenter.default.addObserver(
-                self, selector: #selector(defaultsChanged),
-                name: UserDefaults.didChangeNotification, object: nil
-            )
-        }
-        if needsCaptureServices, !CGPreflightScreenCaptureAccess() {
-            CGRequestScreenCaptureAccess()
         }
 
         if !isDevTool, !UserDefaults.standard.bool(forKey: Settings.Keys.noSplash) {
