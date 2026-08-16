@@ -634,6 +634,10 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
 
     @objc private func reviewToolbarButtonPressed(_ sender: NSButton) {
         if isSaving { return }
+        // The same rule the keyboard follows. A toolbar click, an
+        // accessibility action or any programmatic route reaches this method
+        // without passing a key handler, so the guard belongs here too.
+        if annotationDragging { return }
         if sender.tag == -1 {
             owner?.finish(.cancelled)
             return
@@ -666,6 +670,7 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
     /// tear the overlay down BEFORE presenting; Save keeps the overlay in
     /// `.saving` and returns to review on cancel/failure.
     fileprivate func performReviewAction(_ intent: CaptureIntent) {
+        guard !annotationDragging else { return }
         guard let owner, owner.session.acceptsCommits,
               let selection = areaSelection?.intersection(bounds),
               selection.width >= 4, selection.height >= 4,
@@ -1068,7 +1073,9 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
                 // mouse was still down. Finalizing now would add a mark the
                 // export never saw, and enqueue OCR against a session that is
                 // already closing, so the draft is dropped instead.
-                if isSaving {
+                // Any phase that no longer accepts commits, not only
+                // `.saving`: the document is frozen in all of them.
+                if owner?.session.acceptsCommits != true {
                     annotationSurface?.abandonDrag()
                 } else {
                     annotationSurface?.endDrag()
@@ -1114,6 +1121,15 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
             return
         }
         if event.keyCode == 53 { // Esc
+            // Esc still cancels — it is the way out of a drag the user no
+            // longer wants — but the draft is dropped and the host's drag
+            // state cleared FIRST. Otherwise a mouseUp arriving after teardown
+            // finalizes onto a surface whose host is already gone.
+            if annotationDragging {
+                annotationSurface?.abandonDrag()
+                annotationDragging = false
+                needsDisplay = true
+            }
             handleEscape()
             return
         }
@@ -1122,10 +1138,7 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
         // finalizing transaction is half-built, so a route here can strand the
         // spotlight being replaced, leave a zero-area draft behind, or export
         // a half-drawn mark and let mouseUp mutate the document afterwards.
-        if annotationDragging {
-            super.keyDown(with: event)
-            return
-        }
+        if annotationDragging { return }
         if isReviewing, (event.keyCode == 36 || event.keyCode == 76) {
             // Return / keypad Enter during review = Copy and close. (Esc and
             // click-outside cancel; the overlay never applies the editor's
@@ -1169,10 +1182,9 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
             // ⌘C/⌘Z/⌘V belong to the active text field
             return super.performKeyEquivalent(with: event)
         }
-        // Same rule as keyDown: a live drag owns the document until it ends.
-        if annotationDragging {
-            return super.performKeyEquivalent(with: event)
-        }
+        // Same rule as keyDown, and CONSUMED: forwarding to super would let
+        // the responder or menu chain run the very command being blocked.
+        if annotationDragging { return true }
         let pickFlags = event.modifierFlags.intersection(
             [.command, .shift, .control, .option])
         // `.saving` is part of `isReviewing` but must reject picker mutation.

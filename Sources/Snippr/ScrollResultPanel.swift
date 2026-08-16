@@ -196,7 +196,13 @@ final class ScrollResultPanel: NSPanel {
             surface: annotationSurface,
             baseImage: image.cgImage,
             pixelsPerPoint: pixelsPerPoint)
-        host.isLocked = { [weak self] in self?.saving ?? false }
+        // Every terminal phase, not just saving: once the panel has claimed a
+        // terminal action the image is handed off, and a late mouseUp must not
+        // add to a document that has already left.
+        host.isLocked = { [weak self] in
+            guard let self else { return true }
+            return self.saving || self.terminalActionClaimed
+        }
         // The surface repaints through the host, weakly, and a spotlight dims
         // the WHOLE source image rather than the visible slice.
         annotationSurface.redactionDelegate = host
@@ -320,6 +326,9 @@ final class ScrollResultPanel: NSPanel {
 
     @objc private func toolbarPressed(_ sender: NSButton) {
         if saving || terminalActionClaimed { return }
+        // Clicks, accessibility actions and programmatic routes reach this
+        // without passing a key handler, so the drag guard belongs here too.
+        if annotationHost?.isAnnotationDragging == true { return }
         if sender.tag == -1 {
             dismiss()
             return
@@ -364,16 +373,18 @@ final class ScrollResultPanel: NSPanel {
         }
         if event.keyCode == 53 { // Esc
             if saving { return }
+            // Drop the draft and clear the drag before tearing down, so a
+            // late mouseUp cannot finalize onto a dismissed panel.
+            if annotationHost?.isAnnotationDragging == true {
+                annotationHost?.abandonActiveDrag()
+            }
             dismiss()
             return
         }
         // Nothing routes while a drag is live — including the terminal
         // actions, which would otherwise export a half-drawn mark and then let
         // mouseUp mutate the document after the handoff.
-        if annotationHost?.isAnnotationDragging == true {
-            super.keyDown(with: event)
-            return
-        }
+        if annotationHost?.isAnnotationDragging == true { return }
         if event.keyCode == 36 || event.keyCode == 76 { // Return
             perform(intent: .copy)
             return
@@ -408,9 +419,9 @@ final class ScrollResultPanel: NSPanel {
         if annotationHost?.textEditingActive == true {
             return super.performKeyEquivalent(with: event)
         }
-        if annotationHost?.isAnnotationDragging == true {
-            return super.performKeyEquivalent(with: event)
-        }
+        // CONSUMED, not forwarded: super would let the responder or menu
+        // chain run the command this is blocking.
+        if annotationHost?.isAnnotationDragging == true { return true }
         if event.modifierFlags.contains(.command),
            event.charactersIgnoringModifiers?.lowercased() == "c" {
             perform(intent: .copy)
@@ -491,6 +502,7 @@ final class ScrollResultPanel: NSPanel {
     /// Repeat-Area memory is never touched.
     private func perform(intent: CaptureIntent) {
         guard !saving, !terminalActionClaimed else { return }
+        guard annotationHost?.isAnnotationDragging != true else { return }
         // A terminal click must never race the in-flight text entry: commit
         // the active field BEFORE exportSnapshot reads the surface (same
         // contract as the area review — no Return required first).
@@ -565,6 +577,15 @@ final class AnnotationHostView: NSView, RedactionSurfaceDelegate {
     /// the draft is already in the document and its finalizing transaction is
     /// only half-built.
     var isAnnotationDragging: Bool { dragging }
+
+    /// Drops the draft and ends the drag in one step, for a teardown that has
+    /// to happen while the mouse is still down.
+    func abandonActiveDrag() {
+        guard dragging else { return }
+        surface.abandonDrag()
+        dragging = false
+        needsDisplay = true
+    }
     private var strokeHUD: StrokePreviewView?
     private var strokeHUDHide: DispatchWorkItem?
     /// The panel is deliberately wider than a tall/narrow stitched image so

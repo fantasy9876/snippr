@@ -8721,12 +8721,23 @@ enum SelfTest {
                 uiCanvas.keyDown(with: event)
                 return uiCanvas.currentTool.tooltip
             }
-            let dTool = toolAfter("d")
+            // D is deliberately NOT synthesized. It opens the preset chooser
+            // instead of selecting a tool, and `NSMenu.popUp` runs a nested
+            // event loop that would hang a headless run. Its wiring is pinned
+            // below through the button, and what the chooser does is covered by
+            // the menu gate that drives the real items.
             let sTool = toolAfter("s")
             let mTool = toolAfter("m")
             let shiftBTool = toolAfter("b", .shift)
             let bTool = toolAfter("b")
-            let keyRouting = dTool.hasPrefix("Backdrop")
+            let backdropButton = uiWC.toolButtonsForTesting
+                .first { $0.tool == .backdrop }?.button
+            let backdropWiring = backdropButton?.action
+                == #selector(EditorWindowController.showBackdropMenu(_:))
+                && backdropButton?.target === uiWC
+                && backdropButton?.accessibilityLabel()?
+                    .hasPrefix("Backdrop") == true
+            let keyRouting = backdropWiring
                 && sTool.hasPrefix("Spotlight")
                 && mTool.hasPrefix("Magnifier")
                 && shiftBTool.hasPrefix("Pixelate text")
@@ -8747,7 +8758,7 @@ enum SelfTest {
             uiWC.window?.close()
             check("sliceB2-ui-keys-toolbar",
                   keyRouting && allVisible && labelled && fallbackImage != nil,
-                  "keys d=\(dTool) s=\(sTool) m=\(mTool) shiftB=\(shiftBTool) b=\(bTool) buttons \(buttons.count) visible \(allVisible) labelled \(labelled) fallback \(fallbackImage != nil)")
+                  "keys backdropWiring=\(backdropWiring) s=\(sTool) m=\(mTool) shiftB=\(shiftBTool) b=\(bTool) buttons \(buttons.count) visible \(allVisible) labelled \(labelled) fallback \(fallbackImage != nil)")
         }
 
         // MARK: slice B GREEN1 — terminal actions, OCR lifecycle, tall memory
