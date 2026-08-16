@@ -675,10 +675,15 @@ enum AnnotationRenderer {
     static func pixellateRegion(
         _ image: CGImage, rect: CGRect, scale: CGFloat
     ) -> CGImage? {
-        if forceRegionalPixelateFailureForTesting { return nil }
         let bounds = CGRect(
             x: 0, y: 0, width: image.width, height: image.height)
-        let region = rect.standardized.integral.intersection(bounds)
+        let attempted = rect.standardized.integral.intersection(bounds)
+        // The ATTEMPT is recorded before anything can fail, so a forced failure
+        // still proves the renderer asked for exactly this region.
+        RenderTrace.record(
+            kind: "regionalAttempt", destination: "-", rect: attempted)
+        if forceRegionalPixelateFailureForTesting { return nil }
+        let region = attempted
         guard region.width > 1, region.height > 1,
               let out = pixelatedCIImage(image, scale: scale)
         else { return nil }
@@ -688,13 +693,17 @@ enum AnnotationRenderer {
         AnnotationSurface.regionalPixelateAllocationsForTesting += 1
         AnnotationSurface.lastRegionalPixelateRectForTesting = region
         AnnotationSurface.allRegionalPixelateRectsForTesting.append(region)
-        RenderTrace.record(
-            kind: "regionalPixelate",
-            destination: "\(Int(region.width))x\(Int(region.height))",
-            rect: region)
         AnnotationSurface.lastRegionalPixelateBaseSizeForTesting = CGSize(
             width: image.width, height: image.height)
-        return ciContext.createCGImage(out, from: region)
+        guard let materialized = ciContext.createCGImage(out, from: region)
+        else { return nil }
+        // Only a SUCCESSFUL allocation is recorded: recording before the call
+        // would let a nil result masquerade as an allocation.
+        RenderTrace.record(
+            kind: "regionalMaterialized",
+            destination: "\(Int(region.width))x\(Int(region.height))",
+            rect: region)
+        return materialized
     }
 
     private static func pixelatedCIImage(
@@ -721,49 +730,65 @@ func distanceToSegment(_ p: CGPoint, _ a: CGPoint, _ b: CGPoint) -> CGFloat {
     return hypot(p.x - proj.x, p.y - proj.y)
 }
 
-/// One materialization the renderer actually performed. Gates assert on these
-/// instead of on "did anything blow up": a trace that is EMPTY must fail, and
-/// a full-size pixelated intermediate must never appear.
+/// One materialization the renderer actually attempted or completed. Gates
+/// assert on these instead of on "did anything blow up": an EMPTY trace must
+/// fail, a full-size pixelated intermediate must never appear, and an attempt
+/// that returned nil must never be recorded as an allocation.
 struct RenderTraceEvent: Equatable {
     let host: String        // editor | area | scroll | compositor
     let path: String        // preview | export | magnifier
-    let kind: String        // regionalPixelate | destination
-    let destination: String // pixel size of the buffer that was allocated
+    /// regionalAttempt | regionalMaterialized | destination
+    let kind: String
+    let destination: String // pixel size of the buffer, "-" for an attempt
     let rect: CGRect
 }
 
-enum RenderTrace {
-    nonisolated(unsafe) private(set) static var events: [RenderTraceEvent] = []
-    nonisolated(unsafe) private static var host = "unknown"
-    nonisolated(unsafe) private static var path = "unknown"
-    nonisolated(unsafe) private static var recording = false
+/// Token-owned scoped instrumentation. Frames are pushed and popped under a
+/// lock and identified by token, so nested or overlapping captures cannot
+/// clobber each other's state — the previous raw set/reset could.
+final class RenderTraceToken {
+    fileprivate var events: [RenderTraceEvent] = []
+    fileprivate let host: String
+    fileprivate let path: String
 
-    /// Scoped by construction: the previous state is always restored, so one
-    /// gate can never leak its recording (or its host label) into the next.
+    fileprivate init(host: String, path: String) {
+        self.host = host
+        self.path = path
+    }
+}
+
+enum RenderTrace {
+    nonisolated(unsafe) private static var stack: [RenderTraceToken] = []
+    private static let lock = NSLock()
+
+    /// Records into the innermost active frame. No frame -> no recording.
+    static func record(kind: String, destination: String, rect: CGRect) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let frame = stack.last else { return }
+        frame.events.append(RenderTraceEvent(
+            host: frame.host, path: frame.path, kind: kind,
+            destination: destination, rect: rect))
+    }
+
     static func capture<T>(
         host: String, path: String, _ body: () -> T
     ) -> (result: T, events: [RenderTraceEvent]) {
-        let priorEvents = events, priorHost = self.host
-        let priorPath = self.path, priorRecording = recording
-        events = []
-        self.host = host
-        self.path = path
-        recording = true
+        let token = RenderTraceToken(host: host, path: path)
+        lock.lock()
+        stack.append(token)
+        lock.unlock()
         defer {
-            events = priorEvents
-            self.host = priorHost
-            self.path = priorPath
-            recording = priorRecording
+            lock.lock()
+            if let index = stack.lastIndex(where: { $0 === token }) {
+                stack.remove(at: index)
+            }
+            lock.unlock()
         }
         let value = body()
-        let captured = events
+        lock.lock()
+        let captured = token.events
+        lock.unlock()
         return (value, captured)
-    }
-
-    static func record(kind: String, destination: String, rect: CGRect) {
-        guard recording else { return }
-        events.append(RenderTraceEvent(
-            host: host, path: path, kind: kind,
-            destination: destination, rect: rect))
     }
 }

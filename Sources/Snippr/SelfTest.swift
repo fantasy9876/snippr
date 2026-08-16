@@ -9089,27 +9089,6 @@ enum SelfTest {
             let gridBase = makeNoiseImage(width: 240, height: 160)
             let gridMask = CGRect(x: 40, y: 40, width: 100, height: 60)
             var gridFailures: [String] = []
-            func probe4(_ image: CGImage, _ x: Int, _ y: Int) -> (Int, Int, Int, Int) {
-                var bytes = [UInt8](
-                    repeating: 0, count: image.width * image.height * 4)
-                guard let c = CGContext(
-                    data: &bytes, width: image.width, height: image.height,
-                    bitsPerComponent: 8, bytesPerRow: image.width * 4,
-                    space: CGColorSpace(name: CGColorSpace.sRGB)!,
-                    bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
-                else { return (-1, -1, -1, -1) }
-                c.interpolationQuality = .none
-                c.draw(image, in: CGRect(
-                    x: 0, y: 0, width: image.width, height: image.height))
-                let row = image.height - 1 - y
-                guard x >= 0, x < image.width, row >= 0, row < image.height
-                else { return (-1, -1, -1, -1) }
-                let i = (row * image.width + x) * 4
-                return (
-                    Int(bytes[i]), Int(bytes[i + 1]), Int(bytes[i + 2]),
-                    Int(bytes[i + 3]))
-            }
-
             func gridSnapshot(_ view: NSView) -> CGImage? {
                 guard let rep = view.bitmapImageRepForCachingDisplay(
                     in: view.bounds) else { return nil }
@@ -9260,60 +9239,94 @@ enum SelfTest {
                   registryFailures.isEmpty,
                   registryFailures.joined(separator: " | "))
 
-            // E6. Real hosts: the area overlay and the scroll panel, not a bare
-            //     surface. Full RGBA every-pixel scan of the mask and of the
-            //     area around it, plus an allocation trace that must be
-            //     non-empty and free of full-size intermediates.
+            // E6. Real hosts. The area overlay is driven through its own
+            //     action wrapper, the whole image is rasterized ONCE and every
+            //     pixel is compared as RGBA, and the allocation trace is
+            //     asserted as an exact event vector.
             var hostFailures: [String] = []
-            let hostScreen = NSScreen.main ?? NSScreen.screens[0]
+            guard let hostScreen = NSScreen.main ?? NSScreen.screens.first else {
+                check("sliceB-hosts-failclosed", false, "no screen")
+                return 1
+            }
             let hostFrozen = CapturedImage(
                 cgImage: makeNoiseImage(width: 240, height: 180), scale: 1)
+            let hostSelection = CGRect(x: 20, y: 20, width: 200, height: 140)
             let hostMask = CGRect(x: 60, y: 50, width: 80, height: 50)
-            @MainActor func hostDeps() -> CaptureActionRouter.Dependencies {
-                CaptureActionRouter.Dependencies(
-                    copyToClipboard: { _ in }, autoSave: { _, _ in },
-                    saveAs: { _, _ in }, pin: { _ in }, ocr: { _ in },
-                    openEditor: { _ in }, toast: { _ in },
-                    setLastCapture: { _ in }, setLastAreaRect: { _ in },
-                    logEvent: { _ in })
+
+            /// Rasterize once; comparing pixel by pixel through a helper that
+            /// re-rasterized the whole image each time was O(N^2).
+            func rgba(_ image: CGImage) -> [UInt8] {
+                var bytes = [UInt8](
+                    repeating: 0, count: image.width * image.height * 4)
+                guard let c = CGContext(
+                    data: &bytes, width: image.width, height: image.height,
+                    bitsPerComponent: 8, bytesPerRow: image.width * 4,
+                    space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                    bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+                else { return bytes }
+                c.interpolationQuality = .none
+                c.draw(image, in: CGRect(
+                    x: 0, y: 0, width: image.width, height: image.height))
+                return bytes
             }
-            /// Exhaustive RGBA comparison: every pixel of the mask must be the
-            /// exact opaque cover, every pixel outside it byte-identical.
+            /// Every pixel: inside the mask it must be the exact opaque cover,
+            /// outside it must be byte-identical to the source.
             func scanCover(
-                _ shot: CGImage, _ source: CGImage, mask: CGRect,
-                scale: CGFloat, label: String
+                output: CGImage, source: CGImage, mask: CGRect,
+                originInSource: CGPoint, label: String
             ) {
-                let cover = (31, 31, 31, 255)
-                for x in 0..<shot.width {
-                    for y in 0..<shot.height {
-                        let inMask = mask.contains(CGPoint(
-                            x: CGFloat(x) / scale, y: CGFloat(y) / scale))
-                        let p = probe4(shot, x, y)
-                        if inMask {
-                            if p != cover {
-                                hostFailures.append("\(label):cover@\(x),\(y)=\(p)")
+                let out = rgba(output), src = rgba(source)
+                let cover: [UInt8] = [31, 31, 31, 255]
+                for y in 0..<output.height {
+                    for x in 0..<output.width {
+                        let i = (y * output.width + x) * 4
+                        // output row 0 is the TOP row; convert to bottom-left
+                        let pixel = CGPoint(
+                            x: originInSource.x + CGFloat(x),
+                            y: originInSource.y
+                                + CGFloat(output.height - 1 - y))
+                        let value = Array(out[i..<(i + 4)])
+                        if mask.contains(pixel) {
+                            if value != cover {
+                                hostFailures.append(
+                                    "\(label):cover@\(x),\(y)=\(value)")
                                 return
                             }
-                        } else if p != probe4(source, x, y) {
-                            hostFailures.append("\(label):outside@\(x),\(y)")
-                            return
+                        } else {
+                            let sx = Int(pixel.x)
+                            let sy = source.height - 1 - Int(pixel.y)
+                            guard sx >= 0, sx < source.width,
+                                  sy >= 0, sy < source.height else { continue }
+                            let j = (sy * source.width + sx) * 4
+                            if value != Array(src[j..<(j + 4)]) {
+                                hostFailures.append("\(label):outside@\(x),\(y)")
+                                return
+                            }
                         }
                     }
                 }
             }
+
             MainActor.assumeIsolated {
-                // ---- area review overlay
+                var exported: CapturedImage?
+                var toasts = 0
                 let overlay = SelectionOverlay(
                     purpose: .areaReview,
                     inputs: OverlaySessionInputs(
                         afterShow: true, afterCopy: false, afterSave: false),
                     completion: { _ in })
-                overlay.routerDependenciesOverride = hostDeps()
+                overlay.routerDependenciesOverride =
+                    CaptureActionRouter.Dependencies(
+                        copyToClipboard: { exported = $0 },
+                        autoSave: { _, _ in }, saveAs: { _, _ in },
+                        pin: { _ in }, ocr: { _ in }, openEditor: { _ in },
+                        toast: { _ in toasts += 1 },
+                        setLastCapture: { _ in }, setLastAreaRect: { _ in },
+                        logEvent: { _ in })
                 let view = SelectionOverlayView(
                     mode: .area, screen: hostScreen, frozen: hostFrozen,
                     windowList: [], owner: overlay)
-                view.selectForTesting(
-                    rect: CGRect(x: 20, y: 20, width: 200, height: 140))
+                view.selectForTesting(rect: hostSelection)
                 guard let surface = view.annotationSurface else {
                     hostFailures.append("area:no-surface")
                     return
@@ -9326,24 +9339,82 @@ enum SelfTest {
                 let blur = BlurAnnotation(uiScale: 1)
                 blur.rect = hostMask
                 surface.addAnnotationForTesting(blur)
-                let (exported, events) = RenderTrace.capture(
+
+                // -- forced failure through the REAL action wrapper
+                let (_, failEvents) = RenderTrace.capture(
                     host: "area", path: "export"
-                ) { () -> CGImage? in
+                ) {
                     AnnotationRenderer.withForcedRegionalFailure {
-                        surface.flattened(
-                            base: hostFrozen.cgImage,
-                            cropPixels: CGRect(
-                                x: 0, y: 0, width: 240, height: 180))
+                        view.performReviewActionForTesting(.copy)
                     }
                 }
                 if exported != nil { hostFailures.append("area:exported") }
-                if events.isEmpty { hostFailures.append("area:empty-trace") }
-                if events.contains(where: {
-                    $0.kind == "regionalPixelate"
-                        && $0.rect.width * $0.rect.height
-                            > hostMask.width * hostMask.height * 1.2
-                }) {
-                    hostFailures.append("area:oversized-region")
+                if overlay.session.phase == .finished {
+                    hostFailures.append("area:closed")
+                }
+                let attempts = failEvents.filter { $0.kind == "regionalAttempt" }
+                if attempts.count != 1 {
+                    hostFailures.append("area:attempts \(attempts.count)")
+                }
+                if failEvents.contains(where: { $0.kind == "regionalMaterialized" }) {
+                    hostFailures.append("area:materialized-on-failure")
+                }
+                if failEvents.contains(where: { $0.kind == "destination" }) {
+                    hostFailures.append("area:destination-on-failure")
+                }
+                if let attempt = attempts.first,
+                   !(hostMask.contains(attempt.rect)
+                     && attempt.host == "area" && attempt.path == "export") {
+                    hostFailures.append("area:attempt \(attempt)")
+                }
+
+                // -- healthy run: exactly one materialization inside the mask
+                exported = nil
+                let (_, okEvents) = RenderTrace.capture(
+                    host: "area", path: "export"
+                ) {
+                    view.performReviewActionForTesting(.copy)
+                }
+                let materialized = okEvents.filter {
+                    $0.kind == "regionalMaterialized"
+                }
+                if materialized.count != 1 {
+                    hostFailures.append("area:materialized \(materialized.count)")
+                }
+                if let event = materialized.first,
+                   !hostMask.contains(event.rect) {
+                    hostFailures.append("area:region \(event.rect)")
+                }
+                if okEvents.filter({ $0.kind == "destination" }).count != 1 {
+                    hostFailures.append("area:destinations")
+                }
+                guard let shot = exported?.cgImage else {
+                    hostFailures.append("area:no-export")
+                    return
+                }
+                if shot.width != Int(hostSelection.width)
+                    || shot.height != Int(hostSelection.height) {
+                    hostFailures.append("area:dims \(shot.width)x\(shot.height)")
+                }
+                // The healthy export must NOT be the fail-closed cover, so the
+                // same scan runs against the forced-failure output instead.
+                AnnotationRenderer.withForcedRegionalFailure {
+                    if let cover = surface.flattened(
+                        base: hostFrozen.cgImage,
+                        cropPixels: CGRect(
+                            x: hostSelection.minX,
+                            y: CGFloat(hostFrozen.cgImage.height)
+                                - hostSelection.maxY,
+                            width: hostSelection.width,
+                            height: hostSelection.height)) {
+                        scanCover(
+                            output: cover, source: hostFrozen.cgImage,
+                            mask: hostMask,
+                            originInSource: hostSelection.origin,
+                            label: "area")
+                    } else {
+                        hostFailures.append("area:no-cover-image")
+                    }
                 }
             }
             check("sliceB-hosts-failclosed",

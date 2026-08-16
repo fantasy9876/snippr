@@ -470,8 +470,6 @@ enum SliceBCompositor {
             space: base.colorSpace ?? CGColorSpace(name: CGColorSpace.sRGB)!,
             bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
         else { return nil }
-        RenderTrace.record(
-            kind: "destination", destination: "\(w)x\(h)", rect: region)
         let topLeft = CGRect(
             x: region.minX, y: CGFloat(base.height) - region.maxY,
             width: region.width, height: region.height)
@@ -482,7 +480,10 @@ enum SliceBCompositor {
         guard draw(
             overlapping, in: ctx, base: base, visiblePixels: region)
         else { return nil }
-        return ctx.makeImage()
+        guard let patch = ctx.makeImage() else { return nil }
+        RenderTrace.record(
+            kind: "destination", destination: "\(w)x\(h)", rect: region)
+        return patch
     }
 
     /// A magnifier patch must be rebuilt when a redaction starts (or stops)
@@ -527,16 +528,17 @@ enum SliceBExport {
             space: base.colorSpace ?? CGColorSpace(name: CGColorSpace.sRGB)!,
             bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
         else { return nil }
-        RenderTrace.record(
-            kind: "destination", destination: "\(w)x\(h)",
-            rect: CGRect(x: 0, y: 0, width: w, height: h))
         ctx.draw(base, in: CGRect(x: 0, y: 0, width: w, height: h))
         guard SliceBCompositor.draw(
             annotations, in: ctx, base: base,
             visiblePixels: CGRect(x: 0, y: 0, width: w, height: h),
             pixelScale: pixelScale)
         else { return nil }
-        return ctx.makeImage()
+        guard let out = ctx.makeImage() else { return nil }
+        RenderTrace.record(
+            kind: "destination", destination: "\(w)x\(h)",
+            rect: CGRect(x: 0, y: 0, width: w, height: h))
+        return out
     }
 
     /// 256 MP * 4 bytes, matching slice A's resize cap.
