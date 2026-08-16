@@ -8711,6 +8711,50 @@ enum SelfTest {
                   dupOK && partial == .fallbackFull,
                   "dupWords \(dupWords.count) distinct \(distinctX) partial \(partial)")
 
+            // E2. All-or-nothing matrix: a single bad box must collapse the
+            //     whole result, never mask "the valid subset".
+            let matrixBase = makeSolidImage(
+                width: 200, height: 120, color: NSColor.white.cgColor)
+            let matrixRegion = CGRect(x: 20, y: 20, width: 120, height: 60)
+            let validBox = CGRect(x: 10, y: 10, width: 30, height: 20)
+            let cases: [(String, [CGRect], Bool)] = [
+                ("all-valid",
+                 [validBox, CGRect(x: 50, y: 10, width: 20, height: 20)], true),
+                ("nan",
+                 [validBox, CGRect(x: .nan, y: 10, width: 20, height: 20)], false),
+                ("zero",
+                 [validBox, CGRect(x: 50, y: 10, width: 0, height: 20)], false),
+                ("partial-oob",
+                 [validBox, CGRect(x: 110, y: 10, width: 40, height: 20)], false),
+                ("whole-oob",
+                 [validBox, CGRect(x: 400, y: 400, width: 10, height: 10)], false),
+                ("empty", [], false),
+            ]
+            var matrixFailures: [String] = []
+            for (label, injected, expectWords) in cases {
+                SliceBOCR.recognizerForTesting = { _ in injected }
+                let words = SliceBOCR.wordRects(
+                    base: matrixBase, region: matrixRegion)
+                SliceBOCR.recognizerForTesting = nil
+                let state = RedactionState.resolvedWords(words)
+                let gotWords: Bool
+                if case .words = state { gotWords = true } else { gotWords = false }
+                if gotWords != expectWords {
+                    matrixFailures.append(
+                        label + ":" + String(describing: state))
+                }
+            }
+            // The mask itself must refuse a mixed list even if one is handed in.
+            let mixedMask = SliceBRedaction.maskRects(
+                state: .words([validBox, CGRect(x: .nan, y: 0, width: 5, height: 5)]),
+                rect: matrixRegion)
+            if mixedMask != [matrixRegion] {
+                matrixFailures.append("maskRects:\(mixedMask)")
+            }
+            check("sliceB-ocr-all-or-nothing",
+                  matrixFailures.isEmpty,
+                  matrixFailures.joined(separator: " | "))
+
             // F. Tall images never allocate a full-size pixelated intermediate,
             //    in the editor or in a magnifier patch.
             let tallEditorBase = makeNoiseImage(width: 400, height: 4000)

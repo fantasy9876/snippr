@@ -305,7 +305,27 @@ final class AnnotationSurface {
     func registerRedactionJob(
         _ job: SliceBRedactionJob, for annotation: Annotation
     ) {
-        redactionJobs[ObjectIdentifier(annotation)] = job
+        let id = ObjectIdentifier(annotation)
+        redactionJobs[id] = job
+        // Completion removes the entry itself: a finished job must not sit in
+        // the map holding this surface alive.
+        job.onComplete = { [weak self] finished in
+            guard let self else { return }
+            if self.redactionJobs[id] === finished {
+                self.redactionJobs.removeValue(forKey: id)
+            }
+        }
+    }
+
+    /// Drop entries whose annotation has gone (undo stack cleared, surface
+    /// dismissed) so the map cannot grow without bound.
+    func sweepFinishedRedactionJobs() {
+        let live = Set(
+            (annotations + redoAnnotations).map { ObjectIdentifier($0) })
+        for (id, job) in redactionJobs where !live.contains(id) {
+            job.cancel()
+            redactionJobs.removeValue(forKey: id)
+        }
     }
 
     /// Undo/redo/dismiss/save-lock all supersede work in flight. Cancel the
@@ -323,6 +343,11 @@ final class AnnotationSurface {
     func cancelAllRedactionJobs() {
         for annotation in annotations + redoAnnotations {
             cancelRedactionJob(for: annotation)
+        }
+        sweepFinishedRedactionJobs()
+        for (id, job) in redactionJobs {
+            job.cancel()
+            redactionJobs.removeValue(forKey: id)
         }
     }
 

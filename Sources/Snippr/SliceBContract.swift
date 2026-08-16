@@ -26,9 +26,13 @@ enum RedactionState: Equatable {
     /// Text mode, OCR returned word boxes.
     case words([CGRect])
 
+    /// ALL-OR-NOTHING. Filtering the bad boxes out and keeping the good ones
+    /// would leave exactly the words we failed to map readable, so a single
+    /// invalid box collapses the whole result to the full mask.
     static func resolvedWords(_ rects: [CGRect]) -> RedactionState {
-        let usable = rects.filter { $0.width > 1 && $0.height > 1 }
-        return usable.isEmpty ? .fallbackFull : .words(usable)
+        guard !rects.isEmpty else { return .fallbackFull }
+        for rect in rects where !rect.isValidMaskRect { return .fallbackFull }
+        return .words(rects)
     }
 
     var isTextMode: Bool {
@@ -47,8 +51,12 @@ enum SliceBRedaction {
         case .rect, .pendingFull, .fallbackFull:
             return [rect]
         case let .words(words):
-            let usable = words.filter { $0.width > 1 && $0.height > 1 }
-            return usable.isEmpty ? [rect] : usable
+            // Same rule as `resolvedWords`: one bad box and everything goes
+            // back to the full rect. Never mask "the valid subset".
+            guard !words.isEmpty,
+                  words.allSatisfy({ $0.isValidMaskRect })
+            else { return [rect] }
+            return words
         }
     }
 
@@ -64,6 +72,15 @@ enum SliceBRedaction {
 
     /// Vision boxes hug the ink; anti-aliased edges need a small outset.
     static let wordOutset: CGFloat = 3
+}
+
+extension CGRect {
+    /// A mask rect we are willing to trust: finite, positive, non-empty.
+    var isValidMaskRect: Bool {
+        origin.x.isFinite && origin.y.isFinite
+            && width.isFinite && height.isFinite
+            && width > 1 && height > 1
+    }
 }
 
 // MARK: - Regional OCR
@@ -127,13 +144,17 @@ enum SliceBOCR {
             let global = CGRect(
                 x: patch.origin.x + box.minX, y: patch.origin.y + box.minY,
                 width: box.width, height: box.height)
+            // Must sit ENTIRELY inside the region we actually recognized,
+            // measured BEFORE the anti-aliasing outset. A box hanging over the
+            // edge means the mapping is wrong, not that it needs trimming.
+            guard patch.clip.contains(global) else { return [] }
+            let padded = global
                 .insetBy(
                     dx: -SliceBRedaction.wordOutset,
                     dy: -SliceBRedaction.wordOutset)
                 .intersection(patch.clip)
-            guard !global.isNull, global.width > 1, global.height > 1
-            else { return [] }
-            out.append(global)
+            guard padded.isValidMaskRect else { return [] }
+            out.append(padded)
         }
         return out
     }
@@ -616,11 +637,19 @@ enum SliceBBackdrop {
 @MainActor
 final class SliceBRedactionJob {
     private weak var blur: BlurAnnotation?  // cleared on cancel
+    /// Immutable identity: the owner map must stay cleanable even after the
+    /// weak reference has gone nil, or a dead job would hold the slot forever.
+    private let annotationID: ObjectIdentifier
     private let generation: Int
-    private let redraw: () -> Void
+    /// Cleared on every terminal path so a completed/cancelled job cannot keep
+    /// its host (and therefore the full capture) alive.
+    private var redraw: () -> Void
     private var delivered = false
     private var cancelled = false
     private var holdsSlot = false
+    /// Set by the owning surface so its registry entry disappears the moment
+    /// the job finishes, cancelled or not.
+    var onComplete: ((SliceBRedactionJob) -> Void)?
 
     private func releaseSlot() {
         guard holdsSlot else { return }
@@ -635,8 +664,17 @@ final class SliceBRedactionJob {
         blur: BlurAnnotation, generation: Int, redraw: @escaping () -> Void
     ) {
         self.blur = blur
+        self.annotationID = ObjectIdentifier(blur)
         self.generation = generation
         self.redraw = redraw
+    }
+
+    /// Give up the owner slot, but only if it is still ours. Safe to call when
+    /// the annotation itself is already gone.
+    private func releaseOwnership() {
+        if Self.owners[annotationID] === self {
+            Self.owners.removeValue(forKey: annotationID)
+        }
     }
 
     /// Starts a job, or returns nil when the queue is full or the region
@@ -685,14 +723,17 @@ final class SliceBRedactionJob {
     func cancel() {
         guard !delivered, !cancelled else { return }
         cancelled = true
-        if let blur {
-            let id = ObjectIdentifier(blur)
-            // A stale job must not evict a newer owner.
-            if Self.owners[id] === self { Self.owners.removeValue(forKey: id) }
-            blur.normalizePendingRedaction()
-        }
+        // A stale job must not evict a newer owner, and must still clean up
+        // after itself when its annotation is gone.
+        releaseOwnership()
+        blur?.normalizePendingRedaction()
         blur = nil
-        redraw()
+        let finish = onComplete
+        onComplete = nil
+        let notify = redraw
+        redraw = {}  // drop the owner reference: no late redraw after cancel
+        finish?(self)
+        notify()
     }
 
     /// Applies a result. Safe to call from a gate directly; production calls it
@@ -701,23 +742,29 @@ final class SliceBRedactionJob {
         guard !delivered else { return }
         delivered = true
         releaseSlot()
-        guard !cancelled, let blur else { return }
-        // Only the CURRENT owner may narrow a mask, and only while the
-        // annotation is still waiting for this exact answer.
-        let id = ObjectIdentifier(blur)
-        guard Self.owners[id] === self, blur.redactionState == .pendingFull
-        else {
-            if Self.owners[id] === self { Self.owners.removeValue(forKey: id) }
-            return
+        // Ownership is released on EVERY path, including the one where the
+        // annotation has already been deallocated.
+        let wasOwner = Self.owners[annotationID] === self
+        releaseOwnership()
+        // The host clears its own registry entry; do it before any early
+        // return so a completed job never lingers in a map.
+        let finish = onComplete
+        onComplete = nil
+        defer {
+            let notify = redraw
+            redraw = {}   // never keep the host alive past completion
+            finish?(self)
+            notify()
         }
-        Self.owners.removeValue(forKey: id)
+        guard !cancelled, wasOwner, let blur,
+              blur.redactionState == .pendingFull
+        else { return }
         let resolved = SliceBRedaction.applyWords(
             words, to: blur.redactionState,
             generation: generation, current: blur.redactionGeneration)
         // A superseded result must not leave the annotation pending forever:
         // an orphan `pendingFull` would mask correctly but never resolve.
         blur.redactionState = resolved == .pendingFull ? .fallbackFull : resolved
-        redraw()
     }
 
     /// Test seam: a job that has not been enqueued, so a gate can land a
@@ -733,5 +780,6 @@ final class SliceBRedactionJob {
         owners[ObjectIdentifier(blur)]?.cancel()
         owners[ObjectIdentifier(blur)] = job
         return job
+        
     }
 }
