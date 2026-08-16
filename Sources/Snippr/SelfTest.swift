@@ -8850,6 +8850,47 @@ enum SelfTest {
                   matrixFailures.isEmpty,
                   matrixFailures.joined(separator: " | "))
 
+            // E2b. Direct-state containment: a FINITE box that merely hangs
+            //      over the annotation edge is still a mapping failure, and
+            //      must fall back to the full rect through the real renderer.
+            let containRect = CGRect(x: 40, y: 40, width: 80, height: 40)
+            let insideBox = CGRect(x: 50, y: 50, width: 20, height: 15)
+            let partialBox = CGRect(x: 100, y: 50, width: 40, height: 15)
+            let quarterOut = CGRect(x: 50, y: 50, width: 20, height: 30.25)
+            let containMasks = SliceBRedaction.maskRects(
+                state: .words([insideBox, partialBox]), rect: containRect)
+            let quarterMasks = SliceBRedaction.maskRects(
+                state: .words([insideBox, quarterOut]), rect: containRect)
+            let insideMasks = SliceBRedaction.maskRects(
+                state: .words([insideBox]), rect: containRect)
+            // and through the real renderer: the whole rect must be covered
+            let containBase = makeSolidImage(
+                width: 200, height: 120, color: NSColor.white.cgColor)
+            AnnotationRenderer.forceRegionalPixelateFailureForTesting = true
+            let containBlur = BlurAnnotation(uiScale: 1)
+            containBlur.rect = containRect
+            containBlur.redactionState = .words([insideBox, partialBox])
+            let containShot = AnnotationRenderer.render(
+                base: containBase, annotations: [containBlur], pixellated: nil)
+            AnnotationRenderer.forceRegionalPixelateFailureForTesting = false
+            var containCovered = true
+            for x in stride(from: Int(containRect.minX) + 1,
+                            to: Int(containRect.maxX) - 1, by: 6) {
+                for y in stride(from: Int(containRect.minY) + 1,
+                                to: Int(containRect.maxY) - 1, by: 6) {
+                    let p = probe3(containShot, x, y)
+                    if !(p.0 >= 0 && p.0 < 60 && p.1 < 60 && p.2 < 60) {
+                        containCovered = false
+                    }
+                }
+            }
+            check("sliceB-mask-containment",
+                  containMasks == [containRect]
+                    && quarterMasks == [containRect]
+                    && insideMasks == [insideBox]
+                    && containCovered,
+                  "partial \(containMasks) quarter \(quarterMasks) inside \(insideMasks) covered \(containCovered)")
+
             // E3. Real blocking jobs: ownership, slot accounting and host
             //     lifetime, driven through the production `start` path.
             // Host passed by value the way production will: no `[weak]` in the
@@ -9060,8 +9101,9 @@ enum SelfTest {
                 blur.rect = CGRect(x: 5, y: 5, width: 40, height: 25)
                 surface?.addAnnotationForTesting(blur)
                 // completion path
-                if let job = SliceBRedactionJob.pendingForTesting(
-                    blur: blur, host: surface) as SliceBRedactionJob? {
+                do {
+                    let job = SliceBRedactionJob.pendingForTesting(
+                        blur: blur, host: surface)
                     surface?.registerRedactionJob(job, for: blur)
                     if surface?.redactionJobCountForTesting != 1 {
                         registryFailures.append("register")

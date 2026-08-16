@@ -109,6 +109,13 @@ enum OverlayAnnotationTool: String, CaseIterable {
     }
 }
 
+/// The view that owns an `AnnotationSurface` and repaints it when a redaction
+/// resolves. Weak by construction on the surface side.
+@MainActor
+protocol RedactionSurfaceDelegate: AnyObject {
+    func surfaceNeedsRedactionRepaint()
+}
+
 /// Annotation state + input handling shared by BOTH in-place surfaces (the
 /// area-review overlay and the scroll-result panel). Coordinates live in the
 /// BASE image's pixel space — absolutely positioned, so a crop move/resize
@@ -116,7 +123,7 @@ enum OverlayAnnotationTool: String, CaseIterable {
 /// (QA invariant 24). Reuses the editor's `Annotation` model and renderer so
 /// the two surfaces cannot drift.
 @MainActor
-final class AnnotationSurface: RedactionHost {
+final class AnnotationSurface: RedactionHost, RedactionJobObserver {
     /// Tests replace this before constructing a surface. Production callers
     /// leave it nil and therefore share the editor's Settings-backed store.
     static var strokeWidthStoreOverrideForTesting: OverlayStrokeWidthStore?
@@ -299,10 +306,20 @@ final class AnnotationSurface: RedactionHost {
 
     /// Annotation-only two-stack history. The exact model object moves between
     /// stacks; no clone is needed because overlays do not edit old marks.
-    /// Hosts install this so a finished OCR job repaints the right surface.
-    var redactionDidChangeHandler: (() -> Void)?
+    /// The view hosting this surface. Weak delegate rather than a closure so
+    /// no caller can accidentally retain the host through a repaint callback.
+    weak var redactionDelegate: RedactionSurfaceDelegate?
 
-    func redactionDidChange() { redactionDidChangeHandler?() }
+    func redactionDidChange() {
+        redactionDelegate?.surfaceNeedsRedactionRepaint()
+    }
+
+    /// A job reached a terminal state: drop its registry entry.
+    func redactionJobDidFinish(_ job: SliceBRedactionJob) {
+        for (id, registered) in redactionJobs where registered === job {
+            redactionJobs.removeValue(forKey: id)
+        }
+    }
 
     /// Gate visibility: a finished run must leave the registry empty.
     var redactionJobCountForTesting: Int { redactionJobs.count }
@@ -313,16 +330,10 @@ final class AnnotationSurface: RedactionHost {
     func registerRedactionJob(
         _ job: SliceBRedactionJob, for annotation: Annotation
     ) {
-        let id = ObjectIdentifier(annotation)
-        redactionJobs[id] = job
+        redactionJobs[ObjectIdentifier(annotation)] = job
         // Completion removes the entry itself: a finished job must not sit in
         // the map holding this surface alive.
-        job.onComplete = { [weak self] finished in
-            guard let self else { return }
-            if self.redactionJobs[id] === finished {
-                self.redactionJobs.removeValue(forKey: id)
-            }
-        }
+        job.setCompletionObserver(self)
     }
 
     /// Drop entries whose annotation has gone (undo stack cleared, surface

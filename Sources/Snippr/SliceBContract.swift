@@ -57,7 +57,9 @@ enum SliceBRedaction {
             // would silently uncover whatever hangs outside.
             guard !words.isEmpty,
                   words.allSatisfy({ $0.isValidMaskRect }),
-                  words.allSatisfy({ rect.insetBy(dx: -0.5, dy: -0.5).contains($0) })
+                  // STRICT: a box even a quarter pixel outside the annotation
+                  // means the mapping drifted. Fail closed, do not trim.
+                  words.allSatisfy({ rect.contains($0) })
             else { return [rect] }
             return words
         }
@@ -669,6 +671,14 @@ protocol RedactionHost: AnyObject {
     func redactionDidChange()
 }
 
+/// Owner notified when a job reaches any terminal state, so its registry entry
+/// disappears. A weak protocol reference, not a closure: the type system keeps
+/// the invariant instead of every caller having to remember `[weak]`.
+@MainActor
+protocol RedactionJobObserver: AnyObject {
+    func redactionJobDidFinish(_ job: SliceBRedactionJob)
+}
+
 @MainActor
 final class SliceBRedactionJob {
     private weak var blur: BlurAnnotation?  // cleared on cancel
@@ -683,8 +693,13 @@ final class SliceBRedactionJob {
     private var cancelled = false
     private var holdsSlot = false
     /// Set by the owning surface so its registry entry disappears the moment
-    /// the job finishes, cancelled or not.
-    var onComplete: ((SliceBRedactionJob) -> Void)?
+    /// the job finishes, cancelled or not. Weak: a finished job must not keep
+    /// its surface alive.
+    private weak var completionObserver: RedactionJobObserver?
+
+    func setCompletionObserver(_ observer: RedactionJobObserver?) {
+        completionObserver = observer
+    }
 
     private func releaseSlot() {
         guard holdsSlot else { return }
@@ -763,36 +778,35 @@ final class SliceBRedactionJob {
         // A stale job must not evict a newer owner, and must still clean up
         // after itself when its annotation is gone.
         releaseOwnership()
+        let changed = blur?.redactionState == .pendingFull
         blur?.normalizePendingRedaction()
         blur = nil
-        let finish = onComplete
-        onComplete = nil
+        let observer = completionObserver
+        completionObserver = nil
         let notify = host
         host = nil   // drop the host: no late repaint after cancel
-        finish?(self)
-        notify?.redactionDidChange()
+        observer?.redactionJobDidFinish(self)
+        // Cancel DID change the mask (pending -> full), so this repaint is
+        // real work, not a late echo.
+        if changed { notify?.redactionDidChange() }
     }
 
-    /// Applies a result. Safe to call from a gate directly; production calls it
-    /// on the main queue once Vision returns.
     func deliver(_ words: [CGRect]) {
         guard !delivered else { return }
         delivered = true
         releaseSlot()
-        // Ownership is released on EVERY path, including the one where the
-        // annotation has already been deallocated.
+        // Ownership and registry cleanup happen on EVERY path, including the
+        // one where the annotation has already been deallocated.
         let wasOwner = Self.owners[annotationID] === self
         releaseOwnership()
-        // The host clears its own registry entry; do it before any early
-        // return so a completed job never lingers in a map.
-        let finish = onComplete
-        onComplete = nil
-        defer {
-            let notify = host
-            host = nil    // never reference the host past completion
-            finish?(self)
-            notify?.redactionDidChange()
-        }
+        let observer = completionObserver
+        completionObserver = nil
+        let notify = host
+        host = nil
+        observer?.redactionJobDidFinish(self)
+
+        // A superseded / cancelled / non-owner result is SILENT: it changes
+        // nothing, so it must not repaint anything either.
         guard !cancelled, wasOwner, let blur,
               blur.redactionState == .pendingFull
         else { return }
@@ -802,6 +816,7 @@ final class SliceBRedactionJob {
         // A superseded result must not leave the annotation pending forever:
         // an orphan `pendingFull` would mask correctly but never resolve.
         blur.redactionState = resolved == .pendingFull ? .fallbackFull : resolved
+        notify?.redactionDidChange()
     }
 
     /// Test seam: a job that has not been enqueued, so a gate can land a
