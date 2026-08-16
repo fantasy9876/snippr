@@ -663,6 +663,15 @@ enum AnnotationRenderer {
     /// cover.
     nonisolated(unsafe) static var forceRegionalPixelateFailureForTesting = false
 
+    /// Scoped failure injection: a gate cannot forget to reset it, and one
+    /// gate can never leak the flag into the next.
+    static func withForcedRegionalFailure<T>(_ body: () -> T) -> T {
+        let prior = forceRegionalPixelateFailureForTesting
+        forceRegionalPixelateFailureForTesting = true
+        defer { forceRegionalPixelateFailureForTesting = prior }
+        return body()
+    }
+
     static func pixellateRegion(
         _ image: CGImage, rect: CGRect, scale: CGFloat
     ) -> CGImage? {
@@ -679,6 +688,10 @@ enum AnnotationRenderer {
         AnnotationSurface.regionalPixelateAllocationsForTesting += 1
         AnnotationSurface.lastRegionalPixelateRectForTesting = region
         AnnotationSurface.allRegionalPixelateRectsForTesting.append(region)
+        RenderTrace.record(
+            kind: "regionalPixelate",
+            destination: "\(Int(region.width))x\(Int(region.height))",
+            rect: region)
         AnnotationSurface.lastRegionalPixelateBaseSizeForTesting = CGSize(
             width: image.width, height: image.height)
         return ciContext.createCGImage(out, from: region)
@@ -706,4 +719,51 @@ func distanceToSegment(_ p: CGPoint, _ a: CGPoint, _ b: CGPoint) -> CGFloat {
     t = max(0, min(1, t))
     let proj = CGPoint(x: a.x + t * abx, y: a.y + t * aby)
     return hypot(p.x - proj.x, p.y - proj.y)
+}
+
+/// One materialization the renderer actually performed. Gates assert on these
+/// instead of on "did anything blow up": a trace that is EMPTY must fail, and
+/// a full-size pixelated intermediate must never appear.
+struct RenderTraceEvent: Equatable {
+    let host: String        // editor | area | scroll | compositor
+    let path: String        // preview | export | magnifier
+    let kind: String        // regionalPixelate | destination
+    let destination: String // pixel size of the buffer that was allocated
+    let rect: CGRect
+}
+
+enum RenderTrace {
+    nonisolated(unsafe) private(set) static var events: [RenderTraceEvent] = []
+    nonisolated(unsafe) private static var host = "unknown"
+    nonisolated(unsafe) private static var path = "unknown"
+    nonisolated(unsafe) private static var recording = false
+
+    /// Scoped by construction: the previous state is always restored, so one
+    /// gate can never leak its recording (or its host label) into the next.
+    static func capture<T>(
+        host: String, path: String, _ body: () -> T
+    ) -> (result: T, events: [RenderTraceEvent]) {
+        let priorEvents = events, priorHost = self.host
+        let priorPath = self.path, priorRecording = recording
+        events = []
+        self.host = host
+        self.path = path
+        recording = true
+        defer {
+            events = priorEvents
+            self.host = priorHost
+            self.path = priorPath
+            recording = priorRecording
+        }
+        let value = body()
+        let captured = events
+        return (value, captured)
+    }
+
+    static func record(kind: String, destination: String, rect: CGRect) {
+        guard recording else { return }
+        events.append(RenderTraceEvent(
+            host: host, path: path, kind: kind,
+            destination: destination, rect: rect))
+    }
 }

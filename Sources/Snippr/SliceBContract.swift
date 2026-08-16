@@ -470,6 +470,8 @@ enum SliceBCompositor {
             space: base.colorSpace ?? CGColorSpace(name: CGColorSpace.sRGB)!,
             bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
         else { return nil }
+        RenderTrace.record(
+            kind: "destination", destination: "\(w)x\(h)", rect: region)
         let topLeft = CGRect(
             x: region.minX, y: CGFloat(base.height) - region.maxY,
             width: region.width, height: region.height)
@@ -525,6 +527,9 @@ enum SliceBExport {
             space: base.colorSpace ?? CGColorSpace(name: CGColorSpace.sRGB)!,
             bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
         else { return nil }
+        RenderTrace.record(
+            kind: "destination", destination: "\(w)x\(h)",
+            rect: CGRect(x: 0, y: 0, width: w, height: h))
         ctx.draw(base, in: CGRect(x: 0, y: 0, width: w, height: h))
         guard SliceBCompositor.draw(
             annotations, in: ctx, base: base,

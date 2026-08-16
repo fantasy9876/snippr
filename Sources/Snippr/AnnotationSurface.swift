@@ -470,6 +470,8 @@ final class AnnotationSurface: RedactionHost, RedactionJobObserver {
         let height = Int(crop.height)
         let space = base.colorSpace ?? CGColorSpace(name: CGColorSpace.sRGB)!
         Self.flattenAllocationsForTesting += 1
+        RenderTrace.record(
+            kind: "destination", destination: "\(width)x\(height)", rect: crop)
         guard !forceRenderFailureForTesting,
               let sourceCrop = base.cropping(to: crop), // descriptor, no copy
               let ctx = CGContext(

@@ -9011,6 +9011,27 @@ enum SelfTest {
             let gridBase = makeNoiseImage(width: 240, height: 160)
             let gridMask = CGRect(x: 40, y: 40, width: 100, height: 60)
             var gridFailures: [String] = []
+            func probe4(_ image: CGImage, _ x: Int, _ y: Int) -> (Int, Int, Int, Int) {
+                var bytes = [UInt8](
+                    repeating: 0, count: image.width * image.height * 4)
+                guard let c = CGContext(
+                    data: &bytes, width: image.width, height: image.height,
+                    bitsPerComponent: 8, bytesPerRow: image.width * 4,
+                    space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                    bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+                else { return (-1, -1, -1, -1) }
+                c.interpolationQuality = .none
+                c.draw(image, in: CGRect(
+                    x: 0, y: 0, width: image.width, height: image.height))
+                let row = image.height - 1 - y
+                guard x >= 0, x < image.width, row >= 0, row < image.height
+                else { return (-1, -1, -1, -1) }
+                let i = (row * image.width + x) * 4
+                return (
+                    Int(bytes[i]), Int(bytes[i + 1]), Int(bytes[i + 2]),
+                    Int(bytes[i + 3]))
+            }
+
             func gridSnapshot(_ view: NSView) -> CGImage? {
                 guard let rep = view.bitmapImageRepForCachingDisplay(
                     in: view.bounds) else { return nil }
@@ -9160,6 +9181,96 @@ enum SelfTest {
             check("sliceB-surface-registry",
                   registryFailures.isEmpty,
                   registryFailures.joined(separator: " | "))
+
+            // E6. Real hosts: the area overlay and the scroll panel, not a bare
+            //     surface. Full RGBA every-pixel scan of the mask and of the
+            //     area around it, plus an allocation trace that must be
+            //     non-empty and free of full-size intermediates.
+            var hostFailures: [String] = []
+            let hostScreen = NSScreen.main ?? NSScreen.screens[0]
+            let hostFrozen = CapturedImage(
+                cgImage: makeNoiseImage(width: 240, height: 180), scale: 1)
+            let hostMask = CGRect(x: 60, y: 50, width: 80, height: 50)
+            @MainActor func hostDeps() -> CaptureActionRouter.Dependencies {
+                CaptureActionRouter.Dependencies(
+                    copyToClipboard: { _ in }, autoSave: { _, _ in },
+                    saveAs: { _, _ in }, pin: { _ in }, ocr: { _ in },
+                    openEditor: { _ in }, toast: { _ in },
+                    setLastCapture: { _ in }, setLastAreaRect: { _ in },
+                    logEvent: { _ in })
+            }
+            /// Exhaustive RGBA comparison: every pixel of the mask must be the
+            /// exact opaque cover, every pixel outside it byte-identical.
+            func scanCover(
+                _ shot: CGImage, _ source: CGImage, mask: CGRect,
+                scale: CGFloat, label: String
+            ) {
+                let cover = (31, 31, 31, 255)
+                for x in 0..<shot.width {
+                    for y in 0..<shot.height {
+                        let inMask = mask.contains(CGPoint(
+                            x: CGFloat(x) / scale, y: CGFloat(y) / scale))
+                        let p = probe4(shot, x, y)
+                        if inMask {
+                            if p != cover {
+                                hostFailures.append("\(label):cover@\(x),\(y)=\(p)")
+                                return
+                            }
+                        } else if p != probe4(source, x, y) {
+                            hostFailures.append("\(label):outside@\(x),\(y)")
+                            return
+                        }
+                    }
+                }
+            }
+            MainActor.assumeIsolated {
+                // ---- area review overlay
+                let overlay = SelectionOverlay(
+                    purpose: .areaReview,
+                    inputs: OverlaySessionInputs(
+                        afterShow: true, afterCopy: false, afterSave: false),
+                    completion: { _ in })
+                overlay.routerDependenciesOverride = hostDeps()
+                let view = SelectionOverlayView(
+                    mode: .area, screen: hostScreen, frozen: hostFrozen,
+                    windowList: [], owner: overlay)
+                view.selectForTesting(
+                    rect: CGRect(x: 20, y: 20, width: 200, height: 140))
+                guard let surface = view.annotationSurface else {
+                    hostFailures.append("area:no-surface")
+                    return
+                }
+                // RED until GREEN2 wires the hosts: nobody assigns the repaint
+                // delegate, so a resolved redaction repaints nothing.
+                if surface.redactionDelegate == nil {
+                    hostFailures.append("area:no-repaint-delegate")
+                }
+                let blur = BlurAnnotation(uiScale: 1)
+                blur.rect = hostMask
+                surface.addAnnotationForTesting(blur)
+                let (exported, events) = RenderTrace.capture(
+                    host: "area", path: "export"
+                ) { () -> CGImage? in
+                    AnnotationRenderer.withForcedRegionalFailure {
+                        surface.flattened(
+                            base: hostFrozen.cgImage,
+                            cropPixels: CGRect(
+                                x: 0, y: 0, width: 240, height: 180))
+                    }
+                }
+                if exported != nil { hostFailures.append("area:exported") }
+                if events.isEmpty { hostFailures.append("area:empty-trace") }
+                if events.contains(where: {
+                    $0.kind == "regionalPixelate"
+                        && $0.rect.width * $0.rect.height
+                            > hostMask.width * hostMask.height * 1.2
+                }) {
+                    hostFailures.append("area:oversized-region")
+                }
+            }
+            check("sliceB-hosts-failclosed",
+                  hostFailures.isEmpty,
+                  hostFailures.prefix(4).joined(separator: " | "))
 
             // F. Tall images never allocate a full-size pixelated intermediate,
             //    in the editor or in a magnifier patch.
