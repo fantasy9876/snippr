@@ -419,10 +419,9 @@ final class AnnotationSurface: RedactionHost, RedactionJobObserver {
         // document and take the user's redo branch with it.
         if let pen = activePen, annotations.last === pen {
             // MOTION, not sample count: a press that delivers the same point
-            // twice has two samples and no extent, and stroke width and round
-            // caps mean any real movement paints something. The test is
-            // therefore "did the pointer move at all", with a tolerance only
-            // for floating-point noise.
+            // twice has two samples and no extent. The rule is the input
+            // policy — did the pointer move at all — with a tolerance that
+            // exists for floating-point noise, not as a minimum visible size.
             if Self.hasMotion(pen.points) {
                 redoAnnotations.removeAll()
                 pruneSpotlightReplacements()
@@ -434,10 +433,15 @@ final class AnnotationSurface: RedactionHost, RedactionJobObserver {
         if let shape = activeShape, annotations.last === shape {
             let dx = abs(shape.end.x - shape.start.x)
             let dy = abs(shape.end.y - shape.start.y)
-            // Follow what the renderer actually paints. Line, arrow, rect and
-            // oval are STROKED, so any motion leaves a visible mark — a
-            // flat rectangle strokes as a line. Highlight is FILLED, so a drag
-            // along one axis alone has zero area and paints nothing.
+            // INPUT policy first: a press that never moved creates no mark.
+            // (Not a rendering claim — a zero-length arrow would still draw a
+            // head, because drawArrow floors its length at 1.)
+            //
+            // On top of that, one rendering fact: the highlighter FILLS its
+            // bounds, so a drag along a single axis has zero area and paints
+            // nothing at all. The stroked kinds do paint from single-axis
+            // motion — a flat rectangle strokes as a line — so for them any
+            // motion is enough.
             let isReal: Bool
             switch shape.kind {
             case .highlight:

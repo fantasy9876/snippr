@@ -9593,15 +9593,32 @@ enum SelfTest {
                     abortFailures.append("\(tool):undo-after-complete")
                 }
                 _ = surface.redo()
-                if surface.annotations.last !== drawn || surface.canRedo {
+                if surface.annotations.count != 4
+                    || surface.annotations[0] !== markA
+                    || surface.annotations[1] !== spot0
+                    || surface.annotations[2] !== markB
+                    || surface.annotations[3] !== drawn
+                    || surface.canRedo || surface.isDragging {
                     abortFailures.append("\(tool):redo-after-complete")
                 }
             }
-            // A drag along ONE axis: stroked shapes still paint, so they are
-            // real marks; the filled highlighter paints nothing and must be
-            // discarded with the redo branch intact. The renderer decides
-            // this, not a size threshold.
+            // A drag along ONE axis. The pointer moved, so the input policy
+            // keeps the mark for the stroked kinds; the filled highlighter is
+            // the one exception, because filling a zero-area rect paints
+            // nothing whatever the pointer did.
             var axisFailures: [String] = []
+            func expectedKind(
+                _ tool: OverlayAnnotationTool
+            ) -> ShapeAnnotation.Kind? {
+                switch tool {
+                case .rect: return .rect
+                case .line: return .line
+                case .arrow: return .arrow
+                case .oval: return .oval
+                case .highlight: return .highlight
+                default: return nil
+                }
+            }
             let axisCases: [(OverlayAnnotationTool, Bool)] = [
                 (.line, true), (.arrow, true), (.rect, true), (.oval, true),
                 (.highlight, false), (.pen, true),
@@ -9623,28 +9640,195 @@ enum SelfTest {
                     surface.endDrag()
                     let label = "\(tool)-\(horizontal ? "h" : "v")"
                     if keepsMark {
+                        let drawn = surface.annotations.last
+                        let shapedOK: Bool
+                        if tool == .pen {
+                            let points = (drawn as? PenAnnotation)?.points ?? []
+                            shapedOK = points.first == from
+                                && points.last == to
+                        } else {
+                            let shape = drawn as? ShapeAnnotation
+                            shapedOK = shape?.start == from && shape?.end == to
+                                && shape?.kind == expectedKind(tool)
+                        }
                         if surface.annotations.count != 2
                             || surface.annotations[0] !== seed
+                            || !shapedOK || surface.isDragging
                             || surface.canRedo {
                             axisFailures.append(
-                                "\(label):dropped \(surface.annotations.count)")
+                                "\(label):dropped \(surface.annotations.count) "
+                                + "shape \(shapedOK)")
                         }
                     } else {
                         if surface.annotations.count != 1
                             || surface.annotations[0] !== seed
-                            || !surface.canRedo {
+                            || surface.isDragging || !surface.canRedo {
                             axisFailures.append(
                                 "\(label):kept \(surface.annotations.count) "
                                 + "redo \(surface.canRedo)")
                         }
                         _ = surface.redo()
                         if surface.annotations.count != 2
-                            || surface.annotations[1] !== redoMark {
+                            || surface.annotations[0] !== seed
+                            || surface.annotations[1] !== redoMark
+                            || surface.isDragging || surface.canRedo {
                             axisFailures.append("\(label):redo")
                         }
                     }
                 }
             }
+            // K. Digits 1-9 while IDLE. The mid-drag gate proves they are
+            //    blocked during a drag; this proves they work when they should,
+            //    on both hosts, through real keys and the real toolbar.
+            var digitFailures: [String] = []
+            let runDigits = {
+                guard let screen = NSScreen.screens.first else {
+                    digitFailures.append("no-screen")
+                    return
+                }
+                func digitEvent(
+                    _ chars: String, _ flags: NSEvent.ModifierFlags = [],
+                    keypad: Bool = false
+                ) -> NSEvent? {
+                    NSEvent.keyEvent(
+                        with: .keyDown, location: .zero,
+                        modifierFlags: keypad ? flags.union(.numericPad) : flags,
+                        timestamp: 0, windowNumber: 0, context: nil,
+                        characters: chars, charactersIgnoringModifiers: chars,
+                        isARepeat: false, keyCode: 0)
+                }
+
+                // --- scroll panel
+                let panelImage = CapturedImage(
+                    cgImage: makeSolidImage(
+                        width: 600, height: 400, color: NSColor.white.cgColor),
+                    scale: 1)
+                let panel = ScrollResultPanel.show(
+                    image: panelImage,
+                    inputs: OverlaySessionInputs(
+                        afterShow: true, afterCopy: false, afterSave: false),
+                    screen: screen,
+                    dependencies: CaptureActionRouter.Dependencies(
+                        copyToClipboard: { _ in }, autoSave: { _, _ in },
+                        saveAs: { _, _ in }, pin: { _ in }, ocr: { _ in },
+                        openEditor: { _ in }, toast: { _ in },
+                        setLastCapture: { _ in }, setLastAreaRect: { _ in },
+                        logEvent: { _ in }))
+                let surface = panel.annotationSurface
+                var historyEvents = 0
+                surface.historyDidChange = { historyEvents += 1 }
+                // No spotlight yet: a digit must do nothing at all.
+                let beforeNoSpot = historyEvents
+                if let event = digitEvent("5") { panel.keyDown(with: event) }
+                if surface.annotations.count != 0
+                    || historyEvents != beforeNoSpot {
+                    digitFailures.append("panel:no-spot-mutated")
+                }
+                // A real spotlight, drawn with the real tool.
+                panel.clickToolbarButtonForTesting(
+                    tag: OverlayAnnotationTool.spotlight.toolbarTag)
+                panel.drawWithRealEventsForTesting(
+                    fromView: CGPoint(x: 60, y: 60),
+                    toView: CGPoint(x: 200, y: 160))
+                guard let firstSpot = surface.annotations
+                    .compactMap({ $0 as? SpotlightAnnotation }).last else {
+                    digitFailures.append("panel:no-spotlight")
+                    panel.dismissForTesting()
+                    return
+                }
+                if firstSpot.dimFraction != 0.6 {
+                    digitFailures.append(
+                        "panel:default \(firstSpot.dimFraction)")
+                }
+                // 1 -> 5 -> 9: each is one clone, one history event, and the
+                // spotlight stays the only one.
+                var previous = firstSpot
+                for (digit, expected) in [("1", 0.1), ("5", 0.5), ("9", 0.9)] {
+                    let before = historyEvents
+                    if let event = digitEvent(digit) {
+                        panel.keyDown(with: event)
+                    }
+                    let spots = surface.annotations
+                        .compactMap { $0 as? SpotlightAnnotation }
+                    guard spots.count == 1, let current = spots.first else {
+                        digitFailures.append(
+                            "panel:\(digit)-count \(spots.count)")
+                        continue
+                    }
+                    if current === previous {
+                        digitFailures.append("panel:\(digit)-not-cloned")
+                    }
+                    if abs(current.dimFraction - expected) > 0.0001 {
+                        digitFailures.append(
+                            "panel:\(digit)-dim \(current.dimFraction)")
+                    }
+                    if historyEvents != before + 1 {
+                        digitFailures.append(
+                            "panel:\(digit)-history "
+                            + "\(historyEvents - before)")
+                    }
+                    previous = current
+                }
+                // Same value again is a no-op, and so are a modified digit and
+                // a digit that is not 1-9.
+                for (label, event) in [
+                    ("repeat", digitEvent("9")),
+                    ("command", digitEvent("5", .command)),
+                    ("zero", digitEvent("0")),
+                ] {
+                    let before = historyEvents
+                    let dim = previous.dimFraction
+                    if let event { panel.keyDown(with: event) }
+                    if historyEvents != before
+                        || previous.dimFraction != dim
+                        || surface.annotations
+                            .compactMap({ $0 as? SpotlightAnnotation })
+                            .count != 1 {
+                        digitFailures.append("panel:\(label)-mutated")
+                    }
+                }
+                // Undo walks back through every step, redo returns.
+                _ = surface.undo()
+                let afterOneUndo = surface.annotations
+                    .compactMap { $0 as? SpotlightAnnotation }.first
+                if afterOneUndo == nil
+                    || abs((afterOneUndo?.dimFraction ?? 0) - 0.5) > 0.0001 {
+                    digitFailures.append(
+                        "panel:undo1 \(afterOneUndo?.dimFraction ?? -1)")
+                }
+                _ = surface.undo()
+                _ = surface.undo()
+                let afterThree = surface.annotations
+                    .compactMap { $0 as? SpotlightAnnotation }.first
+                if afterThree !== firstSpot {
+                    digitFailures.append("panel:undo3")
+                }
+                _ = surface.redo()
+                _ = surface.redo()
+                _ = surface.redo()
+                let afterRedo = surface.annotations
+                    .compactMap { $0 as? SpotlightAnnotation }.first
+                if abs((afterRedo?.dimFraction ?? 0) - 0.9) > 0.0001 {
+                    digitFailures.append(
+                        "panel:redo3 \(afterRedo?.dimFraction ?? -1)")
+                }
+                // Frozen once a terminal action has claimed the image.
+                panel.performActionForTesting(.copy)
+                let frozenDim = afterRedo?.dimFraction ?? 0
+                let beforeFrozen = historyEvents
+                if let event = digitEvent("1") { panel.keyDown(with: event) }
+                if afterRedo?.dimFraction != frozenDim
+                    || historyEvents != beforeFrozen {
+                    digitFailures.append("panel:frozen-mutated")
+                }
+                if ScrollResultPanel.current === panel {
+                    panel.dismissForTesting()
+                }
+            }
+            runDigits()
+            check("sliceB-digits-idle",
+                  digitFailures.isEmpty, digitFailures.joined(separator: " | "))
+
             check("sliceB-single-axis-drag",
                   axisFailures.isEmpty, axisFailures.joined(separator: " | "))
 
