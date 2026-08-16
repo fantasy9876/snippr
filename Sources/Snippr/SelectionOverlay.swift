@@ -651,8 +651,9 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
         if isSaving || isFinished { return }
         // The same rule the keyboard follows. A toolbar click, an
         // accessibility action or any programmatic route reaches this method
-        // without passing a key handler, so the guard belongs here too.
-        if annotationDragging { return }
+        // without passing a key handler, so the guard belongs here too. A crop
+        // drag counts: it is mid-transaction just as an annotation drag is.
+        if annotationDragging || areaDrag != nil { return }
         if sender.tag == -1 {
             owner?.finish(.cancelled)
             return
@@ -685,7 +686,7 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
     /// tear the overlay down BEFORE presenting; Save keeps the overlay in
     /// `.saving` and returns to review on cancel/failure.
     fileprivate func performReviewAction(_ intent: CaptureIntent) {
-        guard !annotationDragging else { return }
+        guard !annotationDragging, areaDrag == nil else { return }
         guard let owner, owner.session.acceptsCommits,
               let selection = areaSelection?.intersection(bounds),
               selection.width >= 4, selection.height >= 4,
@@ -1045,10 +1046,17 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
         updatePointer(from: event)
         guard mode == .area else { return }
         let p = convert(event.locationInWindow, from: nil)
-        // A live annotation drag is deliberately still served: it has to be
-        // able to abandon its draft. The selection routes below are not.
-        if isFinished, !annotationDragging {
+        // Once the document is frozen — finished, or handed off and saving —
+        // a drag in flight is ABANDONED rather than continued. Carrying on
+        // would keep adding pen points, or resizing a shape, on a document
+        // that has already been exported.
+        if isFinished || isSaving {
+            if annotationDragging {
+                annotationSurface?.abandonDrag()
+                annotationDragging = false
+            }
             areaDrag = nil
+            needsDisplay = true
             return
         }
         if annotationDragging {
@@ -1121,7 +1129,10 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
             // Mouse-up IS the capture (no Capture button, no Enter needed).
             if wasCreating, let selection = areaSelection {
                 commitInitialSelection(selection)
-            } else if wasAdjusting, isReviewing {
+            } else if wasAdjusting,
+                      owner?.session.phase == .reviewing {
+                // EXACTLY reviewing: `isReviewing` also covers `.saving`, and
+                // the crop must not move under an image already handed off.
                 // review resize/move finished: selection is the new live crop
                 syncSessionPixelRect()
                 layoutReviewToolbar()
@@ -1153,6 +1164,7 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
                 annotationDragging = false
                 needsDisplay = true
             }
+            areaDrag = nil
             handleEscape()
             return
         }
@@ -1161,7 +1173,7 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
         // finalizing transaction is half-built, so a route here can strand the
         // spotlight being replaced, leave a zero-area draft behind, or export
         // a half-drawn mark and let mouseUp mutate the document afterwards.
-        if annotationDragging { return }
+        if annotationDragging || areaDrag != nil { return }
         if isReviewing, (event.keyCode == 36 || event.keyCode == 76) {
             // Return / keypad Enter during review = Copy and close. (Esc and
             // click-outside cancel; the overlay never applies the editor's
@@ -1207,7 +1219,7 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
         }
         // Same rule as keyDown, and CONSUMED: forwarding to super would let
         // the responder or menu chain run the very command being blocked.
-        if annotationDragging { return true }
+        if annotationDragging || areaDrag != nil { return true }
         let pickFlags = event.modifierFlags.intersection(
             [.command, .shift, .control, .option])
         // `.saving` is part of `isReviewing` but must reject picker mutation.
@@ -1322,7 +1334,10 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
         textField = nil
         field.removeFromSuperview()
         window?.makeFirstResponder(self)
-        if commit, !value.isEmpty {
+        // A delegate callback can arrive after the session has finished; the
+        // normal terminal routes commit the field BEFORE the snapshot, so this
+        // only ever discards text that would have missed the export anyway.
+        if commit, !value.isEmpty, owner?.session.phase == .reviewing {
             annotationSurface?.addText(value, atPixel: origin)
             needsDisplay = true
         }
