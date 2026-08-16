@@ -633,9 +633,28 @@ enum SliceBExport {
     /// Overridable so a gate can drive the REAL peak boundary — production
     /// apply, resize and export all read this — without a gigabyte fixture.
     /// Nothing in production ever sets the override.
-    nonisolated(unsafe) static var budgetOverrideForTesting: Int?
+    nonisolated(unsafe) private static var budgetOverride: Int?
+    private static let budgetLock = NSLock()
+
     static var defaultBudgetBytes: Int {
-        budgetOverrideForTesting ?? 256 * 1_000_000 * 4
+        budgetLock.lock()
+        defer { budgetLock.unlock() }
+        return budgetOverride ?? 256 * 1_000_000 * 4
+    }
+
+    /// Scoped, so a gate cannot leave the budget lowered for everything that
+    /// runs after it — an earlier version set a global and restored it by hand.
+    static func withBudgetForTesting<T>(_ bytes: Int, _ body: () -> T) -> T {
+        budgetLock.lock()
+        let previous = budgetOverride
+        budgetOverride = bytes
+        budgetLock.unlock()
+        defer {
+            budgetLock.lock()
+            budgetOverride = previous
+            budgetLock.unlock()
+        }
+        return body()
     }
 
     /// Budget arithmetic that cannot wrap: nil means there is nothing left.

@@ -910,17 +910,20 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
         return (Int(px.width), Int(px.height))
     }
 
-    /// Whether inner and outer can both be alive at once for this preset.
+    /// Whether an image of this size can be exported with this preset — both
+    /// buffers alive at once, which is what the peak actually is.
     ///
     /// Validity is judged against the FULL image, never a pending crop: a crop
     /// is cancelled by Esc, by switching tools and by undo, so a preset that was
     /// only affordable while that crop existed would silently become invalid
     /// under the user. Committing a smaller crop can only lower the peak, so
     /// full-image validity keeps holding afterwards.
+    ///
+    /// `.none` still has to fit: there is no frame, but the export buffer is
+    /// real and its budget is smaller than the resizer's own dimension cap.
     func backdropPeakFits(
         _ preset: BackdropPreset, width: Int, height: Int
     ) -> Bool {
-        guard preset != .none else { return true }
         let reserve = SliceBBackdrop.reservedBytes(
             forInnerWidth: width, height: height, preset: preset,
             pixelScale: pxScale)
@@ -945,8 +948,11 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
         // fit but together do not was accepted here and failed at export.
         // Removing a backdrop is always allowed: it can only shrink the peak,
         // and a document must never be stuck wearing a frame it cannot export.
-        guard backdropPeakFits(preset, width: image.cgImage.width,
-                               height: image.cgImage.height) else {
+        // Removing a frame is always allowed: it only lowers the peak, and a
+        // document must never be stuck wearing one it cannot export.
+        guard preset == .none || backdropPeakFits(
+            preset, width: image.cgImage.width,
+            height: image.cgImage.height) else {
             ToastHUD.show(
                 "This image is too large for a backdrop",
                 symbol: "exclamationmark.triangle.fill")
@@ -1926,20 +1932,24 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
     }
 
     func applyPixelScale(_ factor: CGFloat) {
-        guard abs(factor - 1) >= 0.0001,
-              let scaled = ImageResizer.scale(image, by: factor) else { return }
-        // Growing the image grows the frame with it. Refuse before anything
-        // moves rather than leave the document in a state its own backdrop
-        // cannot export: nothing is scaled, no history entry, and the message
-        // names the backdrop instead of surfacing as a render error later.
+        guard abs(factor - 1) >= 0.0001 else { return }
+        // Ask about the target size BEFORE it is allocated: materializing a
+        // bitmap only to reject it spends the very memory the check exists to
+        // protect. ImageResizer's own cap is larger than the export budget, so
+        // this refusal is also what stops a document from growing past the
+        // point it can be exported at all — with or without a frame.
+        guard let target = ImageResizer.targetDimensions(for: image, by: factor)
+        else { return }
         guard backdropPeakFits(
-            backdropPreset, width: scaled.cgImage.width,
-            height: scaled.cgImage.height) else {
+            backdropPreset, width: target.width, height: target.height) else {
             ToastHUD.show(
-                "This size is too large for the backdrop",
+                backdropPreset == .none
+                    ? "This size is too large to export"
+                    : "This size is too large for the backdrop",
                 symbol: "exclamationmark.triangle.fill")
             return
         }
+        guard let scaled = ImageResizer.scale(image, by: factor) else { return }
         cancelCropSelection()
         registerUndoSnapshot()
         for annotation in annotations {

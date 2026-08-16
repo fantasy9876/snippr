@@ -133,9 +133,13 @@ enum ImageResizer {
 
     /// Scale pixel dimensions by `factor`. Backing `scale` is unchanged so
     /// point size follows pixels. Does **not** read or write `downscaleRetina`.
-    static func scale(_ image: CapturedImage, by factor: CGFloat) -> CapturedImage? {
+    /// The dimensions `scale` would produce, without producing them. A caller
+    /// that must approve a resize before it happens has to ask about the SAME
+    /// numbers, so the rounding and the caps live in one place.
+    static func targetDimensions(
+        for image: CapturedImage, by factor: CGFloat
+    ) -> (width: Int, height: Int)? {
         guard factor > 0, factor.isFinite else { return nil }
-        if abs(factor - 1) < 0.0001 { return image }
         let destW = (Double(image.cgImage.width) * Double(factor)).rounded()
         let destH = (Double(image.cgImage.height) * Double(factor)).rounded()
         guard destW.isFinite, destH.isFinite,
@@ -143,13 +147,27 @@ enum ImageResizer {
               destW <= Double(maxDimension), destH <= Double(maxDimension),
               destW * destH <= Double(maxPixelCount)
         else { return nil }
-        let w = Int(destW)
-        let h = Int(destH)
+        return (Int(destW), Int(destH))
+    }
+
+    static func scale(_ image: CapturedImage, by factor: CGFloat) -> CapturedImage? {
+        guard factor > 0, factor.isFinite else { return nil }
+        if abs(factor - 1) < 0.0001 { return image }
+        guard let target = targetDimensions(for: image, by: factor)
+        else { return nil }
+        let w = target.width
+        let h = target.height
         guard let ctx = CGContext(
             data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
             space: CGColorSpace(name: CGColorSpace.sRGB)!,
             bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
         ) else { return nil }
+        // The destination buffer exists from here on, so the trace must say
+        // so: a caller that refuses a resize has to be able to prove nothing
+        // was allocated, not merely that the document looks unchanged.
+        RenderTrace.record(
+            kind: "destination", destination: "\(w)x\(h)",
+            rect: CGRect(x: 0, y: 0, width: w, height: h))
         ctx.interpolationQuality = .high
         ctx.draw(image.cgImage, in: CGRect(x: 0, y: 0, width: w, height: h))
         guard let out = ctx.makeImage() else { return nil }

@@ -19,7 +19,9 @@ final class ToastHUD {
         guard Settings.shared.confirmationStyle != .none else { return }
         // Recorded synchronously, before the hop to main, so a headless gate
         // can assert WHICH failure the user was told about.
-        lastMessageForTesting = message
+        messageLock.lock()
+        lastMessage = message
+        messageLock.unlock()
         DispatchQueue.main.async {
             showNow(message, symbol: symbol, duration: duration,
                     screen: screen, minLevel: minLevel)
@@ -28,7 +30,32 @@ final class ToastHUD {
 
     static var panelForTesting: NSPanel? { panel }
 
-    nonisolated(unsafe) static var lastMessageForTesting: String?
+    nonisolated(unsafe) private static var lastMessage: String?
+    private static let messageLock = NSLock()
+
+    static var lastMessageForTesting: String? {
+        messageLock.lock()
+        defer { messageLock.unlock() }
+        return lastMessage
+    }
+
+    /// Records what the user was actually told during `body`, and only during
+    /// `body`: an assertion about a message must not be able to read one left
+    /// behind by something else.
+    static func recordingMessagesForTesting<T>(
+        _ body: () -> T
+    ) -> (result: T, message: String?) {
+        messageLock.lock()
+        let previous = lastMessage
+        lastMessage = nil
+        messageLock.unlock()
+        let result = body()
+        messageLock.lock()
+        let captured = lastMessage
+        lastMessage = previous
+        messageLock.unlock()
+        return (result, captured)
+    }
 
     private static func showNow(
         _ message: String, symbol: String, duration: TimeInterval,

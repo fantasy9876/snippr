@@ -8530,56 +8530,112 @@ enum SelfTest {
                 && p3None.map { imagesEqualForTesting($0, p3Image) } == true
             // `.none` returns the input untouched, so it proves nothing about
             // the composed path. The real question is a FRAMED P3 image with
-            // translucent pixels: the frame must stay in the document's colour
-            // space and the gradient must run continuously through the image
-            // instead of the black fill that used to sit under it.
+            // ASYMMETRIC alpha: transparent, 25% and opaque bands in a colour
+            // outside sRGB. A gradient-only output — the old black-fill bug
+            // inverted — has to fail, so the framed result is compared against
+            // a reference composed the same way with NO source image.
             let p3AlphaCtx = CGContext(
                 data: nil, width: 30, height: 20, bitsPerComponent: 8,
                 bytesPerRow: 0, space: p3Space,
                 bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
             p3AlphaCtx.clear(CGRect(x: 0, y: 0, width: 30, height: 20))
-            p3AlphaCtx.setFillColor(
-                NSColor.systemPink.withAlphaComponent(0.25).cgColor)
-            p3AlphaCtx.fill(CGRect(x: 0, y: 0, width: 30, height: 20))
+            // Saturated P3 green: outside sRGB, so a lost colour space shows.
+            let wideGreen = CGColor(
+                colorSpace: p3Space, components: [0, 1, 0, 1])!
+            p3AlphaCtx.setFillColor(wideGreen)
+            p3AlphaCtx.fill(CGRect(x: 10, y: 0, width: 10, height: 20))
+            p3AlphaCtx.setAlpha(0.25)
+            p3AlphaCtx.setFillColor(wideGreen)
+            p3AlphaCtx.fill(CGRect(x: 20, y: 0, width: 10, height: 20))
+            p3AlphaCtx.setAlpha(1)
             let p3Alpha = p3AlphaCtx.makeImage()!
+            let emptyCtx = CGContext(
+                data: nil, width: 30, height: 20, bitsPerComponent: 8,
+                bytesPerRow: 0, space: p3Space,
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+            emptyCtx.clear(CGRect(x: 0, y: 0, width: 30, height: 20))
+            let p3Empty = emptyCtx.makeImage()!
             let p3Framed = SliceBBackdrop.compose(
                 image: p3Alpha, preset: .sunset,
                 budgetBytes: SliceBExport.defaultBudgetBytes)
+            let p3Reference = SliceBBackdrop.compose(
+                image: p3Empty, preset: .sunset,
+                budgetBytes: SliceBExport.defaultBudgetBytes)
             var p3FramedOK = false
             var p3Detail = "framed nil"
-            if let framed = p3Framed {
-                let spaceKept = framed.colorSpace?.name == p3Space.name
-                var bytes = [UInt8](
-                    repeating: 0,
-                    count: framed.width * framed.height * 4)
-                let readback = CGContext(
-                    data: &bytes, width: framed.width, height: framed.height,
-                    bitsPerComponent: 8, bytesPerRow: framed.width * 4,
-                    space: CGColorSpace(name: CGColorSpace.sRGB)!,
-                    bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
-                readback?.interpolationQuality = .none
-                readback?.draw(framed, in: CGRect(
-                    x: 0, y: 0, width: framed.width, height: framed.height))
-                // Sample a horizontal line through the middle of the image:
-                // padding, then the translucent region, then padding again.
-                let row = framed.height / 2
-                func px(_ x: Int) -> (Int, Int, Int, Int) {
-                    let i = (row * framed.width + x) * 4
-                    return (Int(bytes[i]), Int(bytes[i + 1]),
-                            Int(bytes[i + 2]), Int(bytes[i + 3]))
+            if let framed = p3Framed, let reference = p3Reference,
+               framed.width == reference.width {
+                func readBack(_ image: CGImage) -> [UInt8]? {
+                    var bytes = [UInt8](
+                        repeating: 0, count: image.width * image.height * 4)
+                    guard let c = CGContext(
+                        data: &bytes, width: image.width, height: image.height,
+                        bitsPerComponent: 8, bytesPerRow: image.width * 4,
+                        space: p3Space,
+                        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+                    else { return nil }
+                    c.interpolationQuality = .none
+                    c.draw(image, in: CGRect(
+                        x: 0, y: 0, width: image.width, height: image.height))
+                    return bytes
                 }
-                let outside = px(2)
-                let inside = px(framed.width / 2)
-                // Sunset is warm and bright; the old opaque fill made every
-                // translucent pixel near-black, which luma catches directly.
-                let insideLuma = luma((inside.0, inside.1, inside.2))
-                let outsideLuma = luma((outside.0, outside.1, outside.2))
-                let opaqueOut = outside.3 == 255 && inside.3 == 255
-                let gradientShows = insideLuma >= outsideLuma / 2
-                    && insideLuma > 60
-                p3FramedOK = spaceKept && opaqueOut && gradientShows
-                p3Detail = "space \(spaceKept) alpha \(opaqueOut) "
-                    + "in \(insideLuma) out \(outsideLuma)"
+                if let got = readBack(framed), let want = readBack(reference) {
+                    let pad = Int(SliceBBackdrop.padding(forLongEdge: 30))
+                    let row = framed.height / 2
+                    func px(_ b: [UInt8], _ x: Int) -> (Int, Int, Int, Int) {
+                        let i = (row * framed.width + x) * 4
+                        return (Int(b[i]), Int(b[i + 1]), Int(b[i + 2]),
+                                Int(b[i + 3]))
+                    }
+                    // Source-over, computed from the reference itself: the
+                    // transparent band must equal the backdrop exactly, the
+                    // opaque band must equal the source exactly, and the 25%
+                    // band must land between the two.
+                    func blend(_ dst: Int, _ src: Int, _ a: Double) -> Double {
+                        Double(src) * a + Double(dst) * (1 - a)
+                    }
+                    let clearX = pad + 5, solidX = pad + 15, mixX = pad + 25
+                    let clearGot = px(got, clearX), clearWant = px(want, clearX)
+                    let solidGot = px(got, solidX)
+                    let mixGot = px(got, mixX), mixDst = px(want, mixX)
+                    let srcGreen = wideGreen.components ?? [0, 0, 0, 1]
+                    let srcBytes = (
+                        Int((srcGreen[0] * 255).rounded()),
+                        Int((srcGreen[1] * 255).rounded()),
+                        Int((srcGreen[2] * 255).rounded()))
+                    func close(
+                        _ a: (Int, Int, Int, Int), _ b: (Int, Int, Int),
+                        _ tol: Int
+                    ) -> Bool {
+                        abs(a.0 - b.0) <= tol && abs(a.1 - b.1) <= tol
+                            && abs(a.2 - b.2) <= tol
+                    }
+                    let transparentShowsBackdrop = close(
+                        clearGot, (clearWant.0, clearWant.1, clearWant.2), 2)
+                    let opaqueShowsSource = close(solidGot, srcBytes, 3)
+                    let quarterBlends = close(
+                        mixGot,
+                        (Int(blend(mixDst.0, srcBytes.0, 0.25).rounded()),
+                         Int(blend(mixDst.1, srcBytes.1, 0.25).rounded()),
+                         Int(blend(mixDst.2, srcBytes.2, 0.25).rounded())),
+                        4)
+                    // A gradient-only result would satisfy the first check and
+                    // fail these two, which is exactly the point.
+                    let differsFromReference = !close(
+                        solidGot, (px(want, solidX).0, px(want, solidX).1,
+                                   px(want, solidX).2), 6)
+                    let spaceKept = framed.colorSpace?.name == p3Space.name
+                    let opaqueOut = clearGot.3 == 255 && solidGot.3 == 255
+                        && mixGot.3 == 255
+                    p3FramedOK = spaceKept && opaqueOut
+                        && transparentShowsBackdrop && opaqueShowsSource
+                        && quarterBlends && differsFromReference
+                    p3Detail = "space \(spaceKept) alpha \(opaqueOut) "
+                        + "clear \(transparentShowsBackdrop) "
+                        + "solid \(opaqueShowsSource) mix \(quarterBlends) "
+                        + "differs \(differsFromReference) "
+                        + "got \(solidGot) want \(srcBytes)"
+                }
             }
             check("sliceB2-backdrop-mapping",
                   mapped == CGPoint(x: 50, y: 30) && p3Kept && p3FramedOK,
@@ -8990,6 +9046,10 @@ enum SelfTest {
                 "copy": 0, "saveAs": 0, "autoSave": 0, "pin": 0,
                 "ocr": 0, "translate": 0,
             ]
+            // Toasts are suppressed entirely when confirmations are off, and
+            // these gates assert WHICH failure the user was told about.
+            let styleBefore = Settings.shared.confirmationStyle
+            Settings.shared.confirmationStyle = .custom
             for (name, escCopy, escSave, action, expected) in routes {
                 Settings.shared.escCopy = escCopy
                 Settings.shared.escSave = escSave
@@ -9003,7 +9063,12 @@ enum SelfTest {
                 let beforeRefs = canvas.annotationRefsForTesting
                 let beforeSelected = canvas.selectedRefForTesting
                 let beforeEditing = canvas.editingTextRefForTesting
-                AnnotationRenderer.withForcedRegionalFailure { action(wc) }
+                let innerToast = ToastHUD.recordingMessagesForTesting {
+                    AnnotationRenderer.withForcedRegionalFailure { action(wc) }
+                }.message
+                if innerToast != "Couldn't render the redaction — nothing was exported" {
+                    termFailures.append(name + ":toast(\(innerToast ?? "nil"))")
+                }
                 if vector(spy) != zeroVector {
                     termFailures.append(name + ":deps " + spy.description)
                 }
@@ -9045,11 +9110,7 @@ enum SelfTest {
             // seam only fails redaction, so a frame that cannot be composed
             // was never proven to block a terminal action — nor to say so.
             var outerFailures: [String] = []
-            let styleBefore = Settings.shared.confirmationStyle
-            if Settings.shared.confirmationStyle == .none {
-                Settings.shared.confirmationStyle = .custom
-            }
-            for (name, escCopy, escSave, action, _) in routes {
+            for (name, escCopy, escSave, action, expected) in routes {
                 Settings.shared.escCopy = escCopy
                 Settings.shared.escSave = escSave
                 let seedEditing = !name.hasPrefix("esc")
@@ -9066,8 +9127,9 @@ enum SelfTest {
                 let beforeRefs = canvas.annotationRefsForTesting
                 let beforeSelected = canvas.selectedRefForTesting
                 let beforeEditing = canvas.editingTextRefForTesting
-                ToastHUD.lastMessageForTesting = nil
-                ForcedOuterComposeFailure.scoped { action(wc) }
+                let outerToast = ToastHUD.recordingMessagesForTesting {
+                    ForcedOuterComposeFailure.scoped { action(wc) }
+                }.message
                 if vector(spy) != zeroVector {
                     outerFailures.append(name + ":deps " + spy.description)
                 }
@@ -9091,24 +9153,35 @@ enum SelfTest {
                     || canvas.editingTextRefForTesting !== beforeEditing {
                     outerFailures.append(name + ":identity")
                 }
-                // The message must point at the backdrop. Blaming redaction
-                // sends the user to look at the wrong thing entirely.
-                let toast = ToastHUD.lastMessageForTesting ?? ""
-                if !toast.lowercased().contains("backdrop") {
-                    outerFailures.append(name + ":toast(\(toast))")
+                // EXACTLY the backdrop message. "Contains backdrop" would also
+                // accept the redaction text if someone appended a word to it.
+                let backdropToast =
+                    "Couldn't render the backdrop — nothing was exported"
+                let redactionToast =
+                    "Couldn't render the redaction — nothing was exported"
+                if outerToast != backdropToast {
+                    outerFailures.append(name + ":toast(\(outerToast ?? "nil"))")
                 }
+                _ = redactionToast
                 wc.window?.close()
 
-                // Healthy twin with the SAME preset applied: the frame composes
-                // and the route reaches its dependency, so the zeros above mean
-                // blocked rather than broken by the backdrop itself.
+                // Healthy twin on the SAME seeded state with the SAME preset:
+                // it must hit its dependencies EXACTLY — the named ones once,
+                // every other one zero — so the zeros above mean blocked
+                // rather than broken by the backdrop itself.
                 let liveSpy = TerminalSpy()
                 let (liveWC, liveCanvas) = makeSpiedEditor(
                     liveSpy, seedEditing: seedEditing)
-                _ = liveCanvas.applyBackdrop(.ocean)
+                preflight(liveCanvas, "outer-" + name + "-live",
+                          editing: seedEditing)
+                if !liveCanvas.applyBackdrop(.ocean) {
+                    outerFailures.append(name + ":live-apply")
+                }
                 action(liveWC)
-                if vector(liveSpy) == zeroVector {
-                    outerFailures.append(name + ":live-none")
+                var expectedVector = zeroVector
+                for (key, value) in expected { expectedVector[key] = value }
+                if vector(liveSpy) != expectedVector {
+                    outerFailures.append(name + ":live " + liveSpy.description)
                 }
                 liveWC.window?.close()
             }
@@ -9161,12 +9234,15 @@ enum SelfTest {
                     || checked.first?.tag != presets.firstIndex(of: .none) {
                     applyFailures.append("menu-check")
                 }
-                // Drive the menu the way the user does: through the item.
-                if let mintItem = menu.items.first(
-                    where: { $0.tag == presets.firstIndex(of: .mint) }),
-                    let action = mintItem.action {
-                    _ = (mintItem.target as? NSObject)?.perform(
-                        action, with: mintItem)
+                // Drive the menu the way the user does: real dispatch, not a
+                // direct perform, which would bypass validation and fire an
+                // item the user could never click.
+                if !menu.items.allSatisfy({ $0.isEnabled }) {
+                    applyFailures.append("menu-disabled")
+                }
+                if let mintIndex = menu.items.firstIndex(
+                    where: { $0.tag == presets.firstIndex(of: .mint) }) {
+                    menu.performActionForItem(at: mintIndex)
                 } else {
                     applyFailures.append("menu-mint-missing")
                 }
@@ -9207,10 +9283,12 @@ enum SelfTest {
                 wc.window?.close()
             }
 
-            // Both OCR delivery orders across a backdrop undo. The mask must
-            // narrow either way: a result landing after the undo must still
-            // reach the LIVE annotation, and one landing before it must not be
-            // thrown away when the undo runs.
+            // Both OCR delivery orders across a backdrop undo, on a REAL
+            // registered job with a live selection. The mask must narrow
+            // either way: a result landing after the undo must still reach the
+            // live annotation, and one landing before it must not be thrown
+            // away when the undo runs. A backdrop change is not structural, so
+            // it must neither cancel the job nor bump the generation.
             let backdropWord = CGRect(x: 25, y: 25, width: 20, height: 10)
             for deliverFirst in [true, false] {
                 let wc = EditorWindowController.open(
@@ -9219,14 +9297,34 @@ enum SelfTest {
                 let canvas = wc.canvasForTesting
                 let blur = BlurAnnotation(uiScale: 1)
                 blur.rect = CGRect(x: 20, y: 20, width: 60, height: 40)
-                canvas.annotations = [blur]
+                let neighbour = CounterAnnotation(uiScale: 1)
+                canvas.annotations = [blur, neighbour]
+                canvas.selectForTesting(blur)
                 let label = deliverFirst
                     ? "deliver-then-undo" : "undo-then-deliver"
+                let host = CountingRedactionHost()
+                let generation = blur.redactionGeneration
                 MainActor.assumeIsolated {
-                    let host = CountingRedactionHost()
                     let job = SliceBRedactionJob.pendingForTesting(
                         blur: blur, host: host)
+                    canvas.redactionRegistry.register(job, for: blur)
+                    let historyBefore = canvas.historyMutationCountForTesting
                     _ = canvas.applyBackdrop(.sunset)
+                    if canvas.historyMutationCountForTesting != historyBefore + 1 {
+                        applyFailures.append(label + ":history")
+                    }
+                    if canvas.redactionRegistry.count != 1 {
+                        applyFailures.append(
+                            label + ":cancelled \(canvas.redactionRegistry.count)")
+                    }
+                    if blur.redactionGeneration != generation {
+                        applyFailures.append(label + ":generation")
+                    }
+                    if blur.redactionState != .pendingFull {
+                        applyFailures.append(
+                            label + ":pending "
+                            + String(describing: blur.redactionState))
+                    }
                     if deliverFirst {
                         job.deliver([backdropWord])
                         canvas.undoManager?.undo()
@@ -9235,7 +9333,10 @@ enum SelfTest {
                         job.deliver([backdropWord])
                     }
                 }
-                if canvas.annotationRefsForTesting.first !== blur {
+                let refs = canvas.annotationRefsForTesting
+                if refs.count != 2 || refs.first !== blur
+                    || refs.last !== neighbour
+                    || canvas.selectedRefForTesting !== blur {
                     applyFailures.append(label + ":identity")
                 }
                 if canvas.backdropPresetForTesting != .none {
@@ -9244,6 +9345,14 @@ enum SelfTest {
                 if blur.redactionState != .words([backdropWord]) {
                     applyFailures.append(
                         label + ":" + String(describing: blur.redactionState))
+                }
+                if host.repaints < 1 {
+                    applyFailures.append(label + ":norepaint")
+                }
+                // The job finished, so the registry must have released it.
+                if canvas.redactionRegistry.count != 0 {
+                    applyFailures.append(
+                        label + ":leak \(canvas.redactionRegistry.count)")
                 }
                 wc.window?.close()
             }
@@ -9279,87 +9388,199 @@ enum SelfTest {
             // will take away — and growing the image is refused outright
             // rather than leaving a document its own frame cannot export.
             var stabilityFailures: [String] = []
-            let budgetBefore = SliceBExport.budgetOverrideForTesting
-            do {
-                // 900x900 needs 3.24 MB inside and 4.06 MB framed: each fits
-                // in 7 MB on its own, the two together do not. A pending crop
-                // of 80x60 would "afford" the preset easily, which is exactly
-                // the bypass the full-image policy has to refuse.
-                SliceBExport.budgetOverrideForTesting = 7_000_000
-                let wide = makeSolidImage(
-                    width: 900, height: 900, color: NSColor.gray.cgColor)
+            // A seeded document, so a rejection is compared against real state
+            // rather than an empty canvas: marks, a selection, a pending crop
+            // and a transient overlay all have to survive untouched.
+            func seedStabilityEditor(
+                width: Int, height: Int
+            ) -> (EditorWindowController, EditorCanvasView) {
+                let fixture = makeSolidImage(
+                    width: width, height: height, color: NSColor.gray.cgColor)
                 let wc = EditorWindowController.open(
-                    with: CapturedImage(cgImage: wide, scale: 1),
+                    with: CapturedImage(cgImage: fixture, scale: 1),
                     forceFitForTesting: true)
                 let canvas = wc.canvasForTesting
+                let blur = BlurAnnotation(uiScale: 1)
+                blur.rect = CGRect(x: 20, y: 20, width: 60, height: 40)
+                blur.redactionState = .words(
+                    [CGRect(x: 25, y: 25, width: 20, height: 12)])
+                let counter = CounterAnnotation(uiScale: 1)
+                counter.center = CGPoint(x: 120, y: 120)
+                let spot = SpotlightAnnotation(uiScale: 1)
+                spot.rect = CGRect(x: 40, y: 40, width: 80, height: 60)
+                spot.baseBounds = CGRect(
+                    x: 0, y: 0, width: CGFloat(width), height: CGFloat(height))
+                canvas.annotations = [blur, counter, spot]
+                canvas.selectForTesting(counter)
+                return (wc, canvas)
+            }
+            func outerField(_ canvas: EditorCanvasView) -> String {
+                canvas.documentFingerprintForTesting
+                    .split(separator: " ")
+                    .first { $0.hasPrefix("outer=") }
+                    .map(String.init) ?? "missing"
+            }
+            SliceBExport.withBudgetForTesting(7_000_000) {
+                // 900x900 needs 3.24 MB inside and 4.06 MB framed: each fits
+                // in 7 MB alone, the two together do not. A pending crop of
+                // 80x60 would "afford" the preset easily, which is exactly the
+                // bypass that full-image acceptance has to refuse.
+                let (wc, canvas) = seedStabilityEditor(width: 900, height: 900)
                 if canvas.backdropPeakFits(.ocean, width: 900, height: 900) {
                     stabilityFailures.append("fixture-fits")
                 }
                 canvas.currentTool = .crop
                 canvas.setCropSelectionForTesting(
                     CGRect(x: 10, y: 10, width: 80, height: 60))
-                let sneaked = canvas.applyBackdrop(.ocean)
-                if sneaked || canvas.backdropPresetForTesting != .none {
+                let before = canvas.documentFingerprintForTesting
+                let beforeRefs = canvas.annotationRefsForTesting
+                let beforeSelected = canvas.selectedRefForTesting
+                let rejected = ToastHUD.recordingMessagesForTesting {
+                    canvas.applyBackdrop(.ocean)
+                }
+                if rejected.result || canvas.backdropPresetForTesting != .none {
                     stabilityFailures.append("crop-bypass")
+                }
+                if rejected.message != "This image is too large for a backdrop" {
+                    stabilityFailures.append(
+                        "reject-toast(\(rejected.message ?? "nil"))")
+                }
+                let afterRefs = canvas.annotationRefsForTesting
+                if canvas.documentFingerprintForTesting != before
+                    || afterRefs.count != beforeRefs.count
+                    || !zip(afterRefs, beforeRefs).allSatisfy({ $0.0 === $0.1 })
+                    || canvas.selectedRefForTesting !== beforeSelected {
+                    stabilityFailures.append("reject-state")
+                }
+                // Removing a frame is never refused: applied while it fit,
+                // it must still come off after the budget has shrunk.
+                SliceBExport.withBudgetForTesting(1_000_000_000) {
+                    if !canvas.applyBackdrop(.ocean) {
+                        stabilityFailures.append("none-setup")
+                    }
+                }
+                if !canvas.applyBackdrop(.none)
+                    || canvas.backdropPresetForTesting != .none {
+                    stabilityFailures.append("none-refused")
                 }
                 wc.window?.close()
             }
-            do {
-                SliceBExport.budgetOverrideForTesting = 10_000_000
-                let fixture = makeSolidImage(
-                    width: 900, height: 900, color: NSColor.gray.cgColor)
-                let wc = EditorWindowController.open(
-                    with: CapturedImage(cgImage: fixture, scale: 1),
-                    forceFitForTesting: true)
-                let canvas = wc.canvasForTesting
+            SliceBExport.withBudgetForTesting(10_000_000) {
+                let (wc, canvas) = seedStabilityEditor(width: 900, height: 900)
+                // The reported outer size follows the PROSPECTIVE export at
+                // every stage, which is a different question from validity.
+                if outerField(canvas) != "outer=none" {
+                    stabilityFailures.append("outer-plain " + outerField(canvas))
+                }
                 canvas.currentTool = .crop
                 canvas.setCropSelectionForTesting(
                     CGRect(x: 10, y: 10, width: 80, height: 60))
                 if !canvas.applyBackdrop(.graphite) {
                     stabilityFailures.append("apply-refused")
                 }
-                // Cancelling the crop must not invalidate what was accepted.
+                let cropped = canvas.prospectiveInnerPixelSize()
+                let croppedOuter = SliceBBackdrop.outerDimensions(
+                    innerWidth: cropped.width, innerHeight: cropped.height,
+                    preset: .graphite, pixelScale: 1)
+                if outerField(canvas)
+                    != "outer=\(croppedOuter?.width ?? -1)x\(croppedOuter?.height ?? -1)" {
+                    stabilityFailures.append(
+                        "outer-pending " + outerField(canvas))
+                }
+                // Cancelling the crop must not invalidate what was accepted,
+                // and the reported size goes back to the full document.
                 canvas.currentTool = .select
+                let fullOuter = SliceBBackdrop.outerDimensions(
+                    innerWidth: 900, innerHeight: 900, preset: .graphite,
+                    pixelScale: 1)
                 if canvas.backdropPresetForTesting != .graphite
+                    || outerField(canvas)
+                        != "outer=\(fullOuter?.width ?? -1)x\(fullOuter?.height ?? -1)"
                     || !canvas.backdropPeakFits(
-                        .graphite, width: canvas.image.cgImage.width,
-                        height: canvas.image.cgImage.height) {
-                    stabilityFailures.append("cancel-crop")
+                        .graphite, width: 900, height: 900) {
+                    stabilityFailures.append("cancel-crop " + outerField(canvas))
                 }
                 // Committing a crop only shrinks the peak, so it stays valid.
                 canvas.cropForTesting(
                     pixels: CGRect(x: 5, y: 5, width: 600, height: 400))
-                if canvas.backdropPresetForTesting != .graphite {
-                    stabilityFailures.append("crop-commit")
+                let committed = SliceBBackdrop.outerDimensions(
+                    innerWidth: canvas.image.cgImage.width,
+                    innerHeight: canvas.image.cgImage.height,
+                    preset: .graphite, pixelScale: 1)
+                if canvas.backdropPresetForTesting != .graphite
+                    || outerField(canvas)
+                        != "outer=\(committed?.width ?? -1)x\(committed?.height ?? -1)" {
+                    stabilityFailures.append("crop-commit " + outerField(canvas))
                 }
                 canvas.undoManager?.undo()
                 if canvas.backdropPresetForTesting != .graphite
                     || canvas.image.cgImage.width != 900
-                    || !canvas.backdropPeakFits(
-                        .graphite, width: canvas.image.cgImage.width,
-                        height: canvas.image.cgImage.height) {
-                    stabilityFailures.append(
-                        "crop-undo \(canvas.image.cgImage.width)")
+                    || outerField(canvas)
+                        != "outer=\(fullOuter?.width ?? -1)x\(fullOuter?.height ?? -1)" {
+                    stabilityFailures.append("crop-undo " + outerField(canvas))
                 }
                 // Doubling would need 12.96 MB inside alone: refused with
-                // nothing moved — same pixels, same history, same preset.
+                // NOTHING allocated, not merely with the document unchanged.
                 let sizeBefore = canvas.image.cgImage.width
                 let historyBefore = canvas.historyMutationCountForTesting
-                wc.applyResizeFactor(2)
+                let beforeFingerprint = canvas.documentFingerprintForTesting
+                let beforeRefs = canvas.annotationRefsForTesting
+                let rejectTrace = RenderTrace.capture(
+                    host: "gate", path: "resize-reject") {
+                    ToastHUD.recordingMessagesForTesting {
+                        wc.applyResizeFactor(2)
+                    }.message
+                }
+                if !rejectTrace.events.isEmpty {
+                    stabilityFailures.append(
+                        "resize-allocated \(rejectTrace.events.count)")
+                }
+                if rejectTrace.result
+                    != "This size is too large for the backdrop" {
+                    stabilityFailures.append(
+                        "resize-toast(\(rejectTrace.result ?? "nil"))")
+                }
+                let afterRefs = canvas.annotationRefsForTesting
                 if canvas.image.cgImage.width != sizeBefore
                     || canvas.historyMutationCountForTesting != historyBefore
-                    || canvas.backdropPresetForTesting != .graphite {
+                    || canvas.backdropPresetForTesting != .graphite
+                    || canvas.documentFingerprintForTesting != beforeFingerprint
+                    || afterRefs.count != beforeRefs.count
+                    || !zip(afterRefs, beforeRefs).allSatisfy({ $0.0 === $0.1 }) {
                     stabilityFailures.append(
                         "resize-mutated \(canvas.image.cgImage.width)")
                 }
-                // A resize that still fits goes through.
-                wc.applyResizeFactor(0.5)
-                if canvas.image.cgImage.width >= sizeBefore {
+                // A resize that still fits goes through, and DOES allocate.
+                let acceptTrace = RenderTrace.capture(
+                    host: "gate", path: "resize-accept") {
+                    wc.applyResizeFactor(0.5)
+                }
+                if acceptTrace.events.isEmpty
+                    || canvas.image.cgImage.width >= sizeBefore {
                     stabilityFailures.append("resize-blocked")
                 }
                 wc.window?.close()
             }
-            SliceBExport.budgetOverrideForTesting = budgetBefore
+            // `.none` is not a bypass for the export budget itself: the
+            // resizer's dimension cap is larger than what can be rendered.
+            SliceBExport.withBudgetForTesting(4_000_000) {
+                let (wc, canvas) = seedStabilityEditor(width: 900, height: 900)
+                let sizeBefore = canvas.image.cgImage.width
+                let trace = RenderTrace.capture(host: "gate", path: "none") {
+                    ToastHUD.recordingMessagesForTesting {
+                        wc.applyResizeFactor(2)
+                    }.message
+                }
+                if !trace.events.isEmpty
+                    || canvas.image.cgImage.width != sizeBefore {
+                    stabilityFailures.append("none-resize-allowed")
+                }
+                if trace.result != "This size is too large to export" {
+                    stabilityFailures.append(
+                        "none-toast(\(trace.result ?? "nil"))")
+                }
+                wc.window?.close()
+            }
             check("sliceB-backdrop-validity-stable",
                   stabilityFailures.isEmpty,
                   stabilityFailures.joined(separator: " | "))
