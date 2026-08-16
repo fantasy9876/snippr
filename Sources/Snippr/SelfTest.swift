@@ -9282,8 +9282,12 @@ enum SelfTest {
                 // A dirty baseline makes every later slot claim relative to
                 // someone else's worker, so the gate refuses to guess.
                 if slotBase != 0 || ownerBase != 0 {
+                    // Every later OCR gate measures against these numbers, so
+                    // a dirty baseline is not something to note and walk past:
+                    // it takes the same fail-stop as a held seam.
                     lockStageFailures.append(
                         "dirty-baseline \(slotBase)/\(ownerBase)")
+                    seamUnsafe = true
                     return
                 }
                 // Declared BEFORE the drain that waits on them.
@@ -9710,14 +9714,12 @@ enum SelfTest {
             if seamUnsafe {
                 // Fail-stop. Continuing would feed invented OCR results to
                 // every later gate and shift their slot baselines, turning one
-                // real failure into a cascade of false ones. Exits the run the
-                // same way its normal end does, so the summary is still
-                // printed and the exit code is still meaningful.
+                // real failure into a cascade of false ones. Leaves this
+                // block; the run's own end prints the summary once and turns
+                // the recorded failures into the exit code.
                 check("sliceB-seam-isolation", false,
                       "OCR seam left installed; remaining gates skipped")
-                print("\(failures) TEST(S) FAILED")
-                print("Artifacts: \(outputDir)")
-                return 1
+                return
             }
 
             // J. Abandoning a drag restores the redo branch. Pen and the
