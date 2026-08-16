@@ -11512,6 +11512,66 @@ enum SelfTest {
                 }
             }
             runWindowDispatch()
+            // N. An ORDINARY mark forks history the same way a spotlight
+            //    does. The spotlight cases carry replacement records, so they
+            //    could pass on that machinery alone; this one has none.
+            var branchFailures: [String] = []
+            do {
+                let surface = AnnotationSurface(pixelScale: 1)
+                let markA = CounterAnnotation(uiScale: 1)
+                let spot = SpotlightAnnotation(uiScale: 1)
+                spot.rect = CGRect(x: 10, y: 10, width: 40, height: 30)
+                let markB = CounterAnnotation(uiScale: 1)
+                surface.addAnnotationForTesting(markA)
+                surface.addAnnotationForTesting(spot)
+                surface.addAnnotationForTesting(markB)
+                _ = surface.undo()
+                _ = surface.undo()
+                // Redo branch holds the spotlight AND the mark above it.
+                if !surface.canRedo || surface.annotations.count != 1
+                    || surface.annotations.first !== markA {
+                    branchFailures.append("setup \(surface.annotations.count)")
+                }
+                // A plain counter — no replacement record anywhere near it.
+                let fresh = CounterAnnotation(uiScale: 1)
+                surface.addAnnotationForTesting(fresh)
+                if surface.canRedo {
+                    branchFailures.append("branch-survived")
+                }
+                if surface.annotations.count != 2
+                    || surface.annotations[0] !== markA
+                    || surface.annotations[1] !== fresh {
+                    branchFailures.append(
+                        "after-add \(surface.annotations.count)")
+                }
+                // Undo takes the new mark off and does NOT resurrect the
+                // abandoned branch.
+                _ = surface.undo()
+                if surface.annotations.count != 1
+                    || surface.annotations.first !== markA {
+                    branchFailures.append("undo-shape")
+                }
+                _ = surface.redo()
+                if surface.annotations.count != 2
+                    || surface.annotations[1] !== fresh || surface.canRedo {
+                    branchFailures.append("redo-shape")
+                }
+                // And a spotlight added afterwards must not reach back into
+                // the discarded records.
+                let laterSpot = SpotlightAnnotation(uiScale: 1)
+                laterSpot.rect = CGRect(x: 20, y: 20, width: 30, height: 20)
+                surface.addAnnotationForTesting(laterSpot)
+                _ = surface.undo()
+                if surface.annotations.count != 2
+                    || surface.annotations[1] !== fresh
+                    || surface.annotations.contains(where: { $0 === spot }) {
+                    branchFailures.append("stale-record")
+                }
+            }
+            check("sliceB-ordinary-mark-forks-history",
+                  branchFailures.isEmpty,
+                  branchFailures.joined(separator: " | "))
+
             check("sliceB-panel-window-dispatch",
                   dispatchFailures.isEmpty,
                   dispatchFailures.joined(separator: " | "))
