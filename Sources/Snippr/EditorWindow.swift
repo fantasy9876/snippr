@@ -734,6 +734,8 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
         case resizing(handle: SelectionHandle, original: CGRect)
     }
     private var cropDrag: CropDrag?
+    /// Magnifier patches dropped during the current drag, rebuilt when it ends.
+    private var magnifiersClearedDuringDrag: Set<ObjectIdentifier> = []
     private var textField: NSTextField?
     private var editingTextAnnotation: TextAnnotation?
 
@@ -1342,6 +1344,9 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
             // settled.
             refreshMagnifierSnapshotsAfterDocumentChange()
         }
+        // Unconditional: a discarded draft, or one that ended away from the
+        // source, must still get its patch back.
+        rebuildMagnifierSnapshotsClearedDuringDrag()
         isMovingSelection = false
     }
 
@@ -1359,9 +1364,30 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
         for mag in annotations.compactMap({ $0 as? MagnifierAnnotation })
         where mag.snapshot != nil && mag.sourceRect.intersects(rect) {
             mag.snapshot = nil
+            // Remember exactly which patches were dropped, so recovery does
+            // not depend on where the drag happened to end.
+            magnifiersClearedDuringDrag.insert(ObjectIdentifier(mag))
             cleared = true
         }
         if cleared { needsDisplay = true }
+    }
+
+    /// Recovery for the patches cleared mid-drag. Runs after EVERY drag,
+    /// committed or discarded: gating it on the final rect (or on the draft
+    /// being large enough) left the callout permanently blank when the drag
+    /// merely passed over the source or ended as a click.
+    func rebuildMagnifierSnapshotsClearedDuringDrag() {
+        guard !magnifiersClearedDuringDrag.isEmpty else { return }
+        let ids = magnifiersClearedDuringDrag
+        magnifiersClearedDuringDrag.removeAll()
+        let redactions = annotations.compactMap { $0 as? BlurAnnotation }
+        for mag in annotations.compactMap({ $0 as? MagnifierAnnotation })
+        where ids.contains(ObjectIdentifier(mag)) {
+            mag.snapshot = SliceBCompositor.magnifierSnapshot(
+                base: image.cgImage, sourceRect: mag.sourceRect,
+                redactions: redactions)
+        }
+        needsDisplay = true
     }
 
     func refreshMagnifierSnapshotsAfterDocumentChange(force: Bool = true) {
