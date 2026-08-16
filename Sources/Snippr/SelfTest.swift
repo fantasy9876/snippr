@@ -9766,13 +9766,18 @@ enum SelfTest {
                 // 1 -> 5 -> 9: each is one clone, one history event, and the
                 // spotlight stays the only one.
                 var previous = firstSpot
+                var steps: [SpotlightAnnotation] = []
                 let digitSteps: [(String, CGFloat)] = [
                     ("1", 0.1), ("5", 0.5), ("9", 0.9),
                 ]
                 for (digit, expected) in digitSteps {
                     let before = historyEvents
+                    let toolBefore = surface.tool
                     if let event = digitEvent(digit) {
                         panel.keyDown(with: event)
+                    }
+                    if surface.tool != toolBefore {
+                        digitFailures.append("panel:\(digit)-tool")
                     }
                     let spots = surface.annotations
                         .compactMap { $0 as? SpotlightAnnotation }
@@ -9793,6 +9798,7 @@ enum SelfTest {
                             "panel:\(digit)-history "
                             + "\(historyEvents - before)")
                     }
+                    steps.append(current)
                     previous = current
                 }
                 // Same value again is a no-op, and so are a modified digit and
@@ -9823,7 +9829,51 @@ enum SelfTest {
                         digitFailures.append("panel:\(label)-mutated")
                     }
                 }
-                // The keypad digits are the same shortcut.
+                // Undo walks back through every step, redo returns.
+                // Through the REAL buttons, which is also what proves the
+                // production history callback still runs.
+                // Every click walks back to the object recorded when that
+                // step was made — compared against saved references, not
+                // against whatever the array now holds.
+                let backwards: [SpotlightAnnotation] =
+                    steps.count == 3
+                        ? [steps[1], steps[0], firstSpot] : []
+                if backwards.isEmpty {
+                    digitFailures.append("panel:steps \(steps.count)")
+                }
+                for (index, expected) in backwards.enumerated() {
+                    let before = historyEvents
+                    clickUndo()
+                    if surface.annotations.count != 1
+                        || surface.annotations.first !== expected
+                        || !surface.canRedo
+                        || historyEvents != before + 1 {
+                        digitFailures.append(
+                            "panel:undo\(index + 1) "
+                            + "\(surface.annotations.count)")
+                    }
+                }
+                let forwards: [SpotlightAnnotation] =
+                    steps.count == 3 ? [steps[0], steps[1], steps[2]] : []
+                for (index, expected) in forwards.enumerated() {
+                    let before = historyEvents
+                    clickRedo()
+                    let last = index == forwards.count - 1
+                    if surface.annotations.count != 1
+                        || surface.annotations.first !== expected
+                        || historyEvents != before + 1
+                        || surface.canRedo == last {
+                        digitFailures.append(
+                            "panel:redo\(index + 1) "
+                            + "\(surface.annotations.count)")
+                    }
+                }
+                let afterRedo = steps.last
+
+                // Keypad digits are the same shortcut. Left until AFTER the
+                // undo/redo walk: taken earlier it would leave its own entry
+                // on the redo branch, and the walk's "nothing left to redo"
+                // would fail against correct code.
                 let beforeKeypad = historyEvents
                 if let event = digitEvent("3", keypad: true) {
                     panel.keyDown(with: event)
@@ -9831,53 +9881,11 @@ enum SelfTest {
                 let keypadSpot = surface.annotations
                     .compactMap { $0 as? SpotlightAnnotation }.last
                 if abs((keypadSpot?.dimFraction ?? 0) - 0.3) > 0.0001
+                    || surface.annotations.count != 1
+                    || keypadSpot === afterRedo
                     || historyEvents != beforeKeypad + 1 {
                     digitFailures.append(
                         "panel:keypad \(keypadSpot?.dimFraction ?? -1)")
-                }
-                clickUndo()
-                previous = surface.annotations
-                    .compactMap { $0 as? SpotlightAnnotation }.last ?? previous
-                // Undo walks back through every step, redo returns.
-                // Through the REAL buttons, which is also what proves the
-                // production history callback still runs.
-                let historyBeforeUndo = historyEvents
-                clickUndo()
-                let afterOneUndo = surface.annotations
-                    .compactMap { $0 as? SpotlightAnnotation }.first
-                if afterOneUndo == nil
-                    || abs((afterOneUndo?.dimFraction ?? 0) - 0.5) > 0.0001
-                    || surface.annotations.count != 1
-                    || !surface.canRedo
-                    || historyEvents != historyBeforeUndo + 1 {
-                    digitFailures.append(
-                        "panel:undo1 \(afterOneUndo?.dimFraction ?? -1) "
-                        + "count \(surface.annotations.count)")
-                }
-                clickUndo()
-                clickUndo()
-                let afterThree = surface.annotations
-                    .compactMap { $0 as? SpotlightAnnotation }.first
-                if afterThree !== firstSpot || !surface.canRedo
-                    || surface.annotations.count != 1
-                    || surface.annotations.first !== firstSpot {
-                    digitFailures.append(
-                        "panel:undo3 \(surface.annotations.count)")
-                }
-                clickRedo()
-                clickRedo()
-                clickRedo()
-                let afterRedo = surface.annotations
-                    .compactMap { $0 as? SpotlightAnnotation }.first
-                // A singleton again, at the last darkness, with nothing left
-                // on the redo branch.
-                if abs((afterRedo?.dimFraction ?? 0) - 0.9) > 0.0001
-                    || surface.canRedo
-                    || surface.annotations.count != 1
-                    || surface.annotations.first !== afterRedo {
-                    digitFailures.append(
-                        "panel:redo3 \(afterRedo?.dimFraction ?? -1) "
-                        + "count \(surface.annotations.count)")
                 }
                 // Frozen once a terminal action has claimed the image — and
                 // the route has to have actually run, otherwise "digits are
@@ -9889,10 +9897,10 @@ enum SelfTest {
                 if ScrollResultPanel.current === panel || panel.isVisible {
                     digitFailures.append("panel:terminal-open")
                 }
-                let frozenDim = afterRedo?.dimFraction ?? 0
+                let frozenDim = keypadSpot?.dimFraction ?? 0
                 let beforeFrozen = historyEvents
                 if let event = digitEvent("1") { panel.keyDown(with: event) }
-                if afterRedo?.dimFraction != frozenDim
+                if keypadSpot?.dimFraction != frozenDim
                     || historyEvents != beforeFrozen {
                     digitFailures.append("panel:frozen-mutated")
                 }
