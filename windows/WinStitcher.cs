@@ -53,7 +53,9 @@ sealed class WinStitcher : IDisposable
         var lockedFooter = _footerLatched ? FooterRows : (int?)null;
         var match = FindOverlap(prevSig.Value, nextSig.Value, next.Height, lockedFooter)
             ?? FindOverlapMaskingAnimatedBands(prevSig.Value, nextSig.Value, next.Height, lockedFooter);
-        if (match is not (int offset, int pairFooter)) return false;
+        if (match is not Overlap ov) return false;
+        int offset = ov.Offset;
+        int pairFooter = ov.Footer;
         int footer = _footerLatched ? FooterRows : pairFooter;
 
         // A true sticky footer stays identical to the FIRST frame's bottom
@@ -142,7 +144,7 @@ sealed class WinStitcher : IDisposable
     /// uniqueness margin (the old single-pass second-best tracking was
     /// order-dependent: a chain of small improvements could swallow a real
     /// alias and accept a wrong offset on periodic content).
-    static (int offset, int footer)? FindOverlap(Signatures prevS, Signatures nextS, int h,
+    static Overlap? FindOverlap(Signatures prevS, Signatures nextS, int h,
         int? lockedFooter = null)
     {
         const int minHeight = 40;
@@ -266,10 +268,16 @@ sealed class WinStitcher : IDisposable
         // no offsets outside the winner's plateau = zero uniqueness evidence
         // (tiny effective heights after footer subtraction) — don't guess
         if (secondScore == double.MaxValue) return null;
-        bool unique = secondScore > bestScore * 3 + 0.15
-            || secondScore - bestScore > 2.5;
-        return unique ? (bestOffset, footer) : null;
+        bool unique = ScoreClearlyBetter(bestScore, secondScore);
+        return unique ? new Overlap(bestOffset, footer, bestScore) : null;
     }
+
+    /// Same gap the uniqueness pass uses: a winner is ranked only when the
+    /// other score is 3×+0.15 worse or at least 2.5 gray worse. Otherwise
+    /// the two alignments are indistinguishable and must not be tie-broken
+    /// by "pick the smaller offset".
+    static bool ScoreClearlyBetter(double winner, double other)
+        => other > winner * 3 + 0.15 || other - winner > 2.5;
 
     /// Band subsets that may be treated as an "animated region": a sidebar
     /// ad creative, a carousel, an autoplaying video card. At most HALF the
@@ -319,9 +327,11 @@ sealed class WinStitcher : IDisposable
     /// page scrolled coherently. Runs only after the full-width matcher
     /// rejected. Each candidate mask must pass the complete matcher on the
     /// KEPT bands, AND the masked bands must actually differ along that
-    /// alignment; every mask that passes must agree on offset. Three-quarter
-    /// changes have no admissible mask and keep failing closed.
-    static (int offset, int footer)? FindOverlapMaskingAnimatedBands(
+    /// alignment; every mask that passes must agree on offset within ±1.
+    /// Same offset: rank (mask length, score) like macOS. ±1 split: rank by
+    /// score only, fail-closed when scores are not clearly ranked. Three-
+    /// quarter changes have no admissible mask and keep failing closed.
+    static Overlap? FindOverlapMaskingAnimatedBands(
         Signatures prevS, Signatures nextS, int h, int? lockedFooter)
     {
         if (prevS.Bands.Length != h * 4 || nextS.Bands.Length != h * 4) return null;
@@ -337,28 +347,68 @@ sealed class WinStitcher : IDisposable
         }
         if (changedRows <= h / 20) return null;
 
-        (int offset, int footer, int maskLen)? first = null;
-        (int offset, int footer, int maskLen)? best = null;
+        // At most 6 admissible masks.
+        Span<int> offsets = stackalloc int[6];
+        Span<int> footers = stackalloc int[6];
+        Span<int> maskLens = stackalloc int[6];
+        Span<double> scores = stackalloc double[6];
+        int n = 0;
         foreach (var mask in AnimatedBandMasks)
         {
             var maskedPrev = MaskedSignature(prevS, mask, h);
             var maskedNext = MaskedSignature(nextS, mask, h);
-            if (FindOverlap(maskedPrev, maskedNext, h, lockedFooter) is not (int offset, int footer))
+            if (FindOverlap(maskedPrev, maskedNext, h, lockedFooter) is not Overlap ov)
                 continue;
-            if (!MaskedBandsDiffer(prevS, nextS, mask, offset, footer, h))
+            if (!MaskedBandsDiffer(prevS, nextS, mask, ov.Offset, ov.Footer, h))
                 continue;
-            var candidate = (offset, footer, maskLen: mask.Length);
-            if (first is null) first = candidate;
-            else if (Math.Abs(offset - first.Value.offset) > 1)
-                return null; // masks disagree — fail closed
-            if (best is null
-                || candidate.maskLen < best.Value.maskLen
-                || (candidate.maskLen == best.Value.maskLen && offset < best.Value.offset))
-            {
-                best = candidate;
-            }
+            offsets[n] = ov.Offset;
+            footers[n] = ov.Footer;
+            maskLens[n] = mask.Length;
+            scores[n] = ov.Score;
+            n++;
         }
-        return best is { } chosen ? (chosen.offset, chosen.footer) : null;
+        if (n == 0) return null;
+        for (int i = 1; i < n; i++)
+        {
+            if (Math.Abs(offsets[i] - offsets[0]) > 1)
+                return null; // masks disagree by more than ±1 — fail closed
+        }
+
+        bool allSameOffset = true;
+        for (int i = 1; i < n; i++)
+        {
+            if (offsets[i] != offsets[0]) { allSameOffset = false; break; }
+        }
+
+        int best = 0;
+        if (allSameOffset)
+        {
+            // macOS: (mask length, confidenceScore). Offset is not a key.
+            for (int i = 1; i < n; i++)
+            {
+                if (maskLens[i] < maskLens[best]
+                    || (maskLens[i] == maskLens[best] && scores[i] < scores[best]))
+                {
+                    best = i;
+                }
+            }
+            return new Overlap(offsets[best], footers[best], scores[best]);
+        }
+
+        // ±1 disagreement: rank by score only. A shorter mask or a smaller
+        // offset is not a ranking key. Equal-quality halves (left 40 / right
+        // 41) cannot be ranked and must fail closed.
+        for (int i = 1; i < n; i++)
+        {
+            if (scores[i] < scores[best]) best = i;
+        }
+        for (int i = 0; i < n; i++)
+        {
+            if (offsets[i] == offsets[best]) continue;
+            if (!ScoreClearlyBetter(scores[best], scores[i]))
+                return null;
+        }
+        return new Overlap(offsets[best], footers[best], scores[best]);
     }
 
     /// Mean |Δ| of the masked bands over the overlap implied by the match.
@@ -384,6 +434,8 @@ sealed class WinStitcher : IDisposable
         }
         return count > 0 && total / count >= AnimatedBandMinDifference;
     }
+
+    readonly record struct Overlap(int Offset, int Footer, double Score);
 
     readonly record struct Signatures(double[] Bands, double[] Energy);
 
