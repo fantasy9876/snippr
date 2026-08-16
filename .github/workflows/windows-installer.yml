@@ -65,6 +65,9 @@ jobs:
         shell: pwsh
         run: |
           $tag = $env:RELEASE_TAG.Trim()
+          if ($tag -notmatch '^v\d+\.\d+\.\d+$') {
+            throw "release tag must match ^v\\d+\\.\\d+\\.\\d+$ (got: $tag)"
+          }
           $head = (git rev-parse HEAD).ToLower()
           $tagSha = (git rev-parse "refs/tags/$tag^{commit}" 2>$null)
           if ($LASTEXITCODE -ne 0 -or -not $tagSha) {
@@ -195,11 +198,13 @@ jobs:
             }
           }
           Assert-Signed windows/Snippr.exe
-          $setup = Get-Item windows/SnipprSetup-*.exe
-          if (-not $setup) { throw "installer exe not found" }
-          Assert-Signed $setup.FullName
+          $setup = @(Get-Item windows/SnipprSetup-*.exe -ErrorAction SilentlyContinue)
+          if ($setup.Count -ne 1) {
+            throw "expected exactly 1 windows/SnipprSetup-*.exe, got $($setup.Count)"
+          }
+          Assert-Signed $setup[0].FullName
           $lines = @()
-          foreach ($p in @('windows/Snippr.exe', $setup.FullName, 'windows/Snippr-portable-win-x64.zip')) {
+          foreach ($p in @('windows/Snippr.exe', $setup[0].FullName, 'windows/Snippr-portable-win-x64.zip')) {
             $h = Get-FileHash -Algorithm SHA256 $p
             $line = "$($h.Hash.ToLower())  $(Split-Path $p -Leaf)"
             Write-Host $line
@@ -213,8 +218,17 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         shell: pwsh
         run: |
+          $tag = $env:RELEASE_TAG.Trim()
+          if ($tag -notmatch '^v\d+\.\d+\.\d+$') {
+            throw "release tag must match ^v\\d+\\.\\d+\\.\\d+$ (got: $tag)"
+          }
+          $setup = @(Get-Item windows/SnipprSetup-*.exe -ErrorAction SilentlyContinue)
+          if ($setup.Count -ne 1) {
+            throw "expected exactly 1 windows/SnipprSetup-*.exe, got $($setup.Count)"
+          }
           # No --clobber: refuse to overwrite an existing release asset.
-          gh release upload ${{ inputs.tag }} `
-            (Get-Item windows/SnipprSetup-*.exe).FullName `
+          # Tag is taken from $env:RELEASE_TAG (allowlisted), never interpolated into the script.
+          gh release upload $tag `
+            $setup[0].FullName `
             windows/Snippr-portable-win-x64.zip `
             windows/SHA256SUMS
