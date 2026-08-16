@@ -197,6 +197,12 @@ final class ScrollResultPanel: NSPanel {
             baseImage: image.cgImage,
             pixelsPerPoint: pixelsPerPoint)
         host.isLocked = { [weak self] in self?.saving ?? false }
+        // The surface repaints through the host, weakly, and a spotlight dims
+        // the WHOLE source image rather than the visible slice.
+        annotationSurface.redactionDelegate = host
+        annotationSurface.redactionBaseBounds = CGRect(
+            x: 0, y: 0,
+            width: image.cgImage.width, height: image.cgImage.height)
         host.strokeHUDContainer = content
         content.addSubview(host)
         annotationHost = host
@@ -419,11 +425,25 @@ final class ScrollResultPanel: NSPanel {
         if let up = event(.leftMouseUp, b) { host.mouseUp(with: up) }
     }
 
+    /// Cancel every OCR job this panel owns: per annotation first, so each
+    /// pending mask normalizes to the full mask, then sweep any orphan.
+    private func cancelRedactionJobs() {
+        for blur in annotationSurface.annotations.compactMap({
+            $0 as? BlurAnnotation
+        }) {
+            annotationSurface.cancelRedactionJob(for: blur)
+        }
+        annotationSurface.cancelAllRedactionJobs()
+    }
+
     /// Production teardown, exposed so a gate tears the panel down the way the
     /// app does (clearing `current`) instead of just ordering the window out.
     func dismissForTesting() { dismiss() }
 
     private func dismiss() {
+        // Cancel BEFORE the view and `current` go away, or a late result would
+        // land on a surface nobody can repaint.
+        cancelRedactionJobs()
         terminalActionClaimed = true
         if ScrollResultPanel.current === self { ScrollResultPanel.current = nil }
         orderOut(nil)
@@ -514,7 +534,7 @@ final class ScrollResultPanel: NSPanel {
 /// points map to image pixels through one scale factor; the surface itself
 /// stays in absolute pixel space (shared with the area review).
 @MainActor
-final class AnnotationHostView: NSView {
+final class AnnotationHostView: NSView, RedactionSurfaceDelegate {
     private let surface: AnnotationSurface
     private let baseImage: CGImage
     private let pixelsPerPoint: CGFloat
@@ -666,6 +686,9 @@ final class AnnotationHostView: NSView {
     /// Independent evidence that production drawing really ran during a gate's
     /// snapshot, rather than a cached layer being handed back.
     private(set) var drawCallsForTesting = 0
+
+    /// The surface repaints this view when a redaction resolves.
+    func surfaceNeedsRedactionRepaint() { needsDisplay = true }
 
     override func draw(_ dirtyRect: NSRect) {
         drawCallsForTesting += 1

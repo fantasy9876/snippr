@@ -150,6 +150,11 @@ final class AnnotationSurface: RedactionHost, RedactionJobObserver {
     private var activeBlurAnchor: CGPoint?
     private var activeSpotlight: SpotlightAnnotation?
     private var activeSpotlightAnchor: CGPoint?
+    /// The spotlight a drag is about to replace, held so a click can put it
+    /// back and so undo can restore it.
+    private var replacedSpotlight: SpotlightAnnotation?
+    private var spotlightReplacedBy:
+        [ObjectIdentifier: SpotlightAnnotation?] = [:]
     private var strokeTrackpadAccum: CGFloat = 0
     private var redoAnnotations: [Annotation] = []
     /// Hosts install weak-owner callbacks so Undo/Redo enabled state follows
@@ -238,6 +243,15 @@ final class AnnotationSurface: RedactionHost, RedactionJobObserver {
             spot.baseBounds = redactionBaseBounds
             activeSpotlight = spot
             activeSpotlightAnchor = p
+            // v1 is a singleton, so the preview must show ONE candidate: take
+            // the existing spotlight out for the duration of the drag and put
+            // it back if the drag turns out to be a click.
+            if let existing = annotations.compactMap({
+                $0 as? SpotlightAnnotation
+            }).last {
+                replacedSpotlight = existing
+                annotations.removeAll { $0 === existing }
+            }
             annotations.append(spot)
             historyDidChange?()
             return true
@@ -337,15 +351,19 @@ final class AnnotationSurface: RedactionHost, RedactionJobObserver {
         }
         if let spot = activeSpotlight, annotations.last === spot {
             if spot.rect.width <= 1 || spot.rect.height <= 1 {
-                // A click is not a mutation: the previous spotlight stays.
+                // A click is not a mutation: put the previous spotlight back
+                // and leave the redo branch alone.
                 annotations.removeLast()
+                if let previous = replacedSpotlight {
+                    annotations.append(previous)
+                }
             } else {
-                // Singleton replacement is ONE transaction, so undo brings the
-                // previous spotlight back rather than leaving none.
-                annotations = SliceBCompositor.applySpotlight(
-                    existing: annotations.filter { $0 !== spot }, new: spot)
+                // ONE transaction: undo pops this spotlight and restores the
+                // one it replaced, rather than leaving none behind.
+                spotlightReplacedBy[ObjectIdentifier(spot)] = replacedSpotlight
                 redoAnnotations.removeAll()
             }
+            replacedSpotlight = nil
             historyDidChange?()
         }
         clearActiveDraft()
@@ -363,15 +381,11 @@ final class AnnotationSurface: RedactionHost, RedactionJobObserver {
     func startPendingTextRedaction(base: CGImage) -> Bool {
         guard let blur = pendingTextRedaction else { return false }
         pendingTextRedaction = nil
+        // start() already sets the full mask and notifies when it refuses, so
+        // repeating it here would repaint twice.
         guard let job = SliceBRedactionJob.start(
             blur: blur, base: base, host: self)
-        else {
-            // Refused (queue full or region unusable): stay fully masked and
-            // register nothing.
-            blur.redactionState = .fallbackFull
-            redactionDidChange()
-            return false
-        }
+        else { return false }
         registerRedactionJob(job, for: blur)
         return true
     }
@@ -455,6 +469,13 @@ final class AnnotationSurface: RedactionHost, RedactionJobObserver {
     func undo() -> Bool {
         guard let annotation = annotations.popLast() else { return false }
         cancelRedactionJob(for: annotation)
+        // A spotlight that replaced another undoes to that other one, so the
+        // single action reverses as a single action.
+        if let spot = annotation as? SpotlightAnnotation,
+           let replaced = spotlightReplacedBy[ObjectIdentifier(spot)],
+           let previous = replaced {
+            annotations.append(previous)
+        }
         redoAnnotations.append(annotation)
         clearActiveDraft()
         historyDidChange?()
@@ -466,6 +487,11 @@ final class AnnotationSurface: RedactionHost, RedactionJobObserver {
         guard let annotation = redoAnnotations.popLast() else { return false }
         // Redo restores a NORMALIZED state: never an orphan pending mask.
         cancelRedactionJob(for: annotation)
+        if let spot = annotation as? SpotlightAnnotation,
+           let replaced = spotlightReplacedBy[ObjectIdentifier(spot)],
+           let previous = replaced {
+            annotations.removeAll { $0 === previous }
+        }
         annotations.append(annotation)
         clearActiveDraft()
         historyDidChange?()

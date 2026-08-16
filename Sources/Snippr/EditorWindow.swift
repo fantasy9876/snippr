@@ -1213,6 +1213,9 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
                 let before = sel.bounds
                 sel.move(by: CGPoint(x: pp.x - dragStartPoint.x, y: pp.y - dragStartPoint.y))
                 dragStartPoint = pp
+                if sel is BlurAnnotation {
+                    clearMagnifierSnapshotsOverlapping(before.union(sel.bounds))
+                }
                 invalidate(pixelRect: before.union(sel.bounds))
             }
         case .arrow, .line, .rect, .oval, .highlight:
@@ -1239,6 +1242,7 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
                     x: min(dragStartPoint.x, pp.x), y: min(dragStartPoint.y, pp.y),
                     width: abs(pp.x - dragStartPoint.x), height: abs(pp.y - dragStartPoint.y)
                 )
+                clearMagnifierSnapshotsOverlapping(before.union(blur.rect))
                 invalidate(pixelRect: before.union(blur.rect))
             }
         case .spotlight:
@@ -1333,6 +1337,11 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
             needsDisplay = true
             window?.invalidateCursorRects(for: self)
         }
+        if isMovingSelection {
+            // One rebuild at the end of the interaction, once the geometry has
+            // settled.
+            refreshMagnifierSnapshotsAfterDocumentChange()
+        }
         isMovingSelection = false
     }
 
@@ -1340,6 +1349,21 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
     /// or the redactions can make that patch stale, and a stale patch shows
     /// pixels a redaction now covers — so every such change funnels through
     /// here. A failed rebuild clears the patch rather than keeping old pixels.
+    /// Mid-drag fail-closed: the moment a redaction being moved or drawn
+    /// touches a magnifier's source, drop that patch. Rebuilding on every
+    /// mouse-moved event would be far too expensive, and showing the old
+    /// sanitized pixels while the user is covering something is exactly the
+    /// leak this feature exists to prevent.
+    func clearMagnifierSnapshotsOverlapping(_ rect: CGRect) {
+        var cleared = false
+        for mag in annotations.compactMap({ $0 as? MagnifierAnnotation })
+        where mag.snapshot != nil && mag.sourceRect.intersects(rect) {
+            mag.snapshot = nil
+            cleared = true
+        }
+        if cleared { needsDisplay = true }
+    }
+
     func refreshMagnifierSnapshotsAfterDocumentChange(force: Bool = true) {
         let redactions = annotations.compactMap { $0 as? BlurAnnotation }
         let magnifiers = annotations.compactMap { $0 as? MagnifierAnnotation }

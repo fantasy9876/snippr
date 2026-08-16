@@ -185,6 +185,15 @@ final class SelectionOverlay {
     func dismissForTesting() { finish(.cancelled) }
 
     func finish(_ result: OverlayResult) {
+        // Cancel BEFORE the views and `current` go away: a late result must not
+        // land on a surface nobody can repaint.
+        for view in windows.compactMap({ $0.contentView as? SelectionOverlayView }) {
+            guard let surface = view.annotationSurface else { continue }
+            for blur in surface.annotations.compactMap({ $0 as? BlurAnnotation }) {
+                surface.cancelRedactionJob(for: blur)
+            }
+            surface.cancelAllRedactionJobs()
+        }
         guard !tornDown else { return }
         tornDown = true
         session.forceComplete()
@@ -256,7 +265,7 @@ final class SelectionOverlay {
 
 // MARK: - Overlay view
 
-final class SelectionOverlayView: NSView {
+final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
     private let mode: OverlayMode
     private let screen: NSScreen
     private let frozen: CapturedImage?
@@ -429,6 +438,9 @@ final class SelectionOverlayView: NSView {
 
     /// Test hook: runs the production selection→commit path without raw
     /// mouse plumbing (QA prefers small state hooks over synthesized clicks).
+    /// The surface repaints this view when a redaction resolves.
+    func surfaceNeedsRedactionRepaint() { needsDisplay = true }
+
     func selectForTesting(rect: CGRect) {
         owner?.areaSelectionDidBegin(in: self)
         areaSelection = rect
@@ -1326,6 +1338,12 @@ final class SelectionOverlayView: NSView {
                 surface.historyDidChange = { [weak self] in
                     self?.updateHistoryButtons()
                 }
+                // Repaint through the weak host delegate, and let a spotlight
+                // dim the WHOLE source image rather than the selection.
+                surface.redactionDelegate = self
+                surface.redactionBaseBounds = CGRect(
+                    x: 0, y: 0,
+                    width: frozen.cgImage.width, height: frozen.cgImage.height)
                 annotationSurface = surface
                 owner.reviewDidBegin(in: self)
                 layoutReviewToolbar()
