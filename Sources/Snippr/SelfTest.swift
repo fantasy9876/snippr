@@ -9498,6 +9498,7 @@ enum SelfTest {
                 for key in deps.keys { deps[key] = 0 }
                 copyCount = 0
                 toasts = 0
+                defer { overlay.dismissForTesting() }
                 guard let surface = view.annotationSurface else {
                     hostFailures.append("area:no-surface")
                     return
@@ -10104,11 +10105,21 @@ enum SelfTest {
                     }
                 if panelBaseline == nil { panelFailures.append("panel:no-baseline") }
 
-                // Mask expressed in POINTS, converted the way production does.
+                // Mask expressed in POINTS, converted the way production does,
+                // and SNAPPED to backing-pixel boundaries: a fractional edge
+                // is antialiased, so a boundary pixel could be neither exactly
+                // the cover nor exactly the baseline and the gate would be
+                // non-deterministic across displays.
+                let panelBacking = host.window?.backingScaleFactor
+                    ?? hostScreen.backingScaleFactor
+                func snap(_ value: CGFloat) -> CGFloat {
+                    (value * panelBacking).rounded() / panelBacking
+                }
                 let maskInPoints = CGRect(
-                    x: host.bounds.width * 0.2, y: host.bounds.height * 0.3,
-                    width: host.bounds.width * 0.5,
-                    height: host.bounds.height * 0.2)
+                    x: snap(host.bounds.width * 0.2),
+                    y: snap(host.bounds.height * 0.3),
+                    width: snap(host.bounds.width * 0.5),
+                    height: snap(host.bounds.height * 0.2))
                 let panelBlur = BlurAnnotation(uiScale: pixelsPerPoint)
                 panelBlur.rect = CGRect(
                     x: maskInPoints.minX * pixelsPerPoint,
@@ -10483,6 +10494,11 @@ enum SelfTest {
                         lifecycleFailures.append("area:no-overlay")
                         return
                     }
+                    // The overlay is live from here on: if any guard below
+                    // returns early, it must still be torn down or it stays
+                    // `current` and poisons every later gate.
+                    var areaTornDown = false
+                    defer { if !areaTornDown { overlay.dismissForTesting() } }
                     view.selectForTesting(
                         rect: CGRect(x: 20, y: 20, width: 200, height: 140))
                     view.clickReviewToolbarButtonForTesting(
@@ -10503,7 +10519,10 @@ enum SelfTest {
                             surface.redactionDelegate = spy
                         },
                         blur: blur,
-                        teardown: { overlay.dismissForTesting() })
+                        teardown: {
+                            areaTornDown = true
+                            overlay.dismissForTesting()
+                        })
                 }
                 permitLock.lock(); permitOrder.append("scroll"); permitLock.unlock()
                 MainActor.assumeIsolated {
