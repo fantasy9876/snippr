@@ -1530,18 +1530,16 @@ final class EditorCanvasView: NSView {
             width: pixels.width / pxScale, height: pixels.height / pxScale))
     }
 
-    /// Reference identity of every mark, in order. Compared as references, not
-    /// hashes: two different objects can share a hash.
-    var annotationIdentitiesForTesting: [ObjectIdentifier] {
-        annotations.map { ObjectIdentifier($0) }
-    }
+    /// Strong references, compared with `===`. Neither a hash nor an
+    /// ObjectIdentifier is safe on its own: once an object is freed its address
+    /// can be reused by the next allocation, and the comparison would lie.
+    var annotationRefsForTesting: [Annotation] { annotations }
+    var selectedRefForTesting: Annotation? { selected }
+    var editingTextRefForTesting: TextAnnotation? { editingTextAnnotation }
 
-    var selectedIdentityForTesting: ObjectIdentifier? {
-        selected.map { ObjectIdentifier($0) }
-    }
-
-    var editingTextIdentityForTesting: ObjectIdentifier? {
-        editingTextAnnotation.map { ObjectIdentifier($0) }
+    /// Live pointer state — part of what a ruler transient depends on.
+    var pointerStateForTesting: String {
+        "inside=\(pointerInsideView) px=\(lastMousePixel.map { "\($0)" } ?? "nil")"
     }
 
     /// Everything a terminal action must leave untouched when export fails.
@@ -1594,8 +1592,22 @@ final class EditorCanvasView: NSView {
         // Identity is compared as references elsewhere; the string only needs
         // to say WHICH mark, so a positional index is enough here and cannot
         // collide the way a hash can.
-        let pendingText = textField.map {
-            "value=\($0.stringValue) frame=\($0.frame) font=\($0.font?.pointSize ?? -1) backing=\(editingTextAnnotation.map { "\($0.origin)/\($0.fontSizePt)" } ?? "nil")"
+        func rgbaString(_ color: NSColor?) -> String {
+            guard let c = color?.usingColorSpace(.sRGB) else { return "-" }
+            return "\(c.redComponent),\(c.greenComponent),\(c.blueComponent),\(c.alphaComponent)"
+        }
+        let pendingText = textField.map { field -> String in
+            let backing = editingTextAnnotation.map {
+                "text=\($0.text) o=\($0.origin) f=\($0.fontSizePt) rgba=\(rgbaString($0.color))"
+            } ?? "nil"
+            return [
+                "value=\(field.stringValue)",
+                "frame=\(field.frame)",
+                "font=\(field.font?.fontName ?? "-")/\(field.font?.pointSize ?? -1)",
+                "traits=\(field.font.map { NSFontManager.shared.traits(of: $0).rawValue } ?? 0)",
+                "textColor=\(rgbaString(field.textColor))",
+                "backing=[\(backing)]",
+            ].joined(separator: " ")
         } ?? "none"
         return [
             "px=\(SelfTest.imageHashForTesting(image.cgImage))",
@@ -1609,6 +1621,7 @@ final class EditorCanvasView: NSView {
             "redo=\(undoManager?.canRedo == true)",
             "history=\(historyMutationCountForTesting)",
             "transient=\(transientDescriptionForTesting)",
+            "pointer=\(pointerStateForTesting)",
             "marks=[\(marks)]",
         ].joined(separator: " ")
     }
@@ -1653,7 +1666,7 @@ final class EditorCanvasView: NSView {
     var transientDescriptionForTesting: String {
         switch transient {
         case let .ruler(span):
-            return "ruler(\(span.start)->\(span.end) len \(span.length))"
+            return "ruler(axis=\(span.axis) cross=\(span.cross) \(span.start)->\(span.end) len=\(span.length))"
         case let .guide(axis, position):
             return "guide(\(axis) @\(position))"
         case .none:

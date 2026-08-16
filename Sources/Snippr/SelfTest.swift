@@ -8534,11 +8534,14 @@ enum SelfTest {
                     kind: .arrow, start: CGPoint(x: 100, y: 100),
                     end: CGPoint(x: 150, y: 150), uiScale: 1)
                 let pen = PenAnnotation(uiScale: 1)
+                pen.strokeWidthPt = 5
                 pen.points = [
                     CGPoint(x: 10, y: 140), CGPoint(x: 20, y: 150),
                     CGPoint(x: 30, y: 145),
                 ]
                 let text = TextAnnotation(uiScale: 1)
+                text.color = NSColor.systemTeal.withAlphaComponent(0.8)
+                text.fontSizePt = 22
                 text.text = "committed"
                 text.origin = CGPoint(x: 120, y: 30)
                 let counter = CounterAnnotation(uiScale: 1)
@@ -8551,6 +8554,7 @@ enum SelfTest {
                         axis: .horizontal, start: 30, end: 90, cross: 70),
                     uiScale: 1)
                 let spotlight = SpotlightAnnotation(uiScale: 1)
+                spotlight.dimFraction = 0.35
                 spotlight.rect = CGRect(x: 60, y: 60, width: 40, height: 30)
                 spotlight.baseBounds = CGRect(
                     x: 0, y: 0, width: 200, height: 160)
@@ -8587,45 +8591,93 @@ enum SelfTest {
             }
 
             /// The seed must really be what the gate claims, or every
-            /// comparison below could pass on defaults.
+            /// comparison below could pass on defaults. Exact census by
+            /// concrete type AND non-default sentinel payloads — nine counters
+            /// of the wrong kinds must not pass.
             func preflight(
                 _ canvas: EditorCanvasView, _ label: String, editing: Bool
             ) {
                 var problems: [String] = []
-                if canvas.selectedIdentityForTesting == nil {
+                let marks = canvas.annotationRefsForTesting
+                let census: [(String, Int)] = [
+                    ("Blur", marks.filter { $0 is BlurAnnotation }.count),
+                    ("Shape", marks.filter { $0 is ShapeAnnotation }.count),
+                    ("Pen", marks.filter { $0 is PenAnnotation }.count),
+                    ("Text", marks.filter { $0 is TextAnnotation }.count),
+                    ("Counter", marks.filter { $0 is CounterAnnotation }.count),
+                    ("Guide", marks.filter { $0 is GuideAnnotation }.count),
+                    ("Ruler", marks.filter { $0 is RulerAnnotation }.count),
+                    ("Spotlight", marks.filter { $0 is SpotlightAnnotation }.count),
+                    ("Magnifier", marks.filter { $0 is MagnifierAnnotation }.count),
+                ]
+                for (name, count) in census where count < 1 {
+                    problems.append("missing-\(name)")
+                }
+                // Non-default sentinels: a reset to defaults must be visible.
+                if let blur = marks.compactMap({ $0 as? BlurAnnotation }).first {
+                    if case .words = blur.redactionState {} else {
+                        problems.append("blur-state-default")
+                    }
+                }
+                if let shape = marks.compactMap({ $0 as? ShapeAnnotation }).first,
+                   shape.kind != .arrow {
+                    problems.append("shape-kind")
+                }
+                if let pen = marks.compactMap({ $0 as? PenAnnotation }).first,
+                   pen.points.count < 3 {
+                    problems.append("pen-points")
+                }
+                if let counter = marks.compactMap({ $0 as? CounterAnnotation }).first,
+                   counter.number == 1 {
+                    problems.append("counter-default")
+                }
+                if let spot = marks.compactMap({ $0 as? SpotlightAnnotation }).first,
+                   abs(spot.dimFraction - 0.6) < 0.001 {
+                    problems.append("spotlight-default-dim")
+                }
+                if let mag = marks.compactMap({ $0 as? MagnifierAnnotation }).first,
+                   mag.snapshot == nil {
+                    problems.append("magnifier-no-snapshot")
+                }
+                if marks.contains(where: {
+                    ($0.color.usingColorSpace(.sRGB)?.alphaComponent ?? 1) < 1
+                }) == false, marks.allSatisfy({ $0.strokeWidthPt == 3 }) {
+                    problems.append("all-default-stroke")
+                }
+                if canvas.selectedRefForTesting == nil {
                     problems.append("no-selection")
                 }
                 if canvas.undoManager?.canUndo != true { problems.append("no-undo") }
                 if canvas.undoManager?.canRedo != true { problems.append("no-redo") }
-                if canvas.annotations.count < 9 { problems.append("few-marks") }
                 if editing {
                     if canvas.transientKindForTesting != "ruler" {
                         problems.append("no-transient")
                     }
-                    if canvas.editingTextIdentityForTesting == nil {
+                    if canvas.pointerPixelForTesting == nil
+                        || canvas.pointerInsideForTesting != true {
+                        problems.append("no-pointer")
+                    }
+                    if canvas.editingTextRefForTesting == nil {
                         problems.append("no-pending-text")
                     }
                     if !canvas.hasValidCropSelection { problems.append("no-crop") }
-                } else if canvas.transientKindForTesting != nil {
-                    problems.append("unexpected-transient")
+                } else {
+                    // Esc fixtures: the cancel-route state must be ABSENT, or
+                    // Esc would consume it instead of running the terminal path.
+                    if canvas.transientKindForTesting != nil {
+                        problems.append("unexpected-transient")
+                    }
+                    if canvas.editingTextRefForTesting != nil {
+                        problems.append("unexpected-pending-text")
+                    }
+                    if canvas.hasValidCropSelection {
+                        problems.append("unexpected-crop")
+                    }
                 }
                 if !problems.isEmpty {
                     termFailures.append(
                         label + ":seed " + problems.joined(separator: ","))
                 }
-            }
-
-            /// Esc goes through the REAL key path, not a direct call.
-            func pressEscape(_ wc: EditorWindowController) {
-                let canvas = wc.canvasForTesting
-                guard let event = NSEvent.keyEvent(
-                    with: .keyDown, location: .zero, modifierFlags: [],
-                    timestamp: 0, windowNumber: wc.window?.windowNumber ?? 0,
-                    context: nil, characters: "\u{1b}",
-                    charactersIgnoringModifiers: "\u{1b}", isARepeat: false,
-                    keyCode: 53)
-                else { return }
-                canvas.keyDown(with: event)
             }
 
             /// Expected counter vector per route: the named ones fire exactly
@@ -8664,12 +8716,10 @@ enum SelfTest {
                 let (wc, canvas) = makeSpiedEditor(spy, seedEditing: seedEditing)
                 preflight(canvas, name, editing: seedEditing)
                 let before = canvas.documentFingerprintForTesting
-                let beforeIds = canvas.annotationIdentitiesForTesting
-                let beforeSelected = canvas.selectedIdentityForTesting
-                let beforeEditing = canvas.editingTextIdentityForTesting
-                AnnotationRenderer.forceRegionalPixelateFailureForTesting = true
-                action(wc)
-                AnnotationRenderer.forceRegionalPixelateFailureForTesting = false
+                let beforeRefs = canvas.annotationRefsForTesting
+                let beforeSelected = canvas.selectedRefForTesting
+                let beforeEditing = canvas.editingTextRefForTesting
+                AnnotationRenderer.withForcedRegionalFailure { action(wc) }
                 if vector(spy) != zeroVector {
                     termFailures.append(name + ":deps " + spy.description)
                 }
@@ -8679,9 +8729,12 @@ enum SelfTest {
                 if canvas.documentFingerprintForTesting != before {
                     termFailures.append(name + ":state")
                 }
-                if canvas.annotationIdentitiesForTesting != beforeIds
-                    || canvas.selectedIdentityForTesting != beforeSelected
-                    || canvas.editingTextIdentityForTesting != beforeEditing {
+                let afterRefs = canvas.annotationRefsForTesting
+                let sameMarks = afterRefs.count == beforeRefs.count
+                    && zip(afterRefs, beforeRefs).allSatisfy { $0 === $1 }
+                if !sameMarks
+                    || canvas.selectedRefForTesting !== beforeSelected
+                    || canvas.editingTextRefForTesting !== beforeEditing {
                     termFailures.append(name + ":identity")
                 }
                 wc.window?.close()
@@ -8969,13 +9022,14 @@ enum SelfTest {
             // and through the real renderer: the whole rect must be covered
             let containBase = makeSolidImage(
                 width: 200, height: 120, color: NSColor.white.cgColor)
-            AnnotationRenderer.forceRegionalPixelateFailureForTesting = true
             let containBlur = BlurAnnotation(uiScale: 1)
             containBlur.rect = containRect
             containBlur.redactionState = .words([insideBox, partialBox])
-            let containShot = AnnotationRenderer.render(
-                base: containBase, annotations: [containBlur], pixellated: nil)
-            AnnotationRenderer.forceRegionalPixelateFailureForTesting = false
+            let containShot = AnnotationRenderer.withForcedRegionalFailure {
+                AnnotationRenderer.render(
+                    base: containBase, annotations: [containBlur],
+                    pixellated: nil)
+            }
             var containCovered = true
             for x in stride(from: Int(containRect.minX) + 1,
                             to: Int(containRect.maxX) - 1, by: 6) {
