@@ -9508,13 +9508,43 @@ enum SelfTest {
                         previewFailures.append(label + ":padding-hit")
                     }
                 }
+                if !layout.isCollapsed {
+                    // The four corner cut-outs are inside the canvas RECTANGLE
+                    // but outside the rounded document: invisible on screen and
+                    // absent from the export, so they must not be pickable.
+                    let inner = layout.innerPointRect
+                    let d: CGFloat = 1.5
+                    for corner in [
+                        CGPoint(x: inner.minX + d, y: inner.minY + d),
+                        CGPoint(x: inner.maxX - d, y: inner.minY + d),
+                        CGPoint(x: inner.minX + d, y: inner.maxY - d),
+                        CGPoint(x: inner.maxX - d, y: inner.maxY - d),
+                    ] where wrapper.hitTest(corner) != nil {
+                        previewFailures.append(label + ":corner-hit \(corner)")
+                    }
+                    // ...while a point just inside the straight edge, away
+                    // from the curve, still belongs to the canvas.
+                    let onEdge = CGPoint(
+                        x: inner.midX, y: inner.minY + 0.5)
+                    if wrapper.hitTest(onEdge) !== canvas {
+                        previewFailures.append(label + ":edge-hit")
+                    }
+                }
+                // Derived from the fixture, and never on the max edge: a
+                // 60 px wide document at scale 2 is 30 pt wide, so a fixed
+                // 30 pt probe would land exactly on `bounds.maxX`, which
+                // hit-testing excludes — correct code would fail.
+                let probeX = min(15, layout.innerPointSize.width / 2)
+                let probeY = min(20, layout.innerPointSize.height / 2)
                 let insideWrapper = CGPoint(
-                    x: layout.padPoints + 30, y: layout.padPoints + 35)
+                    x: layout.padPoints + probeX, y: layout.padPoints + probeY)
                 if wrapper.hitTest(insideWrapper) !== canvas {
-                    previewFailures.append(label + ":inside-hit")
+                    previewFailures.append(
+                        label + ":inside-hit \(insideWrapper)")
                 }
                 let inCanvas = canvas.convert(insideWrapper, from: wrapper)
-                if abs(inCanvas.x - 30) > 0.01 || abs(inCanvas.y - 35) > 0.01 {
+                if abs(inCanvas.x - probeX) > 0.01
+                    || abs(inCanvas.y - probeY) > 0.01 {
                     previewFailures.append(label + ":map \(inCanvas)")
                 }
                 guard let flat = canvas.flattened() else {
@@ -9763,12 +9793,32 @@ enum SelfTest {
                     with: CapturedImage(cgImage: source, scale: 1),
                     forceFitForTesting: true)
                 let canvas = wc.canvasForTesting
-                _ = canvas.applyBackdrop(.ocean)
-                func expectBadge(_ label: String, _ want: String) {
+                // Same grouping discipline as the gate above: without it the
+                // preset change and the crop coalesce into one event group and
+                // the undo below reverts both, so "Ocean survives" would be
+                // measuring the fixture.
+                let previousGrouping = canvas.undoManager?.groupsByEvent ?? true
+                canvas.undoManager?.groupsByEvent = false
+                func grouped(_ body: () -> Void) {
+                    canvas.undoManager?.beginUndoGrouping()
+                    body()
+                    canvas.undoManager?.endUndoGrouping()
+                }
+                grouped { _ = canvas.applyBackdrop(.ocean) }
+                func expectBadge(
+                    _ label: String, _ want: String,
+                    preset: BackdropPreset = .ocean
+                ) {
                     if wc.sizeBadgeTitleForTesting != want {
                         badgeFailures.append(
                             label + ":" + wc.sizeBadgeTitleForTesting
                             + " want " + want)
+                    }
+                    // The badge string alone would not notice a step that
+                    // dropped the preset and happened to land on the same size.
+                    if canvas.backdropPresetForTesting != preset {
+                        badgeFailures.append(
+                            label + ":preset \(canvas.backdropPresetForTesting)")
                     }
                 }
                 // 200x160 + 40 px padding on each edge.
@@ -9787,13 +9837,107 @@ enum SelfTest {
                 }
                 canvas.currentTool = .select
                 expectBadge("cancelled", "280×240pt")
-                canvas.cropForTesting(
-                    pixels: CGRect(x: 5, y: 5, width: 120, height: 100))
+                grouped {
+                    canvas.cropForTesting(
+                        pixels: CGRect(x: 5, y: 5, width: 120, height: 100))
+                }
                 expectBadge("committed", "200×180pt")
                 canvas.undoManager?.undo()
                 expectBadge("undone", "280×240pt")
+                canvas.undoManager?.groupsByEvent = previousGrouping
                 wc.window?.close()
             }
+            // Fit reacts to the frame appearing AND disappearing, without
+            // anyone calling it: one shared callback in production, but both
+            // directions are pinned so a later change cannot quietly drop one.
+            // And a caption being typed near a corner has to be clipped in the
+            // preview exactly as the export clips it — the text field is a
+            // subview, which a draw-path clip alone does not reach.
+            var chromeFailures: [String] = []
+            do {
+                let source = makeSolidImage(
+                    width: 400, height: 300, color: NSColor.white.cgColor)
+                let wc = EditorWindowController.open(
+                    with: CapturedImage(cgImage: source, scale: 1),
+                    forceFitForTesting: true)
+                let canvas = wc.canvasForTesting
+                func settle() {
+                    RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+                }
+                settle()
+                let plainZoom = wc.scrollMagnificationForTesting
+                _ = canvas.applyBackdrop(.ocean)
+                settle()
+                let framedZoom = wc.scrollMagnificationForTesting
+                if !wc.imageFitsViewportForTesting() {
+                    chromeFailures.append("framed-overflows")
+                }
+                if framedZoom >= plainZoom {
+                    chromeFailures.append(
+                        "framed-zoom \(framedZoom) vs \(plainZoom)")
+                }
+                _ = canvas.applyBackdrop(.none)
+                settle()
+                if !wc.imageFitsViewportForTesting() {
+                    chromeFailures.append("plain-overflows")
+                }
+                if abs(wc.scrollMagnificationForTesting - plainZoom) > 0.001 {
+                    chromeFailures.append(
+                        "removed-zoom \(wc.scrollMagnificationForTesting)")
+                }
+                canvas.undoManager?.undo()
+                settle()
+                if abs(wc.scrollMagnificationForTesting - framedZoom) > 0.001
+                    || !wc.imageFitsViewportForTesting() {
+                    chromeFailures.append(
+                        "undo-zoom \(wc.scrollMagnificationForTesting)")
+                }
+                canvas.undoManager?.redo()
+                settle()
+                if abs(wc.scrollMagnificationForTesting - plainZoom) > 0.001 {
+                    chromeFailures.append(
+                        "redo-zoom \(wc.scrollMagnificationForTesting)")
+                }
+                // A live text field in the corner cut-out must not show in the
+                // preview: the export clips it away.
+                _ = canvas.applyBackdrop(.ocean)
+                settle()
+                let layout = canvas.backdropLayout
+                canvas.beginTextEditingForTesting(at: CGPoint(x: 2, y: 2))
+                if let wrapper = wc.documentWrapperForTesting,
+                   let field = canvas.textFieldForTesting {
+                    wrapper.layoutSubtreeIfNeeded()
+                    // The field lives inside the canvas, which is masked to the
+                    // rounded document, so the corner it sits in is clipped.
+                    let masked = canvas.layer?.masksToBounds == true
+                        && canvas.layer?.cornerRadius
+                            == SliceBBackdrop.cornerRadiusPt
+                    if !masked {
+                        chromeFailures.append("subview-unmasked")
+                    }
+                    // And the point it occupies is not pickable either.
+                    let inWrapper = wrapper.convert(
+                        CGPoint(x: field.frame.minX + 1,
+                                y: field.frame.minY + 1),
+                        from: canvas)
+                    let inner = layout.innerPointRect
+                    let radius = SliceBBackdrop.cornerRadiusPt
+                    let rounded = CGPath(
+                        roundedRect: inner, cornerWidth: radius,
+                        cornerHeight: radius, transform: nil)
+                    if !rounded.contains(inWrapper),
+                       wrapper.hitTest(inWrapper) != nil {
+                        chromeFailures.append("corner-field-hit")
+                    }
+                } else {
+                    chromeFailures.append("no-field")
+                }
+                wc.window?.close()
+            }
+            check("sliceB-backdrop-chrome-follows-frame",
+                  chromeFailures.isEmpty,
+                  chromeFailures.joined(separator: " | "))
+
             check("sliceB-backdrop-badge-reports-export",
                   badgeFailures.isEmpty, badgeFailures.joined(separator: " | "))
 

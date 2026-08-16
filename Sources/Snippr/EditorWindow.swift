@@ -849,11 +849,16 @@ final class BackdropDocumentView: NSView {
         // draws. Without this the preview shows square corners over a rounded
         // plate and the user reviews something the export will not produce.
         //
-        // Clipped while DRAWING, not by a layer mask: a layer corner radius is
-        // applied by the compositor, so it would be missing from every render
-        // that goes through the view's own draw path.
-        canvas.documentCornerRadius = layout.isCollapsed
-            ? 0 : SliceBBackdrop.cornerRadiusPt
+        // BOTH clips, because they cover different things. The draw-path clip
+        // shapes the canvas's own body and survives every render that calls
+        // draw directly; the layer mask is what actually clips SUBVIEWS, and
+        // the live text field being edited is one — without it a caption typed
+        // near a corner shows in the preview and is cut from the export.
+        let radius = layout.isCollapsed ? 0 : SliceBBackdrop.cornerRadiusPt
+        canvas.documentCornerRadius = radius
+        canvas.wantsLayer = true
+        canvas.layer?.cornerRadius = radius
+        canvas.layer?.masksToBounds = radius > 0
         needsDisplay = true
     }
 
@@ -870,9 +875,23 @@ final class BackdropDocumentView: NSView {
 
     /// The frame is decoration: clicks in it belong to no tool, and must not
     /// fall through to the canvas either.
+    ///
+    /// The rounded corners count as frame. The canvas is still a rectangle, so
+    /// its corner cut-outs sit inside its frame while being invisible and
+    /// absent from the export — picking, drawing or cropping there would act on
+    /// pixels the user cannot see and will not get.
     override func hitTest(_ point: NSPoint) -> NSView? {
         let hit = super.hitTest(point)
-        return hit === self ? nil : hit
+        guard hit !== self else { return nil }
+        if !layout.isCollapsed, hit === canvas || hit?.isDescendant(of: canvas) == true {
+            let inner = layout.innerPointRect
+            let radius = SliceBBackdrop.cornerRadiusPt
+            let rounded = CGPath(
+                roundedRect: inner, cornerWidth: radius, cornerHeight: radius,
+                transform: nil)
+            if !rounded.contains(point) { return nil }
+        }
+        return hit
     }
 }
 
@@ -2188,6 +2207,11 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
     var annotationRefsForTesting: [Annotation] { annotations }
     var selectedRefForTesting: Annotation? { selected }
     var editingTextRefForTesting: TextAnnotation? { editingTextAnnotation }
+
+    /// The live field, so a gate can ask where a caption being typed actually
+    /// sits — it is a SUBVIEW, and subviews are clipped by a different
+    /// mechanism than the canvas's own drawing.
+    var textFieldForTesting: NSTextField? { textField }
 
     /// Drives a real drag through the production mouse handlers, in image
     /// pixels, so a gate can create an annotation the way a user does.
