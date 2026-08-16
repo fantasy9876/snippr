@@ -3,31 +3,131 @@ name: Windows installer
 on:
   workflow_dispatch:
     inputs:
-      tag:
-        description: "Existing release tag to upload the installer to"
+      ref:
+        description: "Exact immutable 40-char SHA, or an existing tag"
         required: true
-        default: "v1.0.2"
-
-permissions:
-  contents: write
+        type: string
+      tag:
+        description: "Release tag to upload (empty = gate+build only). Must resolve to the same commit as ref; version must match csproj and NSIS."
+        required: false
+        default: ""
+        type: string
+      allow_unsigned_release:
+        description: "Permit a tagged release without Azure Trusted Signing. Unsigned binaries get SmartScreen warnings. Default false."
+        required: false
+        default: false
+        type: boolean
 
 jobs:
   build:
     runs-on: windows-latest
+    permissions:
+      contents: read
     env:
-      # Signing turns on automatically once the Azure Trusted Signing
-      # secrets are added in repo Settings → Secrets and variables → Actions.
-      ENABLE_SIGNING: ${{ secrets.AZURE_TENANT_ID != '' }}
+      HAS_SIGNING: ${{ secrets.AZURE_TENANT_ID != '' }}
+      REQUESTED_REF: ${{ inputs.ref }}
+      RELEASE_TAG: ${{ inputs.tag }}
+      ALLOW_UNSIGNED: ${{ inputs.allow_unsigned_release }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - name: Pin exact immutable checkout
+        shell: pwsh
+        run: |
+          $want = $env:REQUESTED_REF.Trim()
+          $head = (git rev-parse HEAD).ToLower()
+          Write-Host "requested=$want"
+          Write-Host "HEAD=$head"
+          Write-Host "HAS_SIGNING=$($env:HAS_SIGNING)"
+          Write-Host "ALLOW_UNSIGNED=$($env:ALLOW_UNSIGNED)"
+          Write-Host "RELEASE_TAG=$($env:RELEASE_TAG)"
+          git log -1 --oneline
+          if ($want -match '^[0-9a-fA-F]{40}$') {
+            if ($head -ne $want.ToLower()) {
+              throw "checkout HEAD $head != requested SHA $want"
+            }
+          } elseif ($want -match '^[0-9a-fA-F]{7,39}$') {
+            throw "short SHA is not immutable; pass a 40-char SHA or a tag"
+          } else {
+            $tagSha = (git rev-parse "refs/tags/$want^{commit}" 2>$null)
+            if ($LASTEXITCODE -ne 0 -or -not $tagSha) {
+              throw "ref is not a 40-char SHA or an existing tag: $want"
+            }
+            if ($head -ne $tagSha.ToLower()) {
+              throw "tag $want resolves to $tagSha, HEAD is $head"
+            }
+          }
+
+      - name: git diff --check
+        shell: pwsh
+        run: |
+          git diff --check HEAD^ HEAD
+          if ($LASTEXITCODE -ne 0) { throw "git diff --check failed" }
+
+      - name: Assert tag matches HEAD, csproj, NSIS
+        if: inputs.tag != ''
+        shell: pwsh
+        run: |
+          $tag = $env:RELEASE_TAG.Trim()
+          if ($tag -notmatch '^v\d+\.\d+\.\d+$') {
+            throw "release tag must match ^v\\d+\\.\\d+\\.\\d+$ (got: $tag)"
+          }
+          $head = (git rev-parse HEAD).ToLower()
+          $tagSha = (git rev-parse "refs/tags/$tag^{commit}" 2>$null)
+          if ($LASTEXITCODE -ne 0 -or -not $tagSha) {
+            throw "release tag does not exist: $tag"
+          }
+          if ($tagSha.ToLower() -ne $head) {
+            throw "tag $tag is $tagSha, HEAD is $head"
+          }
+          $csprojRaw = Get-Content windows/Snippr.Win.csproj -Raw
+          $nsisRaw = Get-Content windows/installer.nsi -Raw
+          if ($csprojRaw -notmatch '<Version>([^<]+)</Version>') {
+            throw "csproj Version missing"
+          }
+          $csproj = $Matches[1].Trim()
+          if ($nsisRaw -notmatch 'OutFile "SnipprSetup-([^"]+)-win-x64.exe"') {
+            throw "NSIS OutFile version missing"
+          }
+          $nsisOut = $Matches[1].Trim()
+          if ($nsisRaw -notmatch 'DisplayVersion" "([^"]+)"') {
+            throw "NSIS DisplayVersion missing"
+          }
+          $nsisDisp = $Matches[1].Trim()
+          $ver = $tag.TrimStart('v')
+          Write-Host "tag=$tag ver=$ver csproj=$csproj nsisOut=$nsisOut nsisDisp=$nsisDisp"
+          if ($ver -ne $csproj -or $ver -ne $nsisOut -or $ver -ne $nsisDisp) {
+            throw "version mismatch: tag=$ver csproj=$csproj nsisOut=$nsisOut nsisDisp=$nsisDisp"
+          }
+
+      - name: Require signing secrets or explicit unsigned flag
+        if: inputs.tag != ''
+        shell: pwsh
+        run: |
+          Write-Host "HAS_SIGNING=$($env:HAS_SIGNING) ALLOW_UNSIGNED=$($env:ALLOW_UNSIGNED)"
+          if ($env:HAS_SIGNING -ne 'true' -and $env:ALLOW_UNSIGNED -ne 'true') {
+            throw "tagged release requires Azure Trusted Signing secrets, or allow_unsigned_release=true"
+          }
 
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: "8.0.x"
 
+      - name: Stitcher gate (animated-band + majority fail-closed)
+        run: >
+          dotnet run --project windows/Snippr.Win.StitcherGate/Snippr.Win.StitcherGate.csproj
+          -c Release --no-launch-profile
+
+      - name: Build Win app (Release)
+        run: dotnet build windows/Snippr.Win.csproj -c Release
+
       - name: Publish self-contained exe
-        # ReadyToRun precompiles IL to native code: the tray app and the
-        # editor open without paying JIT cost on first use.
+        if: inputs.tag != ''
         run: >
           dotnet publish windows/Snippr.Win.csproj -c Release -r win-x64
           --self-contained -p:PublishSingleFile=true
@@ -37,6 +137,7 @@ jobs:
           -p:TieredPGO=true
 
       - name: Stage exe next to installer script
+        if: inputs.tag != ''
         shell: pwsh
         run: |
           $exe = Get-ChildItem -Recurse -Path windows -Filter Snippr.exe |
@@ -46,8 +147,8 @@ jobs:
           Copy-Item $exe.FullName windows/Snippr.exe
 
       - name: Sign Snippr.exe (Azure Trusted Signing)
-        if: env.ENABLE_SIGNING == 'true'
-        uses: azure/trusted-signing-action@v0.5.1
+        if: inputs.tag != '' && env.HAS_SIGNING == 'true'
+        uses: azure/trusted-signing-action@0d74250c661747df006298d0fb49944c10f16e03 # v0.5.1
         with:
           azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
@@ -62,16 +163,18 @@ jobs:
           timestamp-digest: SHA256
 
       - name: Install NSIS
+        if: inputs.tag != ''
         run: choco install nsis -y --no-progress
 
       - name: Build NSIS installer
+        if: inputs.tag != ''
         shell: pwsh
         working-directory: windows
         run: '& "C:\Program Files (x86)\NSIS\makensis.exe" installer.nsi'
 
       - name: Sign installer (Azure Trusted Signing)
-        if: env.ENABLE_SIGNING == 'true'
-        uses: azure/trusted-signing-action@v0.5.1
+        if: inputs.tag != '' && env.HAS_SIGNING == 'true'
+        uses: azure/trusted-signing-action@0d74250c661747df006298d0fb49944c10f16e03 # v0.5.1
         with:
           azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
@@ -86,15 +189,311 @@ jobs:
           timestamp-digest: SHA256
 
       - name: Portable ZIP
+        if: inputs.tag != ''
         shell: pwsh
         run: >
           Compress-Archive -Path windows/Snippr.exe
           -DestinationPath windows/Snippr-portable-win-x64.zip -Force
+
+      - name: Verify Authenticode and SHA-256
+        if: inputs.tag != ''
+        shell: pwsh
+        run: |
+          function Get-SetupExe([string]$dir) {
+            $setup = @(Get-Item (Join-Path $dir 'SnipprSetup-*.exe') -ErrorAction SilentlyContinue)
+            if ($setup.Count -ne 1) {
+              throw "expected exactly 1 $dir/SnipprSetup-*.exe, got $($setup.Count)"
+            }
+            if ($setup[0].Name -notmatch '^SnipprSetup-\d+\.\d+\.\d+-win-x64\.exe$') {
+              throw "setup filename not exact: $($setup[0].Name)"
+            }
+            return $setup[0]
+          }
+          function Assert-Authenticode([string]$path, [bool]$expectSigned) {
+            if (-not (Test-Path $path)) { throw "missing $path" }
+            $s = Get-AuthenticodeSignature $path
+            Write-Host "$path Status=$($s.Status) Thumbprint=$($s.SignerCertificate.Thumbprint)"
+            if ($expectSigned) {
+              if ($s.Status -ne 'Valid') {
+                throw "Authenticode not Valid: $path $($s.Status)"
+              }
+            } else {
+              # Explicit unsigned: only NotSigned is acceptable.
+              # UnknownError / HashMismatch / anything else is a hard fail.
+              if ($s.Status -ne 'NotSigned') {
+                throw "explicit unsigned release requires NotSigned (rejected $($s.Status)): $path"
+              }
+            }
+          }
+          function Assert-ReleaseManifest([string]$dir, [bool]$expectSigned) {
+            $sumsPath = Join-Path $dir 'SHA256SUMS'
+            if (-not (Test-Path $sumsPath)) { throw "missing $sumsPath" }
+            $setup = Get-SetupExe $dir
+            $required = @('Snippr.exe', $setup.Name, 'Snippr-portable-win-x64.zip')
+            $raw = @(Get-Content $sumsPath)
+            $expectedCount = 3
+            if (-not $expectSigned) { $expectedCount = 4 }
+            if ($raw.Count -ne $expectedCount) {
+              throw "SHA256SUMS must have exactly $expectedCount lines (3 hashes$(if ($expectSigned) { '' } else { ' + UNSIGNED_RELEASE=true' })), got $($raw.Count)"
+            }
+            $seen = @{}
+            $markerCount = 0
+            foreach ($line in $raw) {
+              if ($line -eq 'UNSIGNED_RELEASE=true') {
+                $markerCount++
+                continue
+              }
+              if ($line -notmatch '^([0-9a-f]{64})  (\S+)$') {
+                throw "SHA256SUMS unexpected line: $line"
+              }
+              $hash = $Matches[1]
+              $name = $Matches[2]
+              if ($seen.ContainsKey($name)) {
+                throw "SHA256SUMS duplicate filename: $name"
+              }
+              if ($name -notin $required) {
+                throw "SHA256SUMS extra filename: $name"
+              }
+              $seen[$name] = $hash
+            }
+            if ($expectSigned) {
+              if ($markerCount -ne 0) {
+                throw "UNSIGNED_RELEASE marker present but signed release"
+              }
+            } else {
+              if ($markerCount -ne 1) {
+                throw "unsigned release requires exactly one UNSIGNED_RELEASE=true marker, got $markerCount"
+              }
+            }
+            $missing = @($required | Where-Object { -not $seen.ContainsKey($_) })
+            if ($missing.Count -ne 0) {
+              throw "SHA256SUMS missing filename(s): $($missing -join ', ')"
+            }
+            if ($seen.Count -ne 3) {
+              throw "SHA256SUMS must list exactly 3 unique filenames, got $($seen.Count)"
+            }
+            foreach ($name in $required) {
+              $path = Join-Path $dir $name
+              if (-not (Test-Path $path)) { throw "missing $path listed in SHA256SUMS" }
+              $got = (Get-FileHash -Algorithm SHA256 $path).Hash.ToLower()
+              if ($got -ne $seen[$name]) {
+                throw "SHA-256 mismatch $name expected $($seen[$name]) got $got"
+              }
+              Write-Host "sha256 ok $name"
+            }
+            return $setup
+          }
+          $setup = Get-SetupExe 'windows'
+          $expectSigned = ($env:HAS_SIGNING -eq 'true')
+          Assert-Authenticode windows/Snippr.exe $expectSigned
+          Assert-Authenticode $setup.FullName $expectSigned
+          if (-not (Test-Path windows/Snippr-portable-win-x64.zip)) {
+            throw "missing windows/Snippr-portable-win-x64.zip"
+          }
+          $lines = @()
+          foreach ($name in @('Snippr.exe', $setup.Name, 'Snippr-portable-win-x64.zip')) {
+            $h = Get-FileHash -Algorithm SHA256 (Join-Path 'windows' $name)
+            $line = "$($h.Hash.ToLower())  $name"
+            Write-Host $line
+            $lines += $line
+          }
+          if (-not $expectSigned) {
+            $lines += 'UNSIGNED_RELEASE=true'
+            Write-Host "UNSIGNED_RELEASE=true"
+            Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "## Unsigned release"
+            Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value ""
+            Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value '`UNSIGNED_RELEASE=true`'
+            Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value ""
+            Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "Azure Trusted Signing was not configured. Authenticode Status=NotSigned on Snippr.exe and the setup exe. SmartScreen will warn."
+          } else {
+            Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "## Signed release"
+            Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value ""
+            Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "Authenticode Status=Valid on Snippr.exe and the setup exe."
+          }
+          $lines | Set-Content -Encoding ascii windows/SHA256SUMS
+          [void](Assert-ReleaseManifest 'windows' $expectSigned)
+          New-Item -ItemType Directory -Force dist/portable | Out-Null
+          Copy-Item $setup.FullName dist/
+          Copy-Item windows/Snippr.exe dist/portable/
+          Copy-Item windows/Snippr-portable-win-x64.zip dist/portable/
+          Copy-Item windows/SHA256SUMS dist/
+
+      - name: Upload verified setup
+        if: inputs.tag != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-setup
+          if-no-files-found: error
+          path: dist/SnipprSetup-*.exe
+
+      - name: Upload verified portable zip
+        if: inputs.tag != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-portable
+          if-no-files-found: error
+          path: dist/portable/
+
+      - name: Upload verified checksums
+        if: inputs.tag != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-checksums
+          if-no-files-found: error
+          path: dist/SHA256SUMS
+
+  release:
+    needs: build
+    if: inputs.tag != ''
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    env:
+      HAS_SIGNING: ${{ secrets.AZURE_TENANT_ID != '' }}
+      RELEASE_TAG: ${{ inputs.tag }}
+      ALLOW_UNSIGNED: ${{ inputs.allow_unsigned_release }}
+    steps:
+      - name: Download verified setup
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-setup
+          path: windows
+
+      - name: Download verified portable zip
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-portable
+          path: windows
+
+      - name: Download verified checksums
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-checksums
+          path: windows
+
+      - name: Recheck SHA-256 and Authenticode
+        shell: pwsh
+        run: |
+          function Get-SetupExe([string]$dir) {
+            $setup = @(Get-Item (Join-Path $dir 'SnipprSetup-*.exe') -ErrorAction SilentlyContinue)
+            if ($setup.Count -ne 1) {
+              throw "expected exactly 1 $dir/SnipprSetup-*.exe, got $($setup.Count)"
+            }
+            if ($setup[0].Name -notmatch '^SnipprSetup-\d+\.\d+\.\d+-win-x64\.exe$') {
+              throw "setup filename not exact: $($setup[0].Name)"
+            }
+            return $setup[0]
+          }
+          function Assert-Authenticode([string]$path, [bool]$expectSigned) {
+            if (-not (Test-Path $path)) { throw "missing $path" }
+            $s = Get-AuthenticodeSignature $path
+            Write-Host "$path Status=$($s.Status) Thumbprint=$($s.SignerCertificate.Thumbprint)"
+            if ($expectSigned) {
+              if ($s.Status -ne 'Valid') {
+                throw "Authenticode not Valid: $path $($s.Status)"
+              }
+            } else {
+              if ($s.Status -ne 'NotSigned') {
+                throw "explicit unsigned release requires NotSigned (rejected $($s.Status)): $path"
+              }
+            }
+          }
+          function Assert-ReleaseManifest([string]$dir, [bool]$expectSigned) {
+            $sumsPath = Join-Path $dir 'SHA256SUMS'
+            if (-not (Test-Path $sumsPath)) { throw "missing $sumsPath" }
+            $setup = Get-SetupExe $dir
+            $required = @('Snippr.exe', $setup.Name, 'Snippr-portable-win-x64.zip')
+            $raw = @(Get-Content $sumsPath)
+            $expectedCount = 3
+            if (-not $expectSigned) { $expectedCount = 4 }
+            if ($raw.Count -ne $expectedCount) {
+              throw "SHA256SUMS must have exactly $expectedCount lines (3 hashes$(if ($expectSigned) { '' } else { ' + UNSIGNED_RELEASE=true' })), got $($raw.Count)"
+            }
+            $seen = @{}
+            $markerCount = 0
+            foreach ($line in $raw) {
+              if ($line -eq 'UNSIGNED_RELEASE=true') {
+                $markerCount++
+                continue
+              }
+              if ($line -notmatch '^([0-9a-f]{64})  (\S+)$') {
+                throw "SHA256SUMS unexpected line: $line"
+              }
+              $hash = $Matches[1]
+              $name = $Matches[2]
+              if ($seen.ContainsKey($name)) {
+                throw "SHA256SUMS duplicate filename: $name"
+              }
+              if ($name -notin $required) {
+                throw "SHA256SUMS extra filename: $name"
+              }
+              $seen[$name] = $hash
+            }
+            if ($expectSigned) {
+              if ($markerCount -ne 0) {
+                throw "UNSIGNED_RELEASE marker present but signed release"
+              }
+            } else {
+              if ($markerCount -ne 1) {
+                throw "unsigned release requires exactly one UNSIGNED_RELEASE=true marker, got $markerCount"
+              }
+            }
+            $missing = @($required | Where-Object { -not $seen.ContainsKey($_) })
+            if ($missing.Count -ne 0) {
+              throw "SHA256SUMS missing filename(s): $($missing -join ', ')"
+            }
+            if ($seen.Count -ne 3) {
+              throw "SHA256SUMS must list exactly 3 unique filenames, got $($seen.Count)"
+            }
+            foreach ($name in $required) {
+              $path = Join-Path $dir $name
+              if (-not (Test-Path $path)) { throw "missing $path listed in SHA256SUMS" }
+              $got = (Get-FileHash -Algorithm SHA256 $path).Hash.ToLower()
+              if ($got -ne $seen[$name]) {
+                throw "SHA-256 mismatch $name expected $($seen[$name]) got $got"
+              }
+              Write-Host "sha256 ok $name"
+            }
+            return $setup
+          }
+          $expectSigned = ($env:HAS_SIGNING -eq 'true')
+          if ($expectSigned) {
+            if ($env:ALLOW_UNSIGNED -eq 'true') {
+              Write-Host "allow_unsigned_release=true ignored because HAS_SIGNING=true; releasing signed"
+            }
+          } else {
+            if ($env:ALLOW_UNSIGNED -ne 'true') {
+              throw "release job reached unsigned path without allow_unsigned_release=true"
+            }
+          }
+          $setup = Assert-ReleaseManifest 'windows' $expectSigned
+          Assert-Authenticode windows/Snippr.exe $expectSigned
+          Assert-Authenticode $setup.FullName $expectSigned
 
       - name: Upload to release
         env:
           GH_TOKEN: ${{ github.token }}
         shell: pwsh
         run: |
-          gh release upload ${{ inputs.tag }} (Get-Item windows/SnipprSetup-*.exe).FullName --clobber
-          gh release upload ${{ inputs.tag }} windows/Snippr-portable-win-x64.zip --clobber
+          $tag = $env:RELEASE_TAG.Trim()
+          if ($tag -notmatch '^v\d+\.\d+\.\d+$') {
+            throw "release tag must match ^v\\d+\\.\\d+\\.\\d+$ (got: $tag)"
+          }
+          $setup = @(Get-Item windows/SnipprSetup-*.exe -ErrorAction SilentlyContinue)
+          if ($setup.Count -ne 1) {
+            throw "expected exactly 1 windows/SnipprSetup-*.exe, got $($setup.Count)"
+          }
+          if ($setup[0].Name -notmatch '^SnipprSetup-\d+\.\d+\.\d+-win-x64\.exe$') {
+            throw "setup filename not exact: $($setup[0].Name)"
+          }
+          foreach ($name in @($setup[0].Name, 'Snippr-portable-win-x64.zip', 'SHA256SUMS')) {
+            $path = Join-Path 'windows' $name
+            if (-not (Test-Path $path)) { throw "refusing upload; missing $path" }
+          }
+          # No --clobber: refuse to overwrite an existing release asset.
+          # Tag is taken from $env:RELEASE_TAG (allowlisted), never interpolated into the script.
+          # This job is the only one with contents: write; the gate-only path never reaches here.
+          gh release upload $tag `
+            $setup[0].FullName `
+            windows/Snippr-portable-win-x64.zip `
+            windows/SHA256SUMS
