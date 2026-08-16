@@ -8712,9 +8712,16 @@ enum SelfTest {
                     } else {
                         problems.append("no-pending-text")
                     }
-                    if canvas.pendingTextFieldStyleForTesting
-                        .contains("systemFont") == false {
-                        problems.append("pending-field-font-default")
+                    // Exact seeded style, compared as values.
+                    if let style = canvas.pendingTextStyleForTesting {
+                        if abs(style.pointSize - 27) > 0.01 || style.isBold {
+                            problems.append("field-font=\(style.pointSize)/\(style.isBold)")
+                        }
+                        if abs(style.alpha - 0.65) > 0.02 {
+                            problems.append("field-alpha=\(style.alpha)")
+                        }
+                    } else {
+                        problems.append("no-field-style")
                     }
                     if !canvas.hasValidCropSelection { problems.append("no-crop") }
                 } else {
@@ -9636,8 +9643,8 @@ enum SelfTest {
                   hostFailures.isEmpty,
                   hostFailures.prefix(4).joined(separator: " | "))
 
-            // E7. Isolation of the two scoped seams under NESTING and under
-            //     CROSS-THREAD overlap. Sequential use cannot tell a
+            // E7. Isolation of the two scoped seams under NESTING and under a
+            //     genuinely FORCED overlap. Sequential use cannot tell a
             //     token-owned scope from the global flag it replaced.
             var isoFailures: [String] = []
             let isoBase = makeSolidImage(
@@ -9661,43 +9668,88 @@ enum SelfTest {
             if !outerEvents.isEmpty {
                 isoFailures.append("nested:outer-leak \(outerEvents.count)")
             }
-            // cross-thread: a capture on this thread must not swallow the
-            // events of concurrent work on another thread, and a forced-failure
-            // scope on one thread must not disable pixelation on the other.
-            let otherDone = DispatchSemaphore(value: 0)
-            var otherMaterialized = 0
-            var mainEventsDuringOverlap: [RenderTraceEvent] = []
+
+            // Forced-failure scope is process-wide by contract, so the thing to
+            // prove is REFERENCE COUNTING: with two overlapping scopes, the
+            // first one exiting must NOT switch it off; only the last one does.
+            let bEntered = DispatchSemaphore(value: 0)
+            let bMayExit = DispatchSemaphore(value: 0)
+            let bDone = DispatchSemaphore(value: 0)
+            var activeInsideBoth = false
             DispatchQueue.global().async {
-                let (_, events) = RenderTrace.capture(host: "other", path: "export") {
-                    _ = AnnotationRenderer.render(
-                        base: isoBase, annotations: [isoBlur], pixellated: nil)
+                AnnotationRenderer.withForcedRegionalFailure {
+                    bEntered.signal()
+                    bMayExit.wait()
                 }
-                otherMaterialized = events.filter {
-                    $0.kind == "regionalMaterialized"
-                }.count
-                otherDone.signal()
+                bDone.signal()
             }
             AnnotationRenderer.withForcedRegionalFailure {
-                let (_, events) = RenderTrace.capture(host: "main", path: "export") {
+                if bEntered.wait(timeout: .now() + 10) == .timedOut {
+                    isoFailures.append("overlap:b-never-entered")
+                }
+                activeInsideBoth =
+                    AnnotationRenderer.forceRegionalPixelateFailureForTesting
+            }
+            let activeAfterAExit =
+                AnnotationRenderer.forceRegionalPixelateFailureForTesting
+            bMayExit.signal()
+            if bDone.wait(timeout: .now() + 10) == .timedOut {
+                isoFailures.append("overlap:b-never-finished")
+            }
+            let activeAfterBExit =
+                AnnotationRenderer.forceRegionalPixelateFailureForTesting
+            if !activeInsideBoth { isoFailures.append("overlap:not-active-inside") }
+            if !activeAfterAExit {
+                isoFailures.append("overlap:released-too-early")
+            }
+            if activeAfterBExit { isoFailures.append("overlap:never-released") }
+
+            // Trace overlap across threads, WITHOUT forced failure so both
+            // sides really materialize: each capture must see only its own.
+            let otherInCapture = DispatchSemaphore(value: 0)
+            let otherMayFinish = DispatchSemaphore(value: 0)
+            let otherFinished = DispatchSemaphore(value: 0)
+            var otherEvents: [RenderTraceEvent] = []
+            DispatchQueue.global().async {
+                let (_, events) = RenderTrace.capture(host: "other", path: "export") {
+                    otherInCapture.signal()
+                    otherMayFinish.wait()
                     _ = AnnotationRenderer.render(
                         base: isoBase, annotations: [isoBlur], pixellated: nil)
                 }
-                mainEventsDuringOverlap = events
+                otherEvents = events
+                otherFinished.signal()
             }
-            _ = otherDone.wait(timeout: .now() + 10)
-            if !mainEventsDuringOverlap.allSatisfy({ $0.host == "main" }) {
+            if otherInCapture.wait(timeout: .now() + 10) == .timedOut {
+                isoFailures.append("thread:other-never-entered")
+            }
+            let (_, mainEvents) = RenderTrace.capture(host: "main", path: "export") {
+                otherMayFinish.signal()
+                _ = AnnotationRenderer.render(
+                    base: isoBase, annotations: [isoBlur], pixellated: nil)
+            }
+            if otherFinished.wait(timeout: .now() + 10) == .timedOut {
+                isoFailures.append("thread:other-never-finished")
+            }
+            if !mainEvents.allSatisfy({ $0.host == "main" }) {
                 isoFailures.append("thread:main-host")
             }
-            if mainEventsDuringOverlap.contains(where: {
-                $0.kind == "regionalMaterialized"
-            }) {
-                isoFailures.append("thread:main-materialized-under-failure")
+            if !otherEvents.allSatisfy({ $0.host == "other" }) {
+                isoFailures.append("thread:other-host")
+            }
+            if otherEvents.filter({ $0.kind == "regionalMaterialized" }).count != 1 {
+                isoFailures.append(
+                    "thread:other-materialized \(otherEvents.count)")
+            }
+            if mainEvents.filter({ $0.kind == "regionalMaterialized" }).count != 1 {
+                isoFailures.append("thread:main-materialized")
             }
             check("sliceB-seam-isolation",
                   isoFailures.isEmpty, isoFailures.joined(separator: " | "))
 
-            // E8. Late results in BOTH completion orders, with a permit per
-            //     invocation so the gate controls which worker finishes first.
+            // E8. Late results in BOTH completion orders. The permit index is
+            //     bound to START order, not to whichever worker the scheduler
+            //     happens to call first, and every wait is on a real condition.
             var orderFailures: [String] = []
             for oldFirst in [true, false] {
                 let started = [
@@ -9708,8 +9760,8 @@ enum SelfTest {
                 ]
                 let indexLock = NSLock()
                 var nextIndex = 0
-                let firstWord = CGRect(x: 8, y: 8, width: 10, height: 8)
-                let secondWord = CGRect(x: 20, y: 8, width: 10, height: 8)
+                let oldWord = CGRect(x: 8, y: 8, width: 10, height: 8)
+                let newWord = CGRect(x: 20, y: 8, width: 10, height: 8)
                 SliceBOCR.recognizerForTesting = { _ in
                     indexLock.lock()
                     let index = min(nextIndex, 1)
@@ -9719,46 +9771,52 @@ enum SelfTest {
                     release[index].wait()
                     return .success([
                         RecognizedWord(
-                            rect: index == 0 ? firstWord : secondWord,
+                            rect: index == 0 ? oldWord : newWord,
                             confidence: 0.9),
                     ])
                 }
                 let raceBlur = BlurAnnotation(uiScale: 1)
                 raceBlur.rect = CGRect(x: 5, y: 5, width: 40, height: 25)
+                // Start OLD and wait until its worker is actually inside the
+                // recognizer, so index 0 is the old job by construction.
                 MainActor.assumeIsolated {
                     _ = SliceBRedactionJob.start(
                         blur: raceBlur, base: isoBase, host: nil)
+                }
+                if started[0].wait(timeout: .now() + 10) == .timedOut {
+                    orderFailures.append("\(oldFirst):old-never-started")
+                }
+                MainActor.assumeIsolated {
                     _ = SliceBRedactionJob.start(
                         blur: raceBlur, base: isoBase, host: nil)
                 }
-                // Both workers must really be running before anything is let go.
-                if started[0].wait(timeout: .now() + 10) == .timedOut {
-                    orderFailures.append("\(oldFirst):worker0-never-started")
-                }
                 if started[1].wait(timeout: .now() + 10) == .timedOut {
-                    orderFailures.append("\(oldFirst):worker1-never-started")
+                    orderFailures.append("\(oldFirst):new-never-started")
                 }
-                let order = oldFirst ? [0, 1] : [1, 0]
-                for index in order {
-                    release[index].signal()
-                    let deadline = Date().addingTimeInterval(5)
-                    while Date() < deadline {
-                        RunLoop.current.run(until: Date().addingTimeInterval(0.02))
+                func drain(to target: Int, label: String) {
+                    let deadline = Date().addingTimeInterval(10)
+                    while MainActor.assumeIsolated({
+                        SliceBRedactionJob.inFlight
+                    }) > target, Date() < deadline {
+                        RunLoop.current.run(
+                            until: Date().addingTimeInterval(0.01))
+                    }
+                    if MainActor.assumeIsolated({
+                        SliceBRedactionJob.inFlight
+                    }) > target {
+                        orderFailures.append("\(oldFirst):\(label)-stuck")
                     }
                 }
-                let deadline = Date().addingTimeInterval(10)
-                while MainActor.assumeIsolated({ SliceBRedactionJob.inFlight }) > 0,
-                      Date() < deadline {
-                    RunLoop.current.run(until: Date().addingTimeInterval(0.02))
-                }
+                let order = oldFirst ? [0, 1] : [1, 0]
+                release[order[0]].signal()
+                drain(to: 1, label: "first")
+                release[order[1]].signal()
+                drain(to: 0, label: "second")
                 SliceBOCR.recognizerForTesting = nil
                 // Whoever finished first, only the CURRENT owner's answer counts.
-                if raceBlur.redactionState != .words([secondWord]) {
+                if raceBlur.redactionState != .words([newWord]) {
                     orderFailures.append(
                         "\(oldFirst):state \(raceBlur.redactionState)")
-                }
-                if MainActor.assumeIsolated({ SliceBRedactionJob.inFlight }) != 0 {
-                    orderFailures.append("\(oldFirst):slots")
                 }
                 if MainActor.assumeIsolated({
                     SliceBRedactionJob.ownerCountForTesting

@@ -1549,14 +1549,33 @@ final class EditorCanvasView: NSView {
     /// near-miss (a backing annotation without first responder, say).
     var isEditingTextForTesting: Bool { isEditingText }
 
-    /// Style actually installed on the live field, so a preflight can prove the
-    /// pending edit is not sitting at production defaults.
-    var pendingTextFieldStyleForTesting: String {
-        guard let field = textField else { return "none" }
-        let rgba = field.textColor?.usingColorSpace(.sRGB).map {
-            "\($0.redComponent),\($0.greenComponent),\($0.blueComponent),\($0.alphaComponent)"
-        } ?? "-"
-        return "\(field.font?.fontName ?? "-")/\(field.font?.pointSize ?? -1)/\(rgba)"
+    /// Style actually installed on the live field. A value, not a string:
+    /// matching on a font NAME is meaningless (the production default is a
+    /// system font too), so the gate compares size, weight traits and colour.
+    struct PendingTextStyle: Equatable {
+        var pointSize: CGFloat = -1
+        var isBold = false
+        var red: CGFloat = -1
+        var green: CGFloat = -1
+        var blue: CGFloat = -1
+        var alpha: CGFloat = -1
+    }
+
+    var pendingTextStyleForTesting: PendingTextStyle? {
+        guard let field = textField else { return nil }
+        var style = PendingTextStyle()
+        if let font = field.font {
+            style.pointSize = font.pointSize
+            style.isBold = NSFontManager.shared.traits(of: font)
+                .contains(.boldFontMask)
+        }
+        if let color = field.textColor?.usingColorSpace(.sRGB) {
+            style.red = color.redComponent
+            style.green = color.greenComponent
+            style.blue = color.blueComponent
+            style.alpha = color.alphaComponent
+        }
+        return style
     }
 
     /// Live pointer state — part of what a ruler transient depends on.
@@ -1625,8 +1644,7 @@ final class EditorCanvasView: NSView {
             return [
                 "value=\(field.stringValue)",
                 "frame=\(field.frame)",
-                "font=\(field.font?.fontName ?? "-")/\(field.font?.pointSize ?? -1)",
-                "traits=\(field.font.map { NSFontManager.shared.traits(of: $0).rawValue } ?? 0)",
+                "style=\(String(describing: pendingTextStyleForTesting))",
                 "textColor=\(rgbaString(field.textColor))",
                 "backing=[\(backing)]",
             ].joined(separator: " ")
