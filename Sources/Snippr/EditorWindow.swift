@@ -865,6 +865,32 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
 
     var backdropPresetForTesting: BackdropPreset { backdropPreset }
 
+    /// The integral pixel rect a flatten would render right now, or nil when
+    /// no valid crop is pending. `flattened()` derives its base from this, so a
+    /// budget check or a fingerprint asking about the prospective size can
+    /// never disagree with the export about what that size is.
+    func prospectiveCropPixelRect() -> CGRect? {
+        guard currentTool == .crop, let crop = cropRect, hasValidCropSelection
+        else { return nil }
+        let viewRect = crop.intersection(bounds)
+        guard !viewRect.isNull, viewRect.width >= 4, viewRect.height >= 4
+        else { return nil }
+        let requested = EditableSelectionGeometry.pixelCropRect(
+            for: viewRect, in: bounds, scale: pxScale)
+        let imageBounds = CGRect(
+            x: 0, y: 0, width: image.cgImage.width, height: image.cgImage.height)
+        let px = requested.intersection(imageBounds)
+        guard !px.isNull, px.width >= 1, px.height >= 1 else { return nil }
+        return px
+    }
+
+    func prospectiveInnerPixelSize() -> (width: Int, height: Int) {
+        guard let px = prospectiveCropPixelRect() else {
+            return (image.cgImage.width, image.cgImage.height)
+        }
+        return (Int(px.width), Int(px.height))
+    }
+
     /// Applying the SAME preset is not an edit and must not touch history.
     @discardableResult
     func applyBackdrop(_ preset: BackdropPreset) -> Bool {
@@ -872,16 +898,31 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
         // Validate the PEAK here, not at export: a preset the document cannot
         // afford must be refused while the user is choosing it, with a message
         // about the backdrop rather than a redaction error much later.
-        let reserve = SliceBBackdrop.reservedBytes(
-            forInner: image.cgImage, preset: preset)
-        guard SliceBExport.budget(
-            SliceBExport.defaultBudgetBytes, minus: reserve) != nil else {
-            ToastHUD.show(
-                "This image is too large for a backdrop",
-                symbol: "exclamationmark.triangle.fill")
-            return false
+        //
+        // The peak is inner AND outer together, measured against the same
+        // dimensions the export will use — an active crop shrinks both. Only
+        // the reserve was checked before, so a document whose two buffers each
+        // fit but together do not was accepted here and failed at export.
+        // Removing a backdrop is always allowed: it can only shrink the peak,
+        // and a document must never be stuck wearing a frame it cannot export.
+        if preset != .none {
+            let inner = prospectiveInnerPixelSize()
+            let reserve = SliceBBackdrop.reservedBytes(
+                forInnerWidth: inner.width, height: inner.height,
+                preset: preset, pixelScale: pxScale)
+            guard let innerBudget = SliceBExport.budget(
+                SliceBExport.defaultBudgetBytes, minus: reserve),
+                let innerBytes = SliceBExport.byteCount(
+                    width: inner.width, height: inner.height),
+                innerBytes <= innerBudget
+            else {
+                ToastHUD.show(
+                    "This image is too large for a backdrop",
+                    symbol: "exclamationmark.triangle.fill")
+                return false
+            }
         }
-        registerUndoSnapshotWithoutCancellingJobs()
+        registerBackdropUndo(from: backdropPreset)
         backdropPreset = preset
         needsDisplay = true
         onStateChange?()
@@ -956,18 +997,11 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
 
         var base = image.cgImage
         var croppedBase: CGImage?
-        if currentTool == .crop, let crop = cropRect, hasValidCropSelection {
-            let viewRect = crop.intersection(bounds)
-            let requested = EditableSelectionGeometry.pixelCropRect(
-                for: viewRect, in: bounds, scale: pxScale)
-            let imageBounds = CGRect(
-                x: 0, y: 0, width: base.width, height: base.height)
-            let px = requested.intersection(imageBounds)
+        if currentTool == .crop, cropRect != nil, hasValidCropSelection {
             // FAIL CLOSED: if the crop cannot be materialized we must NOT fall
             // back to the full base — that would export the pixels the user
             // just cropped away.
-            guard !viewRect.isNull, viewRect.width >= 4, viewRect.height >= 4,
-                  !px.isNull, px.width >= 1, px.height >= 1,
+            guard let px = prospectiveCropPixelRect(),
                   let cropped = base.cropping(to: px),
                   let owned = cropped.materialized()
             else { return nil }
@@ -993,7 +1027,7 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
         // committed. The budget the inner render may use is reduced by what the
         // outer frame will need, because both buffers exist at the same time.
         let outerReserve = SliceBBackdrop.reservedBytes(
-            forInner: base, preset: backdropPreset)
+            forInner: base, preset: backdropPreset, pixelScale: pxScale)
         guard let innerBudget = SliceBExport.budget(
             SliceBExport.defaultBudgetBytes, minus: outerReserve)
         else { return nil }
@@ -1151,15 +1185,23 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
             image: image, backdrop: backdropPreset)
     }
 
-    /// History only. A preset change is not a structural edit, so it must not
-    /// cancel OCR work in flight — that would widen pending masks to full as an
-    /// invisible, un-undoable side effect of picking a colour.
-    func registerUndoSnapshotWithoutCancellingJobs() {
+    /// A preset change touches ONE field, so its undo restores one field.
+    ///
+    /// It must not cancel OCR jobs (that would widen pending masks to full as
+    /// an invisible, un-undoable side effect of picking a colour) and it must
+    /// not snapshot the document either: `snapshot()` clones every annotation,
+    /// so undoing a preset would swap the live blur a job is resolving for a
+    /// detached copy. A result landing after that undo mutates the orphan and
+    /// the visible mask never narrows; a result landing before it is thrown
+    /// away when the stale pending clone is restored. Keeping annotation
+    /// identity untouched makes both delivery orders correct.
+    func registerBackdropUndo(from previous: BackdropPreset) {
         historyMutationCountForTesting += 1
-        let snap = snapshot()
         undoManager?.registerUndo(withTarget: self) { canvas in
-            canvas.registerUndoSnapshotWithoutCancellingJobs()
-            canvas.restore(snap)
+            canvas.registerBackdropUndo(from: canvas.backdropPreset)
+            canvas.backdropPreset = previous
+            canvas.needsDisplay = true
+            canvas.onStateChange?()
         }
     }
 
@@ -2034,12 +2076,17 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
                 "backing=[\(backing)]",
             ].joined(separator: " ")
         } ?? "none"
+        // The size a flatten right now would produce, which is the cropped
+        // size when a crop is pending — reporting the full image there would
+        // make the fingerprint disagree with the export it is meant to police.
         let outerSize: String = {
             guard backdropPreset != .none else { return "none" }
-            let pad = Int(SliceBBackdrop.padding(
-                forLongEdge: CGFloat(max(
-                    image.cgImage.width, image.cgImage.height))))
-            return "\(image.cgImage.width + pad * 2)x\(image.cgImage.height + pad * 2)"
+            let inner = prospectiveInnerPixelSize()
+            guard let outer = SliceBBackdrop.outerDimensions(
+                innerWidth: inner.width, innerHeight: inner.height,
+                preset: backdropPreset, pixelScale: pxScale)
+            else { return "invalid" }
+            return "\(outer.width)x\(outer.height)"
         }()
         return [
             "px=\(SelfTest.imageHashForTesting(image.cgImage))",

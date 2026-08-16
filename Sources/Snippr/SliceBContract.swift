@@ -593,13 +593,10 @@ enum SliceBExport {
         pixelScale: CGFloat = 1
     ) -> CGImage? {
         let w = base.width, h = base.height
-        guard w > 0, h > 0 else { return nil }
         // Same overflow discipline as the outer compose: a huge stitch must
         // fail closed here, not trap or wrap into a small number.
-        let (pixels, pixelsOverflow) = w.multipliedReportingOverflow(by: h)
-        guard !pixelsOverflow else { return nil }
-        let (needed, bytesOverflow) = pixels.multipliedReportingOverflow(by: 4)
-        guard !bytesOverflow, needed <= budgetBytes else { return nil }
+        guard let needed = byteCount(width: w, height: h),
+              needed <= budgetBytes else { return nil }
         guard let ctx = CGContext(
             data: nil, width: w, height: h, bitsPerComponent: 8,
             bytesPerRow: 0,
@@ -618,6 +615,17 @@ enum SliceBExport {
             pixelScale: pixelScale)
         else { return nil }
         return ctx.makeImage()
+    }
+
+    /// Bytes an RGBA buffer of these dimensions occupies, or nil when the
+    /// product cannot be represented. Pure and allocation-free, so a caller can
+    /// check the PEAK of several buffers before it commits to any of them.
+    static func byteCount(width: Int, height: Int) -> Int? {
+        guard width > 0, height > 0 else { return nil }
+        let (pixels, pOverflow) = width.multipliedReportingOverflow(by: height)
+        guard !pOverflow else { return nil }
+        let (bytes, bOverflow) = pixels.multipliedReportingOverflow(by: 4)
+        return bOverflow ? nil : bytes
     }
 
     /// 256 MP * 4 bytes, matching slice A's resize cap.
@@ -663,6 +671,37 @@ enum SliceBSymbols {
 
 // MARK: - Backdrop
 
+/// Drives an OUTER compose failure. The regional seam only fails the inner
+/// render, so without this the fail-closed path through `compose` — the one
+/// that decides whether a terminal action may proceed — is never exercised.
+enum ForcedOuterComposeFailure {
+    nonisolated(unsafe) private static var tokens: Set<ObjectIdentifier> = []
+    private static let lock = NSLock()
+
+    static var isActive: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return !tokens.isEmpty
+    }
+
+    private final class Token {}
+
+    static func scoped<T>(_ body: () -> T) -> T {
+        let token = Token()
+        let id = ObjectIdentifier(token)
+        lock.lock()
+        tokens.insert(id)
+        lock.unlock()
+        defer {
+            lock.lock()
+            tokens.remove(id)
+            lock.unlock()
+            _ = token
+        }
+        return body()
+    }
+}
+
 enum BackdropPreset: String, CaseIterable {
     case none, ocean, sunset, mint, graphite
 }
@@ -673,8 +712,44 @@ enum SliceBBackdrop {
     /// A 40 000 px scrolling capture would otherwise get 2 400 px of padding.
     static let maxPadding: CGFloat = 320
 
-    static func padding(forLongEdge edge: CGFloat) -> CGFloat {
-        min(maxPadding, max(minPadding, (edge * paddingFraction).rounded()))
+    /// How far the drop shadow reaches beyond the image edge, in PIXELS. The
+    /// shadow is a point metric, so at scale 2 it reaches 64 px below the image
+    /// while the 40 px floor would clip it — the frame must be at least this
+    /// wide on every edge or the shadow is cut off at the outer canvas.
+    static func shadowExtent(pixelScale: CGFloat) -> CGFloat {
+        let scale = max(1, pixelScale)
+        return ((shadowBlurPt + abs(shadowOffsetPt)) * scale).rounded(.up)
+    }
+
+    /// The floor is whichever is larger: the fixed minimum or the shadow's own
+    /// reach. The 320 px cap is raised to the floor for the same reason — a cap
+    /// that clips the shadow is not a cap, it is a rendering bug.
+    static func padding(
+        forLongEdge edge: CGFloat, pixelScale: CGFloat = 1
+    ) -> CGFloat {
+        let floor = max(minPadding, shadowExtent(pixelScale: pixelScale))
+        let cap = max(maxPadding, floor)
+        return min(cap, max(floor, (edge * paddingFraction).rounded()))
+    }
+
+    /// Outer canvas size for an inner image of these dimensions. Preview,
+    /// reserve, fingerprint and export all read the frame's size from HERE, so
+    /// none of them can disagree about how big the composed result is.
+    static func outerDimensions(
+        innerWidth: Int, innerHeight: Int, preset: BackdropPreset,
+        pixelScale: CGFloat = 1
+    ) -> (width: Int, height: Int)? {
+        guard innerWidth > 0, innerHeight > 0 else { return nil }
+        guard preset != .none else { return (innerWidth, innerHeight) }
+        let pad = Int(padding(
+            forLongEdge: CGFloat(max(innerWidth, innerHeight)),
+            pixelScale: pixelScale))
+        let (twice, tOverflow) = pad.multipliedReportingOverflow(by: 2)
+        guard !tOverflow else { return nil }
+        let (w, wOverflow) = innerWidth.addingReportingOverflow(twice)
+        let (h, hOverflow) = innerHeight.addingReportingOverflow(twice)
+        guard !wOverflow, !hOverflow else { return nil }
+        return (w, h)
     }
 
     /// Backdrop is an OUTER frame: a click at `padded` must resolve to the
@@ -689,18 +764,26 @@ enum SliceBBackdrop {
     /// are alive at once during a compose, so the caller must reserve this
     /// before it renders the inner one.
     static func reservedBytes(
-        forInner image: CGImage, preset: BackdropPreset
+        forInnerWidth width: Int, height: Int, preset: BackdropPreset,
+        pixelScale: CGFloat = 1
     ) -> Int {
         guard preset != .none else { return 0 }
-        let pad = Int(padding(
-            forLongEdge: CGFloat(max(image.width, image.height))))
-        let (w, wOverflow) = image.width.addingReportingOverflow(pad * 2)
-        let (h, hOverflow) = image.height.addingReportingOverflow(pad * 2)
-        guard !wOverflow, !hOverflow else { return Int.max }
-        let (pixels, pOverflow) = w.multipliedReportingOverflow(by: h)
-        guard !pOverflow else { return Int.max }
-        let (bytes, bOverflow) = pixels.multipliedReportingOverflow(by: 4)
-        return bOverflow ? Int.max : bytes
+        guard let outer = outerDimensions(
+            innerWidth: width, innerHeight: height, preset: preset,
+            pixelScale: pixelScale),
+            let bytes = SliceBExport.byteCount(
+                width: outer.width, height: outer.height)
+        else { return Int.max }
+        return bytes
+    }
+
+    static func reservedBytes(
+        forInner image: CGImage, preset: BackdropPreset,
+        pixelScale: CGFloat = 1
+    ) -> Int {
+        reservedBytes(
+            forInnerWidth: image.width, height: image.height, preset: preset,
+            pixelScale: pixelScale)
     }
 
     /// `.none` is byte-identical to the input; anything over budget fails
@@ -717,29 +800,35 @@ enum SliceBBackdrop {
         pixelScale: CGFloat = 1
     ) -> CGImage? {
         guard preset != .none else { return image }
+        guard !ForcedOuterComposeFailure.isActive else { return nil }
         let pad = padding(
-            forLongEdge: CGFloat(max(image.width, image.height)))
-        let (w, wOverflow) = image.width.addingReportingOverflow(Int(pad) * 2)
-        let (h, hOverflow) = image.height.addingReportingOverflow(Int(pad) * 2)
-        guard !wOverflow, !hOverflow else { return nil }
-        let (pixels, pOverflow) = w.multipliedReportingOverflow(by: h)
-        guard !pOverflow else { return nil }
-        let (bytes, bOverflow) = pixels.multipliedReportingOverflow(by: 4)
-        guard !bOverflow, bytes <= budgetBytes else { return nil }
+            forLongEdge: CGFloat(max(image.width, image.height)),
+            pixelScale: pixelScale)
+        guard let outer = outerDimensions(
+            innerWidth: image.width, innerHeight: image.height, preset: preset,
+            pixelScale: pixelScale),
+            let bytes = SliceBExport.byteCount(
+                width: outer.width, height: outer.height),
+            bytes <= budgetBytes
+        else { return nil }
+        let w = outer.width, h = outer.height
+        // Built ONCE and required. Building it per draw with `if let` and
+        // carrying on when it is nil returns a non-nil frame that is missing
+        // its background entirely — a malformed export that terminal callers
+        // would treat as success.
+        guard let fill = CGGradient(
+            colorsSpace: CGColorSpace(name: CGColorSpace.sRGB)!,
+            colors: gradient(for: preset) as CFArray, locations: [0, 1])
+        else { return nil }
         guard let ctx = CGContext(
             data: nil, width: w, height: h, bitsPerComponent: 8,
             bytesPerRow: 0,
             space: image.colorSpace ?? CGColorSpace(name: CGColorSpace.sRGB)!,
             bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
         else { return nil }
-        let colors = gradient(for: preset)
-        if let gradient = CGGradient(
-            colorsSpace: CGColorSpace(name: CGColorSpace.sRGB)!,
-            colors: colors as CFArray, locations: [0, 1]) {
-            ctx.drawLinearGradient(
-                gradient, start: CGPoint(x: 0, y: CGFloat(h)),
-                end: CGPoint(x: CGFloat(w), y: 0), options: [])
-        }
+        ctx.drawLinearGradient(
+            fill, start: CGPoint(x: 0, y: CGFloat(h)),
+            end: CGPoint(x: CGFloat(w), y: 0), options: [])
         let target = CGRect(
             x: pad, y: pad,
             width: CGFloat(image.width), height: CGFloat(image.height))
@@ -763,13 +852,9 @@ enum SliceBBackdrop {
         ctx.saveGState()
         ctx.addPath(rounded)
         ctx.clip()
-        if let gradient = CGGradient(
-            colorsSpace: CGColorSpace(name: CGColorSpace.sRGB)!,
-            colors: colors as CFArray, locations: [0, 1]) {
-            ctx.drawLinearGradient(
-                gradient, start: CGPoint(x: 0, y: CGFloat(h)),
-                end: CGPoint(x: CGFloat(w), y: 0), options: [])
-        }
+        ctx.drawLinearGradient(
+            fill, start: CGPoint(x: 0, y: CGFloat(h)),
+            end: CGPoint(x: CGFloat(w), y: 0), options: [])
         ctx.draw(image, in: target)
         ctx.restoreGState()
         return ctx.makeImage()

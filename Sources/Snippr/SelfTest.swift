@@ -8184,6 +8184,119 @@ enum SelfTest {
                   padOK && plainParity && framedOK && backdropStarved == nil,
                   "pad \(padOK) none \(plainParity) framed \(framed?.width ?? -1) starved \(backdropStarved == nil)")
 
+            // 10b. Retina: the frame must be wide enough for its own shadow,
+            // and an outer-compose failure must be fail-closed.
+            //
+            // Shadow is a POINT metric: at scale 2 it reaches 64 px past the
+            // image, while the fixed 40 px floor would cut it off at the outer
+            // canvas. The four outer border lines are checked for a dark band,
+            // with the ring just outside the image as a positive control so the
+            // gate cannot pass by finding no shadow at all.
+            let extentOK = SliceBBackdrop.shadowExtent(pixelScale: 2) == 64
+                && SliceBBackdrop.shadowExtent(pixelScale: 1) == 32
+                && SliceBBackdrop.padding(forLongEdge: 60, pixelScale: 2) == 64
+                && SliceBBackdrop.padding(forLongEdge: 60, pixelScale: 1) == 40
+            let retinaInner = makeSolidImage(
+                width: 60, height: 40, color: NSColor.white.cgColor)
+            let retinaFrame = SliceBBackdrop.compose(
+                image: retinaInner, preset: .ocean,
+                budgetBytes: SliceBExport.defaultBudgetBytes, pixelScale: 2)
+            let expectedOuter = SliceBBackdrop.outerDimensions(
+                innerWidth: 60, innerHeight: 40, preset: .ocean, pixelScale: 2)
+            let dimsOK = expectedOuter?.width == 188
+                && expectedOuter?.height == 168
+                && retinaFrame?.width == expectedOuter?.width
+                && retinaFrame?.height == expectedOuter?.height
+            // One rasterization; `probe` redraws the whole image per call.
+            func rasterize(_ image: CGImage) -> [UInt8]? {
+                var bytes = [UInt8](
+                    repeating: 0, count: image.width * image.height * 4)
+                guard let c = CGContext(
+                    data: &bytes, width: image.width, height: image.height,
+                    bitsPerComponent: 8, bytesPerRow: image.width * 4,
+                    space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                    bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+                else { return nil }
+                c.interpolationQuality = .none
+                c.draw(image, in: CGRect(
+                    x: 0, y: 0, width: image.width, height: image.height))
+                return bytes
+            }
+            var shadowOK = false
+            var shadowDetail = "frame nil"
+            if let frame = retinaFrame, let px = rasterize(frame) {
+                let w = frame.width, h = frame.height
+                func at(_ x: Int, _ yBL: Int) -> (Int, Int, Int, Int) {
+                    let i = ((h - 1 - yBL) * w + x) * 4
+                    return (Int(px[i]), Int(px[i + 1]), Int(px[i + 2]),
+                            Int(px[i + 3]))
+                }
+                func lum(_ x: Int, _ y: Int) -> Double {
+                    let p = at(x, y)
+                    return Double(luma((p.0, p.1, p.2)))
+                }
+                // The background is ONE linear gradient, so its luma is an
+                // affine function of position. Fitting that plane from three
+                // far corners — 80 px from the shape, where a 48 px blur has
+                // nothing left — gives the shadow-free background at every
+                // pixel without needing a second render to compare against.
+                let l00 = lum(0, 0)
+                let lx = (lum(w - 1, 0) - l00) / Double(w - 1)
+                let ly = (lum(0, h - 1) - l00) / Double(h - 1)
+                func model(_ x: Int, _ y: Int) -> Double {
+                    l00 + lx * Double(x) + ly * Double(y)
+                }
+                let cornerErr = abs(model(w - 1, h - 1) - lum(w - 1, h - 1))
+                var worstBorder = 0.0
+                var opaque = true
+                for x in 0..<w {
+                    for y in [0, h - 1] {
+                        worstBorder = max(worstBorder, model(x, y) - lum(x, y))
+                        if at(x, y).3 != 255 { opaque = false }
+                    }
+                }
+                for y in 0..<h {
+                    for x in [0, w - 1] {
+                        worstBorder = max(worstBorder, model(x, y) - lum(x, y))
+                        if at(x, y).3 != 255 { opaque = false }
+                    }
+                }
+                // Positive control: two rows below the image IS in shadow, so
+                // the same model must show a large deficit there. Without this
+                // the border check would also pass on a frame with no shadow.
+                let shadowed = (64..<124).map { model($0, 62) - lum($0, 62) }
+                    .min() ?? 0
+                shadowOK = cornerErr <= 4 && worstBorder <= 5 && opaque
+                    && shadowed >= 10
+                shadowDetail = "corner \(Int(cornerErr)) "
+                    + "border \(Int(worstBorder)) opaque \(opaque) "
+                    + "shadowed \(Int(shadowed))"
+            }
+            check("sliceB-backdrop-shadow-extent",
+                  extentOK && dimsOK && shadowOK,
+                  "extent \(extentOK) dims \(dimsOK) \(shadowDetail)")
+
+            // 10c. A failed outer compose returns nil rather than a frame that
+            // is missing its background, so terminal callers cannot proceed.
+            let composeFailed = ForcedOuterComposeFailure.scoped {
+                SliceBBackdrop.compose(
+                    image: retinaInner, preset: .ocean,
+                    budgetBytes: SliceBExport.defaultBudgetBytes, pixelScale: 2)
+            }
+            let composeAfter = SliceBBackdrop.compose(
+                image: retinaInner, preset: .ocean,
+                budgetBytes: SliceBExport.defaultBudgetBytes, pixelScale: 2)
+            let noneUnaffected = ForcedOuterComposeFailure.scoped {
+                SliceBBackdrop.compose(
+                    image: retinaInner, preset: .none,
+                    budgetBytes: SliceBExport.defaultBudgetBytes)
+            }
+            check("sliceB-backdrop-outer-fail-closed",
+                  composeFailed == nil && composeAfter != nil
+                    && noneUnaffected != nil,
+                  "failed \(composeFailed == nil) after \(composeAfter != nil) "
+                    + "none \(noneUnaffected != nil)")
+
             // 11. New types survive copy / move / resize like every other mark.
             let sp = SpotlightAnnotation(uiScale: 1)
             sp.rect = CGRect(x: 10, y: 10, width: 20, height: 20)
