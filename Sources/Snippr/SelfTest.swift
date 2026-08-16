@@ -9861,12 +9861,22 @@ enum SelfTest {
                     with: CapturedImage(cgImage: source, scale: 1),
                     forceFitForTesting: true)
                 let canvas = wc.canvasForTesting
+                // Two preset edits and an undo in the same event would
+                // coalesce, and the undo would run both inverses and land on
+                // None while this gate is asking about Ocean.
+                let previousGrouping = canvas.undoManager?.groupsByEvent ?? true
+                canvas.undoManager?.groupsByEvent = false
+                func grouped(_ body: () -> Void) {
+                    canvas.undoManager?.beginUndoGrouping()
+                    body()
+                    canvas.undoManager?.endUndoGrouping()
+                }
                 func settle() {
                     RunLoop.current.run(until: Date().addingTimeInterval(0.05))
                 }
                 settle()
                 let plainZoom = wc.scrollMagnificationForTesting
-                _ = canvas.applyBackdrop(.ocean)
+                grouped { _ = canvas.applyBackdrop(.ocean) }
                 settle()
                 let framedZoom = wc.scrollMagnificationForTesting
                 if !wc.imageFitsViewportForTesting() {
@@ -9876,7 +9886,7 @@ enum SelfTest {
                     chromeFailures.append(
                         "framed-zoom \(framedZoom) vs \(plainZoom)")
                 }
-                _ = canvas.applyBackdrop(.none)
+                grouped { _ = canvas.applyBackdrop(.none) }
                 settle()
                 if !wc.imageFitsViewportForTesting() {
                     chromeFailures.append("plain-overflows")
@@ -9900,38 +9910,54 @@ enum SelfTest {
                 }
                 // A live text field in the corner cut-out must not show in the
                 // preview: the export clips it away.
-                _ = canvas.applyBackdrop(.ocean)
+                grouped { _ = canvas.applyBackdrop(.ocean) }
                 settle()
                 let layout = canvas.backdropLayout
                 canvas.beginTextEditingForTesting(at: CGPoint(x: 2, y: 2))
                 if let wrapper = wc.documentWrapperForTesting,
                    let field = canvas.textFieldForTesting {
                     wrapper.layoutSubtreeIfNeeded()
-                    // The field lives inside the canvas, which is masked to the
-                    // rounded document, so the corner it sits in is clipped.
+                    // The mask is what clips SUBVIEWS. It is asserted as state
+                    // rather than as pixels on purpose: a layer mask is applied
+                    // by the compositor, and every in-process render of a view
+                    // hierarchy bypasses that, so no snapshot this gate can
+                    // take would show it. The draw-path clip is what the
+                    // raster gates above prove.
                     let masked = canvas.layer?.masksToBounds == true
                         && canvas.layer?.cornerRadius
                             == SliceBBackdrop.cornerRadiusPt
                     if !masked {
                         chromeFailures.append("subview-unmasked")
                     }
-                    // And the point it occupies is not pickable either.
-                    let inWrapper = wrapper.convert(
-                        CGPoint(x: field.frame.minX + 1,
-                                y: field.frame.minY + 1),
-                        from: canvas)
+                    // A point that is inside the FIELD and inside the canvas
+                    // rectangle, but outside the rounded document. The earlier
+                    // probe sat above the canvas entirely, where even a wrapper
+                    // with no corner logic returns nil — it proved nothing.
+                    let local = CGPoint(x: 3, y: 3)
+                    let inField = field.convert(local, from: canvas)
+                    let inWrapper = wrapper.convert(local, from: canvas)
                     let inner = layout.innerPointRect
                     let radius = SliceBBackdrop.cornerRadiusPt
                     let rounded = CGPath(
                         roundedRect: inner, cornerWidth: radius,
                         cornerHeight: radius, transform: nil)
-                    if !rounded.contains(inWrapper),
-                       wrapper.hitTest(inWrapper) != nil {
+                    if !field.bounds.contains(inField) {
+                        chromeFailures.append(
+                            "probe-outside-field \(field.frame)")
+                    }
+                    if !canvas.bounds.contains(local) {
+                        chromeFailures.append("probe-outside-canvas")
+                    }
+                    if rounded.contains(inWrapper) {
+                        chromeFailures.append("probe-inside-curve")
+                    }
+                    if wrapper.hitTest(inWrapper) != nil {
                         chromeFailures.append("corner-field-hit")
                     }
                 } else {
                     chromeFailures.append("no-field")
                 }
+                canvas.undoManager?.groupsByEvent = previousGrouping
                 wc.window?.close()
             }
             check("sliceB-backdrop-chrome-follows-frame",
