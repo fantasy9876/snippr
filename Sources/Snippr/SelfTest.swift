@@ -1061,7 +1061,11 @@ enum SelfTest {
                   forced.status != 0 && forced.installedMarker == "old"
                     && forced.oldMarker == nil && !forced.candidateAlive
                     && forced.gracefulHelperStarted
-                    && !forced.gracefulHelperAlive && forced.elapsed < 10
+                    // The translated x86_64 process pays Rosetta startup
+                    // overhead for each shell/tool child. Keep this fixture
+                    // bounded while allowing the same transaction to run on
+                    // both native arm64 (<10 s observed) and Rosetta.
+                    && !forced.gracefulHelperAlive && forced.elapsed < 15
                     && forced.canonicalOpenCount == 2
                     && forced.reopenedOld && forced.transactionClean
                     && forced.signalLog.contains("--request-terminate-pid")
