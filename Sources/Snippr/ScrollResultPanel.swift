@@ -812,6 +812,11 @@ final class AnnotationHostView: NSView, RedactionSurfaceDelegate {
         let origin = textPixelOrigin
         textField = nil
         field.removeFromSuperview()
+        // Parity with the area view: hand the keyboard back explicitly.
+        // Removing the field leaves the window's first responder wherever the
+        // field editor left it, and every tool shortcut would stay dead until
+        // something else claimed it.
+        window?.makeFirstResponder(self)
         if commit, !value.isEmpty {
             surface.addText(value, atPixel: origin)
             needsDisplay = true
