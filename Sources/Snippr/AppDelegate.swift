@@ -133,8 +133,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Debug breadcrumb: lets tooling confirm the app booted and see its TCC state.
     private func writeLaunchStatus() {
+        let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0"
+        let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "0"
         let status = """
         pid=\(ProcessInfo.processInfo.processIdentifier)
+        version=\(version)
+        build=\(build)
+        executable=\(Bundle.main.executableURL?.path ?? "")
         screenRecording=\(CGPreflightScreenCaptureAccess())
         accessibility=\(AXIsProcessTrusted())
         launchedAt=\(Date())

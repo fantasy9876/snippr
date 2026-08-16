@@ -23,6 +23,16 @@ enum UpdateChecker {
     /// tampered manifest from pointing the downloader at an arbitrary origin.
     nonisolated static let allowedDownloadHost = "snippr.pages.dev"
     nonisolated static let installerExitWaitSeconds = 15
+    nonisolated static let installerHealthWaitSeconds = 10
+
+    /// Public fingerprint of the one release certificate. TCC grants survive
+    /// an update only when the bundle identifier AND signing requirement stay
+    /// the same; accepting any signer for the right identifier silently turns
+    /// the new build into a different app from macOS's point of view.
+    nonisolated static let canonicalReleaseSignerSHA1 =
+        "946c43e6456970f5ec11544b3244c192aae949d6"
+    nonisolated static let canonicalReleaseDesignatedRequirement =
+        "identifier \"com.manhhoang.snippr\" and certificate root = H\"\(canonicalReleaseSignerSHA1)\""
 
     /// A single running Snippr process may only hand off one installer. This
     /// closes the window where repeated manual checks could race through the
@@ -31,10 +41,11 @@ enum UpdateChecker {
 
     // Kept in one place so the detached installer and its fail-first fixture
     // exercise the exact same code-signature verifier arguments.
-    nonisolated static let codeSignatureVerifyArguments = [
-        "--verify", "--deep", "--strict",
-        "-R=identifier \"com.manhhoang.snippr\"",
-    ]
+    nonisolated static func codeSignatureVerifyArguments(
+        requirement: String = canonicalReleaseDesignatedRequirement
+    ) -> [String] {
+        ["--verify", "--deep", "--strict", "-R=\(requirement)"]
+    }
 
     static var currentVersion: String {
         Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0"
@@ -115,7 +126,7 @@ enum UpdateChecker {
 
         let alert = NSAlert()
         alert.messageText = "Snippr \(remote.mac) đã có bản mới"
-        alert.informativeText = "Bạn đang dùng \(currentVersion). Cập nhật sẽ tải bản mới, thay thế và tự mở lại app — quyền hệ thống giữ nguyên."
+        alert.informativeText = "Bạn đang dùng \(currentVersion). Cập nhật sẽ tải bản mới, xác minh đúng nhà phát hành, thay thế và tự mở lại app. Quyền hệ thống được giữ khi bản hiện tại đã dùng cùng danh tính ký; bản ad-hoc/cũ có thể cần cấp lại một lần."
         alert.addButton(withTitle: "Cập nhật & mở lại")
         alert.addButton(withTitle: "Để sau")
         NSApp.activate(ignoringOtherApps: true)
@@ -193,6 +204,8 @@ enum UpdateChecker {
                     String(ProcessInfo.processInfo.processIdentifier),
                     String(installerExitWaitSeconds),
                     "/usr/bin/open", "/bin/mv", privateDirectory.path,
+                    launchStatusURL.path, String(installerHealthWaitSeconds),
+                    "/bin/rm",
                 ]
                 try proc.run()
                 handedOff = true
@@ -208,9 +221,14 @@ enum UpdateChecker {
     ///   $1 DMG path, $2 installed app path, $3 delay seconds, $4 relaunch 0/1,
     ///   $5 expected marketing version, $6 persistent log path,
     ///   $7 expected DMG SHA-256, $8 old app PID, $9 PID wait timeout,
-    ///   $10 open tool, $11 activation move tool, $12 private attempt directory.
-    nonisolated static func detachedInstallerScript() -> String {
-        let verificationFlags = codeSignatureVerifyArguments
+    ///   $10 open tool, $11 activation move tool, $12 private attempt directory,
+    ///   $13 launch-health breadcrumb, $14 launch-health wait timeout,
+    ///   $15 committed-backup cleanup tool.
+    nonisolated static func detachedInstallerScript(
+        signatureRequirement: String = canonicalReleaseDesignatedRequirement
+    ) -> String {
+        let verificationFlags = codeSignatureVerifyArguments(
+            requirement: signatureRequirement)
             .map(shellQuote)
             .joined(separator: " ")
         return """
@@ -224,6 +242,9 @@ enum UpdateChecker {
             OPEN_TOOL="${10:-/usr/bin/open}"
             ACTIVATE_TOOL="${11:-/bin/mv}"
             ATTEMPT_DIR="${12:-}"
+            HEALTH_FILE="${13:-$HOME/Library/Application Support/Snippr/status.txt}"
+            HEALTH_TIMEOUT="${14:-10}"
+            REMOVE_BACKUP_TOOL="${15:-/bin/rm}"
             [ -n "$LOG" ] || LOG="$HOME/Library/Logs/Snippr/update.log"
             LOG_DIR="${LOG%/*}"
             [ "$LOG_DIR" = "$LOG" ] && LOG_DIR="."
@@ -252,6 +273,30 @@ enum UpdateChecker {
             reopen() {
               [ "$RELAUNCH" = "1" ] || return 0
               "$OPEN_TOOL" "$APP" >&3 2>&1
+            }
+            wait_for_health() {
+              [ "$RELAUNCH" = "1" ] || return 0
+              HEALTH_REMAINING="$HEALTH_TIMEOUT"
+              EXPECTED_EXECUTABLE="$APP/Contents/MacOS/Snippr"
+              while [ "$HEALTH_REMAINING" -gt 0 ]; do
+                if [ -f "$HEALTH_FILE" ]; then
+                  HEALTH_PID=$(/usr/bin/sed -n 's/^pid=\\([0-9][0-9]*\\)$/\\1/p' "$HEALTH_FILE" | /usr/bin/head -1)
+                  HEALTH_VERSION=$(/usr/bin/sed -n 's/^version=\\(.*\\)$/\\1/p' "$HEALTH_FILE" | /usr/bin/head -1)
+                  HEALTH_EXECUTABLE=$(/usr/bin/sed -n 's/^executable=\\(.*\\)$/\\1/p' "$HEALTH_FILE" | /usr/bin/head -1)
+                  if [ -n "$HEALTH_PID" ] && [ "$HEALTH_VERSION" = "$EXPECTED_VERSION" ] \
+                    && [ "$HEALTH_EXECUTABLE" = "$EXPECTED_EXECUTABLE" ] \
+                    && /bin/kill -0 "$HEALTH_PID" 2>/dev/null; then
+                    /bin/sleep 1
+                    if /bin/kill -0 "$HEALTH_PID" 2>/dev/null; then
+                      log "HEALTHY version=$HEALTH_VERSION pid=$HEALTH_PID executable=$HEALTH_EXECUTABLE"
+                      return 0
+                    fi
+                  fi
+                fi
+                /bin/sleep 1
+                HEALTH_REMAINING=$((HEALTH_REMAINING - 1))
+              done
+              return 1
             }
             restore_old() {
               if [ "$BACKED_UP" = "1" ] && [ -e "$APP.old" ]; then
@@ -305,6 +350,7 @@ enum UpdateChecker {
             case "$DELAY" in *[!0-9]*|'') STAGE="arguments"; fail 2 ;; esac
             case "$OLD_PID" in *[!0-9]*|'') STAGE="arguments"; fail 2 ;; esac
             case "$WAIT_TIMEOUT" in *[!0-9]*|'') STAGE="arguments"; fail 2 ;; esac
+            case "$HEALTH_TIMEOUT" in *[!0-9]*|'') STAGE="arguments"; fail 2 ;; esac
             [ -n "$DMG" ] && [ -n "$APP" ] && [ -n "$EXPECTED_VERSION" ] \
               && [ -n "$EXPECTED_SHA" ] || { STAGE="arguments"; fail 2; }
 
@@ -369,13 +415,24 @@ enum UpdateChecker {
               fail 1
             fi
             STAGE="cleanup"
+            if [ "$RELAUNCH" = "1" ]; then
+              STAGE="health-prepare"
+              /bin/rm -f "$HEALTH_FILE" 2>&3 || fail
+            fi
             STAGE="relaunch"
             reopen
             REOPEN_STATUS=$?
             [ "$REOPEN_STATUS" -eq 0 ] || fail "$REOPEN_STATUS"
-            /bin/rm -rf "$APP.old" 2>&3 || log "WARN stage=remove-backup app_old=$APP.old"
+            STAGE="health"
+            wait_for_health || fail 1
+            # Health is the commit point. Disable rollback before best-effort
+            # journal cleanup: a signal or partial rm must never replace the
+            # healthy candidate with a partially deleted backup.
             BACKED_UP=0
+            ACTIVATED=0
             trap - HUP INT TERM
+            "$REMOVE_BACKUP_TOOL" -rf "$APP.old" 2>&3 \
+              || log "WARN stage=remove-backup app_old=$APP.old"
             log "SUCCESS version=$EXPECTED_VERSION app=$APP"
             exit 0
             """
@@ -442,6 +499,11 @@ enum UpdateChecker {
     private static var updateLogURL: URL {
         FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Logs/Snippr/update.log")
+    }
+
+    private static var launchStatusURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/Snippr/status.txt")
     }
 
     /// Streaming SHA-256 so a large DMG isn't held in memory all at once.
