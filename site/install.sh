@@ -22,17 +22,6 @@ TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 curl -fsSL "https://snippr.pages.dev/$DMG" -o "$TMP/$DMG"
 
-# Only /Applications/Snippr.app is canonical: macOS ties Screen Recording /
-# Accessibility grants to the installed app's signature; a second copy with the
-# same bundle id (an old drag-install in ~/Applications, a Downloads copy) can be
-# opened by Spotlight/Launchpad instead and the user is asked to grant again.
-# Never delete on the user's behalf — name them.
-DUPES=$(mdfind "kMDItemCFBundleIdentifier == 'com.manhhoang.snippr'" 2>/dev/null   | grep -v '^/Applications/Snippr.app$' | grep -v '^/Volumes/' || true)
-if [ -n "$DUPES" ]; then
-  echo "⚠️  Có bản Snippr khác trên máy — hãy xóa để không bị hỏi lại quyền Screen Recording:"
-  printf '   %s\n' $DUPES
-fi
-
 echo "→ Cài vào /Applications ..."
 MOUNT=$(hdiutil attach -nobrowse -readonly "$TMP/$DMG" | awk -F'\t' '/\/Volumes\//{print $NF}' | tail -1)
 osascript -e 'quit app "Snippr"' >/dev/null 2>&1 || true

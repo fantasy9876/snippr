@@ -83,6 +83,67 @@ enum SelfTest {
                     && !UpdateChecker.updateAllowed(for: nonCanonical)
                     && !UpdateChecker.updateAllowed(for: orphan),
                   "clean \(UpdateChecker.updateAllowed(for: clean)) nonCanonical \(UpdateChecker.updateAllowed(for: nonCanonical))")
+            // Launch disposition is decided BEFORE status item / hotkeys /
+            // launch status / TCC prompt: a wrong copy blocks — production
+            // has no "continue"; only the explicit debug override proceeds.
+            let dispClean = BundleIntegrity.launchDisposition(for: clean)
+            let dispDup = BundleIntegrity.launchDisposition(for: withDup)
+            let dispWrong = BundleIntegrity.launchDisposition(for: nonCanonical)
+            let dispOrphan = BundleIntegrity.launchDisposition(for: orphan)
+            let dispDebug = BundleIntegrity.launchDisposition(
+                for: nonCanonical, allowNonCanonical: true)
+            let dispNoBundle = BundleIntegrity.launchDisposition(for: nil)
+            check("integrity-launch-blocks-wrong-copy",
+                  dispClean == .proceed(warnDuplicates: [])
+                    && dispDup == .proceed(warnDuplicates: [home, dmg])
+                    && dispWrong == .blockWrongCopy(running: home, canonicalExists: true)
+                    && dispOrphan == .blockWrongCopy(running: home, canonicalExists: false)
+                    && dispDebug == .proceed(warnDuplicates: [canonical])
+                    && dispNoBundle == .proceed(warnDuplicates: []),
+                  "wrong \(dispWrong) orphan \(dispOrphan) debug \(dispDebug)")
+            // Handoff ordering, run for real: the helper must wait for the
+            // wrong-copy pid to be gone BEFORE opening the canonical app
+            // (`open -n`, quoted path) — otherwise the canonical
+            // single-instance guard sees the wrong copy and exits, leaving no
+            // Snippr at all. A fake "wrong copy" (sleep 1) stands in for our
+            // pid; /bin/echo stands in for /usr/bin/open.
+            var handoffOK = false
+            var handoffDetail = "not run"
+            do {
+                let fake = Process()
+                fake.executableURL = URL(fileURLWithPath: "/bin/sleep")
+                fake.arguments = ["1"]
+                try fake.run()
+                let argv = BundleIntegrity.handoffCommand(
+                    canonical: URL(fileURLWithPath: "/Applications/Snippr's Test.app"),
+                    waitForPID: fake.processIdentifier, timeoutSeconds: 5,
+                    openTool: "/bin/echo")
+                let helper = Process()
+                helper.executableURL = URL(fileURLWithPath: argv[0])
+                helper.arguments = Array(argv.dropFirst())
+                let pipe = Pipe()
+                helper.standardOutput = pipe
+                let started = Date()
+                try helper.run()
+                helper.waitUntilExit()
+                let elapsed = Date().timeIntervalSince(started)
+                let out = String(
+                    data: pipe.fileHandleForReading.readDataToEndOfFile(),
+                    encoding: .utf8) ?? ""
+                // /bin/echo -n <path> prints the path without newline: the
+                // helper reached `open -n` only after the fake pid ended.
+                handoffOK = !fake.isRunning
+                    && out == "/Applications/Snippr's Test.app"
+                    && elapsed >= 0.9 && elapsed < 4.5
+                    && argv[0] == "/bin/sh"
+                    && argv[2].range(of: "kill -0")!.lowerBound
+                        < argv[2].range(of: " -n ")!.lowerBound
+                handoffDetail = "out '\(out)' elapsed \(String(format: "%.2f", elapsed)) fakeRunning \(fake.isRunning)"
+            } catch {
+                handoffDetail = "error \(error)"
+            }
+            check("integrity-handoff-waits-then-opens-canonical", handoffOK, handoffDetail)
+
             // Live discovery must not crash headless; from a bare binary the
             // verdict is nil (no bundle to judge).
             let live = BundleIntegrity.discoveredBundles()

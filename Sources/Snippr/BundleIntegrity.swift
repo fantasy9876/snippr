@@ -83,43 +83,105 @@ enum BundleIntegrity {
         return evaluate(running: Bundle.main.bundleURL, discovered: discoveredBundles())
     }
 
-    /// Launch-time warning. Non-canonical: a modal that names the path and
-    /// offers to open the installed app instead (or continue — dev builds).
-    /// Canonical with duplicates: a modal that names the copies to remove.
-    /// Never deletes, never touches TCC.
-    @MainActor
-    static func warnOnLaunchIfNeeded(terminate: (() -> Void)? = nil) {
-        guard let verdict = currentVerdict() else { return }
+    /// What the app process may do at launch, decided BEFORE any status item,
+    /// hotkey, launch-status file or TCC prompt exists.
+    enum LaunchDisposition: Equatable {
+        /// Canonical copy: run normally, name any duplicates.
+        case proceed(warnDuplicates: [URL])
+        /// Wrong copy: block. Nothing may be initialised; the process ends
+        /// after the user has been pointed at the installed app.
+        case blockWrongCopy(running: URL, canonicalExists: Bool)
+    }
+
+    /// Pure mapping. `allowNonCanonical` is the DEBUG override (dev tools /
+    /// SNIPPR_ALLOW_NONCANONICAL=1); production never continues from a wrong
+    /// copy — that is exactly the path that ends in "grant it again".
+    static func launchDisposition(
+        for verdict: Verdict?, allowNonCanonical: Bool = false
+    ) -> LaunchDisposition {
         switch verdict {
-        case .canonical(let duplicates):
-            guard !duplicates.isEmpty else { return }
-            let alert = NSAlert()
-            alert.alertStyle = .warning
-            alert.messageText = "Phát hiện bản Snippr trùng"
-            alert.informativeText = "Có \(duplicates.count) bản Snippr khác trên máy. Spotlight/Launchpad có thể mở nhầm bản đó và macOS sẽ hỏi lại quyền Screen Recording. Hãy xóa các bản này, chỉ giữ /Applications/Snippr.app:\n\n"
-                + duplicates.map(\.path).joined(separator: "\n")
-            alert.addButton(withTitle: "OK")
-            alert.addButton(withTitle: "Hiện trong Finder")
-            if alert.runModal() == .alertSecondButtonReturn {
-                NSWorkspace.shared.activateFileViewerSelecting(duplicates)
+        case nil:
+            return .proceed(warnDuplicates: [])
+        case let .canonical(duplicates)?:
+            return .proceed(warnDuplicates: duplicates)
+        case let .runningNonCanonical(running, canonicalExists, duplicates)?:
+            if allowNonCanonical {
+                return .proceed(warnDuplicates: duplicates)
             }
-        case .runningNonCanonical(let running, let canonicalExists, _):
-            let alert = NSAlert()
-            alert.alertStyle = .critical
-            alert.messageText = "Snippr đang chạy từ vị trí không chuẩn"
-            alert.informativeText = "Bản này chạy từ:\n\(running.path)\n\nQuyền Screen Recording/Accessibility được cấp cho /Applications/Snippr.app; chạy bản khác sẽ bị hỏi quyền lại. "
-                + (canonicalExists
-                    ? "Hãy mở bản đã cài trong /Applications và xóa bản này."
-                    : "Hãy kéo Snippr vào /Applications rồi mở từ đó.")
-            if canonicalExists { alert.addButton(withTitle: "Mở bản trong /Applications") }
-            alert.addButton(withTitle: "Vẫn tiếp tục")
-            let response = alert.runModal()
-            if canonicalExists, response == .alertFirstButtonReturn {
-                NSWorkspace.shared.openApplication(
-                    at: canonicalURL, configuration: .init()) { _, _ in
-                    DispatchQueue.main.async { terminate?() ?? NSApp.terminate(nil) }
-                }
-            }
+            return .blockWrongCopy(running: running, canonicalExists: canonicalExists)
+        }
+    }
+
+    static var debugOverrideRequested: Bool {
+        ProcessInfo.processInfo.environment["SNIPPR_ALLOW_NONCANONICAL"] == "1"
+    }
+
+    /// Wrong copy: modal that names the path; "Mở bản trong /Applications"
+    /// (when it exists) opens the installed app. Returns only after the user
+    /// dismissed it — the caller terminates immediately. Never deletes,
+    /// never touches TCC.
+    @MainActor
+    static func presentWrongCopyAlert(running: URL, canonicalExists: Bool) {
+        let alert = NSAlert()
+        alert.alertStyle = .critical
+        alert.messageText = "Snippr đang chạy từ vị trí không chuẩn"
+        alert.informativeText = "Bản này chạy từ:\n\(running.path)\n\nQuyền Screen Recording/Accessibility được cấp cho /Applications/Snippr.app; chạy bản khác sẽ bị hỏi quyền lại. "
+            + (canonicalExists
+                ? "Snippr sẽ mở bản đã cài trong /Applications; hãy xóa bản này."
+                : "Hãy kéo Snippr vào /Applications rồi mở từ đó.")
+        if canonicalExists { alert.addButton(withTitle: "Mở bản trong /Applications") }
+        alert.addButton(withTitle: "Thoát")
+        let response = alert.runModal()
+        if canonicalExists, response == .alertFirstButtonReturn {
+            handoffToCanonicalAndExit()
+        }
+    }
+
+    /// The detached helper that performs the handoff. Ordering is the whole
+    /// point: the canonical app's single-instance guard (main.swift) exits if
+    /// ANY process with our bundle id is alive, so the wrong copy must be
+    /// gone before `open` runs — otherwise the canonical quits and no Snippr
+    /// is left. The helper polls our pid (bounded), then `open -n` (a fresh
+    /// instance — never "activate whatever copy is running").
+    static func handoffCommand(
+        canonical: URL, waitForPID: pid_t, timeoutSeconds: Int = 10,
+        openTool: String = "/usr/bin/open"
+    ) -> [String] {
+        let quotedPath = "'" + canonical.path.replacingOccurrences(of: "'", with: "'\\''") + "'"
+        let quotedTool = "'" + openTool.replacingOccurrences(of: "'", with: "'\\''") + "'"
+        let script = "i=0; while /bin/kill -0 \(waitForPID) 2>/dev/null && [ $i -lt \(timeoutSeconds * 10) ]; do /bin/sleep 0.1; i=$((i+1)); done; exec \(quotedTool) -n \(quotedPath)"
+        return ["/bin/sh", "-c", script]
+    }
+
+    /// Spawns the detached helper and ends THIS process immediately (before
+    /// any status item / hotkey / TCC prompt could exist — the caller only
+    /// reaches here from the launch disposition switch).
+    static func handoffToCanonicalAndExit() -> Never {
+        let argv = handoffCommand(
+            canonical: canonicalURL,
+            waitForPID: ProcessInfo.processInfo.processIdentifier)
+        let helper = Process()
+        helper.executableURL = URL(fileURLWithPath: argv[0])
+        helper.arguments = Array(argv.dropFirst())
+        helper.standardOutput = FileHandle.nullDevice
+        helper.standardError = FileHandle.nullDevice
+        try? helper.run()
+        exit(0)
+    }
+
+    /// Canonical copy with duplicates: warning naming every path.
+    @MainActor
+    static func presentDuplicatesWarning(_ duplicates: [URL]) {
+        guard !duplicates.isEmpty else { return }
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Phát hiện bản Snippr trùng"
+        alert.informativeText = "Có \(duplicates.count) bản Snippr khác trên máy. Spotlight/Launchpad có thể mở nhầm bản đó và macOS sẽ hỏi lại quyền Screen Recording. Hãy xóa các bản này, chỉ giữ /Applications/Snippr.app:\n\n"
+            + duplicates.map(\.path).joined(separator: "\n")
+        alert.addButton(withTitle: "OK")
+        alert.addButton(withTitle: "Hiện trong Finder")
+        if alert.runModal() == .alertSecondButtonReturn {
+            NSWorkspace.shared.activateFileViewerSelecting(duplicates)
         }
     }
 }

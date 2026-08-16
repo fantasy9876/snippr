@@ -51,6 +51,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let needsCaptureServices = !isDevTool
             || captureDevToolFlags.contains { CommandLine.arguments.contains($0) }
 
+        // FIRST decision of the launch: is this the installed Snippr? A wrong
+        // copy (ad-hoc build in ~/Applications, DMG, Downloads) must not
+        // create a status item, register hotkeys, write launch status or
+        // prompt TCC — every one of those would bind state to the wrong
+        // signature. Dev tools and SNIPPR_ALLOW_NONCANONICAL=1 may proceed.
+        let disposition = BundleIntegrity.launchDisposition(
+            for: BundleIntegrity.currentVerdict(),
+            allowNonCanonical: isDevTool || BundleIntegrity.debugOverrideRequested)
+        switch disposition {
+        case let .blockWrongCopy(running, canonicalExists):
+            // Nothing has been initialised yet (no status item, hotkeys,
+            // launch status, TCC prompt). The alert either hands off to the
+            // canonical app (helper waits for THIS pid to die, then opens a
+            // fresh instance) or the process simply ends.
+            BundleIntegrity.presentWrongCopyAlert(
+                running: running, canonicalExists: canonicalExists)
+            exit(0)
+        case let .proceed(warnDuplicates):
+            if !isDevTool { BundleIntegrity.presentDuplicatesWarning(warnDuplicates) }
+        }
+
         // Dev harnesses must not change global hotkeys or write launch state.
         // Only capture-specific harnesses opt into Screen Recording and SCK.
         if !isDevTool {
@@ -64,11 +85,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self, selector: #selector(defaultsChanged),
                 name: UserDefaults.didChangeNotification, object: nil
             )
-        }
-        if !isDevTool {
-            // Before asking for permissions: a second Snippr with a different
-            // signature is the #1 reason grants "disappear". Name it now.
-            BundleIntegrity.warnOnLaunchIfNeeded()
         }
         if needsCaptureServices, !CGPreflightScreenCaptureAccess() {
             CGRequestScreenCaptureAccess()
