@@ -11141,12 +11141,11 @@ enum SelfTest {
                     // PRECISE ONLY. A line event on the blocked path calls the
                     // same reset, so sending one first would mask whether the
                     // precise path resets — the whole point of the sequence.
+                    // NOTHING but the precise event before mouse-up: any other
+                    // wheel on the blocked path resets the accumulator too, and
+                    // the post-drag sequence would then start from zero no
+                    // matter what the precise path did.
                     if let event = wheel(view, deltaY: 9, precise: true) {
-                        view.scrollWheel(with: event)
-                    }
-                    // The drag owns EVERY wheel, modified included.
-                    if let event = wheel(view, deltaY: 3, precise: false,
-                                         modified: true) {
                         view.scrollWheel(with: event)
                     }
                     midDragWrites = writes.count
@@ -11209,6 +11208,26 @@ enum SelfTest {
                 }
                 if writes.count != beforeControl + 1 {
                     wheelFailures.append("area:control")
+                }
+                // The drag owns EVERY wheel, modified included — in a drag of
+                // its own, so it cannot reset the accumulator the precise
+                // sequence above depends on.
+                let modifiedWrites = writes.count
+                let modifiedForwards = viewSpy.forwarded
+                view.annotationDragForTesting(
+                    from: CGPoint(x: 110, y: 110), to: CGPoint(x: 175, y: 155)
+                ) {
+                    if let event = wheel(view, deltaY: 3, precise: false,
+                                         modified: true) {
+                        view.scrollWheel(with: event)
+                    }
+                }
+                if writes.count != modifiedWrites
+                    || viewSpy.forwarded != modifiedForwards {
+                    wheelFailures.append(
+                        "area:modified-mid-drag "
+                        + "\(writes.count - modifiedWrites) "
+                        + "\(viewSpy.forwarded - modifiedForwards)")
                 }
                 overlay.finish(.cancelled)
 
@@ -11273,11 +11292,8 @@ enum SelfTest {
                     toView: CGPoint(x: 160, y: 140)
                 ) {
                     // Precise only, for the same reason as the area case.
+                    // Precise only, for the same reason as the area case.
                     if let event = wheel(host, deltaY: 9, precise: true) {
-                        host.scrollWheel(with: event)
-                    }
-                    if let event = wheel(host, deltaY: 3, precise: false,
-                                         modified: true) {
                         host.scrollWheel(with: event)
                     }
                     panelMidWrites = writes.count
@@ -11334,6 +11350,24 @@ enum SelfTest {
                 }
                 if writes.count != beforePanelControl + 1 {
                     wheelFailures.append("panel:control")
+                }
+                let panelModifiedWrites = writes.count
+                let panelModifiedForwards = hostSpy.forwarded
+                panel.drawWithRealEventsForTesting(
+                    fromView: CGPoint(x: 80, y: 80),
+                    toView: CGPoint(x: 155, y: 135)
+                ) {
+                    if let event = wheel(host, deltaY: 3, precise: false,
+                                         modified: true) {
+                        host.scrollWheel(with: event)
+                    }
+                }
+                if writes.count != panelModifiedWrites
+                    || hostSpy.forwarded != panelModifiedForwards {
+                    wheelFailures.append(
+                        "panel:modified-mid-drag "
+                        + "\(writes.count - panelModifiedWrites) "
+                        + "\(hostSpy.forwarded - panelModifiedForwards)")
                 }
                 if panel.isVisible || ScrollResultPanel.current === panel {
                     panel.dismissForTesting()
