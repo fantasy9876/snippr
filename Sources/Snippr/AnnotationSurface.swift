@@ -394,19 +394,44 @@ final class AnnotationSurface: RedactionHost, RedactionJobObserver {
         activeSpotlight = nil
         activeSpotlightAnchor = nil
         replacedSpotlight = nil
+        // The document changed shape even though history did not, so the Undo
+        // and Redo buttons have to be re-evaluated.
+        historyDidChange?()
     }
 
     func endDrag() {
         // A completed pen stroke or shape forks history HERE, not at
-        // mouseDown: until the release it is only a draft.
+        // mouseDown — and only if it is a real mark. A press-and-release with
+        // no movement leaves a single-point stroke or a zero-size shape that
+        // draws nothing; keeping it would put an invisible annotation in the
+        // document and take the user's redo branch with it.
         if let pen = activePen, annotations.last === pen {
-            redoAnnotations.removeAll()
-            pruneSpotlightReplacements()
+            if pen.points.count > 1 {
+                redoAnnotations.removeAll()
+                pruneSpotlightReplacements()
+            } else {
+                annotations.removeLast()
+            }
             historyDidChange?()
         }
         if let shape = activeShape, annotations.last === shape {
-            redoAnnotations.removeAll()
-            pruneSpotlightReplacements()
+            // Enough extent to be visible: a line or arrow needs length, a
+            // rectangle, oval or highlight needs area.
+            let dx = abs(shape.end.x - shape.start.x)
+            let dy = abs(shape.end.y - shape.start.y)
+            let isReal: Bool
+            switch shape.kind {
+            case .line, .arrow:
+                isReal = (dx * dx + dy * dy).squareRoot() > 1
+            case .rect, .oval, .highlight:
+                isReal = dx > 1 && dy > 1
+            }
+            if isReal {
+                redoAnnotations.removeAll()
+                pruneSpotlightReplacements()
+            } else {
+                annotations.removeLast()
+            }
             historyDidChange?()
         }
         if let blur = activeBlur, annotations.last === blur {

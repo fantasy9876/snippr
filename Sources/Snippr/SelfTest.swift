@@ -9438,10 +9438,13 @@ enum SelfTest {
             //    shapes used to fork history at mouseDown, so a document with
             //    a live redo lost it to a drag that was then declared a no-op.
             var abortFailures: [String] = []
-            for tool in [OverlayAnnotationTool.pen, .rect] {
+            for tool in [OverlayAnnotationTool.pen, .rect, .line] {
                 let surface = AnnotationSurface(pixelScale: 1)
                 let markA = CounterAnnotation(uiScale: 1)
-                let markB = CounterAnnotation(uiScale: 1)
+                // A spotlight on the redo branch, so the replacement records
+                // are part of what has to survive — not just the array.
+                let markB = SpotlightAnnotation(uiScale: 1)
+                markB.rect = CGRect(x: 10, y: 10, width: 40, height: 30)
                 surface.addAnnotationForTesting(markA)
                 surface.addAnnotationForTesting(markB)
                 _ = surface.undo()
@@ -9468,17 +9471,65 @@ enum SelfTest {
                 }
                 _ = surface.redo()
                 if surface.annotations.count != 2
-                    || surface.annotations.last !== markB {
+                    || surface.annotations.first !== markA
+                    || surface.annotations.last !== markB
+                    || surface.canRedo {
                     abortFailures.append("\(tool):redo-object")
                 }
-                // And a drag that COMPLETES does fork the branch.
+
+                // A drag that COMPLETES keeps its mark and forks the branch.
                 _ = surface.undo()
                 surface.tool = tool
                 _ = surface.beginDrag(atPixel: CGPoint(x: 20, y: 20))
                 surface.continueDrag(toPixel: CGPoint(x: 90, y: 70))
                 surface.endDrag()
-                if surface.canRedo {
-                    abortFailures.append("\(tool):fork-missing")
+                let drawn = surface.annotations.last
+                let geometryOK: Bool
+                switch tool {
+                case .pen:
+                    geometryOK = (drawn as? PenAnnotation)?.points.count ?? 0 > 1
+                default:
+                    let shape = drawn as? ShapeAnnotation
+                    geometryOK = shape?.start == CGPoint(x: 20, y: 20)
+                        && shape?.end == CGPoint(x: 90, y: 70)
+                }
+                if surface.annotations.count != 2
+                    || surface.annotations.first !== markA
+                    || drawn === markB || !geometryOK || surface.isDragging
+                    || surface.canRedo {
+                    abortFailures.append(
+                        "\(tool):completed \(surface.annotations.count) "
+                        + "geometry \(geometryOK)")
+                }
+                // Round trip: undo removes the new mark and does NOT bring
+                // back the one the fork discarded; redo puts it back.
+                _ = surface.undo()
+                if surface.annotations.count != 1
+                    || surface.annotations.first !== markA {
+                    abortFailures.append("\(tool):undo-after-complete")
+                }
+                _ = surface.redo()
+                if surface.annotations.last !== drawn {
+                    abortFailures.append("\(tool):redo-after-complete")
+                }
+
+                // A press with NO movement draws nothing, so it must leave no
+                // annotation behind and no history change either.
+                let restored = AnnotationSurface(pixelScale: 1)
+                let onlyMark = CounterAnnotation(uiScale: 1)
+                let redoMark = CounterAnnotation(uiScale: 1)
+                restored.addAnnotationForTesting(onlyMark)
+                restored.addAnnotationForTesting(redoMark)
+                _ = restored.undo()
+                restored.tool = tool
+                _ = restored.beginDrag(atPixel: CGPoint(x: 30, y: 30))
+                restored.endDrag()
+                if restored.annotations.count != 1
+                    || restored.annotations.first !== onlyMark
+                    || !restored.canRedo || restored.isDragging {
+                    abortFailures.append(
+                        "\(tool):degenerate \(restored.annotations.count) "
+                        + "redo \(restored.canRedo)")
                 }
             }
             check("sliceB-abandoned-drag-keeps-redo",
