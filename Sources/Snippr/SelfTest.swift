@@ -9276,6 +9276,23 @@ enum SelfTest {
                 }
                 let slotBase = slots()
                 let ownerBase = owners()
+                // A dirty baseline makes every later slot claim relative to
+                // someone else's worker, so the gate refuses to guess.
+                if slotBase != 0 {
+                    lockStageFailures.append("dirty-slot-baseline \(slotBase)")
+                    return
+                }
+                // Declared BEFORE the drain that waits on them.
+                let workerFinished = DispatchSemaphore(value: 0)
+                let scopeLock = NSLock()
+                var scopeEnded = false
+                func endScope() {
+                    scopeLock.lock()
+                    scopeEnded = true
+                    scopeLock.unlock()
+                    // Wake anything already parked in the closure.
+                    for _ in 0..<8 { release.signal() }
+                }
                 var released = false
                 var workerContained = false
                 @discardableResult
@@ -9290,22 +9307,33 @@ enum SelfTest {
                         workerContained = false
                         return false
                     }
+                    // The slot is given back on the main queue AFTER the
+                    // worker returns, so it is waited for separately — and the
+                    // baseline is a clean zero, so this is about this job.
                     let deadline = Date().addingTimeInterval(5)
-                    while slots() > slotBase, Date() < deadline {
+                    while slots() > 0, Date() < deadline {
                         RunLoop.current.run(
                             until: Date().addingTimeInterval(0.02))
+                    }
+                    if slots() != 0 {
+                        lockStageFailures.append("slot-not-returned \(slots())")
+                        workerContained = false
+                        return false
                     }
                     workerContained = true
                     return true
                 }
-                // THIS worker's own completion signal. Draining on the
-                // aggregate slot count is not containment: another fixture's
-                // worker finishing could balance the number while ours is
-                // still blocked.
-                let workerFinished = DispatchSemaphore(value: 0)
+                // The worker signals its own completion, so the drain waits
+                // for THIS job rather than for an aggregate count another
+                // fixture's worker could balance. Once the scope has ended the
+                // closure stops blocking entirely, so a straggler cannot park
+                // in it and cannot reach real Vision either.
                 SliceBOCR.recognizerForTesting = { _ in
                     started.signal()
-                    release.wait()
+                    scopeLock.lock()
+                    let ended = scopeEnded
+                    scopeLock.unlock()
+                    if !ended { release.wait() }
                     defer { workerFinished.signal() }
                     return .success([
                         RecognizedWord(
@@ -9319,9 +9347,15 @@ enum SelfTest {
                     // returned. If it has not, leaving the blocking recognizer
                     // installed is the containment: a stale worker then wakes
                     // in this closure rather than in real Vision.
-                    if releaseAndDrain() {
-                        SliceBOCR.recognizerForTesting = previousRecognizer
-                    }
+                    // End the scope FIRST: from here the closure no longer
+                    // blocks, so restoring is safe even if a straggler is
+                    // still queued — it will pass straight through this
+                    // closure rather than entering the recognizer that comes
+                    // back. Leaving a blocking closure installed instead would
+                    // hang the next gate that used it.
+                    _ = releaseAndDrain()
+                    endScope()
+                    SliceBOCR.recognizerForTesting = previousRecognizer
                     // Every early exit closes the panel. Either condition is
                     // enough: a regression that clears `current` but forgets
                     // to order the window out would otherwise leak it.
@@ -9340,6 +9374,7 @@ enum SelfTest {
                     /// would say nothing about the order at the boundary.
                     var observe: (() -> Void)?
                     var observations = 0
+                    var copyCalls = 0
                 }
                 let spy = LockSpy()
                 let panelImage = CapturedImage(
@@ -9350,7 +9385,7 @@ enum SelfTest {
                         afterShow: true, afterCopy: false, afterSave: false),
                     screen: screen,
                     dependencies: CaptureActionRouter.Dependencies(
-                        copyToClipboard: { _ in },
+                        copyToClipboard: { _ in spy.copyCalls += 1 },
                         autoSave: { _, _ in },
                         saveAs: { _, done in
                             spy.saveAsCalls += 1
@@ -9465,13 +9500,29 @@ enum SelfTest {
                         spy.inCallback.append("not-current")
                     }
                     // And a competing route inside the sheet does nothing.
+                    // Counted at its own dependency: the mask is already full
+                    // and the registry already empty here, so those alone
+                    // would look identical whether Copy ran or not.
                     let callsBefore = spy.saveAsCalls
+                    let copiesBefore = spy.copyCalls
                     let stateBefore = blur.redactionState
+                    let genBefore = blur.redactionGeneration
+                    let repaintsNow = host.repaints
+                    let ownersNow = owners()
+                    let slotsNow = slots()
                     panel.performActionForTesting(.copy)
-                    if spy.saveAsCalls != callsBefore
+                    if spy.copyCalls != copiesBefore
+                        || spy.saveAsCalls != callsBefore
                         || blur.redactionState != stateBefore
-                        || surface.redactionJobCountForTesting != 0 {
-                        spy.inCallback.append("reentrant")
+                        || blur.redactionGeneration != genBefore
+                        || host.repaints != repaintsNow
+                        || owners() != ownersNow || slots() != slotsNow
+                        || surface.redactionJobCountForTesting != 0
+                        || ScrollResultPanel.current !== panel
+                        || !panel.isVisible
+                        || panel.annotationHostForTesting?.isLocked() != true {
+                        spy.inCallback.append(
+                            "reentrant copies \(spy.copyCalls - copiesBefore)")
                     }
                 }
                 panel.performActionForTesting(.save)
