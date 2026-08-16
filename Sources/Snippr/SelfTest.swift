@@ -11429,7 +11429,14 @@ enum SelfTest {
                 }
                 let surface = panel.annotationSurface
                 let centre = CGPoint(x: host.bounds.midX, y: host.bounds.midY)
-                let inContent = host.convert(centre, to: content)
+                // hitTest takes a point in the RECEIVER'S superview space, and
+                // an event location is in window base coordinates. They only
+                // coincide because a borderless content view sits at the
+                // origin — the same coordinate trap as before, in a special
+                // case that happens to work.
+                let hitPoint = host.convert(
+                    centre, to: content.superview ?? content)
+                let inWindow = host.convert(centre, to: nil)
                 func send(_ type: NSEvent.EventType, _ p: CGPoint) {
                     guard let event = NSEvent.mouseEvent(
                         with: type, location: p, modifierFlags: [],
@@ -11447,7 +11454,7 @@ enum SelfTest {
                 if surface.tool != .pen {
                     dispatchFailures.append("pen:tool \(surface.tool)")
                 }
-                if content.hitTest(inContent) !== host {
+                if content.hitTest(hitPoint) !== host {
                     dispatchFailures.append("pen:hit")
                 }
                 if host.mouseDownCanMoveWindow {
@@ -11455,14 +11462,24 @@ enum SelfTest {
                 }
                 let frameBefore = panel.frame
                 let marksBefore = surface.annotations.count
-                send(.leftMouseDown, inContent)
+                send(.leftMouseDown, inWindow)
                 send(.leftMouseDragged,
-                     CGPoint(x: inContent.x + 60, y: inContent.y + 40))
+                     CGPoint(x: inWindow.x + 60, y: inWindow.y + 40))
                 send(.leftMouseUp,
-                     CGPoint(x: inContent.x + 60, y: inContent.y + 40))
-                if surface.annotations.count != marksBefore + 1 {
+                     CGPoint(x: inWindow.x + 60, y: inWindow.y + 40))
+                // A count alone would accept a malformed draft: the mark has
+                // to be a finished pen stroke that actually moved.
+                let drawn = surface.annotations.last as? PenAnnotation
+                let points = drawn?.points ?? []
+                if surface.annotations.count != marksBefore + 1
+                    || drawn == nil || points.count < 2
+                    || points.first == points.last {
                     dispatchFailures.append(
-                        "pen:no-mark \(surface.annotations.count)")
+                        "pen:no-mark \(surface.annotations.count) "
+                        + "\(points.count)")
+                }
+                if host.isAnnotationDragging || surface.isDragging {
+                    dispatchFailures.append("pen:still-dragging")
                 }
                 if panel.frame != frameBefore {
                     dispatchFailures.append("pen:window-moved \(panel.frame)")
@@ -11478,7 +11495,14 @@ enum SelfTest {
                 if surface.tool != .select {
                     dispatchFailures.append("select:tool \(surface.tool)")
                 }
-                let selectHit = content.hitTest(inContent)
+                // The window itself has to allow the movement Select relies
+                // on; a view that permits it means nothing on a window that
+                // does not.
+                if !panel.isMovable || !panel.isMovableByWindowBackground {
+                    dispatchFailures.append(
+                        "select:window-immovable \(panel.isMovable)")
+                }
+                let selectHit = content.hitTest(hitPoint)
                 if selectHit === host {
                     dispatchFailures.append("select:still-host")
                 } else if selectHit?.mouseDownCanMoveWindow != true {
