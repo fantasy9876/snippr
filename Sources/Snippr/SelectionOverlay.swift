@@ -1017,6 +1017,10 @@ final class SelectionOverlayView: NSView {
         let flags = event.modifierFlags.intersection(
             [.command, .shift, .control, .option])
         if owner?.session.phase == .reviewing,
+           handleColorPickKey(event, flags: flags) {
+            return
+        }
+        if owner?.session.phase == .reviewing,
            flags.isEmpty,
            let key = event.charactersIgnoringModifiers,
            let tool = OverlayAnnotationTool.tool(forShortcutKey: key) {
@@ -1030,6 +1034,11 @@ final class SelectionOverlayView: NSView {
         if textEditingActive {
             // ⌘C/⌘Z/⌘V belong to the active text field
             return super.performKeyEquivalent(with: event)
+        }
+        let pickFlags = event.modifierFlags.intersection(
+            [.command, .shift, .control, .option])
+        if isReviewing, handleColorPickKey(event, flags: pickFlags) {
+            return true
         }
         if isReviewing,
            event.modifierFlags.contains(.command),
@@ -1048,6 +1057,49 @@ final class SelectionOverlayView: NSView {
             return true
         }
         return super.performKeyEquivalent(with: event)
+    }
+
+    @discardableResult
+    private func handleColorPickKey(
+        _ event: NSEvent, flags: NSEvent.ModifierFlags
+    ) -> Bool {
+        guard event.keyCode == 48 else { return false } // Tab
+        let onlyShift = flags == .shift
+        let plain = flags.isEmpty
+        guard onlyShift || plain else { return false }
+        pickColorAtMouse(darkest: onlyShift)
+        return true
+    }
+
+    private func pickColorAtMouse(darkest: Bool) {
+        guard let frozen else { return }
+        let screenPt = NSEvent.mouseLocation
+        let winPt = window?.convertPoint(fromScreen: screenPt) ?? .zero
+        let viewPt = convert(winPt, from: nil)
+        let pixel = pixelPoint(fromView: viewPt)
+        let color = darkest
+            ? PixelColorSampler.darkest(image: frozen.cgImage, around: pixel)
+            : PixelColorSampler.sample(image: frozen.cgImage, at: pixel)
+        guard let color else {
+            ToastHUD.show(
+                "No pixel", symbol: "eyedropper",
+                on: screen, above: window?.level)
+            return
+        }
+        let hex = PixelColorSampler.hexString(from: color)
+        SaveService.copyText(hex)
+        ToastHUD.show(
+            hex, symbol: "eyedropper",
+            on: screen, above: window?.level)
+    }
+
+    func pickColorHexForTesting(at viewPoint: CGPoint, darkest: Bool) -> String? {
+        guard let frozen else { return nil }
+        let pixel = pixelPoint(fromView: viewPoint)
+        let color = darkest
+            ? PixelColorSampler.darkest(image: frozen.cgImage, around: pixel)
+            : PixelColorSampler.sample(image: frozen.cgImage, at: pixel)
+        return color.map(PixelColorSampler.hexString(from:))
     }
 
     // MARK: text annotation entry

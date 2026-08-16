@@ -7388,6 +7388,134 @@ enum SelfTest {
             check("overlay6-doubleclick-over-tools", toolsOK, "see above")
         }
 
+        // MARK: slice A — picker / ruler / guides / resize / scroll hint
+        do {
+            let keys = SliceAHotkeys.editorToolKeys
+            check("sliceA-keys-leave-slice-b",
+                  SliceAHotkeys.reservedForSliceB.isDisjoint(with: Set(keys.keys))
+                    && keys["c"] == .crop
+                    && keys["b"] == .blur
+                    && keys["v"] == .select
+                    && !keys.keys.contains("d")
+                    && !keys.keys.contains("s")
+                    && !keys.keys.contains("m"),
+                  "keys \(keys.keys.sorted())")
+
+            let hint = SliceAHotkeys.bidirectionalScrollHint.lowercased()
+            check("sliceA-scroll-hint-bidirectional",
+                  hint.contains("lên") && hint.contains("xuống")
+                    && ScrollingCapture.bidirectionalScrollHint
+                        == SliceAHotkeys.bidirectionalScrollHint,
+                  hint)
+
+            check("sliceA-overlay-catalog-untouched",
+                  OverlayActionCatalog.items.map(\.intent)
+                    == [.copy, .save, .pin, .ocr, .translate, .openEditor]
+                    && OverlayAnnotationTool.allCases.count == 10,
+                  "actions \(OverlayActionCatalog.items.map(\.intent)) tools \(OverlayAnnotationTool.allCases.count)")
+
+            let red = makeSolidImage(
+                width: 40, height: 30, color: NSColor.red.cgColor)
+            let sampled = PixelColorSampler.sample(
+                image: red, at: CGPoint(x: 10, y: 10))
+            check("sliceA-color-hex",
+                  sampled.map(PixelColorSampler.hexString(from:)) == "#FF0000",
+                  sampled.map(PixelColorSampler.hexString(from:)) ?? "nil")
+
+            let mixed = ctx(80, 80)
+            mixed.setFillColor(NSColor.white.cgColor)
+            mixed.fill(CGRect(x: 0, y: 0, width: 80, height: 80))
+            mixed.setFillColor(NSColor.black.cgColor)
+            mixed.fill(CGRect(x: 35, y: 35, width: 10, height: 10))
+            let mixedImg = mixed.makeImage()!
+            let dark = PixelColorSampler.darkest(
+                image: mixedImg, around: CGPoint(x: 40, y: 40), radius: 10)
+            let far = PixelColorSampler.darkest(
+                image: mixedImg, around: CGPoint(x: 4, y: 4), radius: 3)
+            check("sliceA-color-darkest",
+                  dark.map(PixelColorSampler.hexString(from:)) == "#000000"
+                    && far.map(PixelColorSampler.hexString(from:)) == "#FFFFFF",
+                  "dark \(dark.map(PixelColorSampler.hexString(from:)) ?? "nil") far \(far.map(PixelColorSampler.hexString(from:)) ?? "nil")")
+
+            let bar = ctx(200, 100)
+            bar.setFillColor(NSColor.white.cgColor)
+            bar.fill(CGRect(x: 0, y: 0, width: 200, height: 100))
+            bar.setFillColor(NSColor.red.cgColor)
+            bar.fill(CGRect(x: 40, y: 20, width: 80, height: 60))
+            let barImg = bar.makeImage()!
+            let hSpan = EdgeRuler.measure(
+                image: barImg, from: CGPoint(x: 80, y: 50), axis: .horizontal)
+            let vSpan = EdgeRuler.measure(
+                image: barImg, from: CGPoint(x: 80, y: 50), axis: .vertical)
+            check("sliceA-ruler-bar",
+                  hSpan?.length == 80 && hSpan?.start == 40 && hSpan?.end == 120
+                    && vSpan?.length == 60 && vSpan?.start == 20 && vSpan?.end == 80,
+                  "h \(String(describing: hSpan)) v \(String(describing: vSpan))")
+
+            let gap = EdgeRuler.measure(
+                image: barImg, from: CGPoint(x: 10, y: 50), axis: .horizontal)
+            check("sliceA-ruler-gap",
+                  gap?.start == 0 && gap.map { $0.end <= 41 } == true,
+                  "\(String(describing: gap))")
+
+            let guideBase = makeSolidImage(
+                width: 120, height: 80, color: NSColor.white.cgColor)
+            let guide = GuideAnnotation(
+                axis: .vertical, position: 40, length: 80, uiScale: 1)
+            let guided = AnnotationRenderer.render(
+                base: guideBase, annotations: [guide], pixellated: nil)
+            check("sliceA-guides-imprint",
+                  !imagesEqual(guideBase, guided),
+                  "guide left no ink")
+
+            let beforeRetina = Settings.shared.downscaleRetina
+            Settings.shared.downscaleRetina = true
+            let src = CapturedImage(
+                cgImage: makeSolidImage(
+                    width: 200, height: 100, color: NSColor.blue.cgColor),
+                scale: 2)
+            let shape = ShapeAnnotation(
+                kind: .rect,
+                start: CGPoint(x: 10, y: 10),
+                end: CGPoint(x: 50, y: 40),
+                uiScale: 2)
+            let half = ImageResizer.scale(src, by: 0.5)
+            shape.scaleCoordinates(by: 0.5)
+            check("sliceA-resize-independent",
+                  half?.cgImage.width == 100
+                    && half?.cgImage.height == 50
+                    && half?.scale == 2
+                    && Settings.shared.downscaleRetina == true
+                    && abs(shape.start.x - 5) < 0.01
+                    && abs(shape.end.y - 20) < 0.01,
+                  "half \(half?.cgImage.width ?? -1)x\(half?.cgImage.height ?? -1) scale \(half?.scale ?? -1) retina \(Settings.shared.downscaleRetina) start \(shape.start)")
+            Settings.shared.downscaleRetina = beforeRetina
+
+            let editorImage = CapturedImage(
+                cgImage: makeSolidImage(
+                    width: 160, height: 80, color: NSColor.orange.cgColor),
+                scale: 2)
+            let wc = EditorWindowController.open(
+                with: editorImage, forceFitForTesting: true)
+            let badge = wc.sizeBadgeTitleForTesting
+            wc.applyResizeFactor(0.5)
+            let after = wc.canvasForTesting.image
+            let hex = wc.canvasForTesting.pickColorHexForTesting(
+                at: CGPoint(x: 10, y: 10), darkest: false)
+            wc.canvasForTesting.beginRuler(.horizontal)
+            let rulerOn = wc.canvasForTesting.transientKindForTesting == "ruler"
+            wc.canvasForTesting.beginGuide(.vertical)
+            let guideOn = wc.canvasForTesting.transientKindForTesting == "guide"
+            wc.window?.close()
+            let hexOK = hex?.hasPrefix("#") == true && (hex?.count ?? 0) == 7
+            check("sliceA-editor-badge-and-hooks",
+                  badge.contains("×")
+                    && after.cgImage.width == 80
+                    && after.scale == 2
+                    && hexOK && rulerOn && guideOn,
+                  "badge \(badge) size \(after.cgImage.width) hex \(hex ?? "nil") ruler \(rulerOn) guide \(guideOn)")
+        }
+
         print(failures == 0 ? "ALL TESTS PASSED" : "\(failures) TEST(S) FAILED")
         print("Artifacts: \(outputDir)")
         return failures == 0 ? 0 : 1

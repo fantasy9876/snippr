@@ -6,7 +6,7 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
     private static var controllers: [EditorWindowController] = []
 
     private let canvas: EditorCanvasView
-    private var sizeLabel: NSTextField!
+    private var sizeBadge: NSButton!
     private var zoomLabel: NSTextField!
     private var colorWell: NSColorWell!
     private var toolButtons: [EditorTool: NSButton] = [:]
@@ -188,9 +188,12 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
             colorWell.heightAnchor.constraint(equalToConstant: 24),
         ])
 
-        sizeLabel = NSTextField(labelWithString: "")
-        sizeLabel.font = .monospacedDigitSystemFont(ofSize: 11, weight: .medium)
-        sizeLabel.textColor = .secondaryLabelColor
+        sizeBadge = NSButton(title: "", target: self, action: #selector(sizeBadgeClicked))
+        sizeBadge.isBordered = false
+        sizeBadge.bezelStyle = .inline
+        sizeBadge.font = .monospacedDigitSystemFont(ofSize: 11, weight: .medium)
+        sizeBadge.contentTintColor = .secondaryLabelColor
+        sizeBadge.toolTip = "Scale image — independent of “Resize retina screenshots” on save"
 
         zoomLabel = NSTextField(labelWithString: "100%")
         zoomLabel.font = .monospacedDigitSystemFont(ofSize: 11, weight: .medium)
@@ -210,7 +213,7 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
 
         let stack = NSStackView(
             views: [leftPad, copyBtn, saveBtn, pinBtn, ocrBtn, translateBtn, sep()] + toolViews +
-                   [sep(), colorWell, NSView(), sizeLabel, sep(), zoomLabel]
+                   [sep(), colorWell, NSView(), sizeBadge, sep(), zoomLabel]
         )
         stack.orientation = .horizontal
         stack.distribution = .fill
@@ -256,6 +259,7 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
         ])
 
         selectTool(.select)
+        window.acceptsMouseMovedEvents = true
         window.makeFirstResponder(canvas)
         scrollView.contentView.postsBoundsChangedNotifications = true
         NotificationCenter.default.addObserver(
@@ -372,10 +376,67 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
 
     func refreshLabels() {
         let size = canvas.image.pointSize
-        sizeLabel.stringValue = "\(Int(size.width))×\(Int(size.height))pt"
+        let px = canvas.image.pixelSize
+        sizeBadge.title = "\(Int(size.width))×\(Int(size.height))pt"
+        sizeBadge.toolTip =
+            "\(Int(px.width))×\(Int(px.height)) px — click to scale. Does not change “Resize retina screenshots” on save."
         let pct = Int(round((scrollView?.magnification ?? 1) * 100))
         zoomLabel.stringValue = "\(pct)%"
     }
+
+    var sizeBadgeTitleForTesting: String { sizeBadge.title }
+
+    @objc private func sizeBadgeClicked() {
+        let menu = NSMenu()
+        menu.addItem(withTitle: sizeBadge.title, action: nil, keyEquivalent: "")
+        menu.items.last?.isEnabled = false
+        menu.addItem(.separator())
+        for (title, factor) in [
+            ("Scale to 50%", 0.5),
+            ("Scale to 100%", 1.0),
+            ("Scale to 200%", 2.0),
+        ] as [(String, CGFloat)] {
+            let item = NSMenuItem(
+                title: title, action: #selector(resizeMenuItem(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = factor
+            menu.addItem(item)
+        }
+        let custom = NSMenuItem(
+            title: "Custom…", action: #selector(resizeCustom), keyEquivalent: "")
+        custom.target = self
+        menu.addItem(custom)
+        let loc = NSPoint(x: 0, y: sizeBadge.bounds.height)
+        menu.popUp(positioning: nil, at: loc, in: sizeBadge)
+    }
+
+    @objc private func resizeMenuItem(_ sender: NSMenuItem) {
+        guard let factor = sender.representedObject as? CGFloat else { return }
+        applyResizeFactor(factor)
+    }
+
+    @objc private func resizeCustom() {
+        let alert = NSAlert()
+        alert.messageText = "Scale image"
+        alert.informativeText = "Percent of current size (e.g. 75). Does not change the retina-on-save preference."
+        alert.addButton(withTitle: "Scale")
+        alert.addButton(withTitle: "Cancel")
+        let field = NSTextField(string: "100")
+        field.frame = NSRect(x: 0, y: 0, width: 80, height: 22)
+        alert.accessoryView = field
+        alert.window.initialFirstResponder = field
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let percent = field.doubleValue
+        guard percent > 0 else { return }
+        applyResizeFactor(CGFloat(percent / 100))
+    }
+
+    func applyResizeFactor(_ factor: CGFloat) {
+        canvas.applyPixelScale(factor)
+        refreshLabels()
+    }
+
+    var canvasForTesting: EditorCanvasView { canvas }
 
     func selectTool(_ tool: EditorTool) {
         canvas.currentTool = tool
@@ -557,6 +618,12 @@ final class EditorCanvasView: NSView {
     private var dragStartPoint: CGPoint = .zero
     private var isMovingSelection = false
     private var cropRect: CGRect?
+    private var lastMousePixel: CGPoint?
+    private enum TransientOverlay {
+        case ruler(EdgeRuler.Span)
+        case guide(axis: MeasureAxis, position: CGFloat)
+    }
+    private var transient: TransientOverlay?
     var hasValidCropSelection: Bool {
         guard let cropRect else { return false }
         return cropRect.width >= 4 && cropRect.height >= 4
@@ -578,6 +645,10 @@ final class EditorCanvasView: NSView {
         self.image = image
         super.init(frame: CGRect(origin: .zero, size: image.pointSize))
         wantsLayer = true
+        addTrackingArea(NSTrackingArea(
+            rect: .zero,
+            options: [.mouseMoved, .activeInKeyWindow, .inVisibleRect],
+            owner: self, userInfo: nil))
     }
 
     required init?(coder: NSCoder) { fatalError() }
@@ -639,6 +710,23 @@ final class EditorCanvasView: NSView {
         ctx.restoreGState()
 
         if let crop = cropRect { drawCropChrome(for: crop, in: ctx) }
+
+        ctx.saveGState()
+        ctx.scaleBy(x: 1 / pxScale, y: 1 / pxScale)
+        switch transient {
+        case .ruler(let span):
+            drawRuler(span, in: ctx, uiScale: pxScale, color: .systemYellow, preview: true)
+        case .guide(let axis, let position):
+            let length = axis == .vertical
+                ? CGFloat(image.cgImage.height) : CGFloat(image.cgImage.width)
+            let guide = GuideAnnotation(
+                axis: axis, position: position, length: length, uiScale: pxScale)
+            guide.color = NSColor.systemTeal.withAlphaComponent(0.85)
+            guide.draw(in: ctx, pixellated: nil)
+        case .none:
+            break
+        }
+        ctx.restoreGState()
     }
 
     private var cropChromeScale: CGFloat {
@@ -744,6 +832,8 @@ final class EditorCanvasView: NSView {
         commitTextEditing()
         let vp = convert(event.locationInWindow, from: nil)
         let pp = toPixel(vp)
+        lastMousePixel = pp
+        if imprintTransient(at: pp) { return }
         dragStartPoint = pp
 
         switch currentTool {
@@ -823,9 +913,16 @@ final class EditorCanvasView: NSView {
         setNeedsDisplay(view)
     }
 
+    override func mouseMoved(with event: NSEvent) {
+        let vp = convert(event.locationInWindow, from: nil)
+        lastMousePixel = toPixel(vp)
+        refreshTransient()
+    }
+
     override func mouseDragged(with event: NSEvent) {
         let vp = convert(event.locationInWindow, from: nil)
         let pp = toPixel(vp)
+        lastMousePixel = pp
 
         switch currentTool {
         case .select:
@@ -1000,15 +1097,192 @@ final class EditorCanvasView: NSView {
         textField != nil && window?.firstResponder is NSTextView
     }
 
+    // MARK: slice A — picker / ruler / guides / resize
+
+    @discardableResult
+    private func handleSliceAKey(
+        _ event: NSEvent, flags: NSEvent.ModifierFlags, chars: String
+    ) -> Bool {
+        if handleColorPickKey(event, flags: flags) { return true }
+        if flags.isEmpty {
+            switch event.keyCode {
+            case 123, 124: // left / right
+                beginRuler(.horizontal)
+                return true
+            case 125, 126: // down / up
+                beginRuler(.vertical)
+                return true
+            default: break
+            }
+        }
+        if flags == .option {
+            // ⌥S = vertical guide, ⌥D = horizontal. Bare S/D stay free for slice B.
+            switch event.keyCode {
+            case 1: // kVK_ANSI_S
+                beginGuide(.vertical)
+                return true
+            case 2: // kVK_ANSI_D
+                beginGuide(.horizontal)
+                return true
+            default: break
+            }
+        }
+        _ = chars
+        return false
+    }
+
+    @discardableResult
+    private func handleColorPickKey(
+        _ event: NSEvent, flags: NSEvent.ModifierFlags
+    ) -> Bool {
+        guard event.keyCode == 48 else { return false } // Tab
+        let onlyShift = flags == .shift
+        let plain = flags.isEmpty
+        guard onlyShift || plain else { return false }
+        pickColor(darkest: onlyShift)
+        return true
+    }
+
+    private func pixelUnderMouse() -> CGPoint? {
+        if let last = lastMousePixel { return last }
+        guard let window else { return nil }
+        let screenPt = NSEvent.mouseLocation
+        let winPt = window.convertPoint(fromScreen: screenPt)
+        return toPixel(convert(winPt, from: nil))
+    }
+
+    func pickColor(darkest: Bool) {
+        guard let pixel = pixelUnderMouse() else { return }
+        let color = darkest
+            ? PixelColorSampler.darkest(image: image.cgImage, around: pixel)
+            : PixelColorSampler.sample(image: image.cgImage, at: pixel)
+        guard let color else {
+            ToastHUD.show("No pixel", symbol: "eyedropper")
+            return
+        }
+        let hex = PixelColorSampler.hexString(from: color)
+        SaveService.copyText(hex)
+        ToastHUD.show(hex, symbol: "eyedropper")
+    }
+
+    func beginRuler(_ axis: MeasureAxis) {
+        guard let pixel = pixelUnderMouse(),
+              let span = EdgeRuler.measure(image: image.cgImage, from: pixel, axis: axis)
+        else { return }
+        transient = .ruler(span)
+        needsDisplay = true
+    }
+
+    func beginGuide(_ axis: MeasureAxis) {
+        guard let pixel = pixelUnderMouse() else { return }
+        let position = axis == .vertical ? pixel.x : pixel.y
+        transient = .guide(axis: axis, position: position)
+        needsDisplay = true
+    }
+
+    private func refreshTransient() {
+        guard let pixel = lastMousePixel, transient != nil else { return }
+        switch transient {
+        case .ruler(let span):
+            if let next = EdgeRuler.measure(
+                image: image.cgImage, from: pixel, axis: span.axis)
+            {
+                transient = .ruler(next)
+                needsDisplay = true
+            }
+        case .guide(let axis, _):
+            transient = .guide(
+                axis: axis, position: axis == .vertical ? pixel.x : pixel.y)
+            needsDisplay = true
+        case .none:
+            break
+        }
+    }
+
+    @discardableResult
+    private func imprintTransient(at pixel: CGPoint) -> Bool {
+        switch transient {
+        case .ruler(let span):
+            registerUndoSnapshot()
+            annotations.append(RulerAnnotation(span: span, uiScale: pxScale))
+            transient = nil
+            selected = annotations.last
+            needsDisplay = true
+            onStateChange?()
+            return true
+        case .guide(let axis, _):
+            registerUndoSnapshot()
+            let position = axis == .vertical ? pixel.x : pixel.y
+            let length = axis == .vertical
+                ? CGFloat(image.cgImage.height) : CGFloat(image.cgImage.width)
+            annotations.append(
+                GuideAnnotation(
+                    axis: axis, position: position, length: length,
+                    uiScale: pxScale))
+            transient = nil
+            selected = annotations.last
+            needsDisplay = true
+            onStateChange?()
+            return true
+        case .none:
+            return false
+        }
+    }
+
+    func applyPixelScale(_ factor: CGFloat) {
+        guard abs(factor - 1) >= 0.0001,
+              let scaled = ImageResizer.scale(image, by: factor) else { return }
+        cancelCropSelection()
+        registerUndoSnapshot()
+        for annotation in annotations {
+            annotation.scaleCoordinates(by: factor)
+        }
+        if case .ruler(let span) = transient {
+            var next = span
+            next.start *= factor
+            next.end *= factor
+            next.cross *= factor
+            transient = .ruler(next)
+        } else if case .guide(let axis, let position) = transient {
+            transient = .guide(axis: axis, position: position * factor)
+        }
+        if let last = lastMousePixel {
+            lastMousePixel = CGPoint(x: last.x * factor, y: last.y * factor)
+        }
+        setImage(scaled)
+    }
+
+    func pickColorHexForTesting(at pixel: CGPoint, darkest: Bool) -> String? {
+        lastMousePixel = pixel
+        let color = darkest
+            ? PixelColorSampler.darkest(image: image.cgImage, around: pixel)
+            : PixelColorSampler.sample(image: image.cgImage, at: pixel)
+        return color.map(PixelColorSampler.hexString(from:))
+    }
+
+    var transientKindForTesting: String? {
+        switch transient {
+        case .ruler: return "ruler"
+        case .guide: return "guide"
+        case .none: return nil
+        }
+    }
+
     override func keyDown(with event: NSEvent) {
         if isEditingText {
             super.keyDown(with: event)
             return
         }
-        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        let flags = event.modifierFlags.intersection(
+            [.command, .shift, .control, .option])
         let chars = event.charactersIgnoringModifiers?.lowercased() ?? ""
 
         if event.keyCode == 53 { // Esc
+            if transient != nil {
+                transient = nil
+                needsDisplay = true
+                return
+            }
             if currentTool == .crop {
                 cancelCropSelection()
                 (window?.windowController as? EditorWindowController)?.selectTool(.select)
@@ -1030,15 +1304,10 @@ final class EditorCanvasView: NSView {
             }
             return
         }
-        if flags.isEmpty {
-            let toolKeys: [String: EditorTool] = [
-                "v": .select, "a": .arrow, "l": .line, "r": .rect, "o": .oval,
-                "h": .highlight, "p": .pen, "t": .text, "n": .counter, "b": .blur, "c": .crop,
-            ]
-            if let tool = toolKeys[chars] {
-                (window?.windowController as? EditorWindowController)?.selectTool(tool)
-                return
-            }
+        if handleSliceAKey(event, flags: flags, chars: chars) { return }
+        if flags.isEmpty, let tool = SliceAHotkeys.editorToolKeys[chars] {
+            (window?.windowController as? EditorWindowController)?.selectTool(tool)
+            return
         }
         super.keyDown(with: event)
     }
@@ -1049,6 +1318,9 @@ final class EditorCanvasView: NSView {
         if isEditingText {
             return super.performKeyEquivalent(with: event)
         }
+        let pickFlags = event.modifierFlags.intersection(
+            [.command, .shift, .control, .option])
+        if handleColorPickKey(event, flags: pickFlags) { return true }
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
         let chars = event.charactersIgnoringModifiers?.lowercased() ?? ""
         guard let wc = window?.windowController as? EditorWindowController else {

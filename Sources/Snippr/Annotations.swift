@@ -54,6 +54,11 @@ class Annotation {
     func hitTest(_ p: CGPoint) -> Bool { bounds.insetBy(dx: -8 * uiScale, dy: -8 * uiScale).contains(p) }
     func move(by delta: CGPoint) {}
     func copyAnnotation() -> Annotation { self }
+    /// Pixel-space scale used by the editor resize badge. Stroke/font sizes
+    /// grow with the bitmap so marks keep the same relative weight.
+    func scaleCoordinates(by factor: CGFloat) {
+        strokeWidthPt *= factor
+    }
 }
 
 // MARK: - Shapes (arrow / line / rect / oval / highlight)
@@ -153,6 +158,12 @@ final class ShapeAnnotation: Annotation {
         c.strokeWidthPt = strokeWidthPt
         return c
     }
+
+    override func scaleCoordinates(by factor: CGFloat) {
+        super.scaleCoordinates(by: factor)
+        start = CGPoint(x: start.x * factor, y: start.y * factor)
+        end = CGPoint(x: end.x * factor, y: end.y * factor)
+    }
 }
 
 // MARK: - Pen (freehand)
@@ -206,6 +217,11 @@ final class PenAnnotation: Annotation {
         c.strokeWidthPt = strokeWidthPt
         return c
     }
+
+    override func scaleCoordinates(by factor: CGFloat) {
+        super.scaleCoordinates(by: factor)
+        points = points.map { CGPoint(x: $0.x * factor, y: $0.y * factor) }
+    }
 }
 
 // MARK: - Text
@@ -257,6 +273,12 @@ final class TextAnnotation: Annotation {
         c.fontSizePt = fontSizePt
         c.color = color
         return c
+    }
+
+    override func scaleCoordinates(by factor: CGFloat) {
+        super.scaleCoordinates(by: factor)
+        origin = CGPoint(x: origin.x * factor, y: origin.y * factor)
+        fontSizePt *= factor
     }
 }
 
@@ -312,6 +334,12 @@ final class CounterAnnotation: Annotation {
         c.color = color
         return c
     }
+
+    override func scaleCoordinates(by factor: CGFloat) {
+        super.scaleCoordinates(by: factor)
+        center = CGPoint(x: center.x * factor, y: center.y * factor)
+        radiusPt *= factor
+    }
 }
 
 // MARK: - Blur / pixelate region
@@ -341,6 +369,211 @@ final class BlurAnnotation: Annotation {
         c.rect = rect
         return c
     }
+
+    override func scaleCoordinates(by factor: CGFloat) {
+        super.scaleCoordinates(by: factor)
+        rect = CGRect(
+            x: rect.origin.x * factor, y: rect.origin.y * factor,
+            width: rect.width * factor, height: rect.height * factor)
+    }
+}
+
+// MARK: - Guide (⌥S vertical / ⌥D horizontal)
+
+final class GuideAnnotation: Annotation {
+    var axis: MeasureAxis
+    var position: CGFloat
+    /// Length along the image's other axis at imprint time. Keeps selection
+    /// chrome on the canvas instead of a 2e6-px box.
+    var length: CGFloat
+
+    init(axis: MeasureAxis, position: CGFloat, length: CGFloat = 1_000_000,
+         uiScale: CGFloat) {
+        self.axis = axis
+        self.position = position
+        self.length = max(1, length)
+        super.init(uiScale: uiScale)
+        color = NSColor.systemTeal
+        strokeWidthPt = 1
+    }
+
+    override var bounds: CGRect {
+        let pad = 4 * uiScale
+        switch axis {
+        case .vertical:
+            return CGRect(x: position - pad, y: 0,
+                          width: pad * 2, height: length)
+        case .horizontal:
+            return CGRect(x: 0, y: position - pad,
+                          width: length, height: pad * 2)
+        }
+    }
+
+    override func draw(in ctx: CGContext, pixellated: CGImage?) {
+        ctx.saveGState()
+        defer { ctx.restoreGState() }
+        ctx.setStrokeColor(color.withAlphaComponent(0.9).cgColor)
+        ctx.setLineWidth(max(1, uiScale))
+        ctx.setLineDash(phase: 0, lengths: [5 * uiScale, 4 * uiScale])
+        switch axis {
+        case .vertical:
+            ctx.move(to: CGPoint(x: position, y: 0))
+            ctx.addLine(to: CGPoint(x: position, y: length))
+        case .horizontal:
+            ctx.move(to: CGPoint(x: 0, y: position))
+            ctx.addLine(to: CGPoint(x: length, y: position))
+        }
+        ctx.strokePath()
+        ctx.setLineDash(phase: 0, lengths: [])
+    }
+
+    override func hitTest(_ p: CGPoint) -> Bool {
+        let pad = 6 * uiScale
+        switch axis {
+        case .vertical: return abs(p.x - position) <= pad
+        case .horizontal: return abs(p.y - position) <= pad
+        }
+    }
+
+    override func move(by delta: CGPoint) {
+        switch axis {
+        case .vertical: position += delta.x
+        case .horizontal: position += delta.y
+        }
+    }
+
+    override func copyAnnotation() -> Annotation {
+        let c = GuideAnnotation(
+            axis: axis, position: position, length: length, uiScale: uiScale)
+        c.color = color
+        return c
+    }
+
+    override func scaleCoordinates(by factor: CGFloat) {
+        super.scaleCoordinates(by: factor)
+        position *= factor
+        length *= factor
+    }
+}
+
+// MARK: - Imprinted ruler (arrow keys + click)
+
+final class RulerAnnotation: Annotation {
+    var span: EdgeRuler.Span
+
+    init(span: EdgeRuler.Span, uiScale: CGFloat) {
+        self.span = span
+        super.init(uiScale: uiScale)
+        color = NSColor.systemYellow
+        strokeWidthPt = 1
+    }
+
+    override var bounds: CGRect {
+        let pad = 18 * uiScale
+        switch span.axis {
+        case .horizontal:
+            return CGRect(
+                x: min(span.start, span.end) - pad,
+                y: span.cross - pad,
+                width: span.length + pad * 2,
+                height: pad * 2)
+        case .vertical:
+            return CGRect(
+                x: span.cross - pad,
+                y: min(span.start, span.end) - pad,
+                width: pad * 2,
+                height: span.length + pad * 2)
+        }
+    }
+
+    override func draw(in ctx: CGContext, pixellated: CGImage?) {
+        drawRuler(
+            span, in: ctx, uiScale: uiScale, color: color, preview: false)
+    }
+
+    override func hitTest(_ p: CGPoint) -> Bool { bounds.contains(p) }
+
+    override func move(by delta: CGPoint) {
+        switch span.axis {
+        case .horizontal:
+            span.start += delta.x
+            span.end += delta.x
+            span.cross += delta.y
+        case .vertical:
+            span.start += delta.y
+            span.end += delta.y
+            span.cross += delta.x
+        }
+    }
+
+    override func copyAnnotation() -> Annotation {
+        let c = RulerAnnotation(span: span, uiScale: uiScale)
+        c.color = color
+        return c
+    }
+
+    override func scaleCoordinates(by factor: CGFloat) {
+        super.scaleCoordinates(by: factor)
+        span.start *= factor
+        span.end *= factor
+        span.cross *= factor
+    }
+}
+
+func drawRuler(
+    _ span: EdgeRuler.Span, in ctx: CGContext,
+    uiScale: CGFloat, color: NSColor, preview: Bool
+) {
+    ctx.saveGState()
+    defer { ctx.restoreGState() }
+    let alpha: CGFloat = preview ? 0.85 : 1
+    ctx.setStrokeColor(color.withAlphaComponent(alpha).cgColor)
+    ctx.setFillColor(color.withAlphaComponent(alpha).cgColor)
+    ctx.setLineWidth(max(1, uiScale))
+    let a: CGPoint
+    let b: CGPoint
+    switch span.axis {
+    case .horizontal:
+        a = CGPoint(x: span.start, y: span.cross)
+        b = CGPoint(x: span.end, y: span.cross)
+    case .vertical:
+        a = CGPoint(x: span.cross, y: span.start)
+        b = CGPoint(x: span.cross, y: span.end)
+    }
+    ctx.move(to: a)
+    ctx.addLine(to: b)
+    ctx.strokePath()
+    let tick: CGFloat = 6 * uiScale
+    switch span.axis {
+    case .horizontal:
+        ctx.move(to: CGPoint(x: a.x, y: a.y - tick))
+        ctx.addLine(to: CGPoint(x: a.x, y: a.y + tick))
+        ctx.move(to: CGPoint(x: b.x, y: b.y - tick))
+        ctx.addLine(to: CGPoint(x: b.x, y: b.y + tick))
+    case .vertical:
+        ctx.move(to: CGPoint(x: a.x - tick, y: a.y))
+        ctx.addLine(to: CGPoint(x: a.x + tick, y: a.y))
+        ctx.move(to: CGPoint(x: b.x - tick, y: b.y))
+        ctx.addLine(to: CGPoint(x: b.x + tick, y: b.y))
+    }
+    ctx.strokePath()
+
+    let label = "\(Int(span.length.rounded())) px"
+    let attrs: [NSAttributedString.Key: Any] = [
+        .font: NSFont.monospacedDigitSystemFont(ofSize: 11 * uiScale, weight: .semibold),
+        .foregroundColor: NSColor.white,
+        .backgroundColor: color.withAlphaComponent(0.92),
+    ]
+    let str = NSAttributedString(string: " \(label) ", attributes: attrs)
+    let size = str.size()
+    let origin = CGPoint(
+        x: (a.x + b.x) / 2 - size.width / 2,
+        y: (a.y + b.y) / 2 + 6 * uiScale)
+    let nsCtx = NSGraphicsContext(cgContext: ctx, flipped: false)
+    NSGraphicsContext.saveGraphicsState()
+    NSGraphicsContext.current = nsCtx
+    str.draw(at: origin)
+    NSGraphicsContext.restoreGraphicsState()
 }
 
 // MARK: - Rendering

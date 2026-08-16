@@ -53,6 +53,12 @@ final class ScrollingCapture {
     /// "✓ / Esc để xong" khi Esc đăng ký được, nếu không thì chỉ còn nút ✓.
     private var stopHint: String { escRegistered ? "✓ / Esc để xong" : "bấm ✓ để xong" }
 
+    /// Chrome copy: stitcher already prepends on up-scroll; this only tells
+    /// the user both directions work. Do not change capture/hotkey behavior.
+    nonisolated static var bidirectionalScrollHint: String {
+        SliceAHotkeys.bidirectionalScrollHint
+    }
+
     init(
         inputs: OverlaySessionInputs? = nil,
         onFinish: @escaping @MainActor (ScrollFinish) -> Void
@@ -238,7 +244,8 @@ final class ScrollingCapture {
                     stitcher = SegmentedVerticalStitcher(
                         first: frame.cgImage, scale: scale)
                     startPreview(with: frame.cgImage)
-                    updateProgress("Cuộn từ từ — ảnh ghép hiện bên cạnh · \(stopHint)")
+                    updateProgress(
+                        "\(Self.bidirectionalScrollHint) · \(stopHint)")
                 }
             }
 
@@ -604,7 +611,8 @@ final class ScrollingCapture {
         container.layer?.backgroundColor = NSColor(white: 0.09, alpha: 0.94).cgColor
         container.layer?.cornerRadius = 12
 
-        let label = NSTextField(wrappingLabelWithString: "Cuộn trang từ từ — ảnh ghép hiện tại đây")
+        let label = NSTextField(wrappingLabelWithString:
+            "\(Self.bidirectionalScrollHint) · ảnh ghép hiện tại đây")
         label.font = .systemFont(ofSize: 11.5, weight: .semibold)
         label.textColor = .white
         progressLabel = label
