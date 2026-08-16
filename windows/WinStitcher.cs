@@ -4,8 +4,9 @@ namespace Snippr;
 
 /// Vertical stitcher (GDI+, top-left origin). Frames that can't be matched
 /// confidently are rejected rather than guessed. It shares the conservative
-/// signature/uniqueness/footer gates with macOS; macOS additionally has
-/// platform-specific recovery for fractional Core Animation rasterization.
+/// signature/uniqueness/footer gates with macOS, plus the animated side-band
+/// recovery (≤1/2 width, fail-closed on majority change). macOS additionally
+/// has platform-specific recovery for fractional Core Animation rasterization.
 sealed class WinStitcher : IDisposable
 {
     readonly List<Bitmap> _slices = new();
@@ -49,8 +50,9 @@ sealed class WinStitcher : IDisposable
         var prevSig = _lastSig;
         _firstSig ??= prevSig; // prev of the 1st append IS frame #1
 
-        var match = FindOverlap(prevSig.Value, nextSig.Value, next.Height,
-            _footerLatched ? FooterRows : null);
+        var lockedFooter = _footerLatched ? FooterRows : (int?)null;
+        var match = FindOverlap(prevSig.Value, nextSig.Value, next.Height, lockedFooter)
+            ?? FindOverlapMaskingAnimatedBands(prevSig.Value, nextSig.Value, next.Height, lockedFooter);
         if (match is not (int offset, int pairFooter)) return false;
         int footer = _footerLatched ? FooterRows : pairFooter;
 
@@ -267,6 +269,120 @@ sealed class WinStitcher : IDisposable
         bool unique = secondScore > bestScore * 3 + 0.15
             || secondScore - bestScore > 2.5;
         return unique ? (bestOffset, footer) : null;
+    }
+
+    /// Band subsets that may be treated as an "animated region": a sidebar
+    /// ad creative, a carousel, an autoplaying video card. At most HALF the
+    /// width, and only contiguous edge/single bands — the matcher never gets
+    /// to pick and choose scattered evidence.
+    static readonly int[][] AnimatedBandMasks = [[3], [0], [2], [1], [2, 3], [0, 1]];
+
+    /// Minimum mean |Δ| (gray) the masked bands must show along the accepted
+    /// alignment for the mask to be justified. A column that did not change
+    /// cannot be the reason the full-width matcher rejected.
+    const double AnimatedBandMinDifference = 4.0;
+
+    /// <c>sig</c> with the masked bands replaced by their nearest kept band,
+    /// so per-row averages keep their scale while the masked bands contribute
+    /// exactly what the kept bands say.
+    static Signatures MaskedSignature(Signatures sig, int[] mask, int height)
+    {
+        var bands = (double[])sig.Bands.Clone();
+        Span<int> keptBuf = stackalloc int[4];
+        int keptCount = 0;
+        for (int b = 0; b < 4; b++)
+        {
+            if (Array.IndexOf(mask, b) < 0) keptBuf[keptCount++] = b;
+        }
+        if (keptCount == 0) return sig;
+        foreach (int band in mask)
+        {
+            int source = keptBuf[0];
+            int bestDist = Math.Abs(source - band);
+            for (int i = 1; i < keptCount; i++)
+            {
+                int dist = Math.Abs(keptBuf[i] - band);
+                if (dist < bestDist)
+                {
+                    bestDist = dist;
+                    source = keptBuf[i];
+                }
+            }
+            for (int y = 0; y < height; y++)
+                bands[y * 4 + band] = sig.Bands[y * 4 + source];
+        }
+        return new Signatures(bands, sig.Energy);
+    }
+
+    /// Recovery for a frame pair whose MINORITY of the width changed content
+    /// (an ad creative swapping right after frame #1) while the rest of the
+    /// page scrolled coherently. Runs only after the full-width matcher
+    /// rejected. Each candidate mask must pass the complete matcher on the
+    /// KEPT bands, AND the masked bands must actually differ along that
+    /// alignment; every mask that passes must agree on offset. Three-quarter
+    /// changes have no admissible mask and keep failing closed.
+    static (int offset, int footer)? FindOverlapMaskingAnimatedBands(
+        Signatures prevS, Signatures nextS, int h, int? lockedFooter)
+    {
+        if (prevS.Bands.Length != h * 4 || nextS.Bands.Length != h * 4) return null;
+        int changedRows = 0;
+        for (int y = 0; y < h; y++)
+        {
+            int b = y * 4;
+            double d = (Math.Abs(prevS.Bands[b] - nextS.Bands[b])
+                + Math.Abs(prevS.Bands[b + 1] - nextS.Bands[b + 1])
+                + Math.Abs(prevS.Bands[b + 2] - nextS.Bands[b + 2])
+                + Math.Abs(prevS.Bands[b + 3] - nextS.Bands[b + 3])) / 4;
+            if (d > 1.5) changedRows++;
+        }
+        if (changedRows <= h / 20) return null;
+
+        (int offset, int footer, int maskLen)? first = null;
+        (int offset, int footer, int maskLen)? best = null;
+        foreach (var mask in AnimatedBandMasks)
+        {
+            var maskedPrev = MaskedSignature(prevS, mask, h);
+            var maskedNext = MaskedSignature(nextS, mask, h);
+            if (FindOverlap(maskedPrev, maskedNext, h, lockedFooter) is not (int offset, int footer))
+                continue;
+            if (!MaskedBandsDiffer(prevS, nextS, mask, offset, footer, h))
+                continue;
+            var candidate = (offset, footer, maskLen: mask.Length);
+            if (first is null) first = candidate;
+            else if (Math.Abs(offset - first.Value.offset) > 1)
+                return null; // masks disagree — fail closed
+            if (best is null
+                || candidate.maskLen < best.Value.maskLen
+                || (candidate.maskLen == best.Value.maskLen && offset < best.Value.offset))
+            {
+                best = candidate;
+            }
+        }
+        return best is { } chosen ? (chosen.offset, chosen.footer) : null;
+    }
+
+    /// Mean |Δ| of the masked bands over the overlap implied by the match.
+    /// Down-scroll: next[y] ≈ prev[y + offset].
+    static bool MaskedBandsDiffer(
+        Signatures prev, Signatures next, int[] mask, int offset, int footer, int height)
+    {
+        int effective = height - footer;
+        int start = 0;
+        int end = effective - offset;
+        if (end - start < 8) return false;
+        double total = 0;
+        int count = 0;
+        for (int y = start; y < end; y++)
+        {
+            int a = (y + offset) * 4;
+            int b = y * 4;
+            foreach (int band in mask)
+            {
+                total += Math.Abs(prev.Bands[a + band] - next.Bands[b + band]);
+                count++;
+            }
+        }
+        return count > 0 && total / count >= AnimatedBandMinDifference;
     }
 
     readonly record struct Signatures(double[] Bands, double[] Energy);
