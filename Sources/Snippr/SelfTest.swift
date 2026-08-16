@@ -1106,7 +1106,8 @@ enum SelfTest {
         // (not a relocated /bin/sleep) so lsof can observe a live foreign
         // physical path; health still claims the target so reject is only
         // executable identity. Rollback must restore old and must not STOP
-        // the foreign process.
+        // the foreign process. The first candidate open keeps PID/path/lsof
+        // /health; reopen of the restored old bundle only records reopened.
         if let healthy = runUpdaterPhysicalPathHealthFixture(
             in: URL(fileURLWithPath: outputDir), health: .lexicalApp)
         {
@@ -1165,6 +1166,7 @@ enum SelfTest {
             check("updater-physical-path-rejects-sibling",
                   sibling.ok
                     && sibling.foreignAlive
+                    && sibling.reopened
                     && !sibling.targetPhysical.isEmpty
                     && sibling.targetPhysical != sibling.launchPhysical
                     && sibling.marker == "old"
@@ -1181,6 +1183,7 @@ enum SelfTest {
             check("updater-physical-path-rejects-other-file",
                   other.ok
                     && other.foreignAlive
+                    && other.reopened
                     && !other.targetPhysical.isEmpty
                     && other.targetPhysical != other.launchPhysical
                     && other.marker == "old"
@@ -8223,6 +8226,7 @@ enum SelfTest {
     private struct UpdaterPhysicalPathRejectResult {
         let ok: Bool
         let foreignAlive: Bool
+        let reopened: Bool
         let targetPhysical: String
         let launchPhysical: String
         let marker: String
@@ -8437,6 +8441,8 @@ enum SelfTest {
             }
             let healthFile = root.appendingPathComponent("status.txt")
             let pidFile = root.appendingPathComponent("foreign.pid")
+            let callFile = root.appendingPathComponent("open-called")
+            let reopenedFile = root.appendingPathComponent("old-reopened")
             let lsofFile = root.appendingPathComponent("lsof.txt")
             let lexicalFile = root.appendingPathComponent("lexical.txt")
             let physicalFile = root.appendingPathComponent("physical.txt")
@@ -8444,11 +8450,15 @@ enum SelfTest {
             let openStub = root.appendingPathComponent("open-reject.sh")
             // Health claims the activated APP executable so reject must come
             // from lsof/canonical identity, not a lexical breadcrumb mismatch.
+            // First open records evidence; rollback reopen must not overwrite
+            // it or spawn another foreign process.
             try makeUpdaterObservedOpenStub(
                 at: openStub, pidFile: pidFile, lsofFile: lsofFile,
                 lexicalFile: lexicalFile, physicalFile: physicalFile,
                 launchPhysicalFile: launchPhysicalFile, healthFile: healthFile,
-                health: .lexicalApp, launch: launch, sleepSeconds: 30)
+                health: .lexicalApp, launch: launch,
+                callFile: callFile, reopenedFile: reopenedFile,
+                sleepSeconds: 30)
             guard let fixture = makeUpdaterDMGFixture(
                 at: root, tamperAfterSigning: false) else { return nil }
             defer { cleanupUpdaterDMGFixture(fixture) }
@@ -8464,6 +8474,7 @@ enum SelfTest {
             }
             let marker = updaterFixtureMarker(at: installed) ?? "missing"
             let logText = (try? String(contentsOf: log, encoding: .utf8)) ?? ""
+            let reopened = FileManager.default.fileExists(atPath: reopenedFile.path)
             let targetPhysical = readTrimmedFile(physicalFile)
             let launchPhysical = readTrimmedFile(launchPhysicalFile)
             let lsofText = (try? String(contentsOf: lsofFile, encoding: .utf8)) ?? ""
@@ -8473,7 +8484,8 @@ enum SelfTest {
             let stoppedForeign = logText.contains("STOP stage=activated-candidate")
                 || logText.contains("STOPPED stage=activated-candidate")
                 || logText.contains("FORCE stage=activated-candidate")
-            let ok = !targetPhysical.isEmpty
+            let ok = reopened
+                && !targetPhysical.isEmpty
                 && !launchPhysical.isEmpty
                 && targetPhysical != launchPhysical
                 && lsofHasLaunch
@@ -8486,9 +8498,10 @@ enum SelfTest {
                 && logText.contains("FAIL stage=health")
                 && !logText.contains("SUCCESS")
                 && !logText.contains("HEALTHY")
-            let detail = "tgt \(targetPhysical) launch \(launchPhysical) foreignLex \(foreignLexical) lsofLaunch \(lsofHasLaunch) lsofForeignLex \(lsofHasForeignLexical) lsofTgt \(lsofHasTarget) status \(result.status) marker \(marker) alive \(alive) stoppedForeign \(stoppedForeign) log \(logText) lsof \(lsofText) output \(result.output)"
+            let detail = "tgt \(targetPhysical) launch \(launchPhysical) foreignLex \(foreignLexical) lsofLaunch \(lsofHasLaunch) lsofForeignLex \(lsofHasForeignLexical) lsofTgt \(lsofHasTarget) status \(result.status) marker \(marker) alive \(alive) stoppedForeign \(stoppedForeign) reopened \(reopened) log \(logText) lsof \(lsofText) output \(result.output)"
             return UpdaterPhysicalPathRejectResult(
-                ok: ok, foreignAlive: alive, targetPhysical: targetPhysical,
+                ok: ok, foreignAlive: alive, reopened: reopened,
+                targetPhysical: targetPhysical,
                 launchPhysical: launchPhysical, marker: marker,
                 stoppedForeign: stoppedForeign, detail: detail)
         } catch {
