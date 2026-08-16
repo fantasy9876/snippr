@@ -9414,6 +9414,12 @@ enum SelfTest {
                             || ScrollResultPanel.current === panelToClean {
                             lockStageFailures.append("cleanup-leaked")
                             seamUnsafe = true
+                            // The failure is already recorded, so this hides
+                            // nothing — but the worker is about to be woken,
+                            // and it must not be able to mutate or repaint a
+                            // surface the gate just found still alive.
+                            panelToClean.annotationSurface
+                                .cancelAllRedactionJobs()
                         }
                     }
                     // Then release and drain OUR worker, and only then put the
