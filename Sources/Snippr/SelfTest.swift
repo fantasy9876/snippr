@@ -11353,6 +11353,12 @@ enum SelfTest {
             space: CGColorSpace(name: CGColorSpace.sRGB)!,
             bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
         else { return nil }
+        // Clear the WHOLE device bitmap first: neither host paints every pixel
+        // (the host view is transparent outside its annotations, and the
+        // overlay punches a hole for the selection), so baseline and forced
+        // snapshots would otherwise compare two differently-initialised
+        // allocations.
+        ctx.clear(CGRect(x: 0, y: 0, width: pixelWidth, height: pixelHeight))
         // Independent scale per axis, then move the view's origin to zero.
         ctx.scaleBy(
             x: CGFloat(pixelWidth) / bounds.width,
