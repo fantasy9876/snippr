@@ -9404,6 +9404,11 @@ enum SelfTest {
                 let generation = blur.redactionGeneration
                 MainActor.assumeIsolated {
                     let ownersBefore = SliceBRedactionJob.ownerCountForTesting
+                    // `pendingForTesting` deliberately holds NO physical slot,
+                    // so this gate says nothing about `inFlight` beyond leaving
+                    // it alone. Slot accounting is covered where it belongs, by
+                    // the real-start queue gate below.
+                    let slotsBefore = SliceBRedactionJob.inFlight
                     let job = SliceBRedactionJob.pendingForTesting(
                         blur: blur, host: canvas)
                     canvas.redactionRegistry.register(job, for: blur)
@@ -9451,6 +9456,10 @@ enum SelfTest {
                         applyFailures.append(
                             label + ":owner-leak "
                             + "\(SliceBRedactionJob.ownerCountForTesting)")
+                    }
+                    if SliceBRedactionJob.inFlight != slotsBefore {
+                        applyFailures.append(
+                            label + ":slots \(SliceBRedactionJob.inFlight)")
                     }
                 }
                 let refs = canvas.annotationRefsForTesting
