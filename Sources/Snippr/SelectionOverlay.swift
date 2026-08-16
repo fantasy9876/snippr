@@ -479,8 +479,8 @@ final class SelectionOverlayView: NSView {
         let button = NSButton(frame: .zero)
         button.bezelStyle = .regularSquare
         button.isBordered = false
-        button.image = NSImage(
-            systemSymbolName: symbol, accessibilityDescription: tooltip)
+        button.image = SliceBSymbols.image(
+            named: symbol, fallback: "questionmark.square.dashed")
         button.contentTintColor = tint
         button.toolTip = tooltip
         button.tag = tag

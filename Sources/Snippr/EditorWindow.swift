@@ -129,7 +129,9 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
 
         func makeButton(symbol: String, tooltip: String, action: Selector) -> NSButton {
             let b = NSButton(
-                image: NSImage(systemSymbolName: symbol, accessibilityDescription: tooltip)!,
+                image: SliceBSymbols.image(
+                    named: symbol, fallback: "questionmark.square.dashed")
+                    ?? NSImage(size: NSSize(width: 16, height: 16)),
                 target: self, action: action
             )
             b.isBordered = false
