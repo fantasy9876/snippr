@@ -92,15 +92,36 @@ make_tools() {
   chmod 755 "$GRACEFUL" "$SIGNAL"
 }
 
+poll_lsof_physical() {
+  POLL_PID="$1"
+  POLL_EXPECTED="$2"
+  REMAINING=25
+  while [ "$REMAINING" -gt 0 ]; do
+    if /usr/sbin/lsof -a -p "$POLL_PID" -d txt -Fn 2>/dev/null \
+      | /usr/bin/grep -Fqx "n$POLL_EXPECTED"; then
+      return 0
+    fi
+    /bin/sleep 0.1
+    REMAINING=$((REMAINING - 1))
+  done
+  return 1
+}
+
+make_alias_roots() {
+  mkdir -p "$1/physical"
+  ln -sfn "$1/physical" "$1/via"
+}
+
 run_failure_case() (
   MODE="$1"
-  CASE_ROOT="$ROOT/$MODE"
+  CASE_ROOT="${2:-$ROOT/$MODE}"
+  APP_PATH="${3:-$CASE_ROOT/Snippr.app}"
   mkdir -p "$CASE_ROOT"
   make_tools "$CASE_ROOT" "$MODE"
   export SNIPPR_TEST_SIGNAL_LOG="$CASE_ROOT/signals.log"
   export SNIPPR_TEST_HELPER_PID_FILE="$CASE_ROOT/helper.pid"
   export SNIPPR_INSTALL_LIBRARY_ONLY=1
-  export SNIPPR_INSTALL_TEST_APP="$CASE_ROOT/Snippr.app"
+  export SNIPPR_INSTALL_TEST_APP="$APP_PATH"
   export SNIPPR_INSTALL_TEST_HEALTH_FILE="$CASE_ROOT/status.txt"
   export SNIPPR_INSTALL_TEST_HEALTH_TIMEOUT=7
   export SNIPPR_INSTALL_TEST_STOP_GRACE=1
@@ -212,9 +233,91 @@ run_health_case() (
   wait "$PID" 2>/dev/null || true
 )
 
+assert_alias_stop_case() {
+  CASE_ROOT="$ROOT/alias-stop"
+  mkdir -p "$CASE_ROOT"
+  make_alias_roots "$CASE_ROOT"
+  make_app "$CASE_ROOT/physical/Snippr.app" new
+  APP="$CASE_ROOT/via/Snippr.app"
+  LEXICAL="$APP/Contents/MacOS/Snippr"
+  PHYSICAL="$(/bin/realpath -q "$LEXICAL")"
+  [ -n "$PHYSICAL" ]
+  [ "$LEXICAL" != "$PHYSICAL" ]
+  "$LEXICAL" 30 &
+  /usr/bin/printf '%s\n' "$!" > "$CASE_ROOT/candidate.pid"
+  poll_lsof_physical "$!" "$PHYSICAL" \
+    || { echo "FAIL site-installer-alias-stop lsof missed physical $PHYSICAL" >&2; exit 1; }
+  STARTED_AT="$(/bin/date +%s)"
+  if run_failure_case polite "$CASE_ROOT" "$APP"; then
+    echo "FAIL site-installer-alias-stop expected nonzero transaction" >&2
+    exit 1
+  fi
+  ELAPSED=$(( $(/bin/date +%s) - STARTED_AT ))
+  PID="$(sed -n '1p' "$CASE_ROOT/candidate.pid")"
+  BACKUP_PATH="$(sed -n '1p' "$CASE_ROOT/backup-path")"
+  SIGNALS="$(sed -n '1,20p' "$CASE_ROOT/signals.log" 2>/dev/null || true)"
+  [ "$(marker "$APP")" = old ]
+  [ ! -e "$BACKUP_PATH" ]
+  ! /bin/kill -0 "$PID" 2>/dev/null
+  /usr/bin/printf '%s' "$SIGNALS" | /usr/bin/grep -Fq -- '--request-terminate-pid'
+  ! /usr/bin/printf '%s' "$SIGNALS" | /usr/bin/grep -Fq -- '-KILL'
+  [ "$ELAPSED" -lt 10 ]
+  wait "$PID" 2>/dev/null || true
+  echo "PASS site-installer-alias-stop"
+}
+
+run_alias_health_case() (
+  CASE_ROOT="$ROOT/alias-health"
+  mkdir -p "$CASE_ROOT"
+  make_alias_roots "$CASE_ROOT"
+  make_tools "$CASE_ROOT" polite
+  export SNIPPR_TEST_SIGNAL_LOG="$CASE_ROOT/signals.log"
+  export SNIPPR_TEST_HELPER_PID_FILE="$CASE_ROOT/helper.pid"
+  export SNIPPR_INSTALL_LIBRARY_ONLY=1
+  export SNIPPR_INSTALL_TEST_APP="$CASE_ROOT/via/Snippr.app"
+  export SNIPPR_INSTALL_TEST_HEALTH_FILE="$CASE_ROOT/status.txt"
+  export SNIPPR_INSTALL_TEST_HEALTH_TIMEOUT=7
+  export SNIPPR_INSTALL_TEST_STOP_GRACE=1
+  export SNIPPR_INSTALL_TEST_STOP_FORCE=1
+  export SNIPPR_INSTALL_TEST_TMP="$CASE_ROOT/tmp"
+  export SNIPPR_INSTALL_TEST_GRACEFUL_TOOL="$CASE_ROOT/graceful.sh"
+  export SNIPPR_INSTALL_TEST_SIGNAL_TOOL="$CASE_ROOT/signal.sh"
+  . "$INSTALLER"
+
+  make_app "$APP" new
+  make_app "$BACKUP" old
+  LEXICAL="$EXPECTED_EXECUTABLE"
+  PHYSICAL="$(/bin/realpath -q "$LEXICAL")"
+  [ -n "$PHYSICAL" ]
+  [ "$LEXICAL" != "$PHYSICAL" ]
+  "$LEXICAL" 30 &
+  PID=$!
+  /usr/bin/printf '%s\n' "$PID" > "$CASE_ROOT/candidate.pid"
+  poll_lsof_physical "$PID" "$PHYSICAL" \
+    || { echo "FAIL site-installer-alias-health-commit lsof missed physical $PHYSICAL" >&2; exit 1; }
+  CANDIDATE_VERSION=1.2.4
+  CANDIDATE_BUILD=21
+  ACTIVATED=1
+  BACKED_UP=1
+  TRANSACTION_STARTED=1
+  install_transaction_traps
+  /usr/bin/printf 'pid=%s\nversion=1.2.4\nbuild=21\nexecutable=%s\n' \
+    "$PID" "$EXPECTED_EXECUTABLE" > "$HEALTH_FILE"
+  wait_for_health
+  commit_transaction
+  [ "$BACKED_UP" = 0 ] && [ "$ACTIVATED" = 0 ] && [ "$TRANSACTION_STARTED" = 0 ]
+  [ "$(marker "$APP")" = new ] && [ ! -e "$BACKUP" ]
+  /bin/kill -0 "$PID" 2>/dev/null
+  /bin/kill -KILL "$PID" 2>/dev/null || true
+  wait "$PID" 2>/dev/null || true
+)
+
 assert_failure_case polite
 assert_failure_case force
 assert_failure_case immortal
 run_health_case
 echo "PASS site-installer-health-commit"
+assert_alias_stop_case
+run_alias_health_case
+echo "PASS site-installer-alias-health-commit"
 echo "SITE INSTALLER TRANSACTION TESTS PASSED"

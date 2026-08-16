@@ -8160,7 +8160,7 @@ enum SelfTest {
         case path(String)
     }
 
-    private enum UpdaterRejectKind {
+    private enum UpdaterRejectKind: Equatable {
         case sibling
         case otherSymlink
     }
@@ -8261,7 +8261,16 @@ enum SelfTest {
                 /usr/bin/printf '%s\\n' "$LEXICAL" > "\(lexicalFile.path)"
                 /usr/bin/printf '%s\\n' "$PHYSICAL" > "\(physicalFile.path)"
                 /usr/bin/printf '%s\\n' "$LAUNCH_PHYSICAL" > "\(launchPhysicalFile.path)"
-                /usr/sbin/lsof -a -p "$PID" -d txt -Fn > "\(lsofFile.path)" 2>/dev/null || true
+                LSOF_REMAINING=25
+                while [ "$LSOF_REMAINING" -gt 0 ]; do
+                  /usr/sbin/lsof -a -p "$PID" -d txt -Fn > "\(lsofFile.path)" 2>/dev/null || true
+                  if [ -n "$LAUNCH_PHYSICAL" ] \\
+                    && /usr/bin/grep -Fqx "n$LAUNCH_PHYSICAL" "\(lsofFile.path)"; then
+                    break
+                  fi
+                  /bin/sleep 0.1
+                  LSOF_REMAINING=$((LSOF_REMAINING - 1))
+                done
                 \(healthBlock)
                 \(touchLine)
                 exit 0
