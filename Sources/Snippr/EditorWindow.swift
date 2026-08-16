@@ -1545,6 +1545,24 @@ final class EditorCanvasView: NSView {
     var selectedRefForTesting: Annotation? { selected }
     var editingTextRefForTesting: TextAnnotation? { editingTextAnnotation }
 
+    /// Drives a real drag through the production mouse handlers, in image
+    /// pixels, so a gate can create an annotation the way a user does.
+    func dragForTesting(from start: CGPoint, to end: CGPoint) {
+        let scale = pxScale
+        let a = CGPoint(x: start.x / scale, y: start.y / scale)
+        let b = CGPoint(x: end.x / scale, y: end.y / scale)
+        func event(_ type: NSEvent.EventType, _ point: CGPoint) -> NSEvent? {
+            NSEvent.mouseEvent(
+                with: type, location: convert(point, to: nil),
+                modifierFlags: [], timestamp: 0,
+                windowNumber: window?.windowNumber ?? 0, context: nil,
+                eventNumber: 0, clickCount: 1, pressure: 1)
+        }
+        if let down = event(.leftMouseDown, a) { mouseDown(with: down) }
+        if let drag = event(.leftMouseDragged, b) { mouseDragged(with: drag) }
+        if let up = event(.leftMouseUp, b) { mouseUp(with: up) }
+    }
+
     /// The exact predicate `keyDown` routes on, so a preflight cannot assert a
     /// near-miss (a backing annotation without first responder, say).
     var isEditingTextForTesting: Bool { isEditingText }

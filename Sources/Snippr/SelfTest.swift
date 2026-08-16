@@ -9911,45 +9911,52 @@ enum SelfTest {
             // E9. Slivers and invalid geometry must fail CLOSED.
             var sliverFailures: [String] = []
             let sliverBase = makeNoiseImage(width: 80, height: 60)
-            // A mask that overlaps the visible region by well under a pixel in
-            // one axis: skipping it and returning success left clean pixels
-            // along the redaction edge.
+            // The sliver only exists when the visible/crop region clips the
+            // mask, so this must be driven through a real crop — rendering the
+            // full base would leave a perfectly ordinary 20x20 redaction.
             let sliverBlur = BlurAnnotation(uiScale: 1)
             sliverBlur.rect = CGRect(x: 39.4, y: 10, width: 20, height: 20)
+            let sliverVisible = CGRect(x: 0, y: 0, width: 40, height: 60)
             let sliverCtx = ctx(80, 60)
             sliverCtx.draw(sliverBase, in: CGRect(x: 0, y: 0, width: 80, height: 60))
-            let sliverVisible = CGRect(x: 0, y: 0, width: 40, height: 60)
             let sliverOK = SliceBCompositor.draw(
                 [sliverBlur], in: sliverCtx, base: sliverBase,
                 visiblePixels: sliverVisible)
-            // A region too small to pixelate must fail closed, not succeed.
             if sliverOK { sliverFailures.append("sliver:claimed-ok") }
-            if SliceBExport.checkedRender(
-                base: sliverBase, annotations: [sliverBlur], pixellated: nil,
-                budgetBytes: SliceBExport.defaultBudgetBytes) != nil {
-                // export sees the full base, so the sliver is a real region
-                // there; this asserts the export contract, not the sliver
+            let sliverExport = MainActor.assumeIsolated { () -> CGImage? in
+                let surface = AnnotationSurface(pixelScale: 1)
+                surface.addAnnotationForTesting(sliverBlur)
+                // crop (top-left) that leaves only the 0.6px column visible
+                return surface.flattened(
+                    base: sliverBase,
+                    cropPixels: CGRect(x: 0, y: 0, width: 40, height: 60))
+            }
+            if sliverExport != nil {
                 sliverFailures.append("sliver:export-not-checked")
             }
             if let shot = sliverCtx.makeImage() {
-                let intersection = sliverBlur.rect.intersection(sliverVisible)
-                for x in Int(intersection.minX.rounded(.down))...
-                    Int(intersection.maxX.rounded(.up)) {
-                    for y in Int(intersection.minY)..<Int(intersection.maxY) {
+                let overlap = sliverBlur.rect.intersection(sliverVisible)
+                let scanned = overlap.integral.intersection(sliverVisible)
+                var x = Int(scanned.minX)
+                while x < Int(scanned.maxX) {   // upper-EXCLUSIVE
+                    var y = Int(scanned.minY)
+                    while y < Int(scanned.maxY) {
                         let p = probe3(shot, x, y)
-                        guard p.0 >= 0 else { continue }
-                        if p == probe3(sliverBase, x, y) {
+                        if p.0 >= 0, p == probe3(sliverBase, x, y) {
                             sliverFailures.append("sliver:clean@\(x),\(y)")
-                            break
+                            y = Int(scanned.maxY)
+                            x = Int(scanned.maxX)
+                            continue
                         }
+                        y += 1
                     }
+                    x += 1
                 }
-                // everything outside the mask must be untouched
-                for x in stride(from: 2, to: 38, by: 6) {
-                    for y in stride(from: 2, to: 58, by: 6)
-                    where !sliverBlur.rect.contains(CGPoint(x: x, y: y)) {
-                        if probe3(shot, x, y) != probe3(sliverBase, x, y) {
-                            sliverFailures.append("sliver:outside@\(x),\(y)")
+                for px in stride(from: 2, to: 38, by: 6) {
+                    for py in stride(from: 2, to: 58, by: 6)
+                    where !sliverBlur.rect.contains(CGPoint(x: px, y: py)) {
+                        if probe3(shot, px, py) != probe3(sliverBase, px, py) {
+                            sliverFailures.append("sliver:outside@\(px),\(py)")
                         }
                     }
                 }
@@ -9969,11 +9976,11 @@ enum SelfTest {
                 visiblePixels: CGRect(x: 0, y: 0, width: 80, height: 60))
             if invalidOK { sliverFailures.append("invalid:claimed-ok") }
             if let shot = invalidCtx.makeImage() {
-                for x in stride(from: 4, to: 76, by: 9) {
-                    for y in stride(from: 4, to: 56, by: 9) {
-                        let p = probe3(shot, x, y)
+                for px in stride(from: 4, to: 76, by: 9) {
+                    for py in stride(from: 4, to: 56, by: 9) {
+                        let p = probe3(shot, px, py)
                         if !(p.0 >= 0 && p.0 < 60 && p.1 < 60 && p.2 < 60) {
-                            sliverFailures.append("invalid:uncovered@\(x),\(y)")
+                            sliverFailures.append("invalid:uncovered@\(px),\(py)")
                             break
                         }
                     }
@@ -9981,8 +9988,6 @@ enum SelfTest {
             } else {
                 sliverFailures.append("invalid:no-image")
             }
-            // A magnifier must not sample raw pixels when any redaction has
-            // undefined geometry: it cannot be shown to be safe.
             if SliceBCompositor.magnifierSnapshot(
                 base: sliverBase,
                 sourceRect: CGRect(x: 5, y: 5, width: 20, height: 20),
@@ -10008,6 +10013,11 @@ enum SelfTest {
             MainActor.assumeIsolated {
                 var panelExport: CapturedImage?
                 var panelToasts = 0
+                var panelDeps = [
+                    "autoSave": 0, "saveAs": 0, "pin": 0, "ocr": 0,
+                    "openEditor": 0, "setLastCapture": 0,
+                    "setLastAreaRect": 0, "logEvent": 0,
+                ]
                 let panelBase = makeNoiseImage(width: 200, height: 400)
                 let panel = ScrollResultPanel.show(
                     image: CapturedImage(cgImage: panelBase, scale: 1),
@@ -10016,11 +10026,16 @@ enum SelfTest {
                     screen: hostScreen,
                     dependencies: CaptureActionRouter.Dependencies(
                         copyToClipboard: { panelExport = $0 },
-                        autoSave: { _, _ in }, saveAs: { _, _ in },
-                        pin: { _ in }, ocr: { _ in }, openEditor: { _ in },
+                        autoSave: { _, _ in panelDeps["autoSave"]! += 1 },
+                        saveAs: { _, _ in panelDeps["saveAs"]! += 1 },
+                        pin: { _ in panelDeps["pin"]! += 1 },
+                        ocr: { _ in panelDeps["ocr"]! += 1 },
+                        openEditor: { _ in panelDeps["openEditor"]! += 1 },
                         toast: { _ in panelToasts += 1 },
-                        setLastCapture: { _ in }, setLastAreaRect: { _ in },
-                        logEvent: { _ in }))
+                        setLastCapture: { _ in panelDeps["setLastCapture"]! += 1 },
+                        setLastAreaRect: { _ in panelDeps["setLastAreaRect"]! += 1 },
+                        logEvent: { _ in panelDeps["logEvent"]! += 1 }))
+                for key in panelDeps.keys { panelDeps[key] = 0 }
                 if panel.annotationHostForTesting == nil {
                     panelFailures.append("panel:no-host")
                 }
@@ -10040,6 +10055,10 @@ enum SelfTest {
                     }
                 }
                 if panelExport != nil { panelFailures.append("panel:exported") }
+                if !panel.isVisible { panelFailures.append("panel:closed") }
+                if panelDeps.values.contains(where: { $0 != 0 }) {
+                    panelFailures.append("panel:deps \(panelDeps)")
+                }
                 if panelToasts - toastsBefore != 1 {
                     panelFailures.append(
                         "panel:toasts \(panelToasts - toastsBefore)")
@@ -10052,29 +10071,45 @@ enum SelfTest {
                 ] {
                     panelFailures.append("panel:seq \(panelShape)")
                 }
-                // preview keeps drawing and must be opaque over the mask
+                // Preview is captured from the ACTUAL host view, at whatever
+                // backing scale it renders, and every pixel of the mask is
+                // compared as RGBA.
                 if let host = panel.annotationHostForTesting {
-                    let c = ctx(200, 400)
-                    c.draw(panelBase, in: CGRect(x: 0, y: 0, width: 200, height: 400))
-                    let drew = AnnotationRenderer.withForcedRegionalFailure {
-                        panel.annotationSurface.drawForPreview(
-                            in: c, base: panelBase)
+                    let shot = AnnotationRenderer.withForcedRegionalFailure {
+                        () -> CGImage? in
+                        host.needsDisplay = true
+                        host.display()
+                        guard let rep = host.bitmapImageRepForCachingDisplay(
+                            in: host.bounds) else { return nil }
+                        host.cacheDisplay(in: host.bounds, to: rep)
+                        return rep.cgImage
                     }
-                    if drew { panelFailures.append("panel:preview-claimed-ok") }
-                    if let shot = c.makeImage() {
-                        for x in stride(from: 42, to: 118, by: 9) {
-                            for y in stride(from: 302, to: 348, by: 9) {
-                                let p = probe3(shot, x, y)
-                                if !(p.0 >= 0 && p.0 < 60 && p.1 < 60 && p.2 < 60) {
-                                    panelFailures.append("panel:hole@\(x),\(y)")
-                                    break
-                                }
+                    guard let shot, host.bounds.width > 0 else {
+                        panelFailures.append("panel:no-preview")
+                        panel.orderOut(nil)
+                        return
+                    }
+                    // points -> backing pixels, whatever the device does
+                    let backing = CGFloat(shot.width) / host.bounds.width
+                    let maskInPoints = CGRect(
+                        x: panelBlur.rect.minX, y: panelBlur.rect.minY,
+                        width: panelBlur.rect.width,
+                        height: panelBlur.rect.height)
+                    let bytes = rgba(shot)
+                    var holes = 0
+                    for py in 0..<shot.height {
+                        for px in 0..<shot.width {
+                            let point = CGPoint(
+                                x: CGFloat(px) / backing,
+                                y: CGFloat(shot.height - 1 - py) / backing)
+                            guard maskInPoints.contains(point) else { continue }
+                            let i = (py * shot.width + px) * 4
+                            if Array(bytes[i..<(i + 4)]) != [31, 31, 31, 255] {
+                                holes += 1
                             }
                         }
-                    } else {
-                        panelFailures.append("panel:no-preview")
                     }
-                    _ = host
+                    if holes != 0 { panelFailures.append("panel:holes \(holes)") }
                 }
                 panel.orderOut(nil)
             }
@@ -10086,14 +10121,48 @@ enum SelfTest {
             //      caller that creates a text redaction and registers its job.
             //      Editor, area overlay and scroll panel must each do it.
             var lifecycleFailures: [String] = []
-            let editorHasTextTool = EditorTool.allCases.contains {
+            let editorTextTool = EditorTool.allCases.first {
                 $0.tooltip.hasPrefix("Pixelate text")
             }
-            let overlayHasTextTool = OverlayAnnotationTool.allCases.contains {
+            let overlayTextTool = OverlayAnnotationTool.allCases.first {
                 $0.tooltip.hasPrefix("Pixelate text")
             }
-            if !editorHasTextTool { lifecycleFailures.append("editor:no-tool") }
-            if !overlayHasTextTool { lifecycleFailures.append("overlay:no-tool") }
+            if editorTextTool == nil { lifecycleFailures.append("editor:no-tool") }
+            if overlayTextTool == nil { lifecycleFailures.append("overlay:no-tool") }
+            // When the tool DOES exist, having it in the catalogue proves
+            // nothing: drive the production route and require the whole
+            // lifecycle. A GREEN2 that adds an enum case and a button but never
+            // starts or registers a job must still fail here.
+            if let editorTextTool {
+                MainActor.assumeIsolated {
+                    let wc = EditorWindowController.open(
+                        with: CapturedImage(
+                            cgImage: makeNoiseImage(width: 160, height: 120),
+                            scale: 1),
+                        forceFitForTesting: true)
+                    let canvas = wc.canvasForTesting
+                    wc.selectTool(editorTextTool)
+                    canvas.dragForTesting(
+                        from: CGPoint(x: 20, y: 20), to: CGPoint(x: 90, y: 70))
+                    guard let blur = canvas.annotations
+                        .compactMap({ $0 as? BlurAnnotation }).last else {
+                        lifecycleFailures.append("editor:no-redaction")
+                        wc.window?.close()
+                        return
+                    }
+                    // The mask must be FULL the moment the drag ends.
+                    if blur.redactionState != .pendingFull
+                        && blur.redactionState != .fallbackFull {
+                        lifecycleFailures.append(
+                            "editor:not-masked \(blur.redactionState)")
+                    }
+                    if blur.redactionState == .pendingFull,
+                       SliceBRedactionJob.inFlight == 0 {
+                        lifecycleFailures.append("editor:no-job")
+                    }
+                    wc.window?.close()
+                }
+            }
             check("sliceB-text-redaction-lifecycle-wiring",
                   lifecycleFailures.isEmpty,
                   "GREEN2 wiring pending: " + lifecycleFailures.joined(separator: " | "))
