@@ -152,9 +152,9 @@ final class AnnotationSurface: RedactionHost, RedactionJobObserver {
     private var activeSpotlightAnchor: CGPoint?
     /// The spotlight a drag is about to replace, held so a click can put it
     /// back and so undo can restore it.
-    private var replacedSpotlight: SpotlightAnnotation?
+    private var replacedSpotlight: (spot: SpotlightAnnotation, index: Int)?
     private var spotlightReplacedBy:
-        [ObjectIdentifier: SpotlightAnnotation?] = [:]
+        [ObjectIdentifier: (spot: SpotlightAnnotation, index: Int)] = [:]
     private var strokeTrackpadAccum: CGFloat = 0
     private var redoAnnotations: [Annotation] = []
     /// Hosts install weak-owner callbacks so Undo/Redo enabled state follows
@@ -248,9 +248,13 @@ final class AnnotationSurface: RedactionHost, RedactionJobObserver {
             // it back if the drag turns out to be a click.
             if let existing = annotations.compactMap({
                 $0 as? SpotlightAnnotation
-            }).last {
-                replacedSpotlight = existing
-                annotations.removeAll { $0 === existing }
+            }).last,
+               let index = annotations.firstIndex(where: { $0 === existing }) {
+                // Keep the ORIGINAL position: removing and appending would
+                // reorder it after marks drawn later and break chronological
+                // undo.
+                replacedSpotlight = (existing, index)
+                annotations.remove(at: index)
             }
             annotations.append(spot)
             historyDidChange?()
@@ -355,12 +359,15 @@ final class AnnotationSurface: RedactionHost, RedactionJobObserver {
                 // and leave the redo branch alone.
                 annotations.removeLast()
                 if let previous = replacedSpotlight {
-                    annotations.append(previous)
+                    let index = min(previous.index, annotations.count)
+                    annotations.insert(previous.spot, at: index)
                 }
             } else {
                 // ONE transaction: undo pops this spotlight and restores the
                 // one it replaced, rather than leaving none behind.
-                spotlightReplacedBy[ObjectIdentifier(spot)] = replacedSpotlight
+                if let replaced = replacedSpotlight {
+                    spotlightReplacedBy[ObjectIdentifier(spot)] = replaced
+                }
                 redoAnnotations.removeAll()
             }
             replacedSpotlight = nil
@@ -472,9 +479,9 @@ final class AnnotationSurface: RedactionHost, RedactionJobObserver {
         // A spotlight that replaced another undoes to that other one, so the
         // single action reverses as a single action.
         if let spot = annotation as? SpotlightAnnotation,
-           let replaced = spotlightReplacedBy[ObjectIdentifier(spot)],
-           let previous = replaced {
-            annotations.append(previous)
+           let replaced = spotlightReplacedBy[ObjectIdentifier(spot)] {
+            annotations.insert(
+                replaced.spot, at: min(replaced.index, annotations.count))
         }
         redoAnnotations.append(annotation)
         clearActiveDraft()
@@ -488,9 +495,8 @@ final class AnnotationSurface: RedactionHost, RedactionJobObserver {
         // Redo restores a NORMALIZED state: never an orphan pending mask.
         cancelRedactionJob(for: annotation)
         if let spot = annotation as? SpotlightAnnotation,
-           let replaced = spotlightReplacedBy[ObjectIdentifier(spot)],
-           let previous = replaced {
-            annotations.removeAll { $0 === previous }
+           let replaced = spotlightReplacedBy[ObjectIdentifier(spot)] {
+            annotations.removeAll { $0 === replaced.spot }
         }
         annotations.append(annotation)
         clearActiveDraft()

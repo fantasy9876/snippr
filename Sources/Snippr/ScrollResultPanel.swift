@@ -428,11 +428,8 @@ final class ScrollResultPanel: NSPanel {
     /// Cancel every OCR job this panel owns: per annotation first, so each
     /// pending mask normalizes to the full mask, then sweep any orphan.
     private func cancelRedactionJobs() {
-        for blur in annotationSurface.annotations.compactMap({
-            $0 as? BlurAnnotation
-        }) {
-            annotationSurface.cancelRedactionJob(for: blur)
-        }
+        // cancelAllRedactionJobs already cancels per annotation; doing both
+        // would bump each generation twice and repaint twice.
         annotationSurface.cancelAllRedactionJobs()
     }
 
@@ -497,6 +494,10 @@ final class ScrollResultPanel: NSPanel {
                 dependencies: dependencies)
             dismiss()
         case .save:
+            // The snapshot above already succeeded, so freezing the document
+            // here is safe; a failed render returned earlier with the jobs
+            // still alive.
+            cancelRedactionJobs()
             saving = true
             for button in toolbarButtons { button.isEnabled = false }
             var deps = dependencies ?? .live

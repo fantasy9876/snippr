@@ -187,12 +187,10 @@ final class SelectionOverlay {
     func finish(_ result: OverlayResult) {
         // Cancel BEFORE the views and `current` go away: a late result must not
         // land on a surface nobody can repaint.
+        // cancelAllRedactionJobs already cancels per annotation, so calling
+        // both would bump each generation twice and repaint twice.
         for view in windows.compactMap({ $0.contentView as? SelectionOverlayView }) {
-            guard let surface = view.annotationSurface else { continue }
-            for blur in surface.annotations.compactMap({ $0 as? BlurAnnotation }) {
-                surface.cancelRedactionJob(for: blur)
-            }
-            surface.cancelAllRedactionJobs()
+            view.annotationSurface?.cancelAllRedactionJobs()
         }
         guard !tornDown else { return }
         tornDown = true
@@ -704,6 +702,10 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
                 dependencies: baseDependencies)
             owner.finish(.handled)
         case .save:
+            // The snapshot above already succeeded, so freezing the document
+            // here is safe; a failed render returned earlier with the jobs
+            // still alive. Cancel BEFORE entering .saving and showing the sheet.
+            annotationSurface?.cancelAllRedactionJobs()
             guard owner.session.transition(to: .saving) else { return }
             layoutReviewToolbar() // disable buttons while the panel is up
             // The panel must attach to the overlay window as a sheet — a
