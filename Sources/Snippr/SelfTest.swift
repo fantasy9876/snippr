@@ -9428,6 +9428,13 @@ enum SelfTest {
             MainActor.assumeIsolated {
                 var exported: CapturedImage?
                 var toasts = 0
+                // EVERY dependency is counted, not just the clipboard: a
+                // blocked export must reach none of them.
+                var deps = [
+                    "autoSave": 0, "saveAs": 0, "pin": 0, "ocr": 0,
+                    "openEditor": 0, "setLastCapture": 0,
+                    "setLastAreaRect": 0, "logEvent": 0,
+                ]
                 let overlay = SelectionOverlay(
                     purpose: .areaReview,
                     inputs: OverlaySessionInputs(
@@ -9436,11 +9443,15 @@ enum SelfTest {
                 overlay.routerDependenciesOverride =
                     CaptureActionRouter.Dependencies(
                         copyToClipboard: { exported = $0 },
-                        autoSave: { _, _ in }, saveAs: { _, _ in },
-                        pin: { _ in }, ocr: { _ in }, openEditor: { _ in },
+                        autoSave: { _, _ in deps["autoSave"]! += 1 },
+                        saveAs: { _, _ in deps["saveAs"]! += 1 },
+                        pin: { _ in deps["pin"]! += 1 },
+                        ocr: { _ in deps["ocr"]! += 1 },
+                        openEditor: { _ in deps["openEditor"]! += 1 },
                         toast: { _ in toasts += 1 },
-                        setLastCapture: { _ in }, setLastAreaRect: { _ in },
-                        logEvent: { _ in })
+                        setLastCapture: { _ in deps["setLastCapture"]! += 1 },
+                        setLastAreaRect: { _ in deps["setLastAreaRect"]! += 1 },
+                        logEvent: { _ in deps["logEvent"]! += 1 })
                 let view = SelectionOverlayView(
                     mode: .area, screen: hostScreen, frozen: hostFrozen,
                     windowList: [], owner: overlay)
@@ -9470,6 +9481,10 @@ enum SelfTest {
                 if exported != nil { hostFailures.append("area:exported") }
                 // Delta, not a running total: a cumulative check would let the
                 // healthy run's toast cover a missing warning here.
+                let leaked = deps.filter { $0.value != 0 }
+                if !leaked.isEmpty {
+                    hostFailures.append("area:fail-deps \(leaked)")
+                }
                 if toasts - toastsBeforeFail != 1 {
                     hostFailures.append(
                         "area:fail-toasts \(toasts - toastsBeforeFail)")
@@ -9489,8 +9504,11 @@ enum SelfTest {
                 if failEvents.filter({ $0.kind == "destination" }).count != 1 {
                     hostFailures.append("area:fail-destinations")
                 }
-                if failEvents.count != 2 {
-                    hostFailures.append("area:fail-vector \(failEvents.count)")
+                // Exact SEQUENCE, not just a count: destination is allocated
+                // first, then the redaction is attempted and fails.
+                let failShape = failEvents.map { "\($0.host)/\($0.path)/\($0.kind)" }
+                if failShape != ["area/export/destination", "area/export/regionalAttempt"] {
+                    hostFailures.append("area:fail-seq \(failShape)")
                 }
                 if failEvents.contains(where: {
                     $0.host != "area" || $0.path != "export"
@@ -9529,8 +9547,12 @@ enum SelfTest {
                     || !(okAttempts.first.map { hostMask.contains($0.rect) } ?? false) {
                     hostFailures.append("area:ok-attempt \(okAttempts.count)")
                 }
-                if okEvents.count != 3 {
-                    hostFailures.append("area:ok-vector \(okEvents.count)")
+                let okShape = okEvents.map { "\($0.host)/\($0.path)/\($0.kind)" }
+                if okShape != [
+                    "area/export/destination", "area/export/regionalAttempt",
+                    "area/export/regionalMaterialized",
+                ] {
+                    hostFailures.append("area:ok-seq \(okShape)")
                 }
                 if okEvents.contains(where: {
                     $0.host != "area" || $0.path != "export"
@@ -9613,6 +9635,139 @@ enum SelfTest {
             check("sliceB-hosts-failclosed",
                   hostFailures.isEmpty,
                   hostFailures.prefix(4).joined(separator: " | "))
+
+            // E7. Isolation of the two scoped seams under NESTING and under
+            //     CROSS-THREAD overlap. Sequential use cannot tell a
+            //     token-owned scope from the global flag it replaced.
+            var isoFailures: [String] = []
+            let isoBase = makeSolidImage(
+                width: 60, height: 40, color: NSColor.white.cgColor)
+            let isoBlur = BlurAnnotation(uiScale: 1)
+            isoBlur.rect = CGRect(x: 5, y: 5, width: 30, height: 20)
+            // nested capture: inner events must not appear in the outer frame
+            let (innerEvents, outerEvents) = RenderTrace.capture(
+                host: "outer", path: "export"
+            ) { () -> [RenderTraceEvent] in
+                let (_, inner) = RenderTrace.capture(host: "inner", path: "preview") {
+                    _ = AnnotationRenderer.render(
+                        base: isoBase, annotations: [isoBlur], pixellated: nil)
+                }
+                return inner
+            }
+            if innerEvents.isEmpty { isoFailures.append("nested:inner-empty") }
+            if !innerEvents.allSatisfy({ $0.host == "inner" }) {
+                isoFailures.append("nested:inner-host")
+            }
+            if !outerEvents.isEmpty {
+                isoFailures.append("nested:outer-leak \(outerEvents.count)")
+            }
+            // cross-thread: a capture on this thread must not swallow the
+            // events of concurrent work on another thread, and a forced-failure
+            // scope on one thread must not disable pixelation on the other.
+            let otherDone = DispatchSemaphore(value: 0)
+            var otherMaterialized = 0
+            var mainEventsDuringOverlap: [RenderTraceEvent] = []
+            DispatchQueue.global().async {
+                let (_, events) = RenderTrace.capture(host: "other", path: "export") {
+                    _ = AnnotationRenderer.render(
+                        base: isoBase, annotations: [isoBlur], pixellated: nil)
+                }
+                otherMaterialized = events.filter {
+                    $0.kind == "regionalMaterialized"
+                }.count
+                otherDone.signal()
+            }
+            AnnotationRenderer.withForcedRegionalFailure {
+                let (_, events) = RenderTrace.capture(host: "main", path: "export") {
+                    _ = AnnotationRenderer.render(
+                        base: isoBase, annotations: [isoBlur], pixellated: nil)
+                }
+                mainEventsDuringOverlap = events
+            }
+            _ = otherDone.wait(timeout: .now() + 10)
+            if !mainEventsDuringOverlap.allSatisfy({ $0.host == "main" }) {
+                isoFailures.append("thread:main-host")
+            }
+            if mainEventsDuringOverlap.contains(where: {
+                $0.kind == "regionalMaterialized"
+            }) {
+                isoFailures.append("thread:main-materialized-under-failure")
+            }
+            check("sliceB-seam-isolation",
+                  isoFailures.isEmpty, isoFailures.joined(separator: " | "))
+
+            // E8. Late results in BOTH completion orders, with a permit per
+            //     invocation so the gate controls which worker finishes first.
+            var orderFailures: [String] = []
+            for oldFirst in [true, false] {
+                let started = [
+                    DispatchSemaphore(value: 0), DispatchSemaphore(value: 0),
+                ]
+                let release = [
+                    DispatchSemaphore(value: 0), DispatchSemaphore(value: 0),
+                ]
+                let indexLock = NSLock()
+                var nextIndex = 0
+                let firstWord = CGRect(x: 8, y: 8, width: 10, height: 8)
+                let secondWord = CGRect(x: 20, y: 8, width: 10, height: 8)
+                SliceBOCR.recognizerForTesting = { _ in
+                    indexLock.lock()
+                    let index = min(nextIndex, 1)
+                    nextIndex += 1
+                    indexLock.unlock()
+                    started[index].signal()
+                    release[index].wait()
+                    return .success([
+                        RecognizedWord(
+                            rect: index == 0 ? firstWord : secondWord,
+                            confidence: 0.9),
+                    ])
+                }
+                let raceBlur = BlurAnnotation(uiScale: 1)
+                raceBlur.rect = CGRect(x: 5, y: 5, width: 40, height: 25)
+                MainActor.assumeIsolated {
+                    _ = SliceBRedactionJob.start(
+                        blur: raceBlur, base: isoBase, host: nil)
+                    _ = SliceBRedactionJob.start(
+                        blur: raceBlur, base: isoBase, host: nil)
+                }
+                // Both workers must really be running before anything is let go.
+                if started[0].wait(timeout: .now() + 10) == .timedOut {
+                    orderFailures.append("\(oldFirst):worker0-never-started")
+                }
+                if started[1].wait(timeout: .now() + 10) == .timedOut {
+                    orderFailures.append("\(oldFirst):worker1-never-started")
+                }
+                let order = oldFirst ? [0, 1] : [1, 0]
+                for index in order {
+                    release[index].signal()
+                    let deadline = Date().addingTimeInterval(5)
+                    while Date() < deadline {
+                        RunLoop.current.run(until: Date().addingTimeInterval(0.02))
+                    }
+                }
+                let deadline = Date().addingTimeInterval(10)
+                while MainActor.assumeIsolated({ SliceBRedactionJob.inFlight }) > 0,
+                      Date() < deadline {
+                    RunLoop.current.run(until: Date().addingTimeInterval(0.02))
+                }
+                SliceBOCR.recognizerForTesting = nil
+                // Whoever finished first, only the CURRENT owner's answer counts.
+                if raceBlur.redactionState != .words([secondWord]) {
+                    orderFailures.append(
+                        "\(oldFirst):state \(raceBlur.redactionState)")
+                }
+                if MainActor.assumeIsolated({ SliceBRedactionJob.inFlight }) != 0 {
+                    orderFailures.append("\(oldFirst):slots")
+                }
+                if MainActor.assumeIsolated({
+                    SliceBRedactionJob.ownerCountForTesting
+                }) != 0 {
+                    orderFailures.append("\(oldFirst):owners")
+                }
+            }
+            check("sliceB-job-completion-orders",
+                  orderFailures.isEmpty, orderFailures.joined(separator: " | "))
 
             // F. Tall images never allocate a full-size pixelated intermediate,
             //    in the editor or in a magnifier patch.
