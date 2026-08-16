@@ -8647,31 +8647,38 @@ enum SelfTest {
             check("sliceB-ocr-late-result-dropped",
                   raceFailures.isEmpty, raceFailures.joined(separator: " | "))
 
-            // C. Job queue bounded; a refused job stays fully masked.
+            // C. Job queue bounded; a refused job stays fully masked. Uses the
+            //    REAL lifecycle: no manual deliver while a worker is still
+            //    running, and the global recognizer seam is only restored once
+            //    every physical worker has finished.
             let queueBase = makeSolidImage(
                 width: 80, height: 60, color: NSColor.white.cgColor)
+            func queueSlots() -> Int {
+                MainActor.assumeIsolated { SliceBRedactionJob.inFlight }
+            }
+            SliceBOCR.recognizerForTesting = { _ in .success([]) }
             let queued = MainActor.assumeIsolated { () -> [RedactionState] in
-                SliceBOCR.recognizerForTesting = { _ in .success([]) }
-                defer { SliceBOCR.recognizerForTesting = nil }
                 var states: [RedactionState] = []
-                var held: [SliceBRedactionJob] = []
                 for _ in 0..<(SliceBOCR.maxConcurrentJobs + 1) {
                     let blur = BlurAnnotation(uiScale: 1)
                     blur.rect = CGRect(x: 5, y: 5, width: 40, height: 20)
-                    if let job = SliceBRedactionJob.start(
-                        blur: blur, base: queueBase, redraw: {}) {
-                        held.append(job)
-                    }
+                    _ = SliceBRedactionJob.start(
+                        blur: blur, base: queueBase, redraw: {})
                     states.append(blur.redactionState)
                 }
-                for job in held { job.deliver([]) }
                 return states
             }
+            let queueDeadline = Date().addingTimeInterval(10)
+            while queueSlots() > 0, Date() < queueDeadline {
+                RunLoop.current.run(until: Date().addingTimeInterval(0.02))
+            }
+            SliceBOCR.recognizerForTesting = nil
             check("sliceB-ocr-job-cap",
                   queued.count == SliceBOCR.maxConcurrentJobs + 1
                     && queued.last == .fallbackFull
-                    && queued.dropLast().allSatisfy { $0 == .pendingFull },
-                  "states \(queued)")
+                    && queued.dropLast().allSatisfy { $0 == .pendingFull }
+                    && queueSlots() == 0,
+                  "states \(queued) slots \(queueSlots())")
 
             // D. Word boxes travel with the annotation. Geometry is proven
             //    with the forced-failure opaque cover (a known colour) instead
@@ -8755,7 +8762,7 @@ enum SelfTest {
             let matrixBase = makeSolidImage(
                 width: 200, height: 120, color: NSColor.white.cgColor)
             let matrixRegion = CGRect(x: 20, y: 20, width: 120, height: 60)
-            func word(
+            func mkWord(
                 _ rect: CGRect, _ confidence: Float = 0.9
             ) -> RecognizedWord {
                 RecognizedWord(rect: rect, confidence: confidence)
@@ -8763,26 +8770,26 @@ enum SelfTest {
             let validBox = CGRect(x: 10, y: 10, width: 30, height: 20)
             let secondBox = CGRect(x: 50, y: 10, width: 20, height: 20)
             let cases: [(String, Result<[RecognizedWord], Error>, Bool)] = [
-                ("all-valid", .success([word(validBox), word(secondBox)]), true),
+                ("all-valid", .success([mkWord(validBox), mkWord(secondBox)]), true),
                 ("at-threshold",
-                 .success([word(validBox, 0.300), word(secondBox, 0.300)]), true),
+                 .success([mkWord(validBox, 0.300), mkWord(secondBox, 0.300)]), true),
                 ("just-below",
-                 .success([word(validBox), word(secondBox, 0.299)]), false),
+                 .success([mkWord(validBox), mkWord(secondBox, 0.299)]), false),
                 ("nan",
-                 .success([word(validBox),
-                           word(CGRect(x: .nan, y: 10, width: 20, height: 20))]),
+                 .success([mkWord(validBox),
+                           mkWord(CGRect(x: CGFloat.nan, y: 10, width: 20, height: 20))]),
                  false),
                 ("zero",
-                 .success([word(validBox),
-                           word(CGRect(x: 50, y: 10, width: 0, height: 20))]),
+                 .success([mkWord(validBox),
+                           mkWord(CGRect(x: 50, y: 10, width: 0, height: 20))]),
                  false),
                 ("partial-oob",
-                 .success([word(validBox),
-                           word(CGRect(x: 110, y: 10, width: 40, height: 20))]),
+                 .success([mkWord(validBox),
+                           mkWord(CGRect(x: 110, y: 10, width: 40, height: 20))]),
                  false),
                 ("whole-oob",
-                 .success([word(validBox),
-                           word(CGRect(x: 400, y: 400, width: 10, height: 10))]),
+                 .success([mkWord(validBox),
+                           mkWord(CGRect(x: 400, y: 400, width: 10, height: 10))]),
                  false),
                 ("empty", .success([]), false),
                 ("error", .failure(SliceBOCR.RecognizeError.requestFailed), false),
@@ -8803,7 +8810,7 @@ enum SelfTest {
             }
             // The mask itself must refuse a mixed list even if one is handed in.
             let mixedMask = SliceBRedaction.maskRects(
-                state: .words([validBox, CGRect(x: .nan, y: 0, width: 5, height: 5)]),
+                state: .words([validBox, CGRect(x: CGFloat.nan, y: 0, width: 5, height: 5)]),
                 rect: matrixRegion)
             if mixedMask != [matrixRegion] {
                 matrixFailures.append("maskRects:\(mixedMask)")
@@ -8832,6 +8839,14 @@ enum SelfTest {
                 ])
             }
             var ownershipFailures: [String] = []
+            func jobSlots() -> Int {
+                MainActor.assumeIsolated { SliceBRedactionJob.inFlight }
+            }
+            func jobOwners() -> Int {
+                MainActor.assumeIsolated {
+                    SliceBRedactionJob.ownerCountForTesting
+                }
+            }
             var hostRef: RedrawHost? = RedrawHost()
             weak var weakHost = hostRef
             let blurA = BlurAnnotation(uiScale: 1)
@@ -8874,17 +8889,15 @@ enum SelfTest {
             releaseWorkers.signal()
             releaseWorkers.signal()
             let ownershipDeadline = Date().addingTimeInterval(10)
-            while SliceBRedactionJob.inFlight > 0, Date() < ownershipDeadline {
+            while jobSlots() > 0, Date() < ownershipDeadline {
                 RunLoop.current.run(until: Date().addingTimeInterval(0.02))
             }
             SliceBOCR.recognizerForTesting = nil
-            if SliceBRedactionJob.inFlight != 0 {
-                ownershipFailures.append(
-                    "final-slots \(SliceBRedactionJob.inFlight)")
+            if jobSlots() != 0 {
+                ownershipFailures.append("final-slots \(jobSlots())")
             }
-            if SliceBRedactionJob.ownerCountForTesting != 0 {
-                ownershipFailures.append(
-                    "owners \(SliceBRedactionJob.ownerCountForTesting)")
+            if jobOwners() != 0 {
+                ownershipFailures.append("owners \(jobOwners())")
             }
             // Capacity is back, and the surviving owner's result applied.
             if case .words = blurA.redactionState {} else {
@@ -8901,6 +8914,12 @@ enum SelfTest {
             let gridBase = makeNoiseImage(width: 240, height: 160)
             let gridMask = CGRect(x: 40, y: 40, width: 100, height: 60)
             var gridFailures: [String] = []
+            func gridSnapshot(_ view: NSView) -> CGImage? {
+                guard let rep = view.bitmapImageRepForCachingDisplay(
+                    in: view.bounds) else { return nil }
+                view.cacheDisplay(in: view.bounds, to: rep)
+                return rep.cgImage
+            }
             func coverProbe(_ image: CGImage, _ x: Int, _ y: Int) -> Bool {
                 let p = probe3(image, x, y)
                 return p.0 >= 0 && p.0 < 60 && p.1 < 60 && p.2 < 60
@@ -8955,7 +8974,7 @@ enum SelfTest {
                 canvas.annotations = [blur]
                 EditorCanvasView.forcePixellateFailureForTesting = true
                 canvas.display()
-                let shot = viewSnapshot(canvas)
+                let shot = gridSnapshot(canvas)
                 let exported = canvas.flattened()
                 EditorCanvasView.forcePixellateFailureForTesting = false
                 if exported != nil { problems.append("editor:exported") }

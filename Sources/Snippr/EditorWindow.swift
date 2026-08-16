@@ -491,7 +491,7 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
             SaveService.shared.copyToClipboard($0)
         }
         var saveAs: @MainActor (
-            CapturedImage, NSWindow, @escaping @MainActor (SaveOutcome) -> Void
+            CapturedImage, NSWindow, @escaping @MainActor (SaveAsOutcome) -> Void
         ) -> Void = { image, window, done in
             SaveService.shared.saveAs(image, for: window, completion: done)
         }
@@ -502,6 +502,27 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
         }
         var pin: @MainActor (CapturedImage) -> Void = { PinWindow.pin($0) }
         var recognize: @MainActor (CapturedImage, Bool) -> Void = { _, _ in }
+
+        /// Explicit init: a nested struct of main-actor closures does not get a
+        /// usable memberwise initializer, and gates need to override one field
+        /// at a time.
+        init(
+            copyToClipboard: (@MainActor (CapturedImage) -> Void)? = nil,
+            saveAs: (@MainActor (
+                CapturedImage, NSWindow,
+                @escaping @MainActor (SaveAsOutcome) -> Void) -> Void)? = nil,
+            autoSave: (@MainActor (
+                CapturedImage,
+                @escaping @MainActor (URL?) -> Void) -> Void)? = nil,
+            pin: (@MainActor (CapturedImage) -> Void)? = nil,
+            recognize: (@MainActor (CapturedImage, Bool) -> Void)? = nil
+        ) {
+            if let copyToClipboard { self.copyToClipboard = copyToClipboard }
+            if let saveAs { self.saveAs = saveAs }
+            if let autoSave { self.autoSave = autoSave }
+            if let pin { self.pin = pin }
+            if let recognize { self.recognize = recognize }
+        }
     }
 
     var terminalDependencies = TerminalDependencies()
