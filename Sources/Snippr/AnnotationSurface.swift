@@ -298,7 +298,12 @@ final class AnnotationSurface: RedactionHost, RedactionJobObserver {
             pen.strokeWidthPt = storedStrokeWidth(for: tool)
             pen.points = [p]
             activePen = pen
-            appendNewAnnotation(pen)
+            // Appended WITHOUT forking history yet, like the blur and the
+            // spotlight: a drag that is abandoned — Esc, or a terminal action
+            // freezing the document — must leave the redo branch exactly as it
+            // found it. endDrag forks once the stroke is real.
+            annotations.append(pen)
+            historyDidChange?()
             return true
         case .arrow, .rect, .line, .oval, .highlight:
             let kind: ShapeAnnotation.Kind
@@ -316,7 +321,8 @@ final class AnnotationSurface: RedactionHost, RedactionJobObserver {
             shape.color = color
             shape.strokeWidthPt = storedStrokeWidth(for: tool)
             activeShape = shape
-            appendNewAnnotation(shape)
+            annotations.append(shape)
+            historyDidChange?()
             return true
         case .counter:
             let counter = CounterAnnotation(uiScale: pixelScale)
@@ -391,6 +397,18 @@ final class AnnotationSurface: RedactionHost, RedactionJobObserver {
     }
 
     func endDrag() {
+        // A completed pen stroke or shape forks history HERE, not at
+        // mouseDown: until the release it is only a draft.
+        if let pen = activePen, annotations.last === pen {
+            redoAnnotations.removeAll()
+            pruneSpotlightReplacements()
+            historyDidChange?()
+        }
+        if let shape = activeShape, annotations.last === shape {
+            redoAnnotations.removeAll()
+            pruneSpotlightReplacements()
+            historyDidChange?()
+        }
         if let blur = activeBlur, annotations.last === blur {
             if blur.rect.width <= 1 || blur.rect.height <= 1 {
                 annotations.removeLast()

@@ -13,6 +13,15 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
     /// Anchor for the preset menu. A production reference, not the testing
     /// accessor — a gate seam must never be the app's own router.
     private var backdropButton: NSButton?
+    private var actionButtons: [(name: String, button: NSButton)] = []
+
+    /// The five terminal buttons and the right-hand chrome, by identity.
+    var actionButtonsForTesting: [(name: String, button: NSButton)] {
+        actionButtons
+    }
+    var colorWellForTesting: NSColorWell { colorWell }
+    var sizeBadgeForTesting: NSButton { sizeBadge }
+    var zoomLabelForTesting: NSTextField { zoomLabel }
     private var cropApplyButton: NSButton!
     private var cropCancelButton: NSButton!
     private var cropActionBar: NSStackView!
@@ -167,10 +176,17 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
         }
 
         let copyBtn = makeButton(symbol: "doc.on.doc", tooltip: "Copy (⌘C)", action: #selector(copyImage))
+        // Captured as the row is built, so a gate reads the REAL controls
+        // instead of discovering them by the very tooltip or action it then
+        // asserts on.
         let saveBtn = makeButton(symbol: "square.and.arrow.down", tooltip: "Save (⌘S)", action: #selector(saveImage))
         let pinBtn = makeButton(symbol: "pin", tooltip: "Pin to screen (⌘P)", action: #selector(pinImage))
         let ocrBtn = makeButton(symbol: "text.viewfinder", tooltip: "Recognize text (OCR)", action: #selector(runOCR))
         let translateBtn = makeButton(symbol: "globe", tooltip: "OCR + Translate", action: #selector(runTranslate))
+        actionButtons = [
+            ("copy", copyBtn), ("save", saveBtn), ("pin", pinBtn),
+            ("ocr", ocrBtn), ("translate", translateBtn),
+        ]
 
         var toolViews: [NSView] = []
         for tool in EditorTool.allCases {

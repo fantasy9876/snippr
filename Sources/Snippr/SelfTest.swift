@@ -9156,10 +9156,79 @@ enum SelfTest {
                 } else {
                     toolbarFailures.append("no-sentinel")
                 }
-                // The action row keeps its own controls visible alongside.
-                if actionRow.arrangedSubviews.filter({ !$0.isHidden }).count
-                    < 3 {
-                    toolbarFailures.append("actions-hidden")
+                // The action row, by identity rather than by counting whatever
+                // happens to be visible: separators, spacers and padding would
+                // keep that count healthy while all five terminal buttons were
+                // hidden.
+                let actions = wc.actionButtonsForTesting
+                let expectedActions = [
+                    ("copy", "Copy (⌘C)"), ("save", "Save (⌘S)"),
+                    ("pin", "Pin to screen (⌘P)"),
+                    ("ocr", "Recognize text (OCR)"),
+                    ("translate", "OCR + Translate"),
+                ]
+                if actions.map(\.name) != expectedActions.map(\.0) {
+                    toolbarFailures.append("actions \(actions.map(\.name))")
+                }
+                let chrome: [(String, NSView)] = [
+                    ("colorWell", wc.colorWellForTesting),
+                    ("sizeBadge", wc.sizeBadgeForTesting),
+                    ("zoom", wc.zoomLabelForTesting),
+                ]
+                for (name, view) in actions.map({ ($0.name, $0.button as NSView) })
+                    + chrome {
+                    if view.isHidden || view.frame.width <= 0
+                        || view.frame.height <= 0 {
+                        toolbarFailures.append("\(name):hidden")
+                        continue
+                    }
+                    let inBar = view.convert(view.bounds, to: bar)
+                    if inBar.minX < -0.5 || inBar.maxX > bar.bounds.width + 0.5
+                        || inBar.minY < -0.5
+                        || inBar.maxY > bar.bounds.height + 0.5 {
+                        toolbarFailures.append("\(name):outside \(inBar)")
+                    }
+                    if let content = window.contentView,
+                       let host = content.superview {
+                        let centre = CGPoint(
+                            x: view.bounds.midX, y: view.bounds.midY)
+                        let hit = content.hitTest(view.convert(centre, to: host))
+                        // The chrome may hit a subview of itself (a colour
+                        // well draws through one), so reaching the control or
+                        // anything inside it counts.
+                        if hit !== view && hit?.isDescendant(of: view) != true {
+                            toolbarFailures.append("\(name):hit")
+                        }
+                    }
+                }
+                // Exact wiring on the five terminal buttons: same target as
+                // the tools, the action each one claims, and its own label.
+                for ((name, tooltip), pair) in zip(expectedActions, actions) {
+                    let button = pair.button
+                    if button.target !== wc {
+                        toolbarFailures.append("\(name):target")
+                    }
+                    if button.action
+                        != NSSelectorFromString(
+                            name == "translate" ? "runTranslate"
+                                : name == "ocr" ? "runOCR"
+                                : name == "pin" ? "pinImage"
+                                : name == "save" ? "saveImage" : "copyImage") {
+                        toolbarFailures.append("\(name):action")
+                    }
+                    if button.accessibilityLabel() != tooltip
+                        || button.toolTip != tooltip {
+                        toolbarFailures.append(
+                            "\(name):label(\(button.accessibilityLabel() ?? "nil"))")
+                    }
+                    if button.image == nil {
+                        toolbarFailures.append("\(name):image")
+                    }
+                }
+                // And the tools carry the same target, so all twenty icon
+                // buttons are pinned by identity rather than by non-nil.
+                for (tool, button) in buttons where button.target !== wc {
+                    toolbarFailures.append("\(tool.rawValue):target")
                 }
                 // Re-expanding must not rebuild anything: same objects, same
                 // rows, still laid out.
@@ -9167,7 +9236,9 @@ enum SelfTest {
                 window.contentView?.layoutSubtreeIfNeeded()
                 let after = wc.toolButtonsForTesting
                 if after.count != buttons.count
-                    || !zip(after, buttons).allSatisfy({ $0.button === $1.button })
+                    || !zip(after, buttons).allSatisfy({
+                        $0.0.button === $0.1.button
+                    })
                     || after.first?.button.superview !== toolRow {
                     toolbarFailures.append("identity-after-resize")
                 }
@@ -9235,14 +9306,33 @@ enum SelfTest {
                 let host = ForwardingRepaintDelegate(
                     wrapping: surface.redactionDelegate)
                 surface.redactionDelegate = host
-                let blur = BlurAnnotation(uiScale: 1)
-                blur.rect = CGRect(x: 20, y: 20, width: 80, height: 50)
-                surface.addAnnotationForTesting(blur)
-                let generation = blur.redactionGeneration
-                MainActor.assumeIsolated {
-                    _ = SliceBRedactionJob.start(
-                        blur: blur, base: panelImage.cgImage, host: surface)
+                // Created the way a user creates one: the tool comes from the
+                // real toolbar and the mark from real events, so the job is
+                // started AND registered by production. Starting a job by hand
+                // would leave the surface's registry empty, and the save-lock
+                // would then have nothing to cancel — the stages below would
+                // be describing a document that never existed.
+                panel.clickToolbarButtonForTesting(
+                    tag: OverlayAnnotationTool.pixelateText.toolbarTag)
+                if surface.tool != .pixelateText {
+                    lockStageFailures.append("tool \(surface.tool)")
                 }
+                panel.drawWithRealEventsForTesting(
+                    fromView: CGPoint(x: 40, y: 40),
+                    toView: CGPoint(x: 140, y: 110))
+                guard let blur = surface.annotations
+                    .compactMap({ $0 as? BlurAnnotation }).last else {
+                    lockStageFailures.append("no-redaction")
+                    release.signal()
+                    SliceBOCR.recognizerForTesting = nil
+                    panel.dismissForTesting()
+                    return
+                }
+                if surface.redactionJobCountForTesting != 1 {
+                    lockStageFailures.append(
+                        "not-registered \(surface.redactionJobCountForTesting)")
+                }
+                let generation = blur.redactionGeneration
                 if started.wait(timeout: .now() + 5) == .timedOut {
                     lockStageFailures.append("worker-never-started")
                     release.signal()
@@ -9343,6 +9433,56 @@ enum SelfTest {
             check("sliceB-save-lock-stages",
                   lockStageFailures.isEmpty,
                   lockStageFailures.joined(separator: " | "))
+
+            // J. Abandoning a drag restores the redo branch. Pen and the
+            //    shapes used to fork history at mouseDown, so a document with
+            //    a live redo lost it to a drag that was then declared a no-op.
+            var abortFailures: [String] = []
+            for tool in [OverlayAnnotationTool.pen, .rect] {
+                let surface = AnnotationSurface(pixelScale: 1)
+                let markA = CounterAnnotation(uiScale: 1)
+                let markB = CounterAnnotation(uiScale: 1)
+                surface.addAnnotationForTesting(markA)
+                surface.addAnnotationForTesting(markB)
+                _ = surface.undo()
+                if !surface.canRedo {
+                    abortFailures.append("\(tool):no-redo-setup")
+                }
+                surface.tool = tool
+                let started = surface.beginDrag(atPixel: CGPoint(x: 20, y: 20))
+                surface.continueDrag(toPixel: CGPoint(x: 90, y: 70))
+                if !started || !surface.isDragging {
+                    abortFailures.append("\(tool):not-started")
+                }
+                surface.abandonDrag()
+                if surface.isDragging
+                    || surface.annotations.count != 1
+                    || surface.annotations.first !== markA {
+                    abortFailures.append(
+                        "\(tool):document \(surface.annotations.count)")
+                }
+                // The point of the whole thing: an abandoned drag is a no-op,
+                // so what redo could reach before it can still be reached.
+                if !surface.canRedo {
+                    abortFailures.append("\(tool):redo-lost")
+                }
+                _ = surface.redo()
+                if surface.annotations.count != 2
+                    || surface.annotations.last !== markB {
+                    abortFailures.append("\(tool):redo-object")
+                }
+                // And a drag that COMPLETES does fork the branch.
+                _ = surface.undo()
+                surface.tool = tool
+                _ = surface.beginDrag(atPixel: CGPoint(x: 20, y: 20))
+                surface.continueDrag(toPixel: CGPoint(x: 90, y: 70))
+                surface.endDrag()
+                if surface.canRedo {
+                    abortFailures.append("\(tool):fork-missing")
+                }
+            }
+            check("sliceB-abandoned-drag-keeps-redo",
+                  abortFailures.isEmpty, abortFailures.joined(separator: " | "))
 
             check("sliceB-toolbar-two-rows",
                   toolbarFailures.isEmpty,
