@@ -201,10 +201,10 @@ enum SelfTest {
                     && arbWrongVsWrong == .exitOtherRunning,
                   "evict \(arbEvict) double \(arbDouble) wrong \(arbWrong)")
 
-            // Launch plan: wrong copy touches nothing; canonical writes the
-            // launch status / health breadcrumb and finishes hotkeys + TCC
-            // BEFORE the (deferred) duplicates warning — the updater's
-            // health wait must never see a modal in front of the breadcrumb.
+            // Launch plan: wrong copy touches nothing; canonical initialises
+            // normally and silently even when discovery finds build/test
+            // bundles. Duplicate discovery remains useful for arbitration and
+            // updater safety, but must never put a modal in front of startup.
             let planWrong = BundleIntegrity.launchPlan(
                 for: dispWrong, isDevTool: false, needsCaptureServices: true)
             let planDup = BundleIntegrity.launchPlan(
@@ -213,15 +213,10 @@ enum SelfTest {
                 for: dispClean, isDevTool: false, needsCaptureServices: true)
             let planDev = BundleIntegrity.launchPlan(
                 for: dispDup, isDevTool: true, needsCaptureServices: false)
-            let statusIndex = planDup.firstIndex(of: .writeLaunchStatus)
-            let tccIndex = planDup.firstIndex(of: .requestScreenCapture)
-            let warnIndex = planDup.firstIndex(of: .warnDuplicatesDeferred([home, dmg]))
-            check("integrity-launch-plan-health-before-duplicate-warning",
+            check("integrity-launch-plan-canonical-silent-with-duplicates",
                   planWrong == [.presentWrongCopyAlertAndExit]
                     && planClean == [.setupStatusItem, .writeLaunchStatus, .startHotkeys, .requestScreenCapture]
-                    && statusIndex != nil && tccIndex != nil && warnIndex != nil
-                    && statusIndex! < tccIndex! && tccIndex! < warnIndex!
-                    && warnIndex == planDup.indices.last
+                    && planDup == planClean
                     && planDev.isEmpty,
                   "wrong \(planWrong) dup \(planDup) dev \(planDev)")
 
