@@ -8808,6 +8808,13 @@ enum SelfTest {
                     zeroFailures.append(
                         "old-mutated \(oldSpot.rect) \(oldSpot.dimFraction)")
                 }
+                // Checked HERE, before the redo below: `redo()` clears the
+                // active draft itself, so a release that restored the array
+                // correctly while leaving the draft alive would be cleaned up
+                // by the very step meant to observe it.
+                if surface.isDragging {
+                    zeroFailures.append("still-dragging")
+                }
                 if !redoAvailableBefore || !surface.canRedo {
                     zeroFailures.append(
                         "redo \(redoAvailableBefore) -> "
