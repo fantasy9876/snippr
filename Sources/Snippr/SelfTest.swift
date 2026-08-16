@@ -9945,6 +9945,249 @@ enum SelfTest {
                 }
             }
             runSaveLockStages()
+            // The area review implements its own save-lock, cancelling
+            // before it enters .saving and shows the sheet, so the scroll gate
+            // cannot speak for it.
+            var areaLockFailures: [String] = []
+            let runAreaSaveLock = {
+                guard let screen = NSScreen.screens.first else {
+                    areaLockFailures.append("no-screen")
+                    return
+                }
+                func slots() -> Int {
+                    MainActor.assumeIsolated { SliceBRedactionJob.inFlight }
+                }
+                func owners() -> Int {
+                    MainActor.assumeIsolated {
+                        SliceBRedactionJob.ownerCountForTesting
+                    }
+                }
+                if slots() != 0 || owners() != 0 {
+                    areaLockFailures.append(
+                        "dirty-baseline \(slots())/\(owners())")
+                    seamUnsafe = true
+                    return
+                }
+                let release = DispatchSemaphore(value: 0)
+                let started = DispatchSemaphore(value: 0)
+                let finished = DispatchSemaphore(value: 0)
+                let scopeLock = NSLock()
+                var scopeEnded = false
+                var entered = false
+                var returned = false
+                let previousRecognizer = SliceBOCR.recognizerForTesting
+                SliceBOCR.recognizerForTesting = { _ in
+                    scopeLock.lock()
+                    entered = true
+                    let ended = scopeEnded
+                    scopeLock.unlock()
+                    started.signal()
+                    if !ended { release.wait() }
+                    defer { finished.signal() }
+                    return .success([
+                        RecognizedWord(
+                            rect: CGRect(x: 6, y: 6, width: 20, height: 12),
+                            confidence: 0.9),
+                    ])
+                }
+                final class AreaLockSpy {
+                    var saveDone: (@MainActor (SaveAsOutcome) -> Void)?
+                    var saveAsCalls = 0
+                    var copies = 0
+                    var completions = 0
+                    var observe: (() -> Void)?
+                    var observations = 0
+                    var inCallback: [String] = []
+                }
+                let spy = AreaLockSpy()
+                let overlay = SelectionOverlay(
+                    purpose: .areaReview,
+                    inputs: OverlaySessionInputs(
+                        afterShow: true, afterCopy: false, afterSave: false),
+                    completion: { _ in spy.completions += 1 })
+                overlay.routerDependenciesOverride =
+                    CaptureActionRouter.Dependencies(
+                        copyToClipboard: { _ in spy.copies += 1 },
+                        autoSave: { _, _ in },
+                        saveAs: { _, done in
+                            spy.saveAsCalls += 1
+                            spy.saveDone = done
+                            spy.observations += 1
+                            spy.observe?()
+                        },
+                        pin: { _ in }, ocr: { _ in }, openEditor: { _ in },
+                        toast: { _ in }, setLastCapture: { _ in },
+                        setLastAreaRect: { _ in }, logEvent: { _ in })
+                let view = SelectionOverlayView(
+                    mode: .area, screen: screen,
+                    frozen: CapturedImage(
+                        cgImage: makeNoiseImage(
+                            width: Int(screen.frame.width * 2),
+                            height: Int(screen.frame.height * 2)),
+                        scale: 2),
+                    windowList: [], owner: overlay)
+                view.selectForTesting(
+                    rect: CGRect(x: 60, y: 60, width: 240, height: 180))
+                var cleaned = false
+                func cleanup() {
+                    guard !cleaned else { return }
+                    cleaned = true
+                    // Surface first, then the worker, then the seam — a late
+                    // result must never reach a live surface.
+                    view.annotationSurface?.cancelAllRedactionJobs()
+                    overlay.finish(.cancelled)
+                    scopeLock.lock()
+                    scopeEnded = true
+                    scopeLock.unlock()
+                    for _ in 0..<8 { release.signal() }
+                    if entered, !returned {
+                        if finished.wait(timeout: .now() + 10) == .timedOut {
+                            areaLockFailures.append("worker-never-returned")
+                            seamUnsafe = true
+                            return
+                        }
+                        returned = true
+                    }
+                    let deadline = Date().addingTimeInterval(5)
+                    while slots() > 0, Date() < deadline {
+                        RunLoop.current.run(
+                            until: Date().addingTimeInterval(0.02))
+                    }
+                    if slots() != 0 || owners() != 0 {
+                        areaLockFailures.append("drain \(slots())/\(owners())")
+                        seamUnsafe = true
+                        return
+                    }
+                    SliceBOCR.recognizerForTesting = previousRecognizer
+                }
+                defer { cleanup() }
+
+                guard let surface = view.annotationSurface else {
+                    areaLockFailures.append("no-surface")
+                    return
+                }
+                let host = ForwardingRepaintDelegate(
+                    wrapping: surface.redactionDelegate)
+                surface.redactionDelegate = host
+                view.clickReviewToolbarButtonForTesting(
+                    tag: OverlayAnnotationTool.pixelateText.toolbarTag)
+                view.annotationDragForTesting(
+                    from: CGPoint(x: 100, y: 100),
+                    to: CGPoint(x: 200, y: 170))
+                guard let blur = surface.annotations
+                    .compactMap({ $0 as? BlurAnnotation }).last else {
+                    areaLockFailures.append("no-redaction")
+                    return
+                }
+                if surface.redactionJobCountForTesting != 1 {
+                    areaLockFailures.append(
+                        "not-registered \(surface.redactionJobCountForTesting)")
+                }
+                if started.wait(timeout: .now() + 5) == .timedOut {
+                    areaLockFailures.append("worker-never-started")
+                    return
+                }
+                let generation = blur.redactionGeneration
+                let liveIsRedacted = {
+                    surface.annotations.contains { $0 === blur }
+                }
+
+                // Stage 1 — a failed render must leave the job alive.
+                let repaintsBeforeFail = host.repaints
+                AnnotationRenderer.withForcedRegionalFailure {
+                    view.performReviewActionForTesting(.save)
+                }
+                if spy.saveAsCalls != 0
+                    || blur.redactionState != .pendingFull
+                    || blur.redactionGeneration != generation
+                    || host.repaints != repaintsBeforeFail
+                    || surface.redactionJobCountForTesting != 1
+                    || slots() != 1 || owners() != 1
+                    || overlay.session.phase != .reviewing
+                    || !liveIsRedacted() {
+                    areaLockFailures.append(
+                        "failed-render \(spy.saveAsCalls) "
+                        + String(describing: blur.redactionState))
+                }
+
+                // Stage 2 — the successful handoff, inspected INSIDE saveAs.
+                let repaintsBeforeSave = host.repaints
+                spy.observe = {
+                    if blur.redactionState != .fallbackFull
+                        || blur.redactionGeneration != generation + 1
+                        || surface.redactionJobCountForTesting != 0
+                        || owners() != 0 || slots() != 1
+                        || host.repaints != repaintsBeforeSave + 1
+                        || overlay.session.phase != .saving
+                        || !liveIsRedacted() {
+                        spy.inCallback.append(
+                            "locked " + String(describing: blur.redactionState))
+                    }
+                    // A competing route inside the sheet does nothing.
+                    let copiesBefore = spy.copies
+                    view.performReviewActionForTesting(.copy)
+                    if spy.copies != copiesBefore {
+                        spy.inCallback.append("reentrant")
+                    }
+                }
+                view.performReviewActionForTesting(.save)
+                spy.observe = nil
+                if spy.saveAsCalls != 1 || spy.observations != 1 {
+                    areaLockFailures.append(
+                        "handoff \(spy.saveAsCalls)/\(spy.observations)")
+                }
+                if !spy.inCallback.isEmpty {
+                    areaLockFailures.append(
+                        spy.inCallback.joined(separator: ","))
+                }
+
+                // Stage 3 — cancel unlocks, and the same fixture saves again.
+                let generationAfterLock = blur.redactionGeneration
+                let repaintsAfterLock = host.repaints
+                MainActor.assumeIsolated { spy.saveDone?(.cancelled) }
+                spy.saveDone = nil
+                if spy.saveAsCalls != 1
+                    || blur.redactionGeneration != generationAfterLock
+                    || host.repaints != repaintsAfterLock
+                    || slots() != 1
+                    || surface.redactionJobCountForTesting != 0
+                    || overlay.session.phase != .reviewing
+                    || spy.completions != 0
+                    || !liveIsRedacted() {
+                    areaLockFailures.append(
+                        "cancel \(spy.saveAsCalls) \(overlay.session.phase)")
+                }
+                view.performReviewActionForTesting(.save)
+                if spy.saveAsCalls != 2 || spy.saveDone == nil
+                    || overlay.session.phase != .saving {
+                    areaLockFailures.append("retry \(spy.saveAsCalls)")
+                }
+                MainActor.assumeIsolated {
+                    spy.saveDone?(.saved(URL(fileURLWithPath: "/tmp/a.png")))
+                }
+                spy.saveDone = nil
+                if spy.completions != 1 {
+                    areaLockFailures.append(
+                        "saved-completion \(spy.completions)")
+                }
+
+                // Stage 4 — releasing the worker returns only the slot.
+                let generationAfterClose = blur.redactionGeneration
+                let repaintsAfterClose = host.repaints
+                cleanup()
+                if blur.redactionState != .fallbackFull
+                    || blur.redactionGeneration != generationAfterClose
+                    || host.repaints != repaintsAfterClose {
+                    areaLockFailures.append(
+                        "late-result "
+                        + String(describing: blur.redactionState))
+                }
+            }
+            runAreaSaveLock()
+            check("sliceB-area-save-lock",
+                  areaLockFailures.isEmpty,
+                  areaLockFailures.joined(separator: " | "))
+
             check("sliceB-save-lock-stages",
                   lockStageFailures.isEmpty,
                   lockStageFailures.joined(separator: " | "))
