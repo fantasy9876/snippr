@@ -434,9 +434,18 @@ final class AnnotationSurface: RedactionHost, RedactionJobObserver {
         if let shape = activeShape, annotations.last === shape {
             let dx = abs(shape.end.x - shape.start.x)
             let dy = abs(shape.end.y - shape.start.y)
-            // Same rule for every kind: a stroked shape of any nonzero extent
-            // is visible, so only a shape that never moved is discarded.
-            if max(dx, dy) > Self.motionTolerance {
+            // Follow what the renderer actually paints. Line, arrow, rect and
+            // oval are STROKED, so any motion leaves a visible mark — a
+            // flat rectangle strokes as a line. Highlight is FILLED, so a drag
+            // along one axis alone has zero area and paints nothing.
+            let isReal: Bool
+            switch shape.kind {
+            case .highlight:
+                isReal = dx > Self.motionTolerance && dy > Self.motionTolerance
+            case .line, .arrow, .rect, .oval:
+                isReal = max(dx, dy) > Self.motionTolerance
+            }
+            if isReal {
                 redoAnnotations.removeAll()
                 pruneSpotlightReplacements()
             } else {
