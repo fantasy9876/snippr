@@ -8613,7 +8613,7 @@ enum SelfTest {
             let queueBase = makeSolidImage(
                 width: 80, height: 60, color: NSColor.white.cgColor)
             let queued = MainActor.assumeIsolated { () -> [RedactionState] in
-                SliceBOCR.recognizerForTesting = { _ in [] }
+                SliceBOCR.recognizerForTesting = { _ in .success([]) }
                 defer { SliceBOCR.recognizerForTesting = nil }
                 var states: [RedactionState] = []
                 var held: [SliceBRedactionJob] = []
@@ -8698,7 +8698,7 @@ enum SelfTest {
             let distinctX = Set(dupWords.map { Int($0.minX / 5) }).count
             let dupOK = dupWords.count >= 2 && distinctX >= 2
             let partial = MainActor.assumeIsolated { () -> RedactionState in
-                SliceBOCR.recognizerForTesting = { _ in [] }
+                SliceBOCR.recognizerForTesting = { _ in .success([]) }
                 defer { SliceBOCR.recognizerForTesting = nil }
                 let blur = BlurAnnotation(uiScale: 1)
                 blur.rect = CGRect(x: 10, y: 10, width: 60, height: 30)
@@ -8711,24 +8711,43 @@ enum SelfTest {
                   dupOK && partial == .fallbackFull,
                   "dupWords \(dupWords.count) distinct \(distinctX) partial \(partial)")
 
-            // E2. All-or-nothing matrix: a single bad box must collapse the
-            //     whole result, never mask "the valid subset".
+            // E2. All-or-nothing matrix, driven through the REAL policy
+            //     (SliceBOCR.resolve) with injected confidences and a forced
+            //     recognizer error — no dependency on Vision or the host OS.
             let matrixBase = makeSolidImage(
                 width: 200, height: 120, color: NSColor.white.cgColor)
             let matrixRegion = CGRect(x: 20, y: 20, width: 120, height: 60)
+            func word(
+                _ rect: CGRect, _ confidence: Float = 0.9
+            ) -> RecognizedWord {
+                RecognizedWord(rect: rect, confidence: confidence)
+            }
             let validBox = CGRect(x: 10, y: 10, width: 30, height: 20)
-            let cases: [(String, [CGRect], Bool)] = [
-                ("all-valid",
-                 [validBox, CGRect(x: 50, y: 10, width: 20, height: 20)], true),
+            let secondBox = CGRect(x: 50, y: 10, width: 20, height: 20)
+            let cases: [(String, Result<[RecognizedWord], Error>, Bool)] = [
+                ("all-valid", .success([word(validBox), word(secondBox)]), true),
+                ("at-threshold",
+                 .success([word(validBox, 0.300), word(secondBox, 0.300)]), true),
+                ("just-below",
+                 .success([word(validBox), word(secondBox, 0.299)]), false),
                 ("nan",
-                 [validBox, CGRect(x: .nan, y: 10, width: 20, height: 20)], false),
+                 .success([word(validBox),
+                           word(CGRect(x: .nan, y: 10, width: 20, height: 20))]),
+                 false),
                 ("zero",
-                 [validBox, CGRect(x: 50, y: 10, width: 0, height: 20)], false),
+                 .success([word(validBox),
+                           word(CGRect(x: 50, y: 10, width: 0, height: 20))]),
+                 false),
                 ("partial-oob",
-                 [validBox, CGRect(x: 110, y: 10, width: 40, height: 20)], false),
+                 .success([word(validBox),
+                           word(CGRect(x: 110, y: 10, width: 40, height: 20))]),
+                 false),
                 ("whole-oob",
-                 [validBox, CGRect(x: 400, y: 400, width: 10, height: 10)], false),
-                ("empty", [], false),
+                 .success([word(validBox),
+                           word(CGRect(x: 400, y: 400, width: 10, height: 10))]),
+                 false),
+                ("empty", .success([]), false),
+                ("error", .failure(SliceBOCR.RecognizeError.requestFailed), false),
             ]
             var matrixFailures: [String] = []
             for (label, injected, expectWords) in cases {
@@ -8754,6 +8773,89 @@ enum SelfTest {
             check("sliceB-ocr-all-or-nothing",
                   matrixFailures.isEmpty,
                   matrixFailures.joined(separator: " | "))
+
+            // E3. Real blocking jobs: ownership, slot accounting and host
+            //     lifetime, driven through the production `start` path.
+            final class RedrawHost {
+                var count = 0
+                func touch() { count += 1 }
+            }
+            let ownershipBase = makeSolidImage(
+                width: 120, height: 90, color: NSColor.white.cgColor)
+            let releaseWorkers = DispatchSemaphore(value: 0)
+            let workerStarted = DispatchSemaphore(value: 0)
+            SliceBOCR.recognizerForTesting = { _ in
+                workerStarted.signal()
+                releaseWorkers.wait()
+                return .success([
+                    RecognizedWord(
+                        rect: CGRect(x: 6, y: 6, width: 20, height: 12),
+                        confidence: 0.9),
+                ])
+            }
+            var ownershipFailures: [String] = []
+            var hostRef: RedrawHost? = RedrawHost()
+            weak var weakHost = hostRef
+            let blurA = BlurAnnotation(uiScale: 1)
+            blurA.rect = CGRect(x: 10, y: 10, width: 60, height: 40)
+            let blurB = BlurAnnotation(uiScale: 1)
+            blurB.rect = CGRect(x: 10, y: 10, width: 60, height: 40)
+            MainActor.assumeIsolated {
+                // Two starts on the SAME annotation: the first loses ownership
+                // immediately but keeps its physical slot until it finishes.
+                let first = SliceBRedactionJob.start(
+                    blur: blurA, base: ownershipBase,
+                    redraw: { [weak hostRef] in hostRef?.touch() })
+                let second = SliceBRedactionJob.start(
+                    blur: blurA, base: ownershipBase,
+                    redraw: { [weak hostRef] in hostRef?.touch() })
+                if first == nil || second == nil {
+                    ownershipFailures.append("start-refused")
+                }
+                if SliceBRedactionJob.inFlight != 2 {
+                    ownershipFailures.append(
+                        "slots \(SliceBRedactionJob.inFlight)")
+                }
+                // Cap is now full: a third start must fail closed.
+                let third = SliceBRedactionJob.start(
+                    blur: blurB, base: ownershipBase, redraw: {})
+                if third != nil { ownershipFailures.append("cap-not-enforced") }
+                if blurB.redactionState != .fallbackFull {
+                    ownershipFailures.append("refused-not-masked")
+                }
+                // A stale job must not evict the live owner.
+                first?.cancel()
+                if SliceBRedactionJob.inFlight != 2 {
+                    ownershipFailures.append(
+                        "cancel-freed-slot \(SliceBRedactionJob.inFlight)")
+                }
+            }
+            // The host goes away while both workers are still blocked.
+            hostRef = nil
+            if weakHost != nil { ownershipFailures.append("host-retained") }
+            releaseWorkers.signal()
+            releaseWorkers.signal()
+            let ownershipDeadline = Date().addingTimeInterval(10)
+            while SliceBRedactionJob.inFlight > 0, Date() < ownershipDeadline {
+                RunLoop.current.run(until: Date().addingTimeInterval(0.02))
+            }
+            SliceBOCR.recognizerForTesting = nil
+            if SliceBRedactionJob.inFlight != 0 {
+                ownershipFailures.append(
+                    "final-slots \(SliceBRedactionJob.inFlight)")
+            }
+            if SliceBRedactionJob.ownerCountForTesting != 0 {
+                ownershipFailures.append(
+                    "owners \(SliceBRedactionJob.ownerCountForTesting)")
+            }
+            // Capacity is back, and the surviving owner's result applied.
+            if case .words = blurA.redactionState {} else {
+                ownershipFailures.append(
+                    "ownerResult \(blurA.redactionState)")
+            }
+            check("sliceB-job-ownership-real",
+                  ownershipFailures.isEmpty,
+                  ownershipFailures.joined(separator: " | "))
 
             // F. Tall images never allocate a full-size pixelated intermediate,
             //    in the editor or in a magnifier patch.

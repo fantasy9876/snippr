@@ -85,13 +85,30 @@ extension CGRect {
 
 // MARK: - Regional OCR
 
+/// One word the recognizer claims to have read. A plain value type on purpose:
+/// the contract must not depend on Vision's classes, so gates can inject exact
+/// confidences and forced errors and still exercise the REAL policy.
+struct RecognizedWord: Equatable {
+    /// Bottom-left pixel rect inside the patch that was recognized.
+    let rect: CGRect
+    let confidence: Float
+
+    init(rect: CGRect, confidence: Float) {
+        self.rect = rect
+        self.confidence = confidence
+    }
+}
+
 enum SliceBOCR {
-    /// Tests inject a recognizer so a gate can drive the lifecycle without
-    /// depending on Vision's language models. The closure receives the
-    /// MATERIALIZED region and returns boxes in that region's own bottom-left
-    /// pixel space, exactly like the real recognizer.
+    enum RecognizeError: Error {
+        case requestFailed
+        case unmappableRange
+    }
+
+    /// Tests inject a recognizer so a gate can drive the real policy without
+    /// depending on Vision's language models or the host OS version.
     nonisolated(unsafe) static var recognizerForTesting:
-        ((CGImage) -> [CGRect])?
+        ((CGImage) -> Result<[RecognizedWord], Error>)?
 
     /// At most this many OCR jobs may be in flight; extra requests coalesce.
     static let maxConcurrentJobs = 2
@@ -125,18 +142,23 @@ enum SliceBOCR {
         return Patch(image: cropped, origin: clipped.origin, clip: clipped)
     }
 
-    /// Pure and thread-safe: holds nothing but the patch. Boxes come back
-    /// clamped into the requested region, in global bottom-left pixels.
+    /// THE policy, shared by production and gates.
     ///
-    /// ALL-OR-NOTHING: if any single box is non-finite, degenerate, or falls
-    /// outside the region, the WHOLE result is discarded. Filtering the bad
-    /// ones out would leave exactly the words we failed to map readable.
-    static func wordRects(in patch: Patch) -> [CGRect] {
-        let local = recognizerForTesting?(patch.image)
-            ?? visionWordRects(in: patch.image)
-        guard !local.isEmpty else { return [] }
+    /// ALL-OR-NOTHING: a recognizer error, an empty result, one word below the
+    /// confidence threshold, one non-finite/degenerate box, or one box that is
+    /// not entirely inside the recognized region (measured BEFORE the
+    /// anti-aliasing outset) discards everything. Keeping "the good ones" would
+    /// leave exactly the words we failed to read legible.
+    static func resolve(
+        _ result: Result<[RecognizedWord], Error>, in patch: Patch
+    ) -> [CGRect] {
+        guard case let .success(words) = result, !words.isEmpty else {
+            return []
+        }
         var out: [CGRect] = []
-        for box in local {
+        for word in words {
+            guard word.confidence >= minimumConfidence else { return [] }
+            let box = word.rect
             guard box.origin.x.isFinite, box.origin.y.isFinite,
                   box.width.isFinite, box.height.isFinite,
                   box.width > 0, box.height > 0
@@ -144,9 +166,6 @@ enum SliceBOCR {
             let global = CGRect(
                 x: patch.origin.x + box.minX, y: patch.origin.y + box.minY,
                 width: box.width, height: box.height)
-            // Must sit ENTIRELY inside the region we actually recognized,
-            // measured BEFORE the anti-aliasing outset. A box hanging over the
-            // edge means the mapping is wrong, not that it needs trimming.
             guard patch.clip.contains(global) else { return [] }
             let padded = global
                 .insetBy(
@@ -159,6 +178,13 @@ enum SliceBOCR {
         return out
     }
 
+    /// Pure and thread-safe: holds nothing but the patch.
+    static func wordRects(in patch: Patch) -> [CGRect] {
+        let result = recognizerForTesting?(patch.image)
+            ?? visionWords(in: patch.image)
+        return resolve(result, in: patch)
+    }
+
     /// Convenience for one-shot callers and gates.
     static func wordRects(base: CGImage, region: CGRect) -> [CGRect] {
         guard let patch = patch(base: base, region: region) else { return [] }
@@ -167,12 +193,11 @@ enum SliceBOCR {
 
     /// Per-word boxes: `VNRecognizedText.boundingBox(for:)` hugs the ink much
     /// more tightly than the line-level observation box, which keeps the
-    /// surrounding layout readable.
-    ///
-    /// FAIL CLOSED: if any word of any line cannot be mapped, the whole result
-    /// is discarded (empty -> `fallbackFull` -> full rect). A partial word list
-    /// would leave exactly the unmapped words readable.
-    private static func visionWordRects(in patch: CGImage) -> [CGRect] {
+    /// surrounding layout readable. Any range that cannot be mapped is an
+    /// error, not a word to skip.
+    private static func visionWords(
+        in patch: CGImage
+    ) -> Result<[RecognizedWord], Error> {
         let request = VNRecognizeTextRequest()
         request.recognitionLevel = .accurate
         request.usesLanguageCorrection = false
@@ -182,23 +207,24 @@ enum SliceBOCR {
         } else {
             request.automaticallyDetectsLanguage = true
         }
-        try? VNImageRequestHandler(cgImage: patch, options: [:])
-            .perform([request])
+        do {
+            try VNImageRequestHandler(cgImage: patch, options: [:])
+                .perform([request])
+        } catch {
+            return .failure(error)
+        }
 
         let w = CGFloat(patch.width), h = CGFloat(patch.height)
-        var out: [CGRect] = []
+        var out: [RecognizedWord] = []
         for observation in request.results ?? [] {
-            guard let candidate = observation.topCandidates(1).first,
-                  // Documented threshold: below this we do not trust the
-                  // mapping enough to narrow a mask, so the whole result is
-                  // dropped and the full rect stays covered.
-                  candidate.confidence >= minimumConfidence
-            else { return [] }
+            guard let candidate = observation.topCandidates(1).first else {
+                return .failure(RecognizeError.requestFailed)
+            }
             let text = candidate.string
             let words = text.split(separator: " ")
-            // An observation with no usable words means we saw ink we could
-            // not map: fail closed rather than skip it.
-            guard !words.isEmpty else { return [] }
+            guard !words.isEmpty else {
+                return .failure(RecognizeError.unmappableRange)
+            }
             // Walk ranges SEQUENTIALLY so a repeated word maps to its own
             // occurrence instead of the first one over and over.
             var cursor = text.startIndex
@@ -206,19 +232,17 @@ enum SliceBOCR {
                 guard let range = text.range(
                         of: String(word), range: cursor..<text.endIndex),
                       let box = try? candidate.boundingBox(for: range)
-                else { return [] }
+                else { return .failure(RecognizeError.unmappableRange) }
                 cursor = range.upperBound
                 let bb = box.boundingBox
-                let rect = CGRect(
-                    x: bb.minX * w, y: bb.minY * h,
-                    width: bb.width * w, height: bb.height * h)
-                guard rect.width.isFinite, rect.height.isFinite,
-                      rect.width > 0, rect.height > 0
-                else { return [] }
-                out.append(rect)
+                out.append(RecognizedWord(
+                    rect: CGRect(
+                        x: bb.minX * w, y: bb.minY * h,
+                        width: bb.width * w, height: bb.height * h),
+                    confidence: candidate.confidence))
             }
         }
-        return out
+        return .success(out)
     }
 }
 
@@ -656,6 +680,9 @@ final class SliceBRedactionJob {
         holdsSlot = false
         Self.inFlight = max(0, Self.inFlight - 1)
     }
+
+    /// Gate visibility: a finished run must leave no owner behind.
+    static var ownerCountForTesting: Int { owners.count }
 
     /// Jobs currently in flight, so a surface can refuse to pile more on.
     private(set) static var inFlight = 0
