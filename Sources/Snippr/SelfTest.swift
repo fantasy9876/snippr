@@ -9040,6 +9040,289 @@ enum SelfTest {
                 }
             }
             runPanelMidDrag()
+            // H. The real toolbar, at the smallest size the window allows.
+            //    Fifteen tools cannot fit one 560 pt row, which is why there
+            //    are two — and the proof has to come from the production
+            //    hierarchy, not from a stack rebuilt for the occasion.
+            var toolbarFailures: [String] = []
+            let runToolbarLayout = {
+                let wc = EditorWindowController.open(
+                    with: CapturedImage(
+                        cgImage: makeSolidImage(
+                            width: 400, height: 300,
+                            color: NSColor.white.cgColor),
+                        scale: 1),
+                    forceFitForTesting: true)
+                defer { wc.window?.close() }
+                let buttons = wc.toolButtonsForTesting
+                if buttons.count != 15 {
+                    toolbarFailures.append("count \(buttons.count)")
+                    return
+                }
+                // Derived from a real button: its superview is the tool row,
+                // whose superview is the two-row stack.
+                guard let toolRow = buttons.first?.button.superview
+                        as? NSStackView,
+                      let stack = toolRow.superview as? NSStackView,
+                      let actionRow = stack.arrangedSubviews.first
+                        as? NSStackView,
+                      let bar = stack.superview,
+                      let window = wc.window
+                else {
+                    toolbarFailures.append("hierarchy")
+                    return
+                }
+                if stack.arrangedSubviews.count != 2
+                    || stack.arrangedSubviews.last !== toolRow {
+                    toolbarFailures.append(
+                        "rows \(stack.arrangedSubviews.count)")
+                }
+                // setContentSize, not setFrame: a frame is applied verbatim
+                // and would sail past the minimum this is asking about.
+                window.setContentSize(NSSize(width: 200, height: 300))
+                window.contentView?.layoutSubtreeIfNeeded()
+                let width = window.contentView?.bounds.width ?? 0
+                if abs(width - 560) > 0.5 {
+                    toolbarFailures.append("min-width \(width)")
+                }
+                // Two rows of equal height inside a 70 pt bar.
+                if abs(toolRow.frame.height - 35) > 0.5
+                    || abs(actionRow.frame.height - 35) > 0.5
+                    || abs(bar.frame.height - 70) > 0.5 {
+                    toolbarFailures.append(
+                        "row-heights \(actionRow.frame.height)/"
+                        + "\(toolRow.frame.height)/\(bar.frame.height)")
+                }
+                for (tool, button) in buttons {
+                    let inBar = button.convert(button.bounds, to: bar)
+                    if inBar.minX < -0.5 || inBar.maxX > bar.bounds.width + 0.5
+                        || inBar.minY < -0.5
+                        || inBar.maxY > bar.bounds.height + 0.5 {
+                        toolbarFailures.append("\(tool.rawValue):outside")
+                    }
+                    // A real label, not the symbol name echoed back.
+                    let label = button.accessibilityLabel() ?? ""
+                    if label != tool.tooltip {
+                        toolbarFailures.append(
+                            "\(tool.rawValue):label(\(label))")
+                    }
+                    if button.target == nil || button.action == nil {
+                        toolbarFailures.append("\(tool.rawValue):action")
+                    }
+                    // The centre of every button belongs to that button.
+                    let centre = button.convert(
+                        CGPoint(x: button.bounds.midX, y: button.bounds.midY),
+                        to: bar)
+                    if bar.hitTest(bar.convert(centre, to: bar.superview))
+                        !== button {
+                        toolbarFailures.append("\(tool.rawValue):hit")
+                    }
+                }
+                // No two buttons may overlap.
+                let frames = buttons.map {
+                    ($0.tool, $0.button.convert($0.button.bounds, to: bar))
+                }
+                for i in frames.indices {
+                    for j in frames.indices where j > i {
+                        if frames[i].1.intersects(frames[j].1) {
+                            toolbarFailures.append(
+                                "overlap \(frames[i].0.rawValue)/"
+                                + "\(frames[j].0.rawValue)")
+                        }
+                    }
+                }
+                // The action row keeps its own controls visible alongside.
+                if actionRow.arrangedSubviews.filter({ !$0.isHidden }).count
+                    < 3 {
+                    toolbarFailures.append("actions-hidden")
+                }
+                // Re-expanding must not rebuild anything: same objects, same
+                // rows, still laid out.
+                window.setContentSize(NSSize(width: 900, height: 600))
+                window.contentView?.layoutSubtreeIfNeeded()
+                let after = wc.toolButtonsForTesting
+                if after.count != buttons.count
+                    || !zip(after, buttons).allSatisfy({ $0.button === $1.button })
+                    || after.first?.button.superview !== toolRow {
+                    toolbarFailures.append("identity-after-resize")
+                }
+                if window.contentView?.bounds.width ?? 0 < 899 {
+                    toolbarFailures.append(
+                        "no-expand \(window.contentView?.bounds.width ?? 0)")
+                }
+            }
+            runToolbarLayout()
+            // I. Save-lock against a REAL worker, on the scroll panel.
+            //    pendingForTesting holds no physical slot, so it cannot answer
+            //    what happens to one; this blocks the recognizer instead and
+            //    watches the slot, the owner and the mask through each stage.
+            var lockStageFailures: [String] = []
+            let runSaveLockStages = {
+                guard let screen = NSScreen.screens.first else {
+                    lockStageFailures.append("no-screen")
+                    return
+                }
+                let release = DispatchSemaphore(value: 0)
+                let started = DispatchSemaphore(value: 0)
+                SliceBOCR.recognizerForTesting = { _ in
+                    started.signal()
+                    release.wait()
+                    return .success([
+                        RecognizedWord(
+                            rect: CGRect(x: 6, y: 6, width: 20, height: 12),
+                            confidence: 0.9),
+                    ])
+                }
+                func slots() -> Int {
+                    MainActor.assumeIsolated { SliceBRedactionJob.inFlight }
+                }
+                func owners() -> Int {
+                    MainActor.assumeIsolated {
+                        SliceBRedactionJob.ownerCountForTesting
+                    }
+                }
+                let slotBase = slots()
+                let ownerBase = owners()
+                final class LockSpy {
+                    var saveDone: (@MainActor (SaveAsOutcome) -> Void)?
+                    var saveAsCalls = 0
+                    var observed: [String] = []
+                }
+                let spy = LockSpy()
+                let panelImage = CapturedImage(
+                    cgImage: makeNoiseImage(width: 400, height: 300), scale: 1)
+                let deps = CaptureActionRouter.Dependencies(
+                    copyToClipboard: { _ in },
+                    autoSave: { _, _ in },
+                    saveAs: { _, done in
+                        spy.saveAsCalls += 1
+                        spy.saveDone = done
+                    },
+                    pin: { _ in }, ocr: { _ in }, openEditor: { _ in },
+                    toast: { _ in }, setLastCapture: { _ in },
+                    setLastAreaRect: { _ in }, logEvent: { _ in })
+                let panel = ScrollResultPanel.show(
+                    image: panelImage,
+                    inputs: OverlaySessionInputs(
+                        afterShow: true, afterCopy: false, afterSave: false),
+                    screen: screen, dependencies: deps)
+                let surface = panel.annotationSurface
+                let host = ForwardingRepaintDelegate(
+                    wrapping: surface.redactionDelegate)
+                surface.redactionDelegate = host
+                let blur = BlurAnnotation(uiScale: 1)
+                blur.rect = CGRect(x: 20, y: 20, width: 80, height: 50)
+                surface.addAnnotationForTesting(blur)
+                let generation = blur.redactionGeneration
+                MainActor.assumeIsolated {
+                    _ = SliceBRedactionJob.start(
+                        blur: blur, base: panelImage.cgImage, host: surface)
+                }
+                if started.wait(timeout: .now() + 5) == .timedOut {
+                    lockStageFailures.append("worker-never-started")
+                    release.signal()
+                    SliceBOCR.recognizerForTesting = nil
+                    panel.dismissForTesting()
+                    return
+                }
+                if slots() != slotBase + 1 || owners() != ownerBase + 1
+                    || blur.redactionState != .pendingFull {
+                    lockStageFailures.append(
+                        "start \(slots()) \(owners()) "
+                        + String(describing: blur.redactionState))
+                }
+
+                // Stage 1 — a FAILED render must leave the job alive.
+                let repaintsBeforeFail = host.repaints
+                ForcedOuterComposeFailure.scoped {
+                    AnnotationRenderer.withForcedRegionalFailure {
+                        panel.performActionForTesting(.save)
+                    }
+                }
+                if spy.saveAsCalls != 0 {
+                    lockStageFailures.append(
+                        "failed-render-saved \(spy.saveAsCalls)")
+                }
+                if blur.redactionState != .pendingFull
+                    || blur.redactionGeneration != generation
+                    || host.repaints != repaintsBeforeFail
+                    || slots() != slotBase + 1 || owners() != ownerBase + 1
+                    || !panel.isVisible {
+                    lockStageFailures.append(
+                        "failed-render-disturbed "
+                        + String(describing: blur.redactionState))
+                }
+
+                // Stage 2 — a SUCCESSFUL handoff, observed from inside saveAs:
+                // superseded already, but the physical slot is still held by
+                // the worker that has not returned.
+                spy.saveDone = nil
+                let repaintsBeforeSave = host.repaints
+                panel.performActionForTesting(.save)
+                if spy.saveAsCalls != 1 {
+                    lockStageFailures.append(
+                        "handoff \(spy.saveAsCalls)")
+                }
+                if blur.redactionState != .fallbackFull
+                    || blur.redactionGeneration != generation + 1
+                    || host.repaints != repaintsBeforeSave + 1
+                    || surface.redactionJobCountForTesting != 0
+                    || owners() != ownerBase
+                    || slots() != slotBase + 1 {
+                    lockStageFailures.append(
+                        "locked \(String(describing: blur.redactionState)) "
+                        + "gen \(blur.redactionGeneration) "
+                        + "repaints \(host.repaints - repaintsBeforeSave) "
+                        + "owners \(owners()) slots \(slots())")
+                }
+
+                // Stage 3 — the sheet is cancelled: nothing further moves.
+                let generationAfterLock = blur.redactionGeneration
+                let repaintsAfterLock = host.repaints
+                MainActor.assumeIsolated { spy.saveDone?(.cancelled) }
+                if blur.redactionGeneration != generationAfterLock
+                    || host.repaints != repaintsAfterLock
+                    || slots() != slotBase + 1 {
+                    lockStageFailures.append("cancel-moved")
+                }
+
+                // Stage 4 — teardown bumps once more; the repaint does not
+                // repeat, because the mask is already full.
+                panel.dismissForTesting()
+                if blur.redactionGeneration != generation + 2
+                    || host.repaints != repaintsAfterLock {
+                    lockStageFailures.append(
+                        "teardown gen \(blur.redactionGeneration) "
+                        + "repaints \(host.repaints - repaintsAfterLock)")
+                }
+
+                // Stage 5 — releasing the worker returns ONLY the slot.
+                release.signal()
+                let deadline = Date().addingTimeInterval(10)
+                while slots() > slotBase, Date() < deadline {
+                    RunLoop.current.run(until: Date().addingTimeInterval(0.02))
+                }
+                SliceBOCR.recognizerForTesting = nil
+                if slots() != slotBase || owners() != ownerBase {
+                    lockStageFailures.append(
+                        "drain \(slots()) \(owners())")
+                }
+                if blur.redactionState != .fallbackFull
+                    || blur.redactionGeneration != generation + 2 {
+                    lockStageFailures.append(
+                        "late-result-applied "
+                        + String(describing: blur.redactionState))
+                }
+            }
+            runSaveLockStages()
+            check("sliceB-save-lock-stages",
+                  lockStageFailures.isEmpty,
+                  lockStageFailures.joined(separator: " | "))
+
+            check("sliceB-toolbar-two-rows",
+                  toolbarFailures.isEmpty,
+                  toolbarFailures.joined(separator: " | "))
+
             check("sliceB-mid-drag-routes-blocked",
                   midDragFailures.isEmpty,
                   midDragFailures.joined(separator: " | "))
