@@ -11,14 +11,68 @@
 # with its password stored 0600 next to it, so `codesign` never prompts —
 # including after a reboot (build.sh unlocks it before signing).
 #
-# To share ONE identity across machines (so grants match everywhere), copy both
-# files to the other Mac and run this script there once — it only adds the
-# keychain to the search list and trusts the certificate.
+# To share ONE identity across machines (so grants match everywhere), copy the
+# keychain, its password file, and the adjacent .cert.pem file to the other Mac.
+# This script adds that existing keychain to the search list and trusts its
+# certificate; it never creates a replacement in required-release mode.
 set -euo pipefail
 
 NAME="Snippr Dev"
 KC="$HOME/Library/Keychains/snippr-dev.keychain-db"
 PW_FILE="$HOME/Library/Keychains/snippr-dev.password"
+REQUIRED_SHA1="${SNIPPR_REQUIRED_SIGNER_SHA1:-}"
+
+normalize_sha1() {
+  printf '%s' "$1" | tr '[:lower:]' '[:upper:]' | tr -d ':'
+}
+
+have_required_identity() {
+  local wanted
+  wanted="$(normalize_sha1 "$REQUIRED_SHA1")"
+  [ ${#wanted} -eq 40 ] || return 1
+  security find-identity -v -p codesigning 2>/dev/null \
+    | awk '{print toupper($2)}' | grep -qx "$wanted"
+}
+
+prepare_existing_keychain() {
+  [ -f "$PW_FILE" ] && [ -f "$KC" ] || return 1
+  local password current
+  password="$(cat "$PW_FILE")"
+  security unlock-keychain -p "$password" "$KC" 2>/dev/null || return 1
+  current="$(security list-keychains -d user | tr -d '\" ' )"
+  if ! printf '%s\n' "$current" | grep -qx "$KC"; then
+    security list-keychains -d user -s $(printf '%s\n' "$current") "$KC"
+  fi
+}
+
+# Distribution builds set the canonical public fingerprint. In this mode a
+# missing key is a hard failure: creating another self-signed certificate would
+# produce a different designated requirement and invalidate existing TCC grants.
+if [ -n "$REQUIRED_SHA1" ]; then
+  prepare_existing_keychain || true
+  if have_required_identity; then
+    echo "ensure-dev-cert: required release identity $(normalize_sha1 "$REQUIRED_SHA1") ready"
+    exit 0
+  fi
+  # A transferred keychain may be on the search list but not yet trusted for
+  # code signing. Only import trust when the companion public certificate is
+  # itself the exact required identity; never touch trust for a wrong request.
+  if [ -f "$KC.cert.pem" ]; then
+    CERT_SHA1="$(openssl x509 -in "$KC.cert.pem" -noout -fingerprint -sha1 \
+      | sed 's/^.*=//' | tr -d ':')"
+    if [ "$(normalize_sha1 "$CERT_SHA1")" = "$(normalize_sha1 "$REQUIRED_SHA1")" ]; then
+      security add-trusted-cert -r trustRoot -p codeSign -k "$KC" \
+        "$KC.cert.pem" >/dev/null 2>&1 || true
+    fi
+  fi
+  if have_required_identity; then
+    echo "ensure-dev-cert: required release identity $(normalize_sha1 "$REQUIRED_SHA1") ready"
+    exit 0
+  fi
+  echo "ensure-dev-cert: FAILED — required release identity $(normalize_sha1 "$REQUIRED_SHA1") is unavailable" >&2
+  echo "ensure-dev-cert: refusing to create a replacement certificate because it would lose TCC grants" >&2
+  exit 1
+fi
 
 have_valid_identity() {
   security find-identity -v -p codesigning 2>/dev/null | grep -q "\"$NAME\""

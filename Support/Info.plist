@@ -16,6 +16,8 @@
     <string>1.2.3</string>
     <key>CFBundleVersion</key>
     <string>20</string>
+    <key>SnipprReleaseSignerSHA1</key>
+    <string>946c43e6456970f5ec11544b3244c192aae949d6</string>
     <key>LSMinimumSystemVersion</key>
     <string>14.0</string>
     <key>LSUIElement</key>

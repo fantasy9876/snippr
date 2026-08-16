@@ -5,28 +5,33 @@ cài** — release thiếu hash sẽ khiến client từ chối auto-update (fai
 
 ## macOS (vd. 1.2.2)
 
-0. **Danh tính ký phải ổn định.** `./build.sh` tự tạo/dùng chứng chỉ self-signed
-   `Snippr Dev` (`scripts/ensure-dev-cert.sh`, keychain riêng
-   `~/Library/Keychains/snippr-dev.keychain-db` + file mật khẩu cạnh bên).
-   Release build **từ chối** ký ad-hoc: ad-hoc pin designated requirement vào
+0. **Danh tính ký phải ổn định.** Release được khóa vào fingerprint công khai
+   `946c43e6456970f5ec11544b3244c192aae949d6` trong `Support/Info.plist`.
+   `./build.sh release` chỉ ký bằng đúng private key đó và **không tự tạo cert
+   thay thế** nếu key vắng. Keychain riêng gồm ba file
+   `~/Library/Keychains/snippr-dev.keychain-db`, `snippr-dev.password` và
+   `snippr-dev.keychain-db.cert.pem`; chuyển build host phải chuyển đủ ba file
+   bằng kênh bí mật, giữ permission file mật khẩu 0600, rồi chạy
+   `scripts/ensure-dev-cert.sh` một lần. Release build **từ chối** ký ad-hoc:
+   ad-hoc pin designated requirement vào
    cdhash, mỗi bản build/update mới làm macOS coi là app khác → mất Screen
    Recording/Accessibility dù toggle vẫn bật (sự cố 1.2.2/1.2.3 trên Mac Studio).
-   Build trên nhiều máy: copy 2 file keychain + password sang máy kia và chạy
-   `scripts/ensure-dev-cert.sh` một lần để mọi máy ký cùng một danh tính; nếu
-   không, người dùng phải cấp lại quyền đúng một lần khi đổi máy build.
+   Không commit/upload keychain hoặc file mật khẩu.
 
 1. Bump version: `Support/Info.plist` (`CFBundleShortVersionString` + `CFBundleVersion`),
    `PreferencesWindow.swift` (AboutTab).
-2. `./build.sh release` build app arm64. Build Intel riêng bằng
-   `swift build -c release --arch x86_64`, sau đó đóng hai DMG và copy vào
-   thư mục staging deploy (các DMG bị gitignore, không nằm sẵn trong `site/`).
+2. `./build.sh release arm64` và `./build.sh release x86_64`; mỗi lần copy app
+   ra staging riêng trước khi build kiến trúc kế tiếp. Script ký và kiểm **cùng
+   pinned DR** cho cả hai. Sau đó đóng hai DMG và copy vào thư mục staging deploy
+   (các DMG bị gitignore, không nằm sẵn trong `site/`).
 3. `shasum -a 256 <staging>/Snippr-<ver>.dmg <staging>/Snippr-<ver>-intel.dmg`
 4. Cập nhật `site/version.json`: `mac`, `macUrlArm`, `macUrlIntel`,
    **`macSha256Arm`, `macSha256Intel`** (bắt buộc — client mới sẽ so khớp).
 5. Cập nhật nút tải trong `site/index.html`.
 
 Lưu ý: script cập nhật giờ swap an toàn (`Snippr.app.new` → đổi tên sau khi
-copy xong, có rollback) và verify `codesign --verify --deep` + sha256.
+copy xong, có rollback) và verify SHA-256 + đúng bundle ID + đúng certificate
+root; một DMG ký bằng cert khác bị từ chối trước khi đụng app đang cài.
 
 ## Windows (vd. 1.2.7)
 

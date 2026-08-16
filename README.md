@@ -44,7 +44,10 @@ Plain SwiftPM + a bundling script — no Xcode project. Useful entry points:
 | `Sources/Snippr/EditorWindow.swift` | annotation editor |
 | `Sources/Snippr/SelfTest.swift` | `Snippr --selftest` headless tests |
 
-Note: the app is ad-hoc signed, so macOS ties permissions to each build — after rebuilding you'll need to re-grant Screen Recording.
+Distribution builds use one pinned local signing identity so Screen Recording
+permission survives updates. A first installation still requires the one-time
+macOS permission prompt. Source builds made without that private release key
+should use an ad-hoc/debug signature and will require their own permission grant.
 
 ## License
 
