@@ -12,23 +12,29 @@ on:
         required: false
         default: ""
         type: string
-
-permissions:
-  contents: write
+      allow_unsigned_release:
+        description: "Permit a tagged release without Azure Trusted Signing. Unsigned binaries get SmartScreen warnings. Default false."
+        required: false
+        default: false
+        type: boolean
 
 jobs:
   build:
     runs-on: windows-latest
+    permissions:
+      contents: read
     env:
       HAS_SIGNING: ${{ secrets.AZURE_TENANT_ID != '' }}
       REQUESTED_REF: ${{ inputs.ref }}
       RELEASE_TAG: ${{ inputs.tag }}
+      ALLOW_UNSIGNED: ${{ inputs.allow_unsigned_release }}
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref }}
           fetch-depth: 0
           fetch-tags: true
+          persist-credentials: false
 
       - name: Pin exact immutable checkout
         shell: pwsh
@@ -37,6 +43,9 @@ jobs:
           $head = (git rev-parse HEAD).ToLower()
           Write-Host "requested=$want"
           Write-Host "HEAD=$head"
+          Write-Host "HAS_SIGNING=$($env:HAS_SIGNING)"
+          Write-Host "ALLOW_UNSIGNED=$($env:ALLOW_UNSIGNED)"
+          Write-Host "RELEASE_TAG=$($env:RELEASE_TAG)"
           git log -1 --oneline
           if ($want -match '^[0-9a-fA-F]{40}$') {
             if ($head -ne $want.ToLower()) {
@@ -96,12 +105,13 @@ jobs:
             throw "version mismatch: tag=$ver csproj=$csproj nsisOut=$nsisOut nsisDisp=$nsisDisp"
           }
 
-      - name: Require signing secrets for release
+      - name: Require signing secrets or explicit unsigned flag
         if: inputs.tag != ''
         shell: pwsh
         run: |
-          if ($env:HAS_SIGNING -ne 'true') {
-            throw "release upload requires Azure Trusted Signing secrets"
+          Write-Host "HAS_SIGNING=$($env:HAS_SIGNING) ALLOW_UNSIGNED=$($env:ALLOW_UNSIGNED)"
+          if ($env:HAS_SIGNING -ne 'true' -and $env:ALLOW_UNSIGNED -ne 'true') {
+            throw "tagged release requires Azure Trusted Signing secrets, or allow_unsigned_release=true"
           }
 
       - uses: actions/setup-dotnet@v4
@@ -137,8 +147,8 @@ jobs:
           Copy-Item $exe.FullName windows/Snippr.exe
 
       - name: Sign Snippr.exe (Azure Trusted Signing)
-        if: inputs.tag != ''
-        uses: azure/trusted-signing-action@v0.5.1
+        if: inputs.tag != '' && env.HAS_SIGNING == 'true'
+        uses: azure/trusted-signing-action@0d74250c661747df006298d0fb49944c10f16e03 # v0.5.1
         with:
           azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
@@ -163,8 +173,8 @@ jobs:
         run: '& "C:\Program Files (x86)\NSIS\makensis.exe" installer.nsi'
 
       - name: Sign installer (Azure Trusted Signing)
-        if: inputs.tag != ''
-        uses: azure/trusted-signing-action@v0.5.1
+        if: inputs.tag != '' && env.HAS_SIGNING == 'true'
+        uses: azure/trusted-signing-action@0d74250c661747df006298d0fb49944c10f16e03 # v0.5.1
         with:
           azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
@@ -189,31 +199,166 @@ jobs:
         if: inputs.tag != ''
         shell: pwsh
         run: |
-          function Assert-Signed([string]$path) {
+          function Get-SetupExe {
+            $setup = @(Get-Item windows/SnipprSetup-*.exe -ErrorAction SilentlyContinue)
+            if ($setup.Count -ne 1) {
+              throw "expected exactly 1 windows/SnipprSetup-*.exe, got $($setup.Count)"
+            }
+            return $setup[0]
+          }
+          function Assert-Authenticode([string]$path, [bool]$expectSigned) {
             if (-not (Test-Path $path)) { throw "missing $path" }
             $s = Get-AuthenticodeSignature $path
             Write-Host "$path Status=$($s.Status) Thumbprint=$($s.SignerCertificate.Thumbprint)"
-            if ($s.Status -ne 'Valid') {
-              throw "Authenticode not Valid: $path $($s.Status)"
+            if ($expectSigned) {
+              if ($s.Status -ne 'Valid') {
+                throw "Authenticode not Valid: $path $($s.Status)"
+              }
+            } else {
+              # Explicit unsigned: only NotSigned is acceptable.
+              # UnknownError / HashMismatch / anything else is a hard fail.
+              if ($s.Status -ne 'NotSigned') {
+                throw "explicit unsigned release requires NotSigned (rejected $($s.Status)): $path"
+              }
             }
           }
-          Assert-Signed windows/Snippr.exe
-          $setup = @(Get-Item windows/SnipprSetup-*.exe -ErrorAction SilentlyContinue)
-          if ($setup.Count -ne 1) {
-            throw "expected exactly 1 windows/SnipprSetup-*.exe, got $($setup.Count)"
-          }
-          Assert-Signed $setup[0].FullName
+          $setup = Get-SetupExe
+          $expectSigned = ($env:HAS_SIGNING -eq 'true')
+          Assert-Authenticode windows/Snippr.exe $expectSigned
+          Assert-Authenticode $setup.FullName $expectSigned
           $lines = @()
-          foreach ($p in @('windows/Snippr.exe', $setup[0].FullName, 'windows/Snippr-portable-win-x64.zip')) {
+          foreach ($p in @('windows/Snippr.exe', $setup.FullName, 'windows/Snippr-portable-win-x64.zip')) {
             $h = Get-FileHash -Algorithm SHA256 $p
             $line = "$($h.Hash.ToLower())  $(Split-Path $p -Leaf)"
             Write-Host $line
             $lines += $line
           }
+          if (-not $expectSigned) {
+            $lines += 'UNSIGNED_RELEASE=true'
+            Write-Host "UNSIGNED_RELEASE=true"
+            Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "## Unsigned release"
+            Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value ""
+            Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value '`UNSIGNED_RELEASE=true`'
+            Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value ""
+            Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "Azure Trusted Signing was not configured. Authenticode Status=NotSigned on Snippr.exe and the setup exe. SmartScreen will warn."
+          } else {
+            Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "## Signed release"
+            Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value ""
+            Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "Authenticode Status=Valid on Snippr.exe and the setup exe."
+          }
           $lines | Set-Content -Encoding ascii windows/SHA256SUMS
+          New-Item -ItemType Directory -Force dist/portable | Out-Null
+          Copy-Item $setup.FullName dist/
+          Copy-Item windows/Snippr.exe dist/portable/
+          Copy-Item windows/Snippr-portable-win-x64.zip dist/portable/
+          Copy-Item windows/SHA256SUMS dist/
+
+      - name: Upload verified setup
+        if: inputs.tag != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-setup
+          if-no-files-found: error
+          path: dist/SnipprSetup-*.exe
+
+      - name: Upload verified portable zip
+        if: inputs.tag != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-portable
+          if-no-files-found: error
+          path: dist/portable/
+
+      - name: Upload verified checksums
+        if: inputs.tag != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-checksums
+          if-no-files-found: error
+          path: dist/SHA256SUMS
+
+  release:
+    needs: build
+    if: inputs.tag != ''
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    env:
+      HAS_SIGNING: ${{ secrets.AZURE_TENANT_ID != '' }}
+      RELEASE_TAG: ${{ inputs.tag }}
+      ALLOW_UNSIGNED: ${{ inputs.allow_unsigned_release }}
+    steps:
+      - name: Download verified setup
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-setup
+          path: windows
+
+      - name: Download verified portable zip
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-portable
+          path: windows
+
+      - name: Download verified checksums
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-checksums
+          path: windows
+
+      - name: Recheck SHA-256 and Authenticode
+        shell: pwsh
+        run: |
+          if (-not (Test-Path windows/SHA256SUMS)) { throw "missing windows/SHA256SUMS" }
+          $sums = Get-Content windows/SHA256SUMS
+          $marker = @($sums | Where-Object { $_ -eq 'UNSIGNED_RELEASE=true' })
+          $hashLines = @($sums | Where-Object { $_ -match '^[0-9a-f]{64}  \S+' })
+          if ($env:HAS_SIGNING -eq 'true') {
+            if ($marker.Count -ne 0) {
+              throw "UNSIGNED_RELEASE marker present but HAS_SIGNING=true"
+            }
+            if ($env:ALLOW_UNSIGNED -eq 'true') {
+              Write-Host "allow_unsigned_release=true ignored because HAS_SIGNING=true; releasing signed"
+            }
+          } else {
+            if ($env:ALLOW_UNSIGNED -ne 'true') {
+              throw "release job reached unsigned path without allow_unsigned_release=true"
+            }
+            if ($marker.Count -ne 1) {
+              throw "unsigned release missing UNSIGNED_RELEASE=true marker in SHA256SUMS"
+            }
+          }
+          foreach ($line in $hashLines) {
+            $hash, $name = $line -split '  ', 2
+            $path = Join-Path 'windows' $name
+            if (-not (Test-Path $path)) { throw "missing $path listed in SHA256SUMS" }
+            $got = (Get-FileHash -Algorithm SHA256 $path).Hash.ToLower()
+            if ($got -ne $hash) { throw "SHA-256 mismatch $name expected $hash got $got" }
+            Write-Host "sha256 ok $name"
+          }
+          function Assert-Authenticode([string]$path, [bool]$expectSigned) {
+            if (-not (Test-Path $path)) { throw "missing $path" }
+            $s = Get-AuthenticodeSignature $path
+            Write-Host "$path Status=$($s.Status) Thumbprint=$($s.SignerCertificate.Thumbprint)"
+            if ($expectSigned) {
+              if ($s.Status -ne 'Valid') {
+                throw "Authenticode not Valid: $path $($s.Status)"
+              }
+            } else {
+              if ($s.Status -ne 'NotSigned') {
+                throw "explicit unsigned release requires NotSigned (rejected $($s.Status)): $path"
+              }
+            }
+          }
+          $setup = @(Get-Item windows/SnipprSetup-*.exe -ErrorAction SilentlyContinue)
+          if ($setup.Count -ne 1) {
+            throw "expected exactly 1 windows/SnipprSetup-*.exe, got $($setup.Count)"
+          }
+          $expectSigned = ($env:HAS_SIGNING -eq 'true')
+          Assert-Authenticode windows/Snippr.exe $expectSigned
+          Assert-Authenticode $setup[0].FullName $expectSigned
 
       - name: Upload to release
-        if: inputs.tag != ''
         env:
           GH_TOKEN: ${{ github.token }}
         shell: pwsh
@@ -228,6 +373,7 @@ jobs:
           }
           # No --clobber: refuse to overwrite an existing release asset.
           # Tag is taken from $env:RELEASE_TAG (allowlisted), never interpolated into the script.
+          # This job is the only one with contents: write; the gate-only path never reaches here.
           gh release upload $tag `
             $setup[0].FullName `
             windows/Snippr-portable-win-x64.zip `
