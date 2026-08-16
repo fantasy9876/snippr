@@ -10,6 +10,9 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
     private var zoomLabel: NSTextField!
     private var colorWell: NSColorWell!
     private var toolButtons: [EditorTool: NSButton] = [:]
+    /// Anchor for the preset menu. A production reference, not the testing
+    /// accessor — a gate seam must never be the app's own router.
+    private var backdropButton: NSButton?
     private var cropApplyButton: NSButton!
     private var cropCancelButton: NSButton!
     private var cropActionBar: NSStackView!
@@ -169,6 +172,7 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
             let b = makeButton(symbol: tool.symbol, tooltip: tool.tooltip, action: action)
             b.identifier = NSUserInterfaceItemIdentifier(tool.rawValue)
             toolButtons[tool] = b
+            if tool == .backdrop { backdropButton = b }
             toolViews.append(b)
         }
 
@@ -501,6 +505,12 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
 
     /// The real preset menu. Opening it changes nothing; only choosing an item
     /// applies a preset, and choosing the current one is a no-op.
+    /// One policy for both entry points: never touches the active tool.
+    func openBackdropChooser() {
+        guard let button = backdropButton else { return }
+        showBackdropMenu(button)
+    }
+
     @objc func showBackdropMenu(_ sender: NSButton) {
         let menu = NSMenu(title: "Backdrop")
         for (index, preset) in BackdropPreset.allCases.enumerated() {
@@ -2163,12 +2173,11 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
         if flags.isEmpty, let tool = SliceAHotkeys.editorToolKeys[chars] {
             let controller = window?.windowController as? EditorWindowController
             if tool == .backdrop {
-                // Opening the chooser is not an edit.
-                controller?.selectTool(.backdrop)
-                if let button = controller?.toolButtonsForTesting
-                    .first(where: { $0.tool == .backdrop })?.button {
-                    controller?.showBackdropMenu(button)
-                }
+                // Same non-destructive path as the button: opening the chooser
+                // must not change the active tool, because leaving .crop would
+                // cancel a live crop selection and leave the canvas in an inert
+                // Backdrop mode even if the menu is dismissed.
+                controller?.openBackdropChooser()
                 return
             }
             controller?.selectTool(tool)
