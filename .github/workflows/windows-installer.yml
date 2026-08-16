@@ -267,6 +267,69 @@ jobs:
           }
           Write-Host "embedded app icon PASS: $($exe.FullName)"
 
+      - name: Install NSIS
+        run: choco install nsis -y --no-progress
+
+      - name: Gate NSIS consumes approved icon
+        if: inputs.tag == ''
+        shell: pwsh
+        run: |
+          $exe = @(Get-ChildItem windows/bin/Release -Recurse -Filter Snippr.exe |
+            Where-Object { $_.FullName -notlike '*publish*' }) | Select-Object -First 1
+          if (-not $exe) { throw 'built Snippr.exe not found for NSIS smoke gate' }
+          Copy-Item $exe.FullName windows/Snippr.exe -Force
+          Push-Location windows
+          try {
+            & "C:\Program Files (x86)\NSIS\makensis.exe" installer.nsi
+            if ($LASTEXITCODE -ne 0) { throw "makensis failed: $LASTEXITCODE" }
+          } finally {
+            Pop-Location
+          }
+
+          $setup = @(Get-Item windows/SnipprSetup-*.exe -ErrorAction SilentlyContinue)
+          if ($setup.Count -ne 1) {
+            throw "NSIS smoke expected exactly one setup exe, got $($setup.Count)"
+          }
+          $nsisRaw = Get-Content windows/installer.nsi -Raw
+          $csprojRaw = Get-Content windows/Snippr.Win.csproj -Raw
+          if ($nsisRaw -notmatch 'OutFile "(SnipprSetup-([^\"]+)-win-x64\.exe)"') {
+            throw 'NSIS smoke could not read installer output/version'
+          }
+          $expectedSetup = $Matches[1]
+          $nsisVersion = $Matches[2]
+          if ($csprojRaw -notmatch '<Version>([^<]+)</Version>') {
+            throw 'NSIS smoke could not read csproj version'
+          }
+          $csprojVersion = $Matches[1].Trim()
+          if ($setup[0].Name -ne $expectedSetup -or $nsisVersion -ne $csprojVersion) {
+            throw "NSIS smoke version mismatch: setup=$($setup[0].Name) expected=$expectedSetup nsis=$nsisVersion csproj=$csprojVersion"
+          }
+
+          Add-Type -AssemblyName System.Drawing.Common
+          $expectedIcon = [Drawing.Icon]::new((Resolve-Path windows/snippr.ico).Path, 32, 32)
+          $actualIcon = [Drawing.Icon]::ExtractAssociatedIcon($setup[0].FullName)
+          if (-not $actualIcon) { throw 'NSIS setup embedded icon missing' }
+          $expected = $expectedIcon.ToBitmap()
+          $actual = $actualIcon.ToBitmap()
+          try {
+            if ($actual.Width -ne $expected.Width -or $actual.Height -ne $expected.Height) {
+              throw "NSIS icon dimensions differ: $($actual.Width)x$($actual.Height)"
+            }
+            for ($y = 0; $y -lt $expected.Height; $y++) {
+              for ($x = 0; $x -lt $expected.Width; $x++) {
+                if ($actual.GetPixel($x, $y).ToArgb() -ne $expected.GetPixel($x, $y).ToArgb()) {
+                  throw "NSIS setup icon pixel mismatch at $x,$y"
+                }
+              }
+            }
+          } finally {
+            $expected.Dispose()
+            $actual.Dispose()
+            $expectedIcon.Dispose()
+            $actualIcon.Dispose()
+          }
+          Write-Host "NSIS setup icon PASS: $($setup[0].FullName)"
+
       - name: Publish self-contained exe
         if: inputs.tag != ''
         run: >
@@ -302,10 +365,6 @@ jobs:
           file-digest: SHA256
           timestamp-rfc3161: http://timestamp.acs.microsoft.com
           timestamp-digest: SHA256
-
-      - name: Install NSIS
-        if: inputs.tag != ''
-        run: choco install nsis -y --no-progress
 
       - name: Build NSIS installer
         if: inputs.tag != ''
