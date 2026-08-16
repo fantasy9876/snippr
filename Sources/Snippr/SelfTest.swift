@@ -8744,8 +8744,12 @@ enum SelfTest {
                 if surface.annotations.count != 3
                     || surface.annotations[0] !== markA
                     || surface.annotations[1] !== markB
-                    || surface.annotations[2] !== newSpot {
-                    spotFailures.append("after-redo")
+                    || surface.annotations[2] !== newSpot
+                    // ONE transaction: the replacement is a single step, so
+                    // nothing is left on the redo branch after it.
+                    || surface.canRedo {
+                    spotFailures.append(
+                        "after-redo canRedo \(surface.canRedo)")
                 }
             }
             check("sliceB-spotlight-prior-index",
@@ -8769,8 +8773,27 @@ enum SelfTest {
                 surface.addAnnotationForTesting(discarded)
                 _ = surface.undo()
                 let redoAvailableBefore = surface.canRedo
+                // Snapshot the fields too: reinserting the SAME object after
+                // mutating it in place would satisfy an identity check while
+                // having changed exactly what the user drew.
+                let oldRect = oldSpot.rect
+                let oldDim = oldSpot.dimFraction
+                let oldBase = oldSpot.baseBounds
                 surface.tool = .spotlight
-                _ = surface.beginDrag(atPixel: CGPoint(x: 80, y: 80))
+                let started = surface.beginDrag(atPixel: CGPoint(x: 80, y: 80))
+                // A drag that never started would leave the document already
+                // correct, and every assertion below would pass for nothing.
+                if !started || !surface.isDragging {
+                    zeroFailures.append(
+                        "not-started \(started) \(surface.isDragging)")
+                }
+                // Mid-drag the draft HAS displaced the previous spotlight:
+                // that is the state the release has to undo.
+                let midSpots = surface.annotations
+                    .compactMap { $0 as? SpotlightAnnotation }
+                if midSpots.count != 1 || midSpots.first === oldSpot {
+                    zeroFailures.append("mid-draft \(midSpots.count)")
+                }
                 surface.continueDrag(toPixel: CGPoint(x: 80, y: 80))
                 surface.endDrag()
                 if surface.annotations.count != 3
@@ -8780,15 +8803,27 @@ enum SelfTest {
                     zeroFailures.append(
                         "order \(surface.annotations.count)")
                 }
+                if oldSpot.rect != oldRect || oldSpot.dimFraction != oldDim
+                    || oldSpot.baseBounds != oldBase {
+                    zeroFailures.append(
+                        "old-mutated \(oldSpot.rect) \(oldSpot.dimFraction)")
+                }
                 if !redoAvailableBefore || !surface.canRedo {
                     zeroFailures.append(
                         "redo \(redoAvailableBefore) -> "
                         + "\(surface.canRedo)")
                 }
-                // And redo still restores the same object it always would.
+                // Redo restores the whole document, not just its last element.
                 _ = surface.redo()
-                if surface.annotations.last !== discarded {
-                    zeroFailures.append("redo-object")
+                if surface.annotations.count != 4
+                    || surface.annotations[0] !== markA
+                    || surface.annotations[1] !== oldSpot
+                    || surface.annotations[2] !== markB
+                    || surface.annotations[3] !== discarded
+                    || surface.canRedo {
+                    zeroFailures.append(
+                        "after-redo \(surface.annotations.count) "
+                        + "canRedo \(surface.canRedo)")
                 }
             }
             // G. Nothing routes while the mouse is down. Driven through the
@@ -8796,8 +8831,13 @@ enum SelfTest {
             //    drag and the release — the window where the draft is already
             //    in the document and its transaction is half-built.
             var midDragFailures: [String] = []
-            do {
-                let screen = NSScreen.screens.first!
+            // Immediately invoked, so an environment guard can bail out of
+            // THIS case without returning from the whole selftest.
+            let runAreaMidDrag = {
+                guard let screen = NSScreen.screens.first else {
+                    midDragFailures.append("no-screen")
+                    return
+                }
                 let frozenImage = makeSolidImage(
                     width: Int(screen.frame.width * 2),
                     height: Int(screen.frame.height * 2),
@@ -8901,14 +8941,19 @@ enum SelfTest {
                 }
             }
 
+            runAreaMidDrag()
+
             // The panel implements the same policy separately, so it gets the
             // same question asked of it through its own real events.
-            do {
+            let runPanelMidDrag = {
                 final class PanelMidDragSpy {
                     var copies = 0
                 }
                 let spy = PanelMidDragSpy()
-                let screen = NSScreen.screens.first!
+                guard let screen = NSScreen.screens.first else {
+                    midDragFailures.append("no-screen-panel")
+                    return
+                }
                 let panelImage = CapturedImage(
                     cgImage: makeSolidImage(
                         width: 600, height: 400, color: NSColor.white.cgColor),
@@ -8977,6 +9022,7 @@ enum SelfTest {
                 }
                 panel.dismissForTesting()
             }
+            runPanelMidDrag()
             check("sliceB-mid-drag-routes-blocked",
                   midDragFailures.isEmpty,
                   midDragFailures.joined(separator: " | "))
