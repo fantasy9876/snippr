@@ -1098,6 +1098,224 @@ enum SelfTest {
                   "could not create unstoppable candidate fixture")
         }
 
+        // Health writes the lexical APP path through a directory symlink;
+        // lsof reports the physical txt. Healthy commit must still accept the
+        // exact activated executable, and failure-stop must still find it.
+        // Sibling / symlink-to-other-file stay rejected so identity cannot
+        // loosen to "any realpath that exists".
+        do {
+            let root = URL(fileURLWithPath: outputDir)
+                .appendingPathComponent("updater-phys-healthy-\(UUID().uuidString)")
+            defer { try? FileManager.default.removeItem(at: root) }
+            let layout = try makeUpdaterAliasLayout(in: root)
+            try makeUpdaterInstalledFixture(at: layout.physicalApp, marker: "old")
+            let aliasDiverges = updaterLexicalDivergesFromPhysical(layout.aliasRoot.path)
+            let healthFile = root.appendingPathComponent("status.txt")
+            let opened = root.appendingPathComponent("opened")
+            let openStub = root.appendingPathComponent("open-alias-health.sh")
+            try makeUpdaterHealthyOpenStub(
+                at: openStub, healthFile: healthFile, touchFile: opened)
+            if let fixture = makeUpdaterDMGFixture(
+                at: root, tamperAfterSigning: false)
+            {
+                defer { cleanupUpdaterDMGFixture(fixture) }
+                let log = root.appendingPathComponent("update.log")
+                let result = runUpdaterInstaller(
+                    fixture, installed: layout.aliasApp, log: log,
+                    relaunch: true, openTool: openStub.path,
+                    healthFile: healthFile.path)
+                let marker = updaterFixtureMarker(at: layout.aliasApp) ?? "missing"
+                let logText = (try? String(contentsOf: log, encoding: .utf8)) ?? ""
+                let healthText = (try? String(contentsOf: healthFile, encoding: .utf8)) ?? ""
+                let lexicalExec = layout.aliasApp
+                    .appendingPathComponent("Contents/MacOS/Snippr").path
+                let physicalExec = realpathQuiet(lexicalExec) ?? ""
+                let healthWroteAlias = healthText.contains(
+                    "executable=\(lexicalExec)")
+                let pid = healthText.split(separator: "\n")
+                    .first(where: { $0.hasPrefix("pid=") })
+                    .flatMap { Int32($0.dropFirst(4)) }
+                defer {
+                    if let pid, kill(pid, 0) == 0 { kill(pid, SIGKILL) }
+                }
+                check("updater-physical-path-healthy-alias",
+                      aliasDiverges
+                        && !physicalExec.isEmpty
+                        && lexicalExec != physicalExec
+                        && healthWroteAlias
+                        && result.status == 0
+                        && marker == "new"
+                        && FileManager.default.fileExists(atPath: opened.path)
+                        && updaterFixtureIsClean(
+                            fixture, installed: layout.aliasApp)
+                        && logText.contains("HEALTHY")
+                        && logText.contains("SUCCESS")
+                        && logText.contains("app=\(layout.aliasApp.path)"),
+                      "diverge \(aliasDiverges) lex \(lexicalExec) phys \(physicalExec) healthAlias \(healthWroteAlias) status \(result.status) marker \(marker) log \(logText) health \(healthText) output \(result.output)")
+            } else {
+                check("updater-physical-path-healthy-alias", false,
+                      "could not create signed DMG fixture")
+            }
+        } catch {
+            check("updater-physical-path-healthy-alias", false,
+                  "fixture error \(error)")
+        }
+
+        if let stopped = runUpdaterCandidateStopFixture(
+            in: URL(fileURLWithPath: outputDir), mode: .polite,
+            installViaAlias: true)
+        {
+            check("updater-physical-path-stop-alias",
+                  stopped.aliasDiverged
+                    && stopped.status != 0 && stopped.installedMarker == "old"
+                    && stopped.oldMarker == nil && !stopped.candidateAlive
+                    && stopped.canonicalOpenCount == 2
+                    && stopped.reopenedOld && stopped.transactionClean
+                    && stopped.signalLog.contains("--request-terminate-pid")
+                    && stopped.log.contains("STOP stage=activated-candidate")
+                    && stopped.log.contains("STOPPED stage=activated-candidate")
+                    && !stopped.log.contains("FORCE stage=activated-candidate"),
+                  stopped.detail)
+        } else {
+            check("updater-physical-path-stop-alias", false,
+                  "could not create alias candidate-stop fixture")
+        }
+
+        do {
+            let root = URL(fileURLWithPath: outputDir)
+                .appendingPathComponent("updater-phys-sibling-\(UUID().uuidString)")
+            defer { try? FileManager.default.removeItem(at: root) }
+            let installed = root.appendingPathComponent("installed/Snippr.app")
+            try makeUpdaterInstalledFixture(at: installed, marker: "old")
+            let sibling = root.appendingPathComponent("sibling/Snippr.app")
+            try makeUpdaterRunnableSleepApp(at: sibling)
+            let siblingExec = sibling.appendingPathComponent("Contents/MacOS/Snippr")
+            let healthFile = root.appendingPathComponent("status.txt")
+            let pidFile = root.appendingPathComponent("sibling.pid")
+            let openStub = root.appendingPathComponent("open-sibling.sh")
+            try makeUpdaterExecutable(
+                at: openStub,
+                contents: """
+                    #!/bin/sh
+                    APP="${2:-$1}"
+                    "\(siblingExec.path)" 30 &
+                    PID=$!
+                    /usr/bin/printf '%s\\n' "$PID" > "\(pidFile.path)"
+                    /usr/bin/printf 'pid=%s\\nversion=1.2.3\\nbuild=18\\nexecutable=%s\\n' "$PID" "$APP/Contents/MacOS/Snippr" > "\(healthFile.path)"
+                    exit 0
+                    """)
+            if let fixture = makeUpdaterDMGFixture(
+                at: root, tamperAfterSigning: false)
+            {
+                defer { cleanupUpdaterDMGFixture(fixture) }
+                let log = root.appendingPathComponent("update.log")
+                let result = runUpdaterInstaller(
+                    fixture, installed: installed, log: log,
+                    relaunch: true, openTool: openStub.path,
+                    healthFile: healthFile.path, healthTimeout: 1)
+                let siblingPID = (try? String(
+                    contentsOf: pidFile, encoding: .utf8))
+                    .flatMap { Int32($0.trimmingCharacters(
+                        in: .whitespacesAndNewlines)) }
+                let siblingAlive = siblingPID.map { kill($0, 0) == 0 } ?? false
+                defer {
+                    if let siblingPID, kill(siblingPID, 0) == 0 {
+                        kill(siblingPID, SIGKILL)
+                    }
+                }
+                let marker = updaterFixtureMarker(at: installed) ?? "missing"
+                let logText = (try? String(contentsOf: log, encoding: .utf8)) ?? ""
+                let targetExec = installed
+                    .appendingPathComponent("Contents/MacOS/Snippr").path
+                let siblingPhysical = realpathQuiet(siblingExec.path) ?? ""
+                let targetPhysical = realpathQuiet(targetExec) ?? ""
+                check("updater-physical-path-rejects-sibling",
+                      siblingPhysical != targetPhysical
+                        && result.status != 0 && marker == "old"
+                        && siblingAlive
+                        && updaterFixtureIsClean(fixture, installed: installed)
+                        && logText.contains("FAIL stage=health")
+                        && !logText.contains("SUCCESS")
+                        && !logText.contains("HEALTHY"),
+                      "sib \(siblingPhysical) tgt \(targetPhysical) status \(result.status) marker \(marker) alive \(siblingAlive) log \(logText) output \(result.output)")
+            } else {
+                check("updater-physical-path-rejects-sibling", false,
+                      "could not create signed DMG fixture")
+            }
+        } catch {
+            check("updater-physical-path-rejects-sibling", false,
+                  "fixture error \(error)")
+        }
+
+        do {
+            let root = URL(fileURLWithPath: outputDir)
+                .appendingPathComponent("updater-phys-other-\(UUID().uuidString)")
+            defer { try? FileManager.default.removeItem(at: root) }
+            let installed = root.appendingPathComponent("installed/Snippr.app")
+            try makeUpdaterInstalledFixture(at: installed, marker: "old")
+            let other = root.appendingPathComponent("other-bin")
+            try FileManager.default.copyItem(
+                at: URL(fileURLWithPath: "/bin/sleep"), to: other)
+            let link = root.appendingPathComponent("not-the-app")
+            try FileManager.default.createSymbolicLink(
+                atPath: link.path, withDestinationPath: other.path)
+            let healthFile = root.appendingPathComponent("status.txt")
+            let pidFile = root.appendingPathComponent("other.pid")
+            let openStub = root.appendingPathComponent("open-other-link.sh")
+            try makeUpdaterExecutable(
+                at: openStub,
+                contents: """
+                    #!/bin/sh
+                    "\(other.path)" 30 &
+                    PID=$!
+                    /usr/bin/printf '%s\\n' "$PID" > "\(pidFile.path)"
+                    /usr/bin/printf 'pid=%s\\nversion=1.2.3\\nbuild=18\\nexecutable=%s\\n' "$PID" "\(link.path)" > "\(healthFile.path)"
+                    exit 0
+                    """)
+            if let fixture = makeUpdaterDMGFixture(
+                at: root, tamperAfterSigning: false)
+            {
+                defer { cleanupUpdaterDMGFixture(fixture) }
+                let log = root.appendingPathComponent("update.log")
+                let result = runUpdaterInstaller(
+                    fixture, installed: installed, log: log,
+                    relaunch: true, openTool: openStub.path,
+                    healthFile: healthFile.path, healthTimeout: 1)
+                let otherPID = (try? String(
+                    contentsOf: pidFile, encoding: .utf8))
+                    .flatMap { Int32($0.trimmingCharacters(
+                        in: .whitespacesAndNewlines)) }
+                let otherAlive = otherPID.map { kill($0, 0) == 0 } ?? false
+                defer {
+                    if let otherPID, kill(otherPID, 0) == 0 {
+                        kill(otherPID, SIGKILL)
+                    }
+                }
+                let marker = updaterFixtureMarker(at: installed) ?? "missing"
+                let logText = (try? String(contentsOf: log, encoding: .utf8)) ?? ""
+                let targetExec = installed
+                    .appendingPathComponent("Contents/MacOS/Snippr").path
+                let linkPhysical = realpathQuiet(link.path) ?? ""
+                let targetPhysical = realpathQuiet(targetExec) ?? ""
+                check("updater-physical-path-rejects-other-file",
+                      !linkPhysical.isEmpty
+                        && linkPhysical != targetPhysical
+                        && result.status != 0 && marker == "old"
+                        && otherAlive
+                        && updaterFixtureIsClean(fixture, installed: installed)
+                        && logText.contains("FAIL stage=health")
+                        && !logText.contains("SUCCESS")
+                        && !logText.contains("HEALTHY"),
+                      "link \(linkPhysical) tgt \(targetPhysical) status \(result.status) marker \(marker) alive \(otherAlive) log \(logText) output \(result.output)")
+            } else {
+                check("updater-physical-path-rejects-other-file", false,
+                      "could not create signed DMG fixture")
+            }
+        } catch {
+            check("updater-physical-path-rejects-other-file", false,
+                  "fixture error \(error)")
+        }
+
         // Once launch health commits the new app, failure to delete the old
         // journal is only a cleanup warning. It must never roll back a healthy
         // candidate using a potentially partial backup.
@@ -8013,14 +8231,58 @@ enum SelfTest {
         let reopenedOld: Bool
         let transactionClean: Bool
         let downloadClean: Bool
+        let aliasDiverged: Bool
         let log: String
         let signalLog: String
 
         var detail: String {
             let installed = installedMarker ?? "nil"
             let old = oldMarker ?? "nil"
-            return "status \(status) installed \(installed) old \(old) alive \(candidateAlive) helper \(gracefulHelperStarted)/\(gracefulHelperAlive) elapsed \(elapsed) opens \(canonicalOpenCount) reopened \(reopenedOld) clean \(transactionClean)/\(downloadClean) signals \(signalLog) log \(log)"
+            return "status \(status) installed \(installed) old \(old) alive \(candidateAlive) helper \(gracefulHelperStarted)/\(gracefulHelperAlive) elapsed \(elapsed) opens \(canonicalOpenCount) reopened \(reopenedOld) clean \(transactionClean)/\(downloadClean) alias \(aliasDiverged) signals \(signalLog) log \(log)"
         }
+    }
+
+    private struct UpdaterAliasLayout {
+        let physicalRoot: URL
+        let aliasRoot: URL
+        let physicalApp: URL
+        let aliasApp: URL
+    }
+
+    private static func realpathQuiet(_ path: String) -> String? {
+        let result = runCommand("/bin/realpath", ["-q", path])
+        guard result.status == 0 else { return nil }
+        let trimmed = result.output.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private static func updaterLexicalDivergesFromPhysical(_ path: String) -> Bool {
+        guard let physical = realpathQuiet(path) else { return false }
+        return physical != path
+    }
+
+    private static func makeUpdaterAliasLayout(in root: URL) throws -> UpdaterAliasLayout {
+        let physicalRoot = root.appendingPathComponent("physical")
+        let aliasRoot = root.appendingPathComponent("via")
+        try FileManager.default.createDirectory(
+            at: physicalRoot, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(
+            atPath: aliasRoot.path, withDestinationPath: physicalRoot.path)
+        return UpdaterAliasLayout(
+            physicalRoot: physicalRoot,
+            aliasRoot: aliasRoot,
+            physicalApp: physicalRoot.appendingPathComponent("installed/Snippr.app"),
+            aliasApp: aliasRoot.appendingPathComponent("installed/Snippr.app"))
+    }
+
+    private static func makeUpdaterRunnableSleepApp(at app: URL) throws {
+        let macOS = app.appendingPathComponent("Contents/MacOS")
+        try FileManager.default.createDirectory(
+            at: macOS, withIntermediateDirectories: true)
+        try FileManager.default.copyItem(
+            at: URL(fileURLWithPath: "/bin/sleep"),
+            to: macOS.appendingPathComponent("Snippr"))
+        try makeUpdaterInstalledFixture(at: app, marker: "sibling")
     }
 
     private static func runCommand(_ executable: String, _ arguments: [String]) -> CommandResult {
@@ -8103,7 +8365,8 @@ enum SelfTest {
 
     private static func runUpdaterCandidateStopFixture(
         in outputRoot: URL,
-        mode: UpdaterCandidateStopMode
+        mode: UpdaterCandidateStopMode,
+        installViaAlias: Bool = false
     ) -> UpdaterCandidateStopResult? {
         let label: String
         switch mode {
@@ -8111,12 +8374,23 @@ enum SelfTest {
         case .force: label = "force"
         case .immortal: label = "immortal"
         }
+        let suffix = installViaAlias ? "-alias" : ""
         let root = outputRoot.appendingPathComponent(
-            "updater-candidate-stop-\(label)-\(UUID().uuidString)")
+            "updater-candidate-stop-\(label)\(suffix)-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: root) }
-        let installed = root.appendingPathComponent("installed/Snippr.app")
         do {
-            try makeUpdaterInstalledFixture(at: installed, marker: "old")
+            let installed: URL
+            let aliasDiverged: Bool
+            if installViaAlias {
+                let layout = try makeUpdaterAliasLayout(in: root)
+                try makeUpdaterInstalledFixture(at: layout.physicalApp, marker: "old")
+                installed = layout.aliasApp
+                aliasDiverged = updaterLexicalDivergesFromPhysical(layout.aliasRoot.path)
+            } else {
+                installed = root.appendingPathComponent("installed/Snippr.app")
+                try makeUpdaterInstalledFixture(at: installed, marker: "old")
+                aliasDiverged = false
+            }
             guard let fixture = makeUpdaterDMGFixture(
                 at: root, tamperAfterSigning: false, marker: "new") else {
                 return nil
@@ -8230,6 +8504,7 @@ enum SelfTest {
                 reopenedOld: FileManager.default.fileExists(atPath: reopenedFile.path),
                 transactionClean: transactionClean,
                 downloadClean: downloadClean,
+                aliasDiverged: aliasDiverged,
                 log: log, signalLog: signalLog)
             if let pid, alive {
                 _ = kill(pid, SIGKILL)
