@@ -8531,6 +8531,13 @@ enum SelfTest {
                     end: CGPoint(x: 150, y: 150), uiScale: 1)
                 canvas.annotations = [blur, arrow]
                 canvas.selectForTesting(arrow)
+                // Nonempty history AND redo stack, plus a live transient, so a
+                // fingerprint comparison cannot pass on empty/nil defaults.
+                canvas.registerUndoSnapshot()
+                canvas.annotations.append(
+                    CounterAnnotation(uiScale: 1))
+                canvas.undoManager?.undo()
+                canvas.beginRuler(.horizontal)
                 if seedEditing {
                     wc.selectTool(.crop)
                     canvas.setCropSelectionForTesting(
@@ -8554,23 +8561,37 @@ enum SelfTest {
                 canvas.keyDown(with: event)
             }
 
+            /// Expected counter vector per route: the named ones fire exactly
+            /// once and EVERY other counter must stay at zero, so a stray
+            /// cross-call or a missing autosave cannot hide.
             let routes: [(String, Bool, Bool, (EditorWindowController) -> Void,
-                          (TerminalSpy) -> Int)] = [
-                ("copy", false, false, { $0.copyImage() }, { $0.copies }),
-                ("save", false, false, { $0.saveImage() }, { $0.saveAs }),
-                ("saveAs", false, false, { $0.saveImageAs() }, { $0.saveAs }),
-                ("pin", false, false, { $0.pinImage() }, { $0.pins }),
-                ("ocr", false, false, { $0.runOCR() }, { $0.ocr }),
-                ("translate", false, false, { $0.runTranslate() }, { $0.translate }),
-                ("esc-copy", true, false, pressEscape, { $0.copies }),
-                ("esc-save", false, true, pressEscape, { $0.autoSaves }),
-                ("esc-both", true, true, pressEscape, { $0.copies }),
+                          [String: Int])] = [
+                ("copy", false, false, { $0.copyImage() }, ["copy": 1]),
+                ("save", false, false, { $0.saveImage() }, ["saveAs": 1]),
+                ("saveAs", false, false, { $0.saveImageAs() }, ["saveAs": 1]),
+                ("pin", false, false, { $0.pinImage() }, ["pin": 1]),
+                ("ocr", false, false, { $0.runOCR() }, ["ocr": 1]),
+                ("translate", false, false, { $0.runTranslate() }, ["translate": 1]),
+                ("esc-copy", true, false, pressEscape, ["copy": 1]),
+                ("esc-save", false, true, pressEscape, ["autoSave": 1]),
+                ("esc-both", true, true, pressEscape, ["copy": 1, "autoSave": 1]),
             ]
-            for (name, escCopy, escSave, action, counter) in routes {
+            func vector(_ spy: TerminalSpy) -> [String: Int] {
+                [
+                    "copy": spy.copies, "saveAs": spy.saveAs,
+                    "autoSave": spy.autoSaves, "pin": spy.pins,
+                    "ocr": spy.ocr, "translate": spy.translate,
+                ]
+            }
+            let zeroVector = [
+                "copy": 0, "saveAs": 0, "autoSave": 0, "pin": 0,
+                "ocr": 0, "translate": 0,
+            ]
+            for (name, escCopy, escSave, action, expected) in routes {
                 Settings.shared.escCopy = escCopy
                 Settings.shared.escSave = escSave
-                // Esc must be exercised on a canvas with no active text/crop:
-                // those are separate cancel routes, not terminal actions.
+                // Esc must be exercised with no active text/crop: those are
+                // separate cancel routes, not terminal actions.
                 let seedEditing = !name.hasPrefix("esc")
                 let spy = TerminalSpy()
                 let (wc, canvas) = makeSpiedEditor(spy, seedEditing: seedEditing)
@@ -8578,7 +8599,7 @@ enum SelfTest {
                 AnnotationRenderer.forceRegionalPixelateFailureForTesting = true
                 action(wc)
                 AnnotationRenderer.forceRegionalPixelateFailureForTesting = false
-                if spy.total != 0 {
+                if vector(spy) != zeroVector {
                     termFailures.append(name + ":deps " + spy.description)
                 }
                 if wc.window?.isVisible != true {
@@ -8589,12 +8610,16 @@ enum SelfTest {
                 }
                 wc.window?.close()
 
-                // Healthy positive for the SAME route: the dependency must fire
-                // exactly once, so a zero above means blocked, not unwired.
+                // Healthy twin on the SAME complex seeded state: it must reach
+                // its dependencies exactly, which proves the zeros above mean
+                // "blocked" rather than "never wired" — including the
+                // prospective text/crop path.
                 let liveSpy = TerminalSpy()
-                let (liveWC, _) = makeSpiedEditor(liveSpy, seedEditing: false)
+                let (liveWC, _) = makeSpiedEditor(liveSpy, seedEditing: seedEditing)
                 action(liveWC)
-                if counter(liveSpy) != 1 {
+                var expectedVector = zeroVector
+                for (key, value) in expected { expectedVector[key] = value }
+                if vector(liveSpy) != expectedVector {
                     termFailures.append(
                         name + ":live " + liveSpy.description)
                 }

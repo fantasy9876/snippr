@@ -983,6 +983,7 @@ final class EditorCanvasView: NSView {
     }
 
     func registerUndoSnapshot() {
+        historyMutationCountForTesting += 1
         // Any structural edit (delete, crop, resize, undo, redo) supersedes
         // every OCR job in flight: a late result must not narrow a mask on an
         // annotation the user has already changed.
@@ -1535,27 +1536,38 @@ final class EditorCanvasView: NSView {
     /// image's pixel hash and scale, and the full history/transient state.
     var documentFingerprintForTesting: String {
         func describe(_ a: Annotation) -> String {
+            let rgba = a.color.usingColorSpace(.sRGB).map {
+                "\($0.redComponent),\($0.greenComponent),\($0.blueComponent),\($0.alphaComponent)"
+            } ?? "?"
             var parts = [
                 "\(type(of: a))",
+                "id=\(UInt(bitPattern: ObjectIdentifier(a).hashValue))",
                 "b=\(a.bounds)",
-                "c=\(a.color.usingColorSpace(.sRGB).map { "\($0.redComponent),\($0.greenComponent),\($0.blueComponent)" } ?? "?")",
+                "rgba=\(rgba)",
                 "w=\(a.strokeWidthPt)",
             ]
             switch a {
             case let shape as ShapeAnnotation:
-                parts.append("s=\(shape.start) e=\(shape.end)")
+                parts.append("kind=\(shape.kind) s=\(shape.start) e=\(shape.end)")
             case let text as TextAnnotation:
                 parts.append("t=\(text.text) o=\(text.origin) f=\(text.fontSizePt)")
             case let counter as CounterAnnotation:
-                parts.append("n=\(counter.number) c=\(counter.center)")
+                parts.append("n=\(counter.number) c=\(counter.center) r=\(counter.radiusPt)")
             case let pen as PenAnnotation:
-                parts.append("p=\(pen.points.count):\(pen.points.first.map { "\($0)" } ?? "-")")
+                parts.append("pts=\(pen.points.map { "\($0.x),\($0.y)" }.joined(separator: ";"))")
             case let blur as BlurAnnotation:
                 parts.append("r=\(blur.rect) st=\(blur.redactionState) g=\(blur.redactionGeneration)")
             case let spot as SpotlightAnnotation:
                 parts.append("r=\(spot.rect) d=\(spot.dimFraction) bb=\(spot.baseBounds)")
             case let mag as MagnifierAnnotation:
-                parts.append("src=\(mag.sourceRect) out=\(mag.calloutRect) snap=\(mag.snapshot != nil)")
+                let snap = mag.snapshot.map {
+                    "\($0.width)x\($0.height)#\(SelfTest.imageHashForTesting($0))"
+                } ?? "nil"
+                parts.append("src=\(mag.sourceRect) out=\(mag.calloutRect) snap=\(snap)")
+            case let guide as GuideAnnotation:
+                parts.append("axis=\(guide.axis) pos=\(guide.position) len=\(guide.length)")
+            case let ruler as RulerAnnotation:
+                parts.append("span=\(ruler.span.start)->\(ruler.span.end)")
             default:
                 break
             }
@@ -1565,8 +1577,11 @@ final class EditorCanvasView: NSView {
         let selectedIndex = selected.flatMap { sel in
             annotations.firstIndex { $0 === sel }
         }
+        let selectedIdentity = selected.map {
+            "\(UInt(bitPattern: ObjectIdentifier($0).hashValue))"
+        } ?? "nil"
         let pendingText = textField.map {
-            "value=\($0.stringValue) frame=\($0.frame) font=\($0.font?.pointSize ?? -1)"
+            "value=\($0.stringValue) frame=\($0.frame) font=\($0.font?.pointSize ?? -1) backing=\(editingTextAnnotation.map { "\($0.origin)/\($0.fontSizePt)" } ?? "nil")"
         } ?? "none"
         return [
             "px=\(SelfTest.imageHashForTesting(image.cgImage))",
@@ -1576,9 +1591,11 @@ final class EditorCanvasView: NSView {
             "cropValid=\(hasValidCropSelection)",
             "text=[\(pendingText)]",
             "selIdx=\(selectedIndex.map(String.init) ?? "nil")",
+            "selId=\(selectedIdentity)",
             "undo=\(undoManager?.canUndo == true)",
             "redo=\(undoManager?.canRedo == true)",
-            "transient=\(transientKindForTesting ?? "none")",
+            "history=\(historyMutationCountForTesting)",
+            "transient=\(transientDescriptionForTesting)",
             "marks=[\(marks)]",
         ].joined(separator: " ")
     }
@@ -1617,6 +1634,24 @@ final class EditorCanvasView: NSView {
         case .none: return nil
         }
     }
+
+    /// Full transient payload, not just its kind: a gate must see the measured
+    /// span or the guide position, not only that "something" is there.
+    var transientDescriptionForTesting: String {
+        switch transient {
+        case let .ruler(span):
+            return "ruler(\(span.start)->\(span.end) len \(span.length))"
+        case let .guide(axis, position):
+            return "guide(\(axis) @\(position))"
+        case .none:
+            return "none"
+        }
+    }
+
+    /// Monotonic count of real history mutations. NSUndoManager will not report
+    /// its depth, and `canUndo` alone cannot tell "one edit" from "five edits
+    /// and four undos".
+    private(set) var historyMutationCountForTesting = 0
 
     override func keyDown(with event: NSEvent) {
         if isEditingText {
