@@ -94,12 +94,12 @@ enum SelfTest {
                 for: nonCanonical, allowNonCanonical: true)
             let dispNoBundle = BundleIntegrity.launchDisposition(for: nil)
             check("integrity-launch-blocks-wrong-copy",
-                  dispClean == .proceed(warnDuplicates: [])
-                    && dispDup == .proceed(warnDuplicates: [home, dmg])
+                  dispClean == .proceed
+                    && dispDup == .proceed
                     && dispWrong == .blockWrongCopy(running: home, canonicalExists: true)
                     && dispOrphan == .blockWrongCopy(running: home, canonicalExists: false)
-                    && dispDebug == .proceed(warnDuplicates: [canonical])
-                    && dispNoBundle == .proceed(warnDuplicates: []),
+                    && dispDebug == .proceed
+                    && dispNoBundle == .proceed,
                   "wrong \(dispWrong) orphan \(dispOrphan) debug \(dispDebug)")
             // Handoff ordering, run for real: the helper must wait for the
             // wrong-copy pid to be gone BEFORE opening the canonical app

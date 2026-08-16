@@ -56,9 +56,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // create a status item, register hotkeys, write launch status or
         // prompt TCC — every one of those would bind state to the wrong
         // signature. Dev tools and SNIPPR_ALLOW_NONCANONICAL=1 may proceed.
-        // The order below is BundleIntegrity.launchPlan (gated headlessly):
-        // status/health first, duplicates warning deferred to the next
-        // main-loop turn so the updater's health breadcrumb is never delayed.
+        // The order below is BundleIntegrity.launchPlan (gated headlessly).
+        // A canonical app starts normally and silently; only a process that is
+        // itself running from the wrong bundle path is blocked.
         let disposition = BundleIntegrity.launchDisposition(
             for: BundleIntegrity.currentVerdict(),
             allowNonCanonical: isDevTool || BundleIntegrity.debugOverrideRequested)
@@ -88,10 +88,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             case .requestScreenCapture:
                 if !CGPreflightScreenCaptureAccess() {
                     CGRequestScreenCaptureAccess()
-                }
-            case let .warnDuplicatesDeferred(duplicates):
-                DispatchQueue.main.async {
-                    BundleIntegrity.presentDuplicatesWarning(duplicates)
                 }
             }
         }

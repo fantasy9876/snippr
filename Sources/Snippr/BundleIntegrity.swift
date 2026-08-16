@@ -193,17 +193,15 @@ enum BundleIntegrity {
     }
 
     /// Launch order for AppDelegate, as data so it can be proven headlessly.
-    /// The wrong-copy branch touches nothing; the canonical branch writes the
-    /// launch status / health breadcrumb and finishes initialisation BEFORE
-    /// any duplicates warning may block the main thread (the updater waits
-    /// for that breadcrumb and would otherwise roll a healthy app back).
+    /// The wrong-copy branch touches nothing; the canonical branch starts
+    /// normally without interrupting the user for build/test bundles that
+    /// LaunchServices may have discovered elsewhere on disk.
     enum LaunchStep: Equatable {
         case presentWrongCopyAlertAndExit
         case setupStatusItem
         case writeLaunchStatus
         case startHotkeys
         case requestScreenCapture
-        case warnDuplicatesDeferred([URL])
     }
 
     static func launchPlan(
@@ -212,15 +210,12 @@ enum BundleIntegrity {
         switch disposition {
         case .blockWrongCopy:
             return [.presentWrongCopyAlertAndExit]
-        case let .proceed(warnDuplicates):
+        case .proceed:
             var steps: [LaunchStep] = []
             if !isDevTool {
                 steps += [.setupStatusItem, .writeLaunchStatus, .startHotkeys]
             }
             if needsCaptureServices { steps.append(.requestScreenCapture) }
-            if !isDevTool, !warnDuplicates.isEmpty {
-                steps.append(.warnDuplicatesDeferred(warnDuplicates))
-            }
             return steps
         }
     }
@@ -228,8 +223,8 @@ enum BundleIntegrity {
     /// What the app process may do at launch, decided BEFORE any status item,
     /// hotkey, launch-status file or TCC prompt exists.
     enum LaunchDisposition: Equatable {
-        /// Canonical copy: run normally, name any duplicates.
-        case proceed(warnDuplicates: [URL])
+        /// Canonical copy (or an explicit debug override): run normally.
+        case proceed
         /// Wrong copy: block. Nothing may be initialised; the process ends
         /// after the user has been pointed at the installed app.
         case blockWrongCopy(running: URL, canonicalExists: Bool)
@@ -243,12 +238,12 @@ enum BundleIntegrity {
     ) -> LaunchDisposition {
         switch verdict {
         case nil:
-            return .proceed(warnDuplicates: [])
-        case let .canonical(duplicates)?:
-            return .proceed(warnDuplicates: duplicates)
-        case let .runningNonCanonical(running, canonicalExists, duplicates)?:
+            return .proceed
+        case .canonical?:
+            return .proceed
+        case let .runningNonCanonical(running, canonicalExists, _)?:
             if allowNonCanonical {
-                return .proceed(warnDuplicates: duplicates)
+                return .proceed
             }
             return .blockWrongCopy(running: running, canonicalExists: canonicalExists)
         }
@@ -340,19 +335,4 @@ enum BundleIntegrity {
         exit(1)
     }
 
-    /// Canonical copy with duplicates: warning naming every path.
-    @MainActor
-    static func presentDuplicatesWarning(_ duplicates: [URL]) {
-        guard !duplicates.isEmpty else { return }
-        let alert = NSAlert()
-        alert.alertStyle = .warning
-        alert.messageText = "Phát hiện bản Snippr trùng"
-        alert.informativeText = "Có \(duplicates.count) bản Snippr khác trên máy. Spotlight/Launchpad có thể mở nhầm bản đó và macOS sẽ hỏi lại quyền Screen Recording. Hãy xóa các bản này, chỉ giữ /Applications/Snippr.app:\n\n"
-            + duplicates.map(\.path).joined(separator: "\n")
-        alert.addButton(withTitle: "OK")
-        alert.addButton(withTitle: "Hiện trong Finder")
-        if alert.runModal() == .alertSecondButtonReturn {
-            NSWorkspace.shared.activateFileViewerSelecting(duplicates)
-        }
-    }
 }
