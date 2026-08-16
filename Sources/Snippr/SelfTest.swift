@@ -8790,7 +8790,7 @@ enum SelfTest {
                 }
                 let afterRefs = canvas.annotationRefsForTesting
                 let sameMarks = afterRefs.count == beforeRefs.count
-                    && zip(afterRefs, beforeRefs).allSatisfy { $0 === $1 }
+                    && zip(afterRefs, beforeRefs).allSatisfy { $0.0 === $0.1 }
                 if !sameMarks
                     || canvas.selectedRefForTesting !== beforeSelected
                     || canvas.editingTextRefForTesting !== beforeEditing {
