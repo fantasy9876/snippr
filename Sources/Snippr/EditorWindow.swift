@@ -103,6 +103,9 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
         }
         canvas.onCropSelectionChange = { [weak self] isValid in
             self?.cropApplyButton?.isEnabled = isValid
+            // The pending crop changes what an export would produce, so the
+            // size the badge reports moves with it.
+            self?.refreshLabels()
         }
         refreshLabels()
         applyInitialZoom()
@@ -382,7 +385,9 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
         window?.contentView?.layoutSubtreeIfNeeded()
         scrollView.layoutSubtreeIfNeeded()
         let visibleDocumentRect = scrollView.contentView.bounds
-        let imageSize = canvas.image.pointSize
+        // The frame counts: measuring the image alone would call a document
+        // fitted while its backdrop is cut off at the edges.
+        let imageSize = canvas.backdropLayout.outerPointSize
         return imageSize.width <= visibleDocumentRect.width + tolerance
             && imageSize.height <= visibleDocumentRect.height + tolerance
     }
@@ -431,16 +436,36 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
         if let scrollView {
             scrollView.reflectScrolledClipView(scrollView.contentView)
         }
+        // Adding a frame makes the document bigger, so a view that was fitted
+        // is no longer fitted: keeping the old magnification pushes the very
+        // padding the user just asked for out of the viewport. Removing one
+        // leaves the document under-zoomed for the same reason. Refit after the
+        // layout pass, exactly as an image change does.
+        guard keepsImageFitted else { return }
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.keepsImageFitted else { return }
+            self.fitImageToWindow()
+        }
     }
 
     func refreshLabels() {
-        let layout = canvas.backdropLayout
+        // The EXPORT layout, not the live one: while a crop is pending, what
+        // Save writes is the cropped document, and the badge claims to report
+        // the exported size.
+        let layout = canvas.exportLayout
         // The badge reports what would be EXPORTED. Showing the inner size
         // while a frame is on would understate the file the user is about to
         // produce; the inner size stays visible in the tooltip.
         let size = layout.outerPointSize
         let px = layout.outerPixelSize
-        sizeBadge.title = "\(Int(size.width))×\(Int(size.height))pt"
+        // Not truncated: an odd pixel size on a Retina document lands on a
+        // half point, and rounding it down misreports the export.
+        func pt(_ value: CGFloat) -> String {
+            value == value.rounded()
+                ? "\(Int(value))"
+                : String(format: "%.1f", Double(value))
+        }
+        sizeBadge.title = "\(pt(size.width))×\(pt(size.height))pt"
         let innerPx = layout.innerPixelSize
         let frameNote = layout.isCollapsed
             ? ""
@@ -820,6 +845,15 @@ final class BackdropDocumentView: NSView {
         setFrameSize(layout.outerPointSize)
         canvas.setFrameOrigin(layout.innerPointRect.origin)
         canvas.setFrameSize(layout.innerPointSize)
+        // The export clips the document to the same rounded rect the plate
+        // draws. Without this the preview shows square corners over a rounded
+        // plate and the user reviews something the export will not produce.
+        //
+        // Clipped while DRAWING, not by a layer mask: a layer corner radius is
+        // applied by the compositor, so it would be missing from every render
+        // that goes through the view's own draw path.
+        canvas.documentCornerRadius = layout.isCollapsed
+            ? 0 : SliceBBackdrop.cornerRadiusPt
         needsDisplay = true
     }
 
@@ -981,6 +1015,18 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
             innerPixels: CGSize(
                 width: CGFloat(image.cgImage.width),
                 height: CGFloat(image.cgImage.height)),
+            pixelScale: pxScale, preset: backdropPreset)
+    }
+
+    /// The layout an export would produce right now, which honours a pending
+    /// crop. Distinct from `backdropLayout` on purpose: the wrapper and fit
+    /// describe the LIVE document the user is still cropping, while anything
+    /// reporting the resulting file has to describe what Save would write.
+    var exportLayout: BackdropLayout {
+        let inner = prospectiveInnerPixelSize()
+        return BackdropLayout(
+            innerPixels: CGSize(
+                width: CGFloat(inner.width), height: CGFloat(inner.height)),
             pixelScale: pxScale, preset: backdropPreset)
     }
 
@@ -1206,8 +1252,26 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
 
     // MARK: drawing
 
+    /// Corner radius the document is clipped to, in points. Non-zero only
+    /// while a backdrop frames it, and applied here rather than on the layer so
+    /// it survives every drawing path.
+    var documentCornerRadius: CGFloat = 0 {
+        didSet {
+            guard documentCornerRadius != oldValue else { return }
+            needsDisplay = true
+        }
+    }
+
     override func draw(_ dirtyRect: NSRect) {
         guard let ctx = NSGraphicsContext.current?.cgContext else { return }
+        if documentCornerRadius > 0 {
+            ctx.saveGState()
+            ctx.addPath(CGPath(
+                roundedRect: bounds, cornerWidth: documentCornerRadius,
+                cornerHeight: documentCornerRadius, transform: nil))
+            ctx.clip()
+        }
+        defer { if documentCornerRadius > 0 { ctx.restoreGState() } }
         ctx.interpolationQuality = .high
         ctx.draw(image.cgImage, in: bounds)
 

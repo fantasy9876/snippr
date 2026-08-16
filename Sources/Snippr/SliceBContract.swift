@@ -908,8 +908,7 @@ enum SliceBBackdrop {
             colorsSpace: CGColorSpace(name: CGColorSpace.sRGB)!,
             colors: gradient(for: preset) as CFArray, locations: [0, 1])
         else { return false }
-        let axis = gradientAxis(
-            width: Int(size.width), height: Int(size.height))
+        let axis = gradientAxis(width: size.width, height: size.height)
         ctx.drawLinearGradient(
             fill, start: axis.start, end: axis.end, options: [])
         let scale = max(1, pixelScale)
@@ -991,10 +990,13 @@ enum SliceBBackdrop {
 
     /// Gradient axis for a frame of this size, shared by `compose` and by
     /// anything reproducing the background.
+    /// Takes the size as it IS, not truncated to whole units: a 121x81 @2
+    /// document frames to 140.5 x 120.5 pt on screen, and rounding that down
+    /// tilts the on-screen gradient away from the exported one.
     static func gradientAxis(
-        width: Int, height: Int
+        width: CGFloat, height: CGFloat
     ) -> (start: CGPoint, end: CGPoint) {
-        (CGPoint(x: 0, y: CGFloat(height)), CGPoint(x: CGFloat(width), y: 0))
+        (CGPoint(x: 0, y: height), CGPoint(x: width, y: 0))
     }
 
     private static func gradient(for preset: BackdropPreset) -> [CGColor] {
