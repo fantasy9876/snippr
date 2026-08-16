@@ -9131,6 +9131,22 @@ enum SelfTest {
                         }
                     }
                 }
+                // A real click on a NON-Backdrop tool must select it: target
+                // and action being non-nil says they exist, not that they
+                // work. Backdrop, the terminal actions and the size badge are
+                // left alone — their menus run nested event loops.
+                let sentinel = EditorTool.rect
+                wc.selectTool(.select)
+                if let button = buttons.first(where: { $0.tool == sentinel })?
+                    .button {
+                    button.performClick(nil)
+                    if wc.canvasForTesting.currentTool != sentinel {
+                        toolbarFailures.append(
+                            "click \(wc.canvasForTesting.currentTool.rawValue)")
+                    }
+                } else {
+                    toolbarFailures.append("no-sentinel")
+                }
                 // The action row keeps its own controls visible alongside.
                 if actionRow.arrangedSubviews.filter({ !$0.isHidden }).count
                     < 3 {
