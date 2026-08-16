@@ -10044,8 +10044,9 @@ enum SelfTest {
                   sliverFailures.isEmpty,
                   sliverFailures.prefix(4).joined(separator: " | "))
 
-            // E10. Scroll result panel: the third real host, driven through
-            //      its own production action route.
+            // E10. Scroll result panel: the third real host, on a stitch that
+            //      must be FITTED (never 1:1), driven through its own
+            //      production action route.
             var panelFailures: [String] = []
             MainActor.assumeIsolated {
                 var panelExport: CapturedImage?
@@ -10056,7 +10057,8 @@ enum SelfTest {
                     "openEditor": 0, "setLastCapture": 0,
                     "setLastAreaRect": 0, "logEvent": 0,
                 ]
-                let panelBase = makeNoiseImage(width: 200, height: 400)
+                let panelPixels = 4000
+                let panelBase = makeNoiseImage(width: 300, height: panelPixels)
                 let panel = ScrollResultPanel.show(
                     image: CapturedImage(cgImage: panelBase, scale: 1),
                     inputs: OverlaySessionInputs(
@@ -10074,17 +10076,50 @@ enum SelfTest {
                         setLastAreaRect: { _ in panelDeps["setLastAreaRect"]! += 1 },
                         logEvent: { _ in panelDeps["logEvent"]! += 1 }))
                 for key in panelDeps.keys { panelDeps[key] = 0 }
-                if panel.annotationHostForTesting == nil {
+                panelCopies = 0
+                panelToasts = 0
+                guard let host = panel.annotationHostForTesting,
+                      host.bounds.width > 8, host.bounds.height > 8 else {
                     panelFailures.append("panel:no-host")
+                    panel.dismissForTesting()
+                    return
                 }
+                if abs(host.bounds.height - CGFloat(panelPixels)) < 1 {
+                    panelFailures.append("panel:fixture-is-1to1")
+                }
+                let pixelsPerPoint = CGFloat(panelPixels) / host.bounds.height
                 // RED until GREEN2 wires the hosts.
                 if panel.annotationSurface.redactionDelegate == nil {
                     panelFailures.append("panel:no-repaint-delegate")
                 }
-                let panelBlur = BlurAnnotation(uiScale: 1)
-                panelBlur.rect = CGRect(x: 40, y: 300, width: 80, height: 50)
+                // Baseline of the live host BEFORE anything is drawn on it.
+                host.needsDisplay = true
+                host.display()
+                let panelBaseline: CGImage? = host
+                    .bitmapImageRepForCachingDisplay(in: host.bounds)
+                    .flatMap { rep -> CGImage? in
+                        host.cacheDisplay(in: host.bounds, to: rep)
+                        return rep.cgImage
+                    }
+                if panelBaseline == nil { panelFailures.append("panel:no-baseline") }
+
+                // Mask expressed in POINTS, converted the way production does.
+                let maskInPoints = CGRect(
+                    x: host.bounds.width * 0.2, y: host.bounds.height * 0.3,
+                    width: host.bounds.width * 0.5,
+                    height: host.bounds.height * 0.2)
+                let panelBlur = BlurAnnotation(uiScale: pixelsPerPoint)
+                panelBlur.rect = CGRect(
+                    x: maskInPoints.minX * pixelsPerPoint,
+                    y: maskInPoints.minY * pixelsPerPoint,
+                    width: maskInPoints.width * pixelsPerPoint,
+                    height: maskInPoints.height * pixelsPerPoint)
                 panel.annotationSurface.addAnnotationForTesting(panelBlur)
-                let toastsBefore = panelToasts
+                if abs(panelBlur.rect.height
+                        - maskInPoints.height * pixelsPerPoint) > 1 {
+                    panelFailures.append("panel:mapping")
+                }
+
                 let (_, panelEvents) = RenderTrace.capture(
                     host: "scroll", path: "export"
                 ) {
@@ -10094,22 +10129,23 @@ enum SelfTest {
                 }
                 if panelExport != nil { panelFailures.append("panel:exported") }
                 if panelCopies != 0 { panelFailures.append("panel:copies") }
+                if panelDeps.values.contains(where: { $0 != 0 }) {
+                    panelFailures.append("panel:deps \(panelDeps)")
+                }
+                if panelToasts != 1 {
+                    panelFailures.append("panel:fail-toasts \(panelToasts)")
+                }
                 if !panel.isVisible { panelFailures.append("panel:closed") }
                 if ScrollResultPanel.current !== panel {
                     panelFailures.append("panel:not-current")
                 }
                 if panel.annotationSurface.annotations.count != 1
-                    || panel.annotationSurface.annotations.first !== panelBlur
-                    || panelBlur.rect != CGRect(x: 40, y: 300, width: 80, height: 50) {
+                    || panel.annotationSurface.annotations.first !== panelBlur {
                     panelFailures.append("panel:state-mutated")
                 }
-                if panelDeps.values.contains(where: { $0 != 0 }) {
-                    panelFailures.append("panel:deps \(panelDeps)")
-                }
-                if panelToasts - toastsBefore != 1 {
-                    panelFailures.append(
-                        "panel:toasts \(panelToasts - toastsBefore)")
-                }
+                // Exact trace payload: one destination for the full stitch and
+                // one attempt over the mask, in that order, nothing else.
+                let expectedRegion = panelBlur.rect.standardized.integral
                 let panelShape = panelEvents.map {
                     "\($0.host)/\($0.path)/\($0.kind)"
                 }
@@ -10118,58 +10154,81 @@ enum SelfTest {
                 ] {
                     panelFailures.append("panel:seq \(panelShape)")
                 }
-                // Preview is captured from the ACTUAL host view, at whatever
-                // backing scale it renders, and every pixel of the mask is
-                // compared as RGBA.
-                if let host = panel.annotationHostForTesting {
-                    let shot = AnnotationRenderer.withForcedRegionalFailure {
-                        () -> CGImage? in
-                        host.needsDisplay = true
-                        host.display()
-                        guard let rep = host.bitmapImageRepForCachingDisplay(
-                            in: host.bounds) else { return nil }
-                        host.cacheDisplay(in: host.bounds, to: rep)
-                        return rep.cgImage
-                    }
-                    guard let shot, host.bounds.width > 0 else {
-                        panelFailures.append("panel:no-preview")
-                        panel.dismissForTesting()
-                        return
-                    }
-                    // points -> backing pixels, whatever the device does
+                if let attempt = panelEvents.first(where: {
+                    $0.kind == "regionalAttempt"
+                }), attempt.rect != expectedRegion || attempt.destination != "-" {
+                    panelFailures.append("panel:attempt \(attempt.rect)")
+                }
+                if let destination = panelEvents.first(where: {
+                    $0.kind == "destination"
+                }), destination.destination != "300x\(panelPixels)" {
+                    panelFailures.append("panel:dest \(destination.destination)")
+                }
+
+                // Preview from the ACTUAL host view: mask exactly covered,
+                // everything else byte-identical to the baseline.
+                let shot = AnnotationRenderer.withForcedRegionalFailure {
+                    () -> CGImage? in
+                    host.needsDisplay = true
+                    host.display()
+                    guard let rep = host.bitmapImageRepForCachingDisplay(
+                        in: host.bounds) else { return nil }
+                    host.cacheDisplay(in: host.bounds, to: rep)
+                    return rep.cgImage
+                }
+                if let shot, let panelBaseline, host.bounds.width > 0 {
                     let backing = CGFloat(shot.width) / host.bounds.width
-                    let maskInPoints = CGRect(
-                        x: panelBlur.rect.minX, y: panelBlur.rect.minY,
-                        width: panelBlur.rect.width,
-                        height: panelBlur.rect.height)
-                    let bytes = rgba(shot)
-                    var holes = 0
+                    let bytes = rgba(shot), baseBytes = rgba(panelBaseline)
+                    var holes = 0, changed = 0
                     for py in 0..<shot.height {
                         for px in 0..<shot.width {
                             let point = CGPoint(
                                 x: CGFloat(px) / backing,
                                 y: CGFloat(shot.height - 1 - py) / backing)
-                            guard maskInPoints.contains(point) else { continue }
                             let i = (py * shot.width + px) * 4
-                            if Array(bytes[i..<(i + 4)]) != [31, 31, 31, 255] {
-                                holes += 1
+                            let value = Array(bytes[i..<(i + 4)])
+                            if maskInPoints.insetBy(dx: 1, dy: 1).contains(point) {
+                                if value != [31, 31, 31, 255] { holes += 1 }
+                            } else if !maskInPoints.insetBy(dx: -2, dy: -2)
+                                .contains(point) {
+                                if i + 4 <= baseBytes.count,
+                                   value != Array(baseBytes[i..<(i + 4)]) {
+                                    changed += 1
+                                }
                             }
                         }
                     }
                     if holes != 0 { panelFailures.append("panel:holes \(holes)") }
+                    if changed != 0 {
+                        panelFailures.append("panel:outside-changed \(changed)")
+                    }
+                } else {
+                    panelFailures.append("panel:no-preview")
                 }
-                // A blocked export must not latch the panel: a healthy action
-                // right after has to go through.
+
+                // Healthy retry: the blocked export must not have latched the
+                // panel, the vector must be exact, and the panel dismisses
+                // ITSELF — a manual dismiss would hide a stuck terminal latch.
+                panelToasts = 0
                 panel.performActionForTesting(.copy)
-                if panelExport == nil {
-                    panelFailures.append("panel:latched-after-fail")
+                if panelCopies != 1 {
+                    panelFailures.append("panel:retry-copies \(panelCopies)")
                 }
-                // Production teardown, not just ordering the window out.
-                panel.dismissForTesting()
+                if panelToasts != 1 {
+                    panelFailures.append("panel:retry-toasts \(panelToasts)")
+                }
+                if panelDeps.values.contains(where: { $0 != 0 }) {
+                    panelFailures.append("panel:retry-deps \(panelDeps)")
+                }
                 if ScrollResultPanel.current != nil {
-                    panelFailures.append("panel:current-leak")
+                    panelFailures.append("panel:no-auto-dismiss")
                 }
                 if panel.isVisible { panelFailures.append("panel:still-visible") }
+                // A replay after the terminal action must be rejected.
+                panel.performActionForTesting(.copy)
+                if panelCopies != 1 {
+                    panelFailures.append("panel:replay-accepted \(panelCopies)")
+                }
             }
             check("sliceB-scroll-host-failclosed",
                   panelFailures.isEmpty,
