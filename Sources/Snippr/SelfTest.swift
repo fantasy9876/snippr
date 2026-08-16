@@ -9810,6 +9810,9 @@ enum SelfTest {
                 ] {
                     let before = historyEvents
                     let dim = previous.dimFraction
+                    // Identity alone cannot see a field mutated in place.
+                    let rect = previous.rect
+                    let base = previous.baseBounds
                     let arrayBefore = surface.annotations
                     let toolBefore = surface.tool
                     let redoBefore = surface.canRedo
@@ -9820,6 +9823,8 @@ enum SelfTest {
                     let arrayAfter = surface.annotations
                     if historyEvents != before
                         || previous.dimFraction != dim
+                        || previous.rect != rect
+                        || previous.baseBounds != base
                         || arrayAfter.count != arrayBefore.count
                         || !zip(arrayAfter, arrayBefore).allSatisfy({
                             $0.0 === $0.1
@@ -9883,6 +9888,8 @@ enum SelfTest {
                 if abs((keypadSpot?.dimFraction ?? 0) - 0.3) > 0.0001
                     || surface.annotations.count != 1
                     || keypadSpot === afterRedo
+                    || surface.tool != .spotlight
+                    || surface.canRedo
                     || historyEvents != beforeKeypad + 1 {
                     digitFailures.append(
                         "panel:keypad \(keypadSpot?.dimFraction ?? -1)")
@@ -9897,10 +9904,25 @@ enum SelfTest {
                 if ScrollResultPanel.current === panel || panel.isVisible {
                     digitFailures.append("panel:terminal-open")
                 }
+                // Measured on the LIVE document, not on a detached reference:
+                // a clone that replaced the spotlight without notifying, or a
+                // tool change, would be invisible to the old object alone.
+                let frozenArray = surface.annotations
                 let frozenDim = keypadSpot?.dimFraction ?? 0
+                let frozenRect = keypadSpot?.rect ?? .zero
+                let frozenBase = keypadSpot?.baseBounds ?? .zero
+                let frozenTool = surface.tool
+                let frozenRedo = surface.canRedo
                 let beforeFrozen = historyEvents
                 if let event = digitEvent("1") { panel.keyDown(with: event) }
+                let liveArray = surface.annotations
                 if keypadSpot?.dimFraction != frozenDim
+                    || keypadSpot?.rect != frozenRect
+                    || keypadSpot?.baseBounds != frozenBase
+                    || liveArray.count != frozenArray.count
+                    || !zip(liveArray, frozenArray).allSatisfy({ $0.0 === $0.1 })
+                    || surface.tool != frozenTool
+                    || surface.canRedo != frozenRedo
                     || historyEvents != beforeFrozen {
                     digitFailures.append("panel:frozen-mutated")
                 }
