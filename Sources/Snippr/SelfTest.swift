@@ -9413,15 +9413,25 @@ enum SelfTest {
             // The overlay paints the frozen capture across the WHOLE screen, so
             // annotation pixels only line up with view points when the fixture
             // is screen-sized. A 240x180 fixture made every coordinate wrong.
+            // Retina fixture: with scale 1 the overlay's ctx.scaleBy(1/scale)
+            // is the identity, so a missing or doubled transform would sail
+            // straight through this gate.
+            let hostScale: CGFloat = 2
             let hostFrozen = CapturedImage(
                 cgImage: makeNoiseImage(
-                    width: Int(hostScreen.frame.width),
-                    height: Int(hostScreen.frame.height)),
-                scale: 1)
+                    width: Int(hostScreen.frame.width * hostScale),
+                    height: Int(hostScreen.frame.height * hostScale)),
+                scale: hostScale)
             // Asymmetric in Y (20 + 110 != 180 - 20) so a top-left/bottom-left
             // mix-up cannot survive the dimension and pixel checks.
+            // Selection and mask live in VIEW POINTS; the annotation model and
+            // the trace live in image PIXELS.
             let hostSelection = CGRect(x: 20, y: 30, width: 200, height: 110)
-            let hostMask = CGRect(x: 60, y: 50, width: 80, height: 50)
+            let maskView = CGRect(x: 60, y: 50, width: 80, height: 50)
+            let hostMaskPixels = CGRect(
+                x: maskView.minX * hostScale, y: maskView.minY * hostScale,
+                width: maskView.width * hostScale,
+                height: maskView.height * hostScale)
 
             /// Rasterize once; comparing pixel by pixel through a helper that
             /// re-rasterized the whole image each time was O(N^2).
@@ -9482,9 +9492,11 @@ enum SelfTest {
                 var copyCount = 0
                 var toasts = 0
                 let expectedTopLeft = CGRect(
-                    x: hostSelection.minX,
-                    y: CGFloat(hostFrozen.cgImage.height) - hostSelection.maxY,
-                    width: hostSelection.width, height: hostSelection.height)
+                    x: hostSelection.minX * hostScale,
+                    y: CGFloat(hostFrozen.cgImage.height)
+                        - hostSelection.maxY * hostScale,
+                    width: hostSelection.width * hostScale,
+                    height: hostSelection.height * hostScale).integral
                 // EVERY dependency is counted, not just the clipboard: a
                 // blocked export must reach none of them.
                 var deps = [
@@ -9538,8 +9550,11 @@ enum SelfTest {
                     || abs(hostFrozen.pointSize.height - view.bounds.height) > 0.5 {
                     hostFailures.append("area:frozen-size \(hostFrozen.pointSize)")
                 }
+                if hostFrozen.scale != hostScale {
+                    hostFailures.append("area:frozen-scale \(hostFrozen.scale)")
+                }
                 if !view.bounds.contains(hostSelection)
-                    || !hostSelection.contains(hostMask) {
+                    || !hostSelection.contains(maskView) {
                     hostFailures.append("area:geometry")
                 }
                 view.selectForTesting(rect: hostSelection)
@@ -9558,8 +9573,8 @@ enum SelfTest {
                 if surface.redactionDelegate == nil {
                     hostFailures.append("area:no-repaint-delegate")
                 }
-                let blur = BlurAnnotation(uiScale: 1)
-                blur.rect = hostMask
+                let blur = BlurAnnotation(uiScale: hostScale)
+                blur.rect = hostMaskPixels
                 surface.addAnnotationForTesting(blur)
 
                 // -- forced failure through the REAL action wrapper
@@ -9621,7 +9636,7 @@ enum SelfTest {
                     hostFailures.append("area:fail-attribution")
                 }
                 // Exact payload, not merely containment.
-                let expectedRegion = hostMask.standardized.integral
+                let expectedRegion = hostMaskPixels.standardized.integral
                 if let attempt = attempts.first, attempt.rect != expectedRegion {
                     hostFailures.append("area:attempt-rect \(attempt.rect)")
                 }
@@ -9629,7 +9644,7 @@ enum SelfTest {
                     $0.kind == "destination"
                 }) {
                     if destination.destination
-                        != "\(Int(hostSelection.width))x\(Int(hostSelection.height))"
+                        != "\(Int(expectedTopLeft.width))x\(Int(expectedTopLeft.height))"
                         || destination.rect != expectedTopLeft {
                         hostFailures.append(
                             "area:fail-dest \(destination.destination) \(destination.rect)")
@@ -9660,7 +9675,7 @@ enum SelfTest {
                     hostFailures.append("area:preview-seq \(previewShape)")
                 }
                 if let attempt = previewEvents.first,
-                   attempt.rect != hostMask.standardized.integral
+                   attempt.rect != hostMaskPixels.standardized.integral
                     || attempt.destination != "-" {
                     hostFailures.append("area:preview-attempt \(attempt.rect)")
                 }
@@ -9690,9 +9705,9 @@ enum SelfTest {
                             width: 1 / backingX, height: 1 / backingY)
                         let i = (py * viewShot.width + px) * 4
                         let value = Array(viewBytes[i..<(i + 4)])
-                        if hostMask.contains(cell) {
+                        if maskView.contains(cell) {
                             if value != cover { uncovered += 1 }
-                        } else if !hostMask.intersects(cell) {
+                        } else if !maskView.intersects(cell) {
                             // Outside the mask the view must be byte-identical
                             // to the baseline taken moments earlier.
                             if let baseBytes, i + 4 <= baseBytes.count,
@@ -9750,7 +9765,7 @@ enum SelfTest {
                     $0.kind == "destination"
                 }), okDestination.rect != expectedTopLeft
                     || okDestination.destination
-                        != "\(Int(hostSelection.width))x\(Int(hostSelection.height))" {
+                        != "\(Int(expectedTopLeft.width))x\(Int(expectedTopLeft.height))" {
                     hostFailures.append(
                         "area:ok-dest \(okDestination.rect) \(okDestination.destination)")
                 }
@@ -9790,8 +9805,8 @@ enum SelfTest {
                     hostFailures.append("area:no-export")
                     return
                 }
-                if shot.width != Int(hostSelection.width)
-                    || shot.height != Int(hostSelection.height) {
+                if shot.width != Int(expectedTopLeft.width)
+                    || shot.height != Int(expectedTopLeft.height) {
                     hostFailures.append("area:dims \(shot.width)x\(shot.height)")
                 }
                 // Dimensions alone cannot see a top-left / bottom-left swap
@@ -9804,10 +9819,10 @@ enum SelfTest {
                     for y in 0..<shot.height {
                         for x in 0..<shot.width {
                             let pixel = CGPoint(
-                                x: hostSelection.minX + CGFloat(x),
-                                y: hostSelection.minY
+                                x: hostSelection.minX * hostScale + CGFloat(x),
+                                y: hostSelection.minY * hostScale
                                     + CGFloat(shot.height - 1 - y))
-                            if hostMask.contains(pixel) { continue }
+                            if hostMaskPixels.contains(pixel) { continue }
                             let i = (y * shot.width + x) * 4
                             if Array(out[i..<(i + 4)]) != Array(ref[i..<(i + 4)]) {
                                 mismatch += 1
