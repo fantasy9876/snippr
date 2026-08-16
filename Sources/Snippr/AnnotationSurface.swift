@@ -399,6 +399,18 @@ final class AnnotationSurface: RedactionHost, RedactionJobObserver {
         historyDidChange?()
     }
 
+    /// Below this the pointer did not move; it exists for floating-point
+    /// noise, not as a minimum visible size.
+    static let motionTolerance: CGFloat = 0.01
+
+    static func hasMotion(_ points: [CGPoint]) -> Bool {
+        guard let first = points.first else { return false }
+        return points.contains {
+            abs($0.x - first.x) > motionTolerance
+                || abs($0.y - first.y) > motionTolerance
+        }
+    }
+
     func endDrag() {
         // A completed pen stroke or shape forks history HERE, not at
         // mouseDown — and only if it is a real mark. A press-and-release with
@@ -406,7 +418,12 @@ final class AnnotationSurface: RedactionHost, RedactionJobObserver {
         // draws nothing; keeping it would put an invisible annotation in the
         // document and take the user's redo branch with it.
         if let pen = activePen, annotations.last === pen {
-            if pen.points.count > 1 {
+            // MOTION, not sample count: a press that delivers the same point
+            // twice has two samples and no extent, and stroke width and round
+            // caps mean any real movement paints something. The test is
+            // therefore "did the pointer move at all", with a tolerance only
+            // for floating-point noise.
+            if Self.hasMotion(pen.points) {
                 redoAnnotations.removeAll()
                 pruneSpotlightReplacements()
             } else {
@@ -415,18 +432,11 @@ final class AnnotationSurface: RedactionHost, RedactionJobObserver {
             historyDidChange?()
         }
         if let shape = activeShape, annotations.last === shape {
-            // Enough extent to be visible: a line or arrow needs length, a
-            // rectangle, oval or highlight needs area.
             let dx = abs(shape.end.x - shape.start.x)
             let dy = abs(shape.end.y - shape.start.y)
-            let isReal: Bool
-            switch shape.kind {
-            case .line, .arrow:
-                isReal = (dx * dx + dy * dy).squareRoot() > 1
-            case .rect, .oval, .highlight:
-                isReal = dx > 1 && dy > 1
-            }
-            if isReal {
+            // Same rule for every kind: a stroked shape of any nonzero extent
+            // is visible, so only a shape that never moved is discarded.
+            if max(dx, dy) > Self.motionTolerance {
                 redoAnnotations.removeAll()
                 pruneSpotlightReplacements()
             } else {
