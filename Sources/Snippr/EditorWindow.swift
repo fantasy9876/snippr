@@ -490,7 +490,7 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
 
     /// Applies a backdrop preset from the popover. Kept separate from tool
     /// selection so picking the tool is never itself an edit.
-    @objc func applyBackdropPresetForTesting(_ preset: BackdropPreset) {
+    func applyBackdropPresetForTesting(_ preset: BackdropPreset) {
         canvas.applyBackdrop(preset)
     }
 

@@ -594,8 +594,12 @@ enum SliceBExport {
     ) -> CGImage? {
         let w = base.width, h = base.height
         guard w > 0, h > 0 else { return nil }
-        let needed = w * h * 4
-        guard needed <= budgetBytes else { return nil }
+        // Same overflow discipline as the outer compose: a huge stitch must
+        // fail closed here, not trap or wrap into a small number.
+        let (pixels, pixelsOverflow) = w.multipliedReportingOverflow(by: h)
+        guard !pixelsOverflow else { return nil }
+        let (needed, bytesOverflow) = pixels.multipliedReportingOverflow(by: 4)
+        guard !bytesOverflow, needed <= budgetBytes else { return nil }
         guard let ctx = CGContext(
             data: nil, width: w, height: h, bitsPerComponent: 8,
             bytesPerRow: 0,
