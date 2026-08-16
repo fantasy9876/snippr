@@ -8893,6 +8893,89 @@ enum SelfTest {
                     || surface?.annotations.first !== existing {
                     midDragFailures.append("undo-prior")
                 }
+                // POSITIVE CONTROL. Without it the zeros above could simply
+                // mean this fixture can never route a terminal action at all.
+                view.performReviewActionForTesting(.copy)
+                if spy.copies != 1 {
+                    midDragFailures.append("control-copies \(spy.copies)")
+                }
+            }
+
+            // The panel implements the same policy separately, so it gets the
+            // same question asked of it through its own real events.
+            do {
+                final class PanelMidDragSpy {
+                    var copies = 0
+                }
+                let spy = PanelMidDragSpy()
+                let screen = NSScreen.screens.first!
+                let panelImage = CapturedImage(
+                    cgImage: makeSolidImage(
+                        width: 600, height: 400, color: NSColor.white.cgColor),
+                    scale: 1)
+                let deps = CaptureActionRouter.Dependencies(
+                    copyToClipboard: { _ in spy.copies += 1 },
+                    autoSave: { _, _ in }, saveAs: { _, _ in },
+                    pin: { _ in }, ocr: { _ in }, openEditor: { _ in },
+                    toast: { _ in }, setLastCapture: { _ in },
+                    setLastAreaRect: { _ in }, logEvent: { _ in })
+                let panel = ScrollResultPanel.show(
+                    image: panelImage,
+                    inputs: OverlaySessionInputs(
+                        afterShow: true, afterCopy: false, afterSave: false),
+                    screen: screen, dependencies: deps)
+                let surface = panel.annotationSurface
+                let existing = SpotlightAnnotation(uiScale: 1)
+                existing.rect = CGRect(x: 40, y: 40, width: 80, height: 60)
+                existing.dimFraction = 0.3
+                surface.addAnnotationForTesting(existing)
+                surface.tool = .spotlight
+                func panelKey(_ chars: String) -> NSEvent? {
+                    NSEvent.keyEvent(
+                        with: .keyDown, location: .zero, modifierFlags: [],
+                        timestamp: 0, windowNumber: panel.windowNumber,
+                        context: nil, characters: chars,
+                        charactersIgnoringModifiers: chars,
+                        isARepeat: false, keyCode: 0)
+                }
+                var panelDim: CGFloat = 0
+                var panelCopies = 0
+                panel.drawWithRealEventsForTesting(
+                    fromView: CGPoint(x: 60, y: 60),
+                    toView: CGPoint(x: 160, y: 140)
+                ) {
+                    if let event = panelKey("5") { panel.keyDown(with: event) }
+                    if let event = panelKey("l") { panel.keyDown(with: event) }
+                    panel.performActionForTesting(.copy)
+                    panelDim = existing.dimFraction
+                    panelCopies = spy.copies
+                }
+                if panelDim != 0.3 {
+                    midDragFailures.append("panel-digit \(panelDim)")
+                }
+                if panelCopies != 0 {
+                    midDragFailures.append("panel-terminal \(panelCopies)")
+                }
+                if surface.tool != .spotlight {
+                    midDragFailures.append("panel-tool \(surface.tool)")
+                }
+                let spots = surface.annotations
+                    .compactMap { $0 as? SpotlightAnnotation }
+                if spots.count != 1 || spots.first === existing
+                    || spots.first?.dimFraction != 0.6 {
+                    midDragFailures.append("panel-finalize \(spots.count)")
+                }
+                _ = surface.undo()
+                if surface.annotations.count != 1
+                    || surface.annotations.first !== existing {
+                    midDragFailures.append("panel-undo-prior")
+                }
+                // Same positive control on the panel's own route.
+                panel.performActionForTesting(.copy)
+                if spy.copies != 1 {
+                    midDragFailures.append("panel-control \(spy.copies)")
+                }
+                panel.dismissForTesting()
             }
             check("sliceB-mid-drag-routes-blocked",
                   midDragFailures.isEmpty,
