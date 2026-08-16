@@ -8712,16 +8712,34 @@ enum SelfTest {
                     } else {
                         problems.append("no-pending-text")
                     }
-                    // Exact seeded style, compared as values.
-                    if let style = canvas.pendingTextStyleForTesting {
+                    // Exact seeded style, compared as values — including RGB,
+                    // so a reset to a different colour with the same alpha
+                    // cannot pass.
+                    let seeded = NSColor.systemPurple
+                        .withAlphaComponent(0.65).usingColorSpace(.sRGB)
+                    if let style = canvas.pendingTextStyleForTesting,
+                       let seeded {
                         if abs(style.pointSize - 27) > 0.01 || style.isBold {
                             problems.append("field-font=\(style.pointSize)/\(style.isBold)")
                         }
-                        if abs(style.alpha - 0.65) > 0.02 {
-                            problems.append("field-alpha=\(style.alpha)")
+                        if abs(style.red - seeded.redComponent) > 0.02
+                            || abs(style.green - seeded.greenComponent) > 0.02
+                            || abs(style.blue - seeded.blueComponent) > 0.02
+                            || abs(style.alpha - seeded.alphaComponent) > 0.02 {
+                            problems.append(
+                                "field-rgba=\(style.red),\(style.green),\(style.blue),\(style.alpha)")
                         }
                     } else {
                         problems.append("no-field-style")
+                    }
+                    if let backing = canvas.editingTextRefForTesting,
+                       let seeded,
+                       let color = backing.color.usingColorSpace(.sRGB) {
+                        if abs(color.redComponent - seeded.redComponent) > 0.02
+                            || abs(color.greenComponent - seeded.greenComponent) > 0.02
+                            || abs(color.blueComponent - seeded.blueComponent) > 0.02 {
+                            problems.append("backing-rgb")
+                        }
                     }
                     if !canvas.hasValidCropSelection { problems.append("no-crop") }
                 } else {
@@ -9434,7 +9452,12 @@ enum SelfTest {
 
             MainActor.assumeIsolated {
                 var exported: CapturedImage?
+                var copyCount = 0
                 var toasts = 0
+                let expectedTopLeft = CGRect(
+                    x: hostSelection.minX,
+                    y: CGFloat(hostFrozen.cgImage.height) - hostSelection.maxY,
+                    width: hostSelection.width, height: hostSelection.height)
                 // EVERY dependency is counted, not just the clipboard: a
                 // blocked export must reach none of them.
                 var deps = [
@@ -9449,7 +9472,7 @@ enum SelfTest {
                     completion: { _ in })
                 overlay.routerDependenciesOverride =
                     CaptureActionRouter.Dependencies(
-                        copyToClipboard: { exported = $0 },
+                        copyToClipboard: { exported = $0; copyCount += 1 },
                         autoSave: { _, _ in deps["autoSave"]! += 1 },
                         saveAs: { _, _ in deps["saveAs"]! += 1 },
                         pin: { _ in deps["pin"]! += 1 },
@@ -9463,6 +9486,12 @@ enum SelfTest {
                     mode: .area, screen: hostScreen, frozen: hostFrozen,
                     windowList: [], owner: overlay)
                 view.selectForTesting(rect: hostSelection)
+                // Selecting already runs the initial capture, which legitimately
+                // records the capture and logs an event. Rebase every counter
+                // here so each run below is measured as a DELTA.
+                for key in deps.keys { deps[key] = 0 }
+                copyCount = 0
+                toasts = 0
                 guard let surface = view.annotationSurface else {
                     hostFailures.append("area:no-surface")
                     return
@@ -9529,11 +9558,15 @@ enum SelfTest {
                 }
                 if let destination = failEvents.first(where: {
                     $0.kind == "destination"
-                }), destination.destination
-                    != "\(Int(hostSelection.width))x\(Int(hostSelection.height))" {
-                    hostFailures.append(
-                        "area:fail-dest \(destination.destination)")
+                }) {
+                    if destination.destination
+                        != "\(Int(hostSelection.width))x\(Int(hostSelection.height))"
+                        || destination.rect != expectedTopLeft {
+                        hostFailures.append(
+                            "area:fail-dest \(destination.destination) \(destination.rect)")
+                    }
                 }
+                if copyCount != 0 { hostFailures.append("area:fail-copies") }
 
                 // -- healthy run: exactly one materialization inside the mask
                 exported = nil
@@ -9564,9 +9597,18 @@ enum SelfTest {
                     || !(okAttempts.first.map { hostMask.contains($0.rect) } ?? false) {
                     hostFailures.append("area:ok-attempt \(okAttempts.count)")
                 }
-                let okDeps = deps.filter { $0.value != 0 }
-                if !okDeps.isEmpty {
-                    hostFailures.append("area:ok-deps \(okDeps)")
+                // The production copy route legitimately records the capture
+                // and the area rect; everything else must stay at zero.
+                let expectedOK = [
+                    "autoSave": 0, "saveAs": 0, "pin": 0, "ocr": 0,
+                    "openEditor": 0, "setLastCapture": 1,
+                    "setLastAreaRect": 1, "logEvent": 0,
+                ]
+                if deps != expectedOK {
+                    hostFailures.append("area:ok-deps \(deps)")
+                }
+                if copyCount != 1 {
+                    hostFailures.append("area:ok-copies \(copyCount)")
                 }
                 let okShape = okEvents.map { "\($0.host)/\($0.path)/\($0.kind)" }
                 if okShape != [
@@ -9599,10 +9641,6 @@ enum SelfTest {
                 // because the selection is asymmetric only in ORIGIN. Compare
                 // the pixels outside the mask against the crop we expect, and
                 // assert the destination rect the renderer actually allocated.
-                let expectedTopLeft = CGRect(
-                    x: hostSelection.minX,
-                    y: CGFloat(hostFrozen.cgImage.height) - hostSelection.maxY,
-                    width: hostSelection.width, height: hostSelection.height)
                 if let reference = hostFrozen.cgImage.cropping(to: expectedTopLeft) {
                     let out = rgba(shot), ref = rgba(reference)
                     var mismatch = 0
@@ -9900,6 +9938,19 @@ enum SelfTest {
                 }
             } else {
                 sliverFailures.append("invalid:no-image")
+            }
+            // A magnifier must not sample raw pixels when any redaction has
+            // undefined geometry: it cannot be shown to be safe.
+            if SliceBCompositor.magnifierSnapshot(
+                base: sliverBase,
+                sourceRect: CGRect(x: 5, y: 5, width: 20, height: 20),
+                redactions: [invalidBlur]) != nil {
+                sliverFailures.append("invalid:magnifier-sampled")
+            }
+            if !SliceBCompositor.needsRebuild(
+                source: CGRect(x: 5, y: 5, width: 20, height: 20),
+                redactions: [invalidBlur]) {
+                sliverFailures.append("invalid:no-rebuild")
             }
             let invalidExport = SliceBExport.checkedRender(
                 base: sliverBase, annotations: [invalidBlur], pixellated: nil,

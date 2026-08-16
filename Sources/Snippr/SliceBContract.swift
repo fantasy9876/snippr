@@ -468,6 +468,11 @@ enum SliceBCompositor {
         let region = sourceRect.standardized.integral.intersection(bounds)
         guard region.width > 1, region.height > 1 else { return nil }
 
+        // A redaction with undefined geometry cannot be shown NOT to cover the
+        // source, so the callout must not sample raw pixels. Fail closed.
+        guard redactions.allSatisfy({ $0.rect.isValidMaskRect }) else {
+            return nil
+        }
         let overlapping = redactions.filter {
             SliceBRedaction.maskRects(state: $0.redactionState, rect: $0.rect)
                 .contains { $0.intersects(region) }
@@ -511,7 +516,10 @@ enum SliceBCompositor {
     static func needsRebuild(
         source: CGRect, redactions: [BlurAnnotation]
     ) -> Bool {
-        redactions.contains { blur in
+        // Undefined geometry means we cannot prove the patch is still safe, so
+        // it must be rebuilt (and the rebuild will fail closed).
+        if redactions.contains(where: { !$0.rect.isValidMaskRect }) { return true }
+        return redactions.contains { blur in
             SliceBRedaction.maskRects(state: blur.redactionState, rect: blur.rect)
                 .contains { $0.intersects(source) }
         }
