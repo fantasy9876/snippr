@@ -9992,6 +9992,10 @@ enum SelfTest {
                     return
                 }
                 var areaSteps: [SpotlightAnnotation] = []
+                // Seeded with the ORIGINAL spotlight: comparing against
+                // `areaSteps.last` leaves the first digit comparing to nil, so
+                // mutating the original in place would have passed.
+                var areaPrevious = areaFirst
                 for (digit, expected) in digitSteps {
                     let before = areaHistory
                     let toolBefore = areaSurface.tool
@@ -10008,11 +10012,41 @@ enum SelfTest {
                     if abs(current.dimFraction - expected) > 0.0001
                         || areaHistory != before + 1
                         || areaSurface.tool != toolBefore
-                        || current === areaSteps.last {
+                        || current === areaPrevious {
                         digitFailures.append(
                             "area:\(digit) \(current.dimFraction)")
                     }
                     areaSteps.append(current)
+                    areaPrevious = current
+                }
+                // The same no-op cases as the panel: this host routes keys
+                // itself, so a guard missing here would not show up there.
+                for (label, event) in [
+                    ("repeat", digitEvent("9")),
+                    ("command", digitEvent("5", .command)),
+                    ("zero", digitEvent("0")),
+                ] {
+                    let before = areaHistory
+                    let dim = areaPrevious.dimFraction
+                    let rect = areaPrevious.rect
+                    let base = areaPrevious.baseBounds
+                    let arrayBefore = areaSurface.annotations
+                    let toolBefore = areaSurface.tool
+                    let redoBefore = areaSurface.canRedo
+                    if let event { view.keyDown(with: event) }
+                    let arrayAfter = areaSurface.annotations
+                    if areaHistory != before
+                        || areaPrevious.dimFraction != dim
+                        || areaPrevious.rect != rect
+                        || areaPrevious.baseBounds != base
+                        || arrayAfter.count != arrayBefore.count
+                        || !zip(arrayAfter, arrayBefore).allSatisfy({
+                            $0.0 === $0.1
+                        })
+                        || areaSurface.tool != toolBefore
+                        || areaSurface.canRedo != redoBefore {
+                        digitFailures.append("area:\(label)-mutated")
+                    }
                 }
                 // Undo and redo through the overlay's own buttons.
                 func areaUndo() {
@@ -10051,17 +10085,56 @@ enum SelfTest {
                     }
                 }
                 // Saving blocks the shortcut; cancelling unlocks it.
+                // Keypad on this host too — it routes keys itself.
+                let areaBeforeKeypad = areaHistory
+                if let event = digitEvent("3", keypad: true) {
+                    view.keyDown(with: event)
+                }
+                let areaKeypad = areaSurface.annotations
+                    .compactMap { $0 as? SpotlightAnnotation }.first
+                if abs((areaKeypad?.dimFraction ?? 0) - 0.3) > 0.0001
+                    || areaSurface.annotations.count != 1
+                    || areaKeypad === areaSteps.last
+                    || areaSurface.tool != .spotlight
+                    || areaSurface.canRedo
+                    || areaHistory != areaBeforeKeypad + 1 {
+                    digitFailures.append(
+                        "area:keypad \(areaKeypad?.dimFraction ?? -1)")
+                }
+
                 view.performReviewActionForTesting(.save)
+                if overlay.session.phase != .saving {
+                    digitFailures.append(
+                        "area:phase \(overlay.session.phase)")
+                }
                 let saving = areaSurface.annotations
                     .compactMap { $0 as? SpotlightAnnotation }.first
+                let savingArray = areaSurface.annotations
                 let savingDim = saving?.dimFraction ?? 0
+                let savingRect = saving?.rect ?? .zero
+                let savingBase = saving?.baseBounds ?? .zero
+                let savingTool = areaSurface.tool
+                let savingRedo = areaSurface.canRedo
                 let beforeSaving = areaHistory
                 if let event = digitEvent("2") { view.keyDown(with: event) }
+                let liveSaving = areaSurface.annotations
                 if saving?.dimFraction != savingDim
+                    || saving?.rect != savingRect
+                    || saving?.baseBounds != savingBase
+                    || liveSaving.count != savingArray.count
+                    || !zip(liveSaving, savingArray).allSatisfy({
+                        $0.0 === $0.1
+                    })
+                    || areaSurface.tool != savingTool
+                    || areaSurface.canRedo != savingRedo
                     || areaHistory != beforeSaving {
                     digitFailures.append("area:saving-mutated")
                 }
                 MainActor.assumeIsolated { areaSpy.saveDone?(.cancelled) }
+                if overlay.session.phase != .reviewing {
+                    digitFailures.append(
+                        "area:unlock-phase \(overlay.session.phase)")
+                }
                 // ...and the SAME fixture works again once unlocked, which is
                 // what makes the negative above mean "blocked" rather than
                 // "this document could never change".
