@@ -9277,26 +9277,36 @@ enum SelfTest {
                 let slotBase = slots()
                 let ownerBase = owners()
                 var released = false
-                func releaseAndDrain() {
-                    guard !released else { return }
+                var workerContained = false
+                @discardableResult
+                func releaseAndDrain() -> Bool {
+                    guard !released else { return workerContained }
                     released = true
                     release.signal()
-                    let deadline = Date().addingTimeInterval(10)
+                    // Wait for OUR worker to return, then let the main queue
+                    // deliver its result so the slot is actually given back.
+                    if workerFinished.wait(timeout: .now() + 10) == .timedOut {
+                        lockStageFailures.append("worker-never-returned")
+                        workerContained = false
+                        return false
+                    }
+                    let deadline = Date().addingTimeInterval(5)
                     while slots() > slotBase, Date() < deadline {
                         RunLoop.current.run(
                             until: Date().addingTimeInterval(0.02))
                     }
-                    // A worker still holding a slot here would wake inside
-                    // whatever recognizer is restored next, so this is a
-                    // failure rather than something to pass over quietly.
-                    if slots() > slotBase {
-                        lockStageFailures.append(
-                            "drain-timeout \(slots())")
-                    }
+                    workerContained = true
+                    return true
                 }
+                // THIS worker's own completion signal. Draining on the
+                // aggregate slot count is not containment: another fixture's
+                // worker finishing could balance the number while ours is
+                // still blocked.
+                let workerFinished = DispatchSemaphore(value: 0)
                 SliceBOCR.recognizerForTesting = { _ in
                     started.signal()
                     release.wait()
+                    defer { workerFinished.signal() }
                     return .success([
                         RecognizedWord(
                             rect: CGRect(x: 6, y: 6, width: 20, height: 12),
@@ -9305,11 +9315,19 @@ enum SelfTest {
                 }
                 var panelToClean: ScrollResultPanel?
                 defer {
-                    releaseAndDrain()
-                    SliceBOCR.recognizerForTesting = previousRecognizer
-                    // Every early exit closes the panel: a live one left in
-                    // ScrollResultPanel.current poisons the next fixture.
-                    if let panelToClean, ScrollResultPanel.current === panelToClean {
+                    // The seam goes back ONLY once our worker has provably
+                    // returned. If it has not, leaving the blocking recognizer
+                    // installed is the containment: a stale worker then wakes
+                    // in this closure rather than in real Vision.
+                    if releaseAndDrain() {
+                        SliceBOCR.recognizerForTesting = previousRecognizer
+                    }
+                    // Every early exit closes the panel. Either condition is
+                    // enough: a regression that clears `current` but forgets
+                    // to order the window out would otherwise leak it.
+                    if let panelToClean,
+                       panelToClean.isVisible
+                        || ScrollResultPanel.current === panelToClean {
                         panelToClean.dismissForTesting()
                     }
                 }
@@ -9398,6 +9416,7 @@ enum SelfTest {
                     || host.repaints != repaintsBeforeFail
                     || surface.redactionJobCountForTesting != 1
                     || slots() != slotBase + 1 || owners() != ownerBase + 1
+                    || ScrollResultPanel.current !== panel
                     || !panel.isVisible {
                     lockStageFailures.append(
                         "failed-render-disturbed "
@@ -9436,6 +9455,24 @@ enum SelfTest {
                         spy.inCallback.append(
                             "repaints \(host.repaints - repaintsBeforeSave)")
                     }
+                    // The SESSION lock itself, not only its consequences: a
+                    // route that cancelled the job and handed off without
+                    // locking would satisfy everything above.
+                    if panel.annotationHostForTesting?.isLocked() != true {
+                        spy.inCallback.append("unlocked")
+                    }
+                    if ScrollResultPanel.current !== panel {
+                        spy.inCallback.append("not-current")
+                    }
+                    // And a competing route inside the sheet does nothing.
+                    let callsBefore = spy.saveAsCalls
+                    let stateBefore = blur.redactionState
+                    panel.performActionForTesting(.copy)
+                    if spy.saveAsCalls != callsBefore
+                        || blur.redactionState != stateBefore
+                        || surface.redactionJobCountForTesting != 0 {
+                        spy.inCallback.append("reentrant")
+                    }
                 }
                 panel.performActionForTesting(.save)
                 spy.observe = nil
@@ -9454,18 +9491,30 @@ enum SelfTest {
                 let repaintsAfterLock = host.repaints
                 MainActor.assumeIsolated { spy.saveDone?(.cancelled) }
                 spy.saveDone = nil
-                if blur.redactionGeneration != generationAfterLock
+                // Cancel on its own, before anything else runs: an unwanted
+                // auto-retry, or a mutation at cancel time, would otherwise be
+                // hidden by the deliberate retry below.
+                if spy.saveAsCalls != 1
+                    || blur.redactionState != .fallbackFull
+                    || blur.redactionGeneration != generationAfterLock
                     || host.repaints != repaintsAfterLock
                     || slots() != slotBase + 1
                     || surface.redactionJobCountForTesting != 0
                     || owners() != ownerBase
-                    || !panel.isVisible {
-                    lockStageFailures.append("cancel-moved")
+                    || ScrollResultPanel.current !== panel
+                    || !panel.isVisible
+                    || panel.annotationHostForTesting?.isLocked() != false {
+                    lockStageFailures.append(
+                        "cancel-moved \(spy.saveAsCalls)")
                 }
                 // Positive retry on the SAME fixture: the unlock is real.
                 panel.performActionForTesting(.save)
-                if spy.saveAsCalls != 2 {
-                    lockStageFailures.append("retry \(spy.saveAsCalls)")
+                if spy.saveAsCalls != 2 || spy.saveDone == nil
+                    || ScrollResultPanel.current !== panel
+                    || !panel.isVisible {
+                    lockStageFailures.append(
+                        "retry \(spy.saveAsCalls) "
+                        + "done \(spy.saveDone != nil)")
                 }
 
                 // Stage 4 — a completed save closes the panel by itself.
