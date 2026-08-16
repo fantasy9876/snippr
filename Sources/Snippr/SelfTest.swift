@@ -1102,8 +1102,11 @@ enum SelfTest {
         // stubs capture live `lsof -Fn` so gates assert n<physical> and the
         // absence of the lexical alias. A second healthy case writes the
         // physical breadcrumb for the same file so GREEN cannot pass by
-        // only normalizing lsof. Negatives capture target physical while
-        // the candidate is still active (rollback deletes the executable).
+        // only normalizing lsof. Negatives launch a compiled C fixture
+        // (not a relocated /bin/sleep) so lsof can observe a live foreign
+        // physical path; health still claims the target so reject is only
+        // executable identity. Rollback must restore old and must not STOP
+        // the foreign process.
         if let healthy = runUpdaterPhysicalPathHealthFixture(
             in: URL(fileURLWithPath: outputDir), health: .lexicalApp)
         {
@@ -1160,7 +1163,13 @@ enum SelfTest {
             in: URL(fileURLWithPath: outputDir), kind: .sibling)
         {
             check("updater-physical-path-rejects-sibling",
-                  sibling.ok, sibling.detail)
+                  sibling.ok
+                    && sibling.foreignAlive
+                    && !sibling.targetPhysical.isEmpty
+                    && sibling.targetPhysical != sibling.launchPhysical
+                    && sibling.marker == "old"
+                    && !sibling.stoppedForeign,
+                  sibling.detail)
         } else {
             check("updater-physical-path-rejects-sibling", false,
                   "could not create sibling reject fixture")
@@ -1170,7 +1179,13 @@ enum SelfTest {
             in: URL(fileURLWithPath: outputDir), kind: .otherSymlink)
         {
             check("updater-physical-path-rejects-other-file",
-                  other.ok, other.detail)
+                  other.ok
+                    && other.foreignAlive
+                    && !other.targetPhysical.isEmpty
+                    && other.targetPhysical != other.launchPhysical
+                    && other.marker == "old"
+                    && !other.stoppedForeign,
+                  other.detail)
         } else {
             check("updater-physical-path-rejects-other-file", false,
                   "could not create other-symlink reject fixture")
@@ -8138,13 +8153,45 @@ enum SelfTest {
             aliasApp: aliasRoot.appendingPathComponent("installed/Snippr.app"))
     }
 
+    // A copied Apple platform binary such as /bin/sleep is killed by
+    // library-validation after relocation. Compile a tiny ordinary
+    // process instead, matching scripts/test-site-installer-transaction.sh.
+    private static func compileUpdaterRunnableCFixture(
+        to destination: URL,
+        stamp: String
+    ) throws {
+        let parent = destination.deletingLastPathComponent()
+        try FileManager.default.createDirectory(
+            at: parent, withIntermediateDirectories: true)
+        let source = parent.appendingPathComponent(
+            "\(destination.lastPathComponent)-\(stamp).c")
+        try Data("""
+            #include <unistd.h>
+            int main(void) {
+              static const char ident[] = "\(stamp)";
+              (void)ident;
+              for (;;) sleep(1);
+            }
+            """.utf8).write(to: source)
+        let compile = runCommand(
+            "/usr/bin/clang", [source.path, "-o", destination.path])
+        guard compile.status == 0,
+              FileManager.default.isExecutableFile(atPath: destination.path)
+        else {
+            throw UpdaterFixtureCompileError(output: compile.output)
+        }
+    }
+
+    private struct UpdaterFixtureCompileError: Error {
+        let output: String
+    }
+
     private static func makeUpdaterRunnableSleepApp(at app: URL) throws {
         let macOS = app.appendingPathComponent("Contents/MacOS")
         try FileManager.default.createDirectory(
             at: macOS, withIntermediateDirectories: true)
-        try FileManager.default.copyItem(
-            at: URL(fileURLWithPath: "/bin/sleep"),
-            to: macOS.appendingPathComponent("Snippr"))
+        try compileUpdaterRunnableCFixture(
+            to: macOS.appendingPathComponent("Snippr"), stamp: "sibling")
         try makeUpdaterInstalledFixture(at: app, marker: "sibling")
     }
 
@@ -8175,6 +8222,11 @@ enum SelfTest {
 
     private struct UpdaterPhysicalPathRejectResult {
         let ok: Bool
+        let foreignAlive: Bool
+        let targetPhysical: String
+        let launchPhysical: String
+        let marker: String
+        let stoppedForeign: Bool
         let detail: String
     }
 
@@ -8263,6 +8315,9 @@ enum SelfTest {
                 /usr/bin/printf '%s\\n' "$LAUNCH_PHYSICAL" > "\(launchPhysicalFile.path)"
                 LSOF_REMAINING=25
                 while [ "$LSOF_REMAINING" -gt 0 ]; do
+                  if ! /bin/kill -0 "$PID" 2>/dev/null; then
+                    break
+                  fi
                   /usr/sbin/lsof -a -p "$PID" -d txt -Fn > "\(lsofFile.path)" 2>/dev/null || true
                   if [ -n "$LAUNCH_PHYSICAL" ] \\
                     && /usr/bin/grep -Fqx "n$LAUNCH_PHYSICAL" "\(lsofFile.path)"; then
@@ -8373,8 +8428,7 @@ enum SelfTest {
                 foreignLexical = siblingExec.path
             case .otherSymlink:
                 let other = root.appendingPathComponent("other-bin")
-                try FileManager.default.copyItem(
-                    at: URL(fileURLWithPath: "/bin/sleep"), to: other)
+                try compileUpdaterRunnableCFixture(to: other, stamp: "foreign")
                 let link = root.appendingPathComponent("not-the-app")
                 try FileManager.default.createSymbolicLink(
                     atPath: link.path, withDestinationPath: other.path)
@@ -8416,6 +8470,9 @@ enum SelfTest {
             let lsofHasLaunch = lsofHasExactTxt(lsofText, path: launchPhysical)
             let lsofHasForeignLexical = lsofHasExactTxt(lsofText, path: foreignLexical)
             let lsofHasTarget = lsofHasExactTxt(lsofText, path: targetPhysical)
+            let stoppedForeign = logText.contains("STOP stage=activated-candidate")
+                || logText.contains("STOPPED stage=activated-candidate")
+                || logText.contains("FORCE stage=activated-candidate")
             let ok = !targetPhysical.isEmpty
                 && !launchPhysical.isEmpty
                 && targetPhysical != launchPhysical
@@ -8424,12 +8481,16 @@ enum SelfTest {
                 && !lsofHasTarget
                 && result.status != 0 && marker == "old"
                 && alive
+                && !stoppedForeign
                 && updaterFixtureIsClean(fixture, installed: installed)
                 && logText.contains("FAIL stage=health")
                 && !logText.contains("SUCCESS")
                 && !logText.contains("HEALTHY")
-            let detail = "tgt \(targetPhysical) launch \(launchPhysical) foreignLex \(foreignLexical) lsofLaunch \(lsofHasLaunch) lsofForeignLex \(lsofHasForeignLexical) lsofTgt \(lsofHasTarget) status \(result.status) marker \(marker) alive \(alive) log \(logText) lsof \(lsofText) output \(result.output)"
-            return UpdaterPhysicalPathRejectResult(ok: ok, detail: detail)
+            let detail = "tgt \(targetPhysical) launch \(launchPhysical) foreignLex \(foreignLexical) lsofLaunch \(lsofHasLaunch) lsofForeignLex \(lsofHasForeignLexical) lsofTgt \(lsofHasTarget) status \(result.status) marker \(marker) alive \(alive) stoppedForeign \(stoppedForeign) log \(logText) lsof \(lsofText) output \(result.output)"
+            return UpdaterPhysicalPathRejectResult(
+                ok: ok, foreignAlive: alive, targetPhysical: targetPhysical,
+                launchPhysical: launchPhysical, marker: marker,
+                stoppedForeign: stoppedForeign, detail: detail)
         } catch {
             print("  updater physical-path reject fixture error: \(error)")
             return nil
