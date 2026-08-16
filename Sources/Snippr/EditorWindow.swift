@@ -66,6 +66,9 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
             styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
             backing: .buffered, defer: false
         )
+        // The tool row needs 560pt; without a floor the user could drag the
+        // window narrower and push buttons out of reach.
+        window.contentMinSize = CGSize(width: 560, height: toolbarHeight + 120)
         window.titlebarAppearsTransparent = true
         window.titleVisibility = .hidden
         window.appearance = NSAppearance(named: .darkAqua)
@@ -139,6 +142,9 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
             b.bezelStyle = .regularSquare
             b.contentTintColor = .lightGray
             b.toolTip = tooltip
+            // A tooltip is not an accessibility label; VoiceOver reads this.
+            b.setAccessibilityLabel(tooltip)
+            b.image?.accessibilityDescription = tooltip
             b.translatesAutoresizingMaskIntoConstraints = false
             NSLayoutConstraint.activate([
                 b.widthAnchor.constraint(equalToConstant: 30),

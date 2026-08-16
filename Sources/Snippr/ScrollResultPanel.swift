@@ -249,6 +249,7 @@ final class ScrollResultPanel: NSPanel {
                 named: symbol, fallback: "questionmark.square.dashed")
             button.contentTintColor = tint
             button.toolTip = tooltip
+            button.setAccessibilityLabel(tooltip)
             button.tag = tag
             button.target = self
             button.action = #selector(toolbarPressed(_:))
