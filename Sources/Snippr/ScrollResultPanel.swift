@@ -379,6 +379,14 @@ final class ScrollResultPanel: NSPanel {
             selectAnnotationTool(.pixelateText)
             return
         }
+        // Plain 1-9 set spotlight darkness, BEFORE the tool map, and never
+        // while saving or after the terminal action.
+        if !saving, !terminalActionClaimed, flags.isEmpty,
+           let digit = event.charactersIgnoringModifiers.flatMap(Int.init),
+           (1...9).contains(digit) {
+            annotationSurface.setSpotlightDim(CGFloat(digit) / 10)
+            return
+        }
         if !saving, !terminalActionClaimed, flags.isEmpty,
            let key = event.charactersIgnoringModifiers,
            let tool = OverlayAnnotationTool.tool(forShortcutKey: key) {

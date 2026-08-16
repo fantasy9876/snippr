@@ -1128,6 +1128,14 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
             selectAnnotationTool(.pixelateText)
             return
         }
+        // Plain 1-9 set spotlight darkness, BEFORE the tool map. Reviewing
+        // only — never while saving — and a modified digit does nothing.
+        if owner?.session.phase == .reviewing, flags.isEmpty,
+           let digit = event.charactersIgnoringModifiers.flatMap(Int.init),
+           (1...9).contains(digit) {
+            annotationSurface?.setSpotlightDim(CGFloat(digit) / 10)
+            return
+        }
         if owner?.session.phase == .reviewing,
            flags.isEmpty,
            let key = event.charactersIgnoringModifiers,

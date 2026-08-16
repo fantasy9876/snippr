@@ -50,7 +50,8 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
         canvas = EditorCanvasView(image: image)
         self.forceFitForTesting = forceFitForTesting
 
-        let toolbarHeight: CGFloat = 46
+        // Two rows of controls; see buildUI.
+        let toolbarHeight: CGFloat = 70
         let contentSize = image.pointSize
         let screen = NSScreen.main ?? NSScreen.screens[0]
         let maxSize = CGSize(
@@ -213,19 +214,38 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
         leftPad.translatesAutoresizingMaskIntoConstraints = false
         leftPad.widthAnchor.constraint(equalToConstant: 62).isActive = true
 
-        let stack = NSStackView(
-            views: [leftPad, copyBtn, saveBtn, pinBtn, ocrBtn, translateBtn, sep()] + toolViews +
-                   [sep(), colorWell, NSView(), sizeBadge, sep(), zoomLabel]
-        )
-        stack.orientation = .horizontal
-        stack.distribution = .fill
-        stack.spacing = 2
-        stack.edgeInsets = NSEdgeInsets(top: 0, left: 8, bottom: 0, right: 14)
-        stack.translatesAutoresizingMaskIntoConstraints = false
-        if let flexible = stack.arrangedSubviews.dropLast(3).last {
-            stack.setHuggingPriority(.defaultLow, for: .horizontal)
+        // TWO explicit rows. Fifteen tools plus the terminal actions and the
+        // right-hand chrome cannot fit one 30pt row in a 560pt window, and
+        // hiding or compressing buttons would make them unreachable, so the
+        // tools get a row of their own.
+        let actionRow = NSStackView(
+            views: [leftPad, copyBtn, saveBtn, pinBtn, ocrBtn, translateBtn,
+                    sep(), colorWell, NSView(), sizeBadge, sep(), zoomLabel])
+        actionRow.orientation = .horizontal
+        actionRow.distribution = .fill
+        actionRow.spacing = 2
+        actionRow.edgeInsets = NSEdgeInsets(top: 0, left: 8, bottom: 0, right: 14)
+        actionRow.translatesAutoresizingMaskIntoConstraints = false
+        if let flexible = actionRow.arrangedSubviews.dropLast(3).last {
+            actionRow.setHuggingPriority(.defaultLow, for: .horizontal)
             flexible.setContentHuggingPriority(.init(1), for: .horizontal)
         }
+
+        let toolRow = NSStackView(views: toolViews + [NSView()])
+        toolRow.orientation = .horizontal
+        toolRow.distribution = .fill
+        toolRow.spacing = 2
+        toolRow.edgeInsets = NSEdgeInsets(top: 0, left: 8, bottom: 0, right: 14)
+        toolRow.translatesAutoresizingMaskIntoConstraints = false
+        toolRow.setHuggingPriority(.defaultLow, for: .horizontal)
+        toolRow.arrangedSubviews.last?
+            .setContentHuggingPriority(.init(1), for: .horizontal)
+
+        let stack = NSStackView(views: [actionRow, toolRow])
+        stack.orientation = .vertical
+        stack.distribution = .fillEqually
+        stack.spacing = 0
+        stack.translatesAutoresizingMaskIntoConstraints = false
         bar.addSubview(stack)
 
         let cropActions = NSStackView(views: [cropApply, cropCancel])

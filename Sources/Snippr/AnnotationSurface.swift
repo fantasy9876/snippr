@@ -391,6 +391,34 @@ final class AnnotationSurface: RedactionHost, RedactionJobObserver {
         clearActiveDraft()
     }
 
+    /// Adjusting darkness is a REPLACEMENT, not an in-place mutation: it goes
+    /// through the same prior+index machinery as drawing a new spotlight, so
+    /// undo restores the previous darkness and position exactly once.
+    /// Returns false when there is nothing to change.
+    @discardableResult
+    func setSpotlightDim(_ fraction: CGFloat) -> Bool {
+        let clamped = max(0.1, min(0.9, fraction))
+        guard let current = annotations.compactMap({
+            $0 as? SpotlightAnnotation
+        }).last,
+              let index = annotations.firstIndex(where: { $0 === current })
+        else { return false }
+        guard abs(current.dimFraction - clamped) > 0.0001 else { return false }
+        guard let clone = current.copyAnnotation() as? SpotlightAnnotation
+        else { return false }
+        clone.dimFraction = clamped
+        annotations.remove(at: index)
+        annotations.append(clone)
+        spotlightReplacements.removeAll { $0.new === clone }
+        spotlightReplacements.append(SpotlightReplacement(
+            new: clone, prior: current, priorIndex: index))
+        redoAnnotations.removeAll()
+        pruneSpotlightReplacements()
+        historyDidChange?()
+        redactionDidChange()
+        return true
+    }
+
     /// A record is only meaningful while its spotlight can still be reached by
     /// undo or redo; anything else is abandoned history.
     private func pruneSpotlightReplacements() {
