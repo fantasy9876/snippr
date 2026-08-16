@@ -9253,6 +9253,9 @@ enum SelfTest {
             //    what happens to one; this blocks the recognizer instead and
             //    watches the slot, the owner and the mask through each stage.
             var lockStageFailures: [String] = []
+            // Set when the OCR seam could not be safely handed back. Nothing
+            // after this gate can be trusted in that state.
+            var seamUnsafe = false
             let runSaveLockStages = {
                 guard let screen = NSScreen.screens.first else {
                     lockStageFailures.append("no-screen")
@@ -9294,14 +9297,16 @@ enum SelfTest {
                     // Wake anything already parked in the closure.
                     for _ in 0..<8 { release.signal() }
                 }
-                var released = false
+                var signalled = false
                 var workerContained = false
                 var workerEntered = false
                 let entryLock = NSLock()
                 @discardableResult
                 func releaseAndDrain() -> Bool {
-                    guard !released else { return workerContained }
-                    released = true
+                    // Retryable: signalling happens once, but polling can be
+                    // repeated, so a worker that finishes just after a timeout
+                    // still lets the seam go back.
+                    if workerContained { return true }
                     entryLock.lock()
                     let entered = workerEntered
                     entryLock.unlock()
@@ -9327,7 +9332,10 @@ enum SelfTest {
                         }
                         return workerContained
                     }
-                    release.signal()
+                    if !signalled {
+                        signalled = true
+                        release.signal()
+                    }
                     // Wait for OUR worker to return, then let the main queue
                     // deliver its result so the slot is actually given back.
                     if workerFinished.wait(timeout: .now() + 10) == .timedOut {
@@ -9400,10 +9408,18 @@ enum SelfTest {
                     // would send it into the real one. Keeping this closure
                     // installed is safe now that it no longer blocks.
                     endScope()
-                    if releaseAndDrain() {
+                    // One more attempt after the scope ended, since the
+                    // closure no longer blocks and a straggler may have just
+                    // finished.
+                    if releaseAndDrain() || releaseAndDrain() {
                         SliceBOCR.recognizerForTesting = previousRecognizer
                     } else {
+                        // The suite cannot continue past this: a fake
+                        // recognizer left installed feeds invented words to
+                        // every later OCR gate, and a dirty slot shifts their
+                        // baselines. The flag stops the run below.
                         lockStageFailures.append("seam-held")
+                        seamUnsafe = true
                     }
                 }
 
@@ -9650,6 +9666,12 @@ enum SelfTest {
                 if ScrollResultPanel.current === panel || panel.isVisible {
                     lockStageFailures.append("saved-not-dismissed")
                 }
+                // If the completion failed to dismiss (already recorded as a
+                // failure), close it HERE, before the worker is released: a
+                // late result must not land on a surface that is still live.
+                if panel.isVisible || ScrollResultPanel.current === panel {
+                    panel.dismissForTesting()
+                }
                 let generationAfterClose = blur.redactionGeneration
                 let repaintsAfterClose = host.repaints
 
@@ -9659,6 +9681,9 @@ enum SelfTest {
                 if slots() != slotBase || owners() != ownerBase {
                     lockStageFailures.append(
                         "drain \(slots()) \(owners())")
+                }
+                if panel.isVisible || ScrollResultPanel.current === panel {
+                    lockStageFailures.append("panel-leaked")
                 }
                 if blur.redactionState != .fallbackFull
                     || blur.redactionGeneration != generationAfterClose
@@ -9674,6 +9699,14 @@ enum SelfTest {
             check("sliceB-save-lock-stages",
                   lockStageFailures.isEmpty,
                   lockStageFailures.joined(separator: " | "))
+            if seamUnsafe {
+                // Fail-stop. Continuing would feed invented OCR results to
+                // every later gate and shift their slot baselines, turning one
+                // real failure into a cascade of false ones.
+                check("sliceB-seam-isolation", false,
+                      "OCR seam left installed; remaining gates skipped")
+                return
+            }
 
             // J. Abandoning a drag restores the redo branch. Pen and the
             //    shapes used to fork history at mouseDown, so a document with
