@@ -9542,7 +9542,7 @@ enum SelfTest {
                 if view.bounds.origin != .zero {
                     hostFailures.append("area:view-origin \(view.bounds.origin)")
                 }
-                let baselineShot = SelfTest.snapshotViewForTesting(view)
+                let baselineShot = SelfTest.directDrawSnapshotForTesting(view)
                 if baselineShot == nil {
                     hostFailures.append("area:no-baseline")
                 }
@@ -9617,7 +9617,7 @@ enum SelfTest {
                     host: "area", path: "preview"
                 ) { () -> CGImage? in
                     AnnotationRenderer.withForcedRegionalFailure {
-                        SelfTest.snapshotViewForTesting(view)
+                        SelfTest.directDrawSnapshotForTesting(view)
                     }
                 }
                 // Independent evidence the production draw really ran.
@@ -11366,6 +11366,40 @@ enum SelfTest {
         ctx.translateBy(x: -bounds.minX, y: -bounds.minY)
         let graphics = NSGraphicsContext(cgContext: ctx, flipped: false)
         view.displayIgnoringOpacity(bounds, in: graphics)
+        return ctx.makeImage()
+    }
+
+    /// Same bitmap/CTM setup as `snapshotViewForTesting`, but the view's own
+    /// `draw(_:)` override is invoked directly. The area overlay composites a
+    /// frozen sublayer, and that layer path swallowed the destination even
+    /// under `displayIgnoringOpacity`; calling the override runs the real
+    /// production body (selection clip, 1/scale, compositor) without it.
+    /// Deliberately narrower than the full layer tree — appearance of the
+    /// composed layers is the UI gate's job, not this one's.
+    @MainActor
+    static func directDrawSnapshotForTesting(_ view: NSView) -> CGImage? {
+        let bounds = view.bounds
+        guard bounds.width >= 1, bounds.height >= 1,
+              let rep = view.bitmapImageRepForCachingDisplay(in: bounds)
+        else { return nil }
+        let pixelWidth = max(1, rep.pixelsWide)
+        let pixelHeight = max(1, rep.pixelsHigh)
+        guard let ctx = CGContext(
+            data: nil, width: pixelWidth, height: pixelHeight,
+            bitsPerComponent: 8, bytesPerRow: 0,
+            space: CGColorSpace(name: CGColorSpace.sRGB)!,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        else { return nil }
+        ctx.clear(CGRect(x: 0, y: 0, width: pixelWidth, height: pixelHeight))
+        ctx.scaleBy(
+            x: CGFloat(pixelWidth) / bounds.width,
+            y: CGFloat(pixelHeight) / bounds.height)
+        ctx.translateBy(x: -bounds.minX, y: -bounds.minY)
+        let graphics = NSGraphicsContext(cgContext: ctx, flipped: false)
+        NSGraphicsContext.saveGraphicsState()
+        defer { NSGraphicsContext.restoreGraphicsState() }
+        NSGraphicsContext.current = graphics
+        view.draw(bounds)
         return ctx.makeImage()
     }
 
