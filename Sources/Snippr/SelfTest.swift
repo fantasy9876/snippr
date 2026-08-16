@@ -9583,29 +9583,32 @@ enum SelfTest {
                 canvas.undoManager?.groupsByEvent = previousGrouping
 
                 // A different preset is exactly one history entry; the same one
-                // is none at all.
+                // is none at all. The menu subcases above end on Mint, so this
+                // picks Ocean — asking for Mint again here would be the no-op
+                // case, and expecting it to apply would fail correct code.
                 let h0 = canvas.historyMutationCountForTesting
-                let applied = canvas.applyBackdrop(.mint)
+                let applied = canvas.applyBackdrop(.ocean)
                 let h1 = canvas.historyMutationCountForTesting
-                let repeated = canvas.applyBackdrop(.mint)
+                let repeated = canvas.applyBackdrop(.ocean)
                 let h2 = canvas.historyMutationCountForTesting
                 if !applied || repeated || h1 != h0 + 1 || h2 != h1
-                    || canvas.backdropPresetForTesting != .mint {
+                    || canvas.backdropPresetForTesting != .ocean {
                     applyFailures.append(
                         "apply h\(h0)->\(h1)->\(h2) applied \(applied) "
                         + "repeat \(repeated)")
                 }
 
-                // Undo restores the preset and leaves the marks themselves
-                // alone — identity, not a clone.
+                // Undo restores the PREVIOUS preset — Mint, not none — and
+                // leaves the marks themselves alone: identity, not a clone.
                 let markBefore = canvas.annotationRefsForTesting.first
                 canvas.undoManager?.undo()
-                if canvas.backdropPresetForTesting != .none
+                if canvas.backdropPresetForTesting != .mint
                     || canvas.annotationRefsForTesting.first !== markBefore {
-                    applyFailures.append("undo-preset")
+                    applyFailures.append(
+                        "undo-preset \(canvas.backdropPresetForTesting)")
                 }
                 canvas.undoManager?.redo()
-                if canvas.backdropPresetForTesting != .mint {
+                if canvas.backdropPresetForTesting != .ocean {
                     applyFailures.append("redo-preset")
                 }
                 wc.window?.close()
