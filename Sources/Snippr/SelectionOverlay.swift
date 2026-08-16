@@ -933,19 +933,21 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
     }
 
     override func scrollWheel(with event: NSEvent) {
-        guard mode == .area, let surface = annotationSurface else {
+        guard mode == .area else {
             super.scrollWheel(with: event)
             return
         }
-        guard owner?.session.phase != .saving else {
-            surface.resetStrokeScrollAccumulator()
+        // Ownership FIRST, before the surface is unwrapped. During the initial
+        // crop creation there is no annotation surface yet, so unwrapping
+        // first sent the event to super — the one drag where the wheel was
+        // still getting through — and a retained finished view would forward
+        // it as well.
+        if isSaving || isFinished || annotationDragging || areaDrag != nil {
+            annotationSurface?.resetStrokeScrollAccumulator()
             return
         }
-        // A live drag owns the interaction: the wheel would otherwise change
-        // the persisted stroke width and show its HUD in the middle of a
-        // stroke the user has not finished. Consumed, not forwarded.
-        guard !annotationDragging, areaDrag == nil else {
-            surface.resetStrokeScrollAccumulator()
+        guard let surface = annotationSurface else {
+            super.scrollWheel(with: event)
             return
         }
         guard owner?.session.phase == .reviewing,

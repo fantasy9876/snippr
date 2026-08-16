@@ -10946,6 +10946,191 @@ enum SelfTest {
                   toolbarFailures.isEmpty,
                   toolbarFailures.joined(separator: " | "))
 
+            // L. The wheel is a route too: it changes the PERSISTED stroke
+            //    width, so it must stand aside while a drag owns the
+            //    interaction — on both hosts, and for a crop drag as well.
+            var wheelFailures: [String] = []
+            let runWheelGate = {
+                guard let screen = NSScreen.screens.first else {
+                    wheelFailures.append("no-screen")
+                    return
+                }
+                var writes: [(CGFloat, String)] = []
+                var widths: [String: CGFloat] = [:]
+                let previousStore =
+                    AnnotationSurface.strokeWidthStoreOverrideForTesting
+                AnnotationSurface.strokeWidthStoreOverrideForTesting =
+                    OverlayStrokeWidthStore(
+                        read: { widths[$0] ?? 3 },
+                        write: { value, key in
+                            widths[key] = value
+                            writes.append((value, key))
+                        })
+                defer {
+                    AnnotationSurface.strokeWidthStoreOverrideForTesting =
+                        previousStore
+                }
+                func wheel(
+                    _ view: NSView, deltaY: CGFloat, precise: Bool
+                ) -> NSEvent? {
+                    // A line-based wheel and a precise trackpad scroll take
+                    // different branches, so both are exercised.
+                    NSEvent(
+                        cgEvent: {
+                            let e = CGEvent(
+                                scrollWheelEvent2Source: nil,
+                                units: precise ? .pixel : .line,
+                                wheelCount: 1, wheel1: Int32(deltaY),
+                                wheel2: 0, wheel3: 0)!
+                            return e
+                        }())
+                }
+
+                // --- area overlay
+                let overlay = SelectionOverlay(
+                    purpose: .areaReview,
+                    inputs: OverlaySessionInputs(
+                        afterShow: true, afterCopy: false, afterSave: false),
+                    completion: { _ in })
+                let view = SelectionOverlayView(
+                    mode: .area, screen: screen,
+                    frozen: CapturedImage(
+                        cgImage: makeSolidImage(
+                            width: Int(screen.frame.width * 2),
+                            height: Int(screen.frame.height * 2),
+                            color: NSColor.white.cgColor),
+                        scale: 2),
+                    windowList: [], owner: overlay)
+                view.selectForTesting(
+                    rect: CGRect(x: 60, y: 60, width: 240, height: 180))
+                guard let surface = view.annotationSurface else {
+                    wheelFailures.append("area:no-surface")
+                    return
+                }
+                // The INITIAL crop drag, where there is no annotation surface
+                // yet — the case the ownership guard has to catch before it
+                // unwraps one.
+                // No selectForTesting here: with nothing selected, a real
+                // mouse-down starts a crop creation instead of an annotation,
+                // which is exactly the state being probed. The seam is the
+                // same real-event path either way.
+                let creatingView = SelectionOverlayView(
+                    mode: .area, screen: screen,
+                    frozen: CapturedImage(
+                        cgImage: makeSolidImage(
+                            width: Int(screen.frame.width * 2),
+                            height: Int(screen.frame.height * 2),
+                            color: NSColor.white.cgColor),
+                        scale: 2),
+                    windowList: [], owner: overlay)
+                var creatingWrites = 0
+                creatingView.annotationDragForTesting(
+                    from: CGPoint(x: 40, y: 40), to: CGPoint(x: 160, y: 140)
+                ) {
+                    if let event = wheel(creatingView, deltaY: 3, precise: false) {
+                        creatingView.scrollWheel(with: event)
+                    }
+                    creatingWrites = writes.count
+                }
+                if creatingWrites != 0 {
+                    wheelFailures.append(
+                        "area:creating-writes \(creatingWrites)")
+                }
+
+                surface.tool = .pen
+                var midDragWrites = 0
+                view.annotationDragForTesting(
+                    from: CGPoint(x: 100, y: 100),
+                    to: CGPoint(x: 180, y: 160)
+                ) {
+                    for precise in [false, true] {
+                        if let event = wheel(view, deltaY: 3, precise: precise) {
+                            view.scrollWheel(with: event)
+                        }
+                    }
+                    midDragWrites = writes.count
+                }
+                if midDragWrites != 0 {
+                    wheelFailures.append("area:mid-drag-writes \(midDragWrites)")
+                }
+                // The stroke still finished with the width it started with.
+                let drawnPen = surface.annotations
+                    .compactMap { $0 as? PenAnnotation }.last
+                if drawnPen?.strokeWidthPt != 3 {
+                    wheelFailures.append(
+                        "area:width \(drawnPen?.strokeWidthPt ?? -1)")
+                }
+                // POSITIVE CONTROL: the same wheel, once the drag is over.
+                let beforeControl = writes.count
+                if let event = wheel(view, deltaY: 3, precise: false) {
+                    view.scrollWheel(with: event)
+                }
+                if writes.count == beforeControl {
+                    wheelFailures.append("area:control")
+                }
+                overlay.finish(.cancelled)
+
+                // --- scroll panel
+                let panel = ScrollResultPanel.show(
+                    image: CapturedImage(
+                        cgImage: makeSolidImage(
+                            width: 600, height: 400,
+                            color: NSColor.white.cgColor),
+                        scale: 1),
+                    inputs: OverlaySessionInputs(
+                        afterShow: true, afterCopy: false, afterSave: false),
+                    screen: screen,
+                    dependencies: CaptureActionRouter.Dependencies(
+                        copyToClipboard: { _ in }, autoSave: { _, _ in },
+                        saveAs: { _, _ in }, pin: { _ in }, ocr: { _ in },
+                        openEditor: { _ in }, toast: { _ in },
+                        setLastCapture: { _ in }, setLastAreaRect: { _ in },
+                        logEvent: { _ in }))
+                let panelSurface = panel.annotationSurface
+                panelSurface.tool = .pen
+                guard let host = panel.annotationHostForTesting else {
+                    wheelFailures.append("panel:no-host")
+                    panel.dismissForTesting()
+                    return
+                }
+                var panelMidWrites = 0
+                panel.drawWithRealEventsForTesting(
+                    fromView: CGPoint(x: 60, y: 60),
+                    toView: CGPoint(x: 160, y: 140)
+                ) {
+                    for precise in [false, true] {
+                        if let event = wheel(host, deltaY: 3, precise: precise) {
+                            host.scrollWheel(with: event)
+                        }
+                    }
+                    panelMidWrites = writes.count
+                }
+                if panelMidWrites != writes.count
+                    || panelMidWrites != beforeControl + 1 {
+                    wheelFailures.append(
+                        "panel:mid-drag-writes "
+                        + "\(writes.count - panelMidWrites)")
+                }
+                let panelPen = panelSurface.annotations
+                    .compactMap { $0 as? PenAnnotation }.last
+                if panelPen == nil {
+                    wheelFailures.append("panel:no-stroke")
+                }
+                let beforePanelControl = writes.count
+                if let event = wheel(host, deltaY: 3, precise: false) {
+                    host.scrollWheel(with: event)
+                }
+                if writes.count == beforePanelControl {
+                    wheelFailures.append("panel:control")
+                }
+                if ScrollResultPanel.current === panel {
+                    panel.dismissForTesting()
+                }
+            }
+            runWheelGate()
+            check("sliceB-wheel-blocked-mid-drag",
+                  wheelFailures.isEmpty, wheelFailures.joined(separator: " | "))
+
             check("sliceB-mid-drag-routes-blocked",
                   midDragFailures.isEmpty,
                   midDragFailures.joined(separator: " | "))
