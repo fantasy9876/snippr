@@ -8862,7 +8862,9 @@ enum SelfTest {
             var redrawCounts: [String: Int] = [:]
             func lateResult(
                 _ label: String,
-                mutate: (EditorWindowController, EditorCanvasView, BlurAnnotation) -> Void
+                mutate: @escaping (
+                    EditorWindowController, EditorCanvasView, BlurAnnotation
+                ) -> Void
             ) -> RedactionState {
                 let wc = EditorWindowController.open(
                     with: CapturedImage(cgImage: termBase, scale: 1),
@@ -8883,7 +8885,7 @@ enum SelfTest {
                     return state
                 }
             }
-            let routes: [(String, (EditorWindowController, EditorCanvasView, BlurAnnotation) -> Void)] = [
+            let raceRoutes: [(String, (EditorWindowController, EditorCanvasView, BlurAnnotation) -> Void)] = [
                 ("undo", { _, canvas, _ in
                     canvas.registerUndoSnapshot()
                     canvas.annotations = []
@@ -8903,7 +8905,7 @@ enum SelfTest {
                 ("resize", { wc, _, _ in wc.applyResizeFactor(0.5) }),
                 ("close", { wc, _, _ in wc.window?.close() }),
             ]
-            for (label, mutate) in routes {
+            for (label, mutate) in raceRoutes {
                 let state = lateResult(label, mutate: mutate)
                 if state != .fallbackFull {
                     raceFailures.append(label + ":" + String(describing: state))
@@ -10622,7 +10624,7 @@ enum SelfTest {
             // E12. The shared registry on the SUCCESS path: a resolved job
             //      must remove its own entry through the completion observer,
             //      apply the mask, repaint and leave nothing behind.
-            var registryFailures: [String] = []
+            var successRegistryFailures: [String] = []
             MainActor.assumeIsolated {
                 let registry = RedactionJobRegistry()
                 let base = makeSolidImage(
@@ -10640,12 +10642,12 @@ enum SelfTest {
                 }
                 guard let job = SliceBRedactionJob.start(
                     blur: blur, base: base, host: spy) else {
-                    registryFailures.append("no-job")
+                    successRegistryFailures.append("no-job")
                     SliceBOCR.recognizerForTesting = nil
                     return
                 }
                 registry.register(job, for: blur)
-                if registry.count != 1 { registryFailures.append("not-registered") }
+                if registry.count != 1 { successRegistryFailures.append("not-registered") }
                 let deadline = Date().addingTimeInterval(10)
                 while SliceBRedactionJob.inFlight > slotsBefore,
                       Date() < deadline {
@@ -10655,26 +10657,26 @@ enum SelfTest {
                 SliceBOCR.recognizerForTesting = nil
                 if case let .words(words) = blur.redactionState {
                     if !expected.isEmpty && words != expected {
-                        registryFailures.append("mask \(words)")
+                        successRegistryFailures.append("mask \(words)")
                     }
                 } else {
-                    registryFailures.append("state \(blur.redactionState)")
+                    successRegistryFailures.append("state \(blur.redactionState)")
                 }
-                if registry.count != 0 { registryFailures.append("entry-leak") }
+                if registry.count != 0 { successRegistryFailures.append("entry-leak") }
                 if SliceBRedactionJob.ownerCountForTesting != 0 {
-                    registryFailures.append("owner-leak")
+                    successRegistryFailures.append("owner-leak")
                 }
                 if SliceBRedactionJob.inFlight != slotsBefore {
-                    registryFailures.append("slot-leak")
+                    successRegistryFailures.append("slot-leak")
                 }
                 // one repaint for the immediate pending mask, one for the result
                 if spy.repaints != 2 {
-                    registryFailures.append("repaints \(spy.repaints)")
+                    successRegistryFailures.append("repaints \(spy.repaints)")
                 }
             }
             check("sliceB-registry-success-path",
-                  registryFailures.isEmpty,
-                  registryFailures.joined(separator: " | "))
+                  successRegistryFailures.isEmpty,
+                  successRegistryFailures.joined(separator: " | "))
 
             check("sliceB-text-redaction-lifecycle-wiring",
                   lifecycleFailures.isEmpty,
