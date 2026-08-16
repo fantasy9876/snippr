@@ -488,6 +488,12 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
 
     // MARK: actions
 
+    /// Applies a backdrop preset from the popover. Kept separate from tool
+    /// selection so picking the tool is never itself an edit.
+    @objc func applyBackdropPresetForTesting(_ preset: BackdropPreset) {
+        canvas.applyBackdrop(preset)
+    }
+
     @objc private func toolTapped(_ sender: NSButton) {
         guard let id = sender.identifier?.rawValue, let tool = EditorTool(rawValue: id) else { return }
         selectTool(tool)
@@ -808,6 +814,24 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
         CGPoint(x: (frame.minX + 2) * scale, y: (frame.minY + 4) * scale)
     }
 
+    /// Outer frame applied at EXPORT time. It is never baked into `image`, so
+    /// crop, resize and the annotation coordinate space are untouched and the
+    /// padding is recomputed from whatever the document is at the time.
+    private(set) var backdropPreset: BackdropPreset = .none
+
+    var backdropPresetForTesting: BackdropPreset { backdropPreset }
+
+    /// Applying the SAME preset is not an edit and must not touch history.
+    @discardableResult
+    func applyBackdrop(_ preset: BackdropPreset) -> Bool {
+        guard preset != backdropPreset else { return false }
+        registerUndoSnapshot()
+        backdropPreset = preset
+        needsDisplay = true
+        onStateChange?()
+        return true
+    }
+
     /// Text-redaction jobs owned by this canvas. GREEN2 wires the tool to it;
     /// the lifecycle gate asserts on it and stays red until then.
     let redactionRegistry = RedactionJobRegistry()
@@ -909,9 +933,21 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
             croppedBase = owned
         }
 
-        guard let cg = SliceBExport.checkedRender(
+        // Inner render first, then the outer frame, and only then is anything
+        // committed. The budget the inner render may use is reduced by what the
+        // outer frame will need, because both buffers exist at the same time.
+        let outerReserve = SliceBBackdrop.reservedBytes(
+            forInner: base, preset: backdropPreset)
+        guard let innerBudget = SliceBExport.budget(
+            SliceBExport.defaultBudgetBytes, minus: outerReserve)
+        else { return nil }
+        guard let inner = SliceBExport.checkedRender(
             base: base, annotations: marks, pixellated: nil,
-            budgetBytes: SliceBExport.defaultBudgetBytes, pixelScale: pxScale)
+            budgetBytes: innerBudget, pixelScale: pxScale)
+        else { return nil }
+        guard let cg = SliceBBackdrop.compose(
+            image: inner, preset: backdropPreset,
+            budgetBytes: SliceBExport.defaultBudgetBytes)
         else { return nil }
 
         // Render succeeded — now, and only now, make it real. Commit the very
@@ -1044,8 +1080,18 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
 
     // MARK: undo
 
-    private func snapshot() -> ([Annotation], CapturedImage) {
-        (annotations.map { $0.copyAnnotation() }, image)
+    /// Backdrop is DOCUMENT state, so it travels with undo like the marks and
+    /// the bitmap do.
+    private struct DocumentSnapshot {
+        let annotations: [Annotation]
+        let image: CapturedImage
+        let backdrop: BackdropPreset
+    }
+
+    private func snapshot() -> DocumentSnapshot {
+        DocumentSnapshot(
+            annotations: annotations.map { $0.copyAnnotation() },
+            image: image, backdrop: backdropPreset)
     }
 
     func registerUndoSnapshot() {
@@ -1071,10 +1117,11 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
         }
     }
 
-    private func restore(_ snap: ([Annotation], CapturedImage)) {
-        annotations = snap.0
-        if snap.1.cgImage !== image.cgImage {
-            setImage(snap.1)
+    private func restore(_ snap: DocumentSnapshot) {
+        annotations = snap.annotations
+        backdropPreset = snap.backdrop
+        if snap.image.cgImage !== image.cgImage {
+            setImage(snap.image)
         }
         refreshMagnifierSnapshotsAfterDocumentChange()
         selected = nil
@@ -1181,7 +1228,8 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
             mag.calloutRect = CGRect(origin: pp, size: .zero)
             drafting = mag
         case .backdrop:
-            // A canvas-level style, not a drag: the toolbar popover drives it.
+            // A canvas-level style, not a drag, and CHOOSING the tool changes
+            // nothing: the preset popover is what applies one.
             selected = nil
         case .crop:
             selected = nil

@@ -618,6 +618,12 @@ enum SliceBExport {
 
     /// 256 MP * 4 bytes, matching slice A's resize cap.
     static let defaultBudgetBytes = 256 * 1_000_000 * 4
+
+    /// Budget arithmetic that cannot wrap: nil means there is nothing left.
+    static func budget(_ total: Int, minus reserve: Int) -> Int? {
+        guard reserve >= 0, reserve < total else { return nil }
+        return total - reserve
+    }
 }
 
 // MARK: - Toolbar symbols
@@ -675,6 +681,24 @@ enum SliceBBackdrop {
         CGPoint(x: point.x - padding, y: point.y - padding)
     }
 
+    /// Bytes the outer frame will occupy for a given inner image. Both buffers
+    /// are alive at once during a compose, so the caller must reserve this
+    /// before it renders the inner one.
+    static func reservedBytes(
+        forInner image: CGImage, preset: BackdropPreset
+    ) -> Int {
+        guard preset != .none else { return 0 }
+        let pad = Int(padding(
+            forLongEdge: CGFloat(max(image.width, image.height))))
+        let (w, wOverflow) = image.width.addingReportingOverflow(pad * 2)
+        let (h, hOverflow) = image.height.addingReportingOverflow(pad * 2)
+        guard !wOverflow, !hOverflow else { return Int.max }
+        let (pixels, pOverflow) = w.multipliedReportingOverflow(by: h)
+        guard !pOverflow else { return Int.max }
+        let (bytes, bOverflow) = pixels.multipliedReportingOverflow(by: 4)
+        return bOverflow ? Int.max : bytes
+    }
+
     /// `.none` is byte-identical to the input; anything over budget fails
     /// closed instead of allocating.
     static func compose(
@@ -683,9 +707,13 @@ enum SliceBBackdrop {
         guard preset != .none else { return image }
         let pad = padding(
             forLongEdge: CGFloat(max(image.width, image.height)))
-        let w = image.width + Int(pad) * 2
-        let h = image.height + Int(pad) * 2
-        guard w * h * 4 <= budgetBytes else { return nil }
+        let (w, wOverflow) = image.width.addingReportingOverflow(Int(pad) * 2)
+        let (h, hOverflow) = image.height.addingReportingOverflow(Int(pad) * 2)
+        guard !wOverflow, !hOverflow else { return nil }
+        let (pixels, pOverflow) = w.multipliedReportingOverflow(by: h)
+        guard !pOverflow else { return nil }
+        let (bytes, bOverflow) = pixels.multipliedReportingOverflow(by: 4)
+        guard !bOverflow, bytes <= budgetBytes else { return nil }
         guard let ctx = CGContext(
             data: nil, width: w, height: h, bitsPerComponent: 8,
             bytesPerRow: 0,
