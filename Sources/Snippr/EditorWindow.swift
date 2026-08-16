@@ -859,7 +859,19 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
     @discardableResult
     func applyBackdrop(_ preset: BackdropPreset) -> Bool {
         guard preset != backdropPreset else { return false }
-        registerUndoSnapshot()
+        // Validate the PEAK here, not at export: a preset the document cannot
+        // afford must be refused while the user is choosing it, with a message
+        // about the backdrop rather than a redaction error much later.
+        let reserve = SliceBBackdrop.reservedBytes(
+            forInner: image.cgImage, preset: preset)
+        guard SliceBExport.budget(
+            SliceBExport.defaultBudgetBytes, minus: reserve) != nil else {
+            ToastHUD.show(
+                "This image is too large for a backdrop",
+                symbol: "exclamationmark.triangle.fill")
+            return false
+        }
+        registerUndoSnapshotWithoutCancellingJobs()
         backdropPreset = preset
         needsDisplay = true
         onStateChange?()
@@ -1127,6 +1139,18 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
         DocumentSnapshot(
             annotations: annotations.map { $0.copyAnnotation() },
             image: image, backdrop: backdropPreset)
+    }
+
+    /// History only. A preset change is not a structural edit, so it must not
+    /// cancel OCR work in flight — that would widen pending masks to full as an
+    /// invisible, un-undoable side effect of picking a colour.
+    func registerUndoSnapshotWithoutCancellingJobs() {
+        historyMutationCountForTesting += 1
+        let snap = snapshot()
+        undoManager?.registerUndo(withTarget: self) { canvas in
+            canvas.registerUndoSnapshotWithoutCancellingJobs()
+            canvas.restore(snap)
+        }
     }
 
     func registerUndoSnapshot() {
@@ -2000,8 +2024,17 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
                 "backing=[\(backing)]",
             ].joined(separator: " ")
         } ?? "none"
+        let outerSize: String = {
+            guard backdropPreset != .none else { return "none" }
+            let pad = Int(SliceBBackdrop.padding(
+                forLongEdge: CGFloat(max(
+                    image.cgImage.width, image.cgImage.height))))
+            return "\(image.cgImage.width + pad * 2)x\(image.cgImage.height + pad * 2)"
+        }()
         return [
             "px=\(SelfTest.imageHashForTesting(image.cgImage))",
+            "backdrop=\(backdropPreset.rawValue)",
+            "outer=\(outerSize)",
             "size=\(image.cgImage.width)x\(image.cgImage.height)@\(image.scale)",
             "tool=\(currentTool.rawValue)",
             "crop=\(cropRect.map { "\($0)" } ?? "nil")",

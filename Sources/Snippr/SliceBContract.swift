@@ -752,6 +752,10 @@ enum SliceBBackdrop {
         let rounded = CGPath(
             roundedRect: target, cornerWidth: radius, cornerHeight: radius,
             transform: nil)
+        // The opaque rounded fill exists only to cast the shadow. Leaving it
+        // under the image would turn every transparent or translucent source
+        // pixel black instead of letting the gradient show through, so the
+        // gradient is redrawn inside the shape before the image goes on top.
         ctx.addPath(rounded)
         ctx.setFillColor(NSColor.black.cgColor)
         ctx.fillPath()
@@ -759,6 +763,13 @@ enum SliceBBackdrop {
         ctx.saveGState()
         ctx.addPath(rounded)
         ctx.clip()
+        if let gradient = CGGradient(
+            colorsSpace: CGColorSpace(name: CGColorSpace.sRGB)!,
+            colors: colors as CFArray, locations: [0, 1]) {
+            ctx.drawLinearGradient(
+                gradient, start: CGPoint(x: 0, y: CGFloat(h)),
+                end: CGPoint(x: CGFloat(w), y: 0), options: [])
+        }
         ctx.draw(image, in: target)
         ctx.restoreGState()
         return ctx.makeImage()
