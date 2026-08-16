@@ -17,6 +17,9 @@ final class ToastHUD {
         on screen: NSScreen? = nil, above minLevel: NSWindow.Level? = nil
     ) {
         guard Settings.shared.confirmationStyle != .none else { return }
+        // Recorded synchronously, before the hop to main, so a headless gate
+        // can assert WHICH failure the user was told about.
+        lastMessageForTesting = message
         DispatchQueue.main.async {
             showNow(message, symbol: symbol, duration: duration,
                     screen: screen, minLevel: minLevel)
@@ -24,6 +27,8 @@ final class ToastHUD {
     }
 
     static var panelForTesting: NSPanel? { panel }
+
+    nonisolated(unsafe) static var lastMessageForTesting: String?
 
     private static func showNow(
         _ message: String, symbol: String, duration: TimeInterval,

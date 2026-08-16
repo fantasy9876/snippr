@@ -511,7 +511,10 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
         showBackdropMenu(button)
     }
 
-    @objc func showBackdropMenu(_ sender: NSButton) {
+    /// Built separately from being shown: `popUp` runs a nested event loop, so
+    /// a headless gate can exercise the real items, targets and actions only if
+    /// construction stands on its own.
+    func backdropMenu() -> NSMenu {
         let menu = NSMenu(title: "Backdrop")
         for (index, preset) in BackdropPreset.allCases.enumerated() {
             let item = NSMenuItem(
@@ -522,6 +525,11 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
             item.state = preset == canvas.backdropPreset ? .on : .off
             menu.addItem(item)
         }
+        return menu
+    }
+
+    @objc func showBackdropMenu(_ sender: NSButton) {
+        let menu = backdropMenu()
         backdropMenuForTesting = menu
         menu.popUp(
             positioning: nil,
@@ -625,10 +633,21 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
     var terminalDependencies = TerminalDependencies()
 
     private func flattenedOrWarn() -> CapturedImage? {
-        guard let flat = canvas.flattened() else {
-            ToastHUD.show(
-                "Couldn't render the redaction — nothing was exported",
-                symbol: "exclamationmark.triangle.fill")
+        // The message must name what actually failed: a backdrop frame that
+        // could not be composed is not a redaction problem, and telling the
+        // user to check their redactions sends them looking in the wrong place.
+        var reason = EditorCanvasView.FlattenFailure.render
+        guard let flat = canvas.flattened(failure: &reason) else {
+            switch reason {
+            case .render:
+                ToastHUD.show(
+                    "Couldn't render the redaction — nothing was exported",
+                    symbol: "exclamationmark.triangle.fill")
+            case .backdrop:
+                ToastHUD.show(
+                    "Couldn't render the backdrop — nothing was exported",
+                    symbol: "exclamationmark.triangle.fill")
+            }
             return nil
         }
         return flat
@@ -891,6 +910,27 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
         return (Int(px.width), Int(px.height))
     }
 
+    /// Whether inner and outer can both be alive at once for this preset.
+    ///
+    /// Validity is judged against the FULL image, never a pending crop: a crop
+    /// is cancelled by Esc, by switching tools and by undo, so a preset that was
+    /// only affordable while that crop existed would silently become invalid
+    /// under the user. Committing a smaller crop can only lower the peak, so
+    /// full-image validity keeps holding afterwards.
+    func backdropPeakFits(
+        _ preset: BackdropPreset, width: Int, height: Int
+    ) -> Bool {
+        guard preset != .none else { return true }
+        let reserve = SliceBBackdrop.reservedBytes(
+            forInnerWidth: width, height: height, preset: preset,
+            pixelScale: pxScale)
+        guard let innerBudget = SliceBExport.budget(
+            SliceBExport.defaultBudgetBytes, minus: reserve),
+            let innerBytes = SliceBExport.byteCount(width: width, height: height)
+        else { return false }
+        return innerBytes <= innerBudget
+    }
+
     /// Applying the SAME preset is not an edit and must not touch history.
     @discardableResult
     func applyBackdrop(_ preset: BackdropPreset) -> Bool {
@@ -905,22 +945,12 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
         // fit but together do not was accepted here and failed at export.
         // Removing a backdrop is always allowed: it can only shrink the peak,
         // and a document must never be stuck wearing a frame it cannot export.
-        if preset != .none {
-            let inner = prospectiveInnerPixelSize()
-            let reserve = SliceBBackdrop.reservedBytes(
-                forInnerWidth: inner.width, height: inner.height,
-                preset: preset, pixelScale: pxScale)
-            guard let innerBudget = SliceBExport.budget(
-                SliceBExport.defaultBudgetBytes, minus: reserve),
-                let innerBytes = SliceBExport.byteCount(
-                    width: inner.width, height: inner.height),
-                innerBytes <= innerBudget
-            else {
-                ToastHUD.show(
-                    "This image is too large for a backdrop",
-                    symbol: "exclamationmark.triangle.fill")
-                return false
-            }
+        guard backdropPeakFits(preset, width: image.cgImage.width,
+                               height: image.cgImage.height) else {
+            ToastHUD.show(
+                "This image is too large for a backdrop",
+                symbol: "exclamationmark.triangle.fill")
+            return false
         }
         registerBackdropUndo(from: backdropPreset)
         backdropPreset = preset
@@ -977,7 +1007,16 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
     /// crop chrome, tool, pointer cache) is only committed after the render has
     /// actually succeeded, so a failed export cannot leave the editor changed —
     /// and can never hand back a clean base with the redactions dropped.
+    /// Which stage refused, so the caller can name it to the user.
+    enum FlattenFailure { case render, backdrop }
+
     func flattened() -> CapturedImage? {
+        var ignored = FlattenFailure.render
+        return flattened(failure: &ignored)
+    }
+
+    func flattened(failure: inout FlattenFailure) -> CapturedImage? {
+        failure = .render
         var marks = annotations.map { $0.copyAnnotation() }
         if let pending = editingTextAnnotation, let field = textField {
             let typed = field.stringValue.trimmingCharacters(
@@ -1039,7 +1078,10 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
             image: inner, preset: backdropPreset,
             budgetBytes: SliceBExport.defaultBudgetBytes,
             pixelScale: pxScale)
-        else { return nil }
+        else {
+            failure = .backdrop
+            return nil
+        }
 
         // Render succeeded — now, and only now, make it real. Commit the very
         // base/marks that were rendered: cropping a second time could fail at
@@ -1886,6 +1928,18 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
     func applyPixelScale(_ factor: CGFloat) {
         guard abs(factor - 1) >= 0.0001,
               let scaled = ImageResizer.scale(image, by: factor) else { return }
+        // Growing the image grows the frame with it. Refuse before anything
+        // moves rather than leave the document in a state its own backdrop
+        // cannot export: nothing is scaled, no history entry, and the message
+        // names the backdrop instead of surfacing as a render error later.
+        guard backdropPeakFits(
+            backdropPreset, width: scaled.cgImage.width,
+            height: scaled.cgImage.height) else {
+            ToastHUD.show(
+                "This size is too large for the backdrop",
+                symbol: "exclamationmark.triangle.fill")
+            return
+        }
         cancelCropSelection()
         registerUndoSnapshot()
         for annotation in annotations {

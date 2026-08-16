@@ -629,7 +629,14 @@ enum SliceBExport {
     }
 
     /// 256 MP * 4 bytes, matching slice A's resize cap.
-    static let defaultBudgetBytes = 256 * 1_000_000 * 4
+    ///
+    /// Overridable so a gate can drive the REAL peak boundary — production
+    /// apply, resize and export all read this — without a gigabyte fixture.
+    /// Nothing in production ever sets the override.
+    nonisolated(unsafe) static var budgetOverrideForTesting: Int?
+    static var defaultBudgetBytes: Int {
+        budgetOverrideForTesting ?? 256 * 1_000_000 * 4
+    }
 
     /// Budget arithmetic that cannot wrap: nil means there is nothing left.
     static func budget(_ total: Int, minus reserve: Int) -> Int? {
@@ -716,9 +723,16 @@ enum SliceBBackdrop {
     /// shadow is a point metric, so at scale 2 it reaches 64 px below the image
     /// while the 40 px floor would clip it — the frame must be at least this
     /// wide on every edge or the shadow is cut off at the outer canvas.
+    /// A Gaussian has no hard cutoff, so blur + offset is where the shadow
+    /// becomes negligible, not where it stops. The margin keeps the frame wider
+    /// than the visible tail instead of trusting that figure as an exact API
+    /// contract.
+    static let shadowSafetyFactor: CGFloat = 1.25
+
     static func shadowExtent(pixelScale: CGFloat) -> CGFloat {
         let scale = max(1, pixelScale)
-        return ((shadowBlurPt + abs(shadowOffsetPt)) * scale).rounded(.up)
+        let nominal = (shadowBlurPt + abs(shadowOffsetPt)) * scale
+        return (nominal * shadowSafetyFactor).rounded(.up)
     }
 
     /// The floor is whichever is larger: the fixed minimum or the shadow's own
@@ -826,9 +840,9 @@ enum SliceBBackdrop {
             space: image.colorSpace ?? CGColorSpace(name: CGColorSpace.sRGB)!,
             bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
         else { return nil }
+        let axis = gradientAxis(width: w, height: h)
         ctx.drawLinearGradient(
-            fill, start: CGPoint(x: 0, y: CGFloat(h)),
-            end: CGPoint(x: CGFloat(w), y: 0), options: [])
+            fill, start: axis.start, end: axis.end, options: [])
         let target = CGRect(
             x: pad, y: pad,
             width: CGFloat(image.width), height: CGFloat(image.height))
@@ -853,11 +867,25 @@ enum SliceBBackdrop {
         ctx.addPath(rounded)
         ctx.clip()
         ctx.drawLinearGradient(
-            fill, start: CGPoint(x: 0, y: CGFloat(h)),
-            end: CGPoint(x: CGFloat(w), y: 0), options: [])
+            fill, start: axis.start, end: axis.end, options: [])
         ctx.draw(image, in: target)
         ctx.restoreGState()
         return ctx.makeImage()
+    }
+
+    /// The preset's two stops. Exposed so a caller can reproduce the exact
+    /// background — the gradient geometry is fixed by `compose`, so a reference
+    /// render cannot drift from the real one.
+    static func gradientColors(for preset: BackdropPreset) -> [CGColor] {
+        gradient(for: preset)
+    }
+
+    /// Gradient axis for a frame of this size, shared by `compose` and by
+    /// anything reproducing the background.
+    static func gradientAxis(
+        width: Int, height: Int
+    ) -> (start: CGPoint, end: CGPoint) {
+        (CGPoint(x: 0, y: CGFloat(height)), CGPoint(x: CGFloat(width), y: 0))
     }
 
     private static func gradient(for preset: BackdropPreset) -> [CGColor] {

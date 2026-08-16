@@ -8192,9 +8192,9 @@ enum SelfTest {
             // canvas. The four outer border lines are checked for a dark band,
             // with the ring just outside the image as a positive control so the
             // gate cannot pass by finding no shadow at all.
-            let extentOK = SliceBBackdrop.shadowExtent(pixelScale: 2) == 64
-                && SliceBBackdrop.shadowExtent(pixelScale: 1) == 32
-                && SliceBBackdrop.padding(forLongEdge: 60, pixelScale: 2) == 64
+            let extentOK = SliceBBackdrop.shadowExtent(pixelScale: 2) == 80
+                && SliceBBackdrop.shadowExtent(pixelScale: 1) == 40
+                && SliceBBackdrop.padding(forLongEdge: 60, pixelScale: 2) == 80
                 && SliceBBackdrop.padding(forLongEdge: 60, pixelScale: 1) == 40
             let retinaInner = makeSolidImage(
                 width: 60, height: 40, color: NSColor.white.cgColor)
@@ -8203,8 +8203,8 @@ enum SelfTest {
                 budgetBytes: SliceBExport.defaultBudgetBytes, pixelScale: 2)
             let expectedOuter = SliceBBackdrop.outerDimensions(
                 innerWidth: 60, innerHeight: 40, preset: .ocean, pixelScale: 2)
-            let dimsOK = expectedOuter?.width == 188
-                && expectedOuter?.height == 168
+            let dimsOK = expectedOuter?.width == 220
+                && expectedOuter?.height == 200
                 && retinaFrame?.width == expectedOuter?.width
                 && retinaFrame?.height == expectedOuter?.height
             // One rasterization; `probe` redraws the whole image per call.
@@ -8222,55 +8222,71 @@ enum SelfTest {
                     x: 0, y: 0, width: image.width, height: image.height))
                 return bytes
             }
+            // The reference is the SAME gradient over the SAME frame with no
+            // shadow and no image, built from the preset's own colours and
+            // axis. Comparing against it needs no assumption about where the
+            // shadow falls off — an earlier version fitted a plane to the
+            // border pixels, which would quietly absorb the very shadow it was
+            // meant to detect.
+            func gradientReference(width: Int, height: Int) -> CGImage? {
+                guard let c = CGContext(
+                    data: nil, width: width, height: height,
+                    bitsPerComponent: 8, bytesPerRow: 0,
+                    space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                    bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue),
+                    let g = CGGradient(
+                        colorsSpace: CGColorSpace(name: CGColorSpace.sRGB)!,
+                        colors: SliceBBackdrop.gradientColors(for: .ocean)
+                            as CFArray,
+                        locations: [0, 1])
+                else { return nil }
+                let axis = SliceBBackdrop.gradientAxis(
+                    width: width, height: height)
+                c.drawLinearGradient(
+                    g, start: axis.start, end: axis.end, options: [])
+                return c.makeImage()
+            }
             var shadowOK = false
             var shadowDetail = "frame nil"
-            if let frame = retinaFrame, let px = rasterize(frame) {
+            if let frame = retinaFrame, let px = rasterize(frame),
+               let ref = gradientReference(
+                   width: frame.width, height: frame.height),
+               let refPx = rasterize(ref) {
                 let w = frame.width, h = frame.height
-                func at(_ x: Int, _ yBL: Int) -> (Int, Int, Int, Int) {
+                func lum(_ b: [UInt8], _ x: Int, _ yBL: Int) -> Int {
                     let i = ((h - 1 - yBL) * w + x) * 4
-                    return (Int(px[i]), Int(px[i + 1]), Int(px[i + 2]),
-                            Int(px[i + 3]))
+                    return luma((Int(b[i]), Int(b[i + 1]), Int(b[i + 2])))
                 }
-                func lum(_ x: Int, _ y: Int) -> Double {
-                    let p = at(x, y)
-                    return Double(luma((p.0, p.1, p.2)))
+                func alpha(_ x: Int, _ yBL: Int) -> Int {
+                    Int(px[((h - 1 - yBL) * w + x) * 4 + 3])
                 }
-                // The background is ONE linear gradient, so its luma is an
-                // affine function of position. Fitting that plane from three
-                // far corners — 80 px from the shape, where a 48 px blur has
-                // nothing left — gives the shadow-free background at every
-                // pixel without needing a second render to compare against.
-                let l00 = lum(0, 0)
-                let lx = (lum(w - 1, 0) - l00) / Double(w - 1)
-                let ly = (lum(0, h - 1) - l00) / Double(h - 1)
-                func model(_ x: Int, _ y: Int) -> Double {
-                    l00 + lx * Double(x) + ly * Double(y)
+                func deficit(_ x: Int, _ y: Int) -> Int {
+                    lum(refPx, x, y) - lum(px, x, y)
                 }
-                let cornerErr = abs(model(w - 1, h - 1) - lum(w - 1, h - 1))
-                var worstBorder = 0.0
+                var worstBorder = 0
                 var opaque = true
                 for x in 0..<w {
                     for y in [0, h - 1] {
-                        worstBorder = max(worstBorder, model(x, y) - lum(x, y))
-                        if at(x, y).3 != 255 { opaque = false }
+                        worstBorder = max(worstBorder, abs(deficit(x, y)))
+                        if alpha(x, y) != 255 { opaque = false }
                     }
                 }
                 for y in 0..<h {
                     for x in [0, w - 1] {
-                        worstBorder = max(worstBorder, model(x, y) - lum(x, y))
-                        if at(x, y).3 != 255 { opaque = false }
+                        worstBorder = max(worstBorder, abs(deficit(x, y)))
+                        if alpha(x, y) != 255 { opaque = false }
                     }
                 }
-                // Positive control: two rows below the image IS in shadow, so
-                // the same model must show a large deficit there. Without this
-                // the border check would also pass on a frame with no shadow.
-                let shadowed = (64..<124).map { model($0, 62) - lum($0, 62) }
-                    .min() ?? 0
-                shadowOK = cornerErr <= 4 && worstBorder <= 5 && opaque
-                    && shadowed >= 10
-                shadowDetail = "corner \(Int(cornerErr)) "
-                    + "border \(Int(worstBorder)) opaque \(opaque) "
-                    + "shadowed \(Int(shadowed))"
+                // Positive control in the middle of the band below the image,
+                // away from the corners where the 2-D falloff is weakest and
+                // most kernel-dependent: without it, a frame drawing no shadow
+                // at all would sail through the border check.
+                let pad = 80
+                let band = ((pad + 20)..<(pad + 40)).map { deficit($0, pad - 3) }
+                let shadowed = band.min() ?? 0
+                shadowOK = worstBorder <= 4 && opaque && shadowed >= 10
+                shadowDetail = "border \(worstBorder) opaque \(opaque) "
+                    + "shadowed \(shadowed)"
             }
             check("sliceB-backdrop-shadow-extent",
                   extentOK && dimsOK && shadowOK,
@@ -8512,9 +8528,62 @@ enum SelfTest {
                 budgetBytes: SliceBExport.defaultBudgetBytes)
             let p3Kept = p3None?.colorSpace?.name == p3Space.name
                 && p3None.map { imagesEqualForTesting($0, p3Image) } == true
+            // `.none` returns the input untouched, so it proves nothing about
+            // the composed path. The real question is a FRAMED P3 image with
+            // translucent pixels: the frame must stay in the document's colour
+            // space and the gradient must run continuously through the image
+            // instead of the black fill that used to sit under it.
+            let p3AlphaCtx = CGContext(
+                data: nil, width: 30, height: 20, bitsPerComponent: 8,
+                bytesPerRow: 0, space: p3Space,
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+            p3AlphaCtx.clear(CGRect(x: 0, y: 0, width: 30, height: 20))
+            p3AlphaCtx.setFillColor(
+                NSColor.systemPink.withAlphaComponent(0.25).cgColor)
+            p3AlphaCtx.fill(CGRect(x: 0, y: 0, width: 30, height: 20))
+            let p3Alpha = p3AlphaCtx.makeImage()!
+            let p3Framed = SliceBBackdrop.compose(
+                image: p3Alpha, preset: .sunset,
+                budgetBytes: SliceBExport.defaultBudgetBytes)
+            var p3FramedOK = false
+            var p3Detail = "framed nil"
+            if let framed = p3Framed {
+                let spaceKept = framed.colorSpace?.name == p3Space.name
+                var bytes = [UInt8](
+                    repeating: 0,
+                    count: framed.width * framed.height * 4)
+                let readback = CGContext(
+                    data: &bytes, width: framed.width, height: framed.height,
+                    bitsPerComponent: 8, bytesPerRow: framed.width * 4,
+                    space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                    bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+                readback?.interpolationQuality = .none
+                readback?.draw(framed, in: CGRect(
+                    x: 0, y: 0, width: framed.width, height: framed.height))
+                // Sample a horizontal line through the middle of the image:
+                // padding, then the translucent region, then padding again.
+                let row = framed.height / 2
+                func px(_ x: Int) -> (Int, Int, Int, Int) {
+                    let i = (row * framed.width + x) * 4
+                    return (Int(bytes[i]), Int(bytes[i + 1]),
+                            Int(bytes[i + 2]), Int(bytes[i + 3]))
+                }
+                let outside = px(2)
+                let inside = px(framed.width / 2)
+                // Sunset is warm and bright; the old opaque fill made every
+                // translucent pixel near-black, which luma catches directly.
+                let insideLuma = luma((inside.0, inside.1, inside.2))
+                let outsideLuma = luma((outside.0, outside.1, outside.2))
+                let opaqueOut = outside.3 == 255 && inside.3 == 255
+                let gradientShows = insideLuma >= outsideLuma / 2
+                    && insideLuma > 60
+                p3FramedOK = spaceKept && opaqueOut && gradientShows
+                p3Detail = "space \(spaceKept) alpha \(opaqueOut) "
+                    + "in \(insideLuma) out \(outsideLuma)"
+            }
             check("sliceB2-backdrop-mapping",
-                  mapped == CGPoint(x: 50, y: 30) && p3Kept,
-                  "mapped \(mapped) p3 \(p3Kept)")
+                  mapped == CGPoint(x: 50, y: 30) && p3Kept && p3FramedOK,
+                  "mapped \(mapped) p3 \(p3Kept) \(p3Detail)")
 
             // 8. Spotlight stays a singleton and is hit by its hole
             let spot1 = SpotlightAnnotation(uiScale: 1)
@@ -8971,17 +9040,334 @@ enum SelfTest {
                 }
                 liveWC.window?.close()
             }
+            // Same routes, but the OUTER compose is what fails while the inner
+            // render succeeds. That path had no coverage at all: the regional
+            // seam only fails redaction, so a frame that cannot be composed
+            // was never proven to block a terminal action — nor to say so.
+            var outerFailures: [String] = []
+            let styleBefore = Settings.shared.confirmationStyle
+            if Settings.shared.confirmationStyle == .none {
+                Settings.shared.confirmationStyle = .custom
+            }
+            for (name, escCopy, escSave, action, _) in routes {
+                Settings.shared.escCopy = escCopy
+                Settings.shared.escSave = escSave
+                let seedEditing = !name.hasPrefix("esc")
+                let spy = TerminalSpy()
+                let (wc, canvas) = makeSpiedEditor(spy, seedEditing: seedEditing)
+                preflight(canvas, "outer-" + name, editing: seedEditing)
+                guard canvas.applyBackdrop(.ocean) else {
+                    outerFailures.append(name + ":apply-refused")
+                    wc.window?.close()
+                    continue
+                }
+                let before = canvas.documentFingerprintForTesting
+                let beforeHistory = canvas.historyMutationCountForTesting
+                let beforeRefs = canvas.annotationRefsForTesting
+                let beforeSelected = canvas.selectedRefForTesting
+                let beforeEditing = canvas.editingTextRefForTesting
+                ToastHUD.lastMessageForTesting = nil
+                ForcedOuterComposeFailure.scoped { action(wc) }
+                if vector(spy) != zeroVector {
+                    outerFailures.append(name + ":deps " + spy.description)
+                }
+                if wc.window?.isVisible != true {
+                    outerFailures.append(name + ":closed")
+                }
+                if canvas.documentFingerprintForTesting != before {
+                    outerFailures.append(name + ":state")
+                }
+                if canvas.historyMutationCountForTesting != beforeHistory {
+                    outerFailures.append(name + ":history")
+                }
+                if canvas.backdropPresetForTesting != .ocean {
+                    outerFailures.append(name + ":preset")
+                }
+                let afterRefs = canvas.annotationRefsForTesting
+                let sameMarks = afterRefs.count == beforeRefs.count
+                    && zip(afterRefs, beforeRefs).allSatisfy { $0.0 === $0.1 }
+                if !sameMarks
+                    || canvas.selectedRefForTesting !== beforeSelected
+                    || canvas.editingTextRefForTesting !== beforeEditing {
+                    outerFailures.append(name + ":identity")
+                }
+                // The message must point at the backdrop. Blaming redaction
+                // sends the user to look at the wrong thing entirely.
+                let toast = ToastHUD.lastMessageForTesting ?? ""
+                if !toast.lowercased().contains("backdrop") {
+                    outerFailures.append(name + ":toast(\(toast))")
+                }
+                wc.window?.close()
+
+                // Healthy twin with the SAME preset applied: the frame composes
+                // and the route reaches its dependency, so the zeros above mean
+                // blocked rather than broken by the backdrop itself.
+                let liveSpy = TerminalSpy()
+                let (liveWC, liveCanvas) = makeSpiedEditor(
+                    liveSpy, seedEditing: seedEditing)
+                _ = liveCanvas.applyBackdrop(.ocean)
+                action(liveWC)
+                if vector(liveSpy) == zeroVector {
+                    outerFailures.append(name + ":live-none")
+                }
+                liveWC.window?.close()
+            }
+            Settings.shared.confirmationStyle = styleBefore
             Settings.shared.escCopy = escCopyBefore
             Settings.shared.escSave = escSaveBefore
             check("sliceB-terminal-actions-transactional",
                   termFailures.isEmpty, termFailures.joined(separator: " | "))
+            check("sliceB-backdrop-terminal-fail-closed",
+                  outerFailures.isEmpty, outerFailures.joined(separator: " | "))
 
-            // B. A late OCR result never narrows a mask after a real edit, and
-            //    never leaves the annotation pending forever.
             final class CountingRedactionHost: RedactionHost {
                 var repaints = 0
                 func redactionDidChange() { repaints += 1 }
             }
+
+            // C. Backdrop as document state: what the real menu does, what the
+            //    peak arithmetic allows, and what survives a crop or a resize.
+            var applyFailures: [String] = []
+            do {
+                let wc = EditorWindowController.open(
+                    with: CapturedImage(cgImage: termBase, scale: 1),
+                    forceFitForTesting: true)
+                let canvas = wc.canvasForTesting
+                let blur = BlurAnnotation(uiScale: 1)
+                blur.rect = CGRect(x: 20, y: 20, width: 60, height: 40)
+                canvas.annotations = [blur]
+                canvas.currentTool = .crop
+
+                // Opening the chooser is not an edit — from EITHER entry point.
+                let toolBefore = canvas.currentTool
+                let historyBefore = canvas.historyMutationCountForTesting
+                let fingerprintBefore = canvas.documentFingerprintForTesting
+                // The real menu, built by production. `popUp` runs a nested
+                // event loop and cannot run headlessly, so the gate stops at
+                // construction and then fires the item's OWN target/action.
+                let menu = wc.backdropMenu()
+                if canvas.currentTool != toolBefore
+                    || canvas.historyMutationCountForTesting != historyBefore
+                    || canvas.documentFingerprintForTesting != fingerprintBefore
+                    || canvas.backdropPresetForTesting != .none {
+                    applyFailures.append("chooser-mutates")
+                }
+                let presets = BackdropPreset.allCases
+                if menu.items.count != presets.count {
+                    applyFailures.append("menu-count \(menu.items.count)")
+                }
+                let checked = menu.items.filter { $0.state == .on }
+                if checked.count != 1
+                    || checked.first?.tag != presets.firstIndex(of: .none) {
+                    applyFailures.append("menu-check")
+                }
+                // Drive the menu the way the user does: through the item.
+                if let mintItem = menu.items.first(
+                    where: { $0.tag == presets.firstIndex(of: .mint) }),
+                    let action = mintItem.action {
+                    _ = (mintItem.target as? NSObject)?.perform(
+                        action, with: mintItem)
+                } else {
+                    applyFailures.append("menu-mint-missing")
+                }
+                if canvas.backdropPresetForTesting != .mint {
+                    applyFailures.append("menu-apply")
+                }
+                canvas.undoManager?.undo()
+                if canvas.backdropPresetForTesting != .none {
+                    applyFailures.append("menu-undo")
+                }
+
+                // A different preset is exactly one history entry; the same one
+                // is none at all.
+                let h0 = canvas.historyMutationCountForTesting
+                let applied = canvas.applyBackdrop(.mint)
+                let h1 = canvas.historyMutationCountForTesting
+                let repeated = canvas.applyBackdrop(.mint)
+                let h2 = canvas.historyMutationCountForTesting
+                if !applied || repeated || h1 != h0 + 1 || h2 != h1
+                    || canvas.backdropPresetForTesting != .mint {
+                    applyFailures.append(
+                        "apply h\(h0)->\(h1)->\(h2) applied \(applied) "
+                        + "repeat \(repeated)")
+                }
+
+                // Undo restores the preset and leaves the marks themselves
+                // alone — identity, not a clone.
+                let markBefore = canvas.annotationRefsForTesting.first
+                canvas.undoManager?.undo()
+                if canvas.backdropPresetForTesting != .none
+                    || canvas.annotationRefsForTesting.first !== markBefore {
+                    applyFailures.append("undo-preset")
+                }
+                canvas.undoManager?.redo()
+                if canvas.backdropPresetForTesting != .mint {
+                    applyFailures.append("redo-preset")
+                }
+                wc.window?.close()
+            }
+
+            // Both OCR delivery orders across a backdrop undo. The mask must
+            // narrow either way: a result landing after the undo must still
+            // reach the LIVE annotation, and one landing before it must not be
+            // thrown away when the undo runs.
+            let backdropWord = CGRect(x: 25, y: 25, width: 20, height: 10)
+            for deliverFirst in [true, false] {
+                let wc = EditorWindowController.open(
+                    with: CapturedImage(cgImage: termBase, scale: 1),
+                    forceFitForTesting: true)
+                let canvas = wc.canvasForTesting
+                let blur = BlurAnnotation(uiScale: 1)
+                blur.rect = CGRect(x: 20, y: 20, width: 60, height: 40)
+                canvas.annotations = [blur]
+                let label = deliverFirst
+                    ? "deliver-then-undo" : "undo-then-deliver"
+                MainActor.assumeIsolated {
+                    let host = CountingRedactionHost()
+                    let job = SliceBRedactionJob.pendingForTesting(
+                        blur: blur, host: host)
+                    _ = canvas.applyBackdrop(.sunset)
+                    if deliverFirst {
+                        job.deliver([backdropWord])
+                        canvas.undoManager?.undo()
+                    } else {
+                        canvas.undoManager?.undo()
+                        job.deliver([backdropWord])
+                    }
+                }
+                if canvas.annotationRefsForTesting.first !== blur {
+                    applyFailures.append(label + ":identity")
+                }
+                if canvas.backdropPresetForTesting != .none {
+                    applyFailures.append(label + ":preset")
+                }
+                if blur.redactionState != .words([backdropWord]) {
+                    applyFailures.append(
+                        label + ":" + String(describing: blur.redactionState))
+                }
+                wc.window?.close()
+            }
+            check("sliceB-backdrop-apply-undo",
+                  applyFailures.isEmpty, applyFailures.joined(separator: " | "))
+
+            // Peak arithmetic, as pure functions: inner and outer must fit
+            // TOGETHER, overflow fails closed, and `.none` is always allowed.
+            let total = SliceBExport.defaultBudgetBytes
+            let bigSide = 15_000
+            let innerOnly = SliceBExport.byteCount(
+                width: bigSide, height: bigSide)
+            let outerOnly = SliceBBackdrop.reservedBytes(
+                forInnerWidth: bigSide, height: bigSide, preset: .ocean)
+            let peakRejects = innerOnly.map { $0 < total } == true
+                && outerOnly < total
+                && innerOnly.map { $0 + outerOnly > total } == true
+            let overflowSafe = SliceBBackdrop.reservedBytes(
+                forInnerWidth: Int.max, height: Int.max, preset: .ocean)
+                == Int.max
+                && SliceBExport.byteCount(width: Int.max, height: 2) == nil
+                && SliceBBackdrop.outerDimensions(
+                    innerWidth: Int.max, innerHeight: 4, preset: .ocean) == nil
+                && SliceBBackdrop.reservedBytes(
+                    forInnerWidth: 100, height: 100, preset: .none) == 0
+            check("sliceB-backdrop-peak-arithmetic",
+                  peakRejects && overflowSafe,
+                  "inner \(innerOnly ?? -1) outer \(outerOnly) total \(total) "
+                    + "overflow \(overflowSafe)")
+
+            // Acceptance is judged on the FULL image, so a preset can never
+            // be made valid by a pending crop that Esc, a tool switch or undo
+            // will take away — and growing the image is refused outright
+            // rather than leaving a document its own frame cannot export.
+            var stabilityFailures: [String] = []
+            let budgetBefore = SliceBExport.budgetOverrideForTesting
+            do {
+                // 900x900 needs 3.24 MB inside and 4.06 MB framed: each fits
+                // in 7 MB on its own, the two together do not. A pending crop
+                // of 80x60 would "afford" the preset easily, which is exactly
+                // the bypass the full-image policy has to refuse.
+                SliceBExport.budgetOverrideForTesting = 7_000_000
+                let wide = makeSolidImage(
+                    width: 900, height: 900, color: NSColor.gray.cgColor)
+                let wc = EditorWindowController.open(
+                    with: CapturedImage(cgImage: wide, scale: 1),
+                    forceFitForTesting: true)
+                let canvas = wc.canvasForTesting
+                if canvas.backdropPeakFits(.ocean, width: 900, height: 900) {
+                    stabilityFailures.append("fixture-fits")
+                }
+                canvas.currentTool = .crop
+                canvas.setCropSelectionForTesting(
+                    CGRect(x: 10, y: 10, width: 80, height: 60))
+                let sneaked = canvas.applyBackdrop(.ocean)
+                if sneaked || canvas.backdropPresetForTesting != .none {
+                    stabilityFailures.append("crop-bypass")
+                }
+                wc.window?.close()
+            }
+            do {
+                SliceBExport.budgetOverrideForTesting = 10_000_000
+                let fixture = makeSolidImage(
+                    width: 900, height: 900, color: NSColor.gray.cgColor)
+                let wc = EditorWindowController.open(
+                    with: CapturedImage(cgImage: fixture, scale: 1),
+                    forceFitForTesting: true)
+                let canvas = wc.canvasForTesting
+                canvas.currentTool = .crop
+                canvas.setCropSelectionForTesting(
+                    CGRect(x: 10, y: 10, width: 80, height: 60))
+                if !canvas.applyBackdrop(.graphite) {
+                    stabilityFailures.append("apply-refused")
+                }
+                // Cancelling the crop must not invalidate what was accepted.
+                canvas.currentTool = .select
+                if canvas.backdropPresetForTesting != .graphite
+                    || !canvas.backdropPeakFits(
+                        .graphite, width: canvas.image.cgImage.width,
+                        height: canvas.image.cgImage.height) {
+                    stabilityFailures.append("cancel-crop")
+                }
+                // Committing a crop only shrinks the peak, so it stays valid.
+                canvas.cropForTesting(
+                    pixels: CGRect(x: 5, y: 5, width: 600, height: 400))
+                if canvas.backdropPresetForTesting != .graphite {
+                    stabilityFailures.append("crop-commit")
+                }
+                canvas.undoManager?.undo()
+                if canvas.backdropPresetForTesting != .graphite
+                    || canvas.image.cgImage.width != 900
+                    || !canvas.backdropPeakFits(
+                        .graphite, width: canvas.image.cgImage.width,
+                        height: canvas.image.cgImage.height) {
+                    stabilityFailures.append(
+                        "crop-undo \(canvas.image.cgImage.width)")
+                }
+                // Doubling would need 12.96 MB inside alone: refused with
+                // nothing moved — same pixels, same history, same preset.
+                let sizeBefore = canvas.image.cgImage.width
+                let historyBefore = canvas.historyMutationCountForTesting
+                wc.applyResizeFactor(2)
+                if canvas.image.cgImage.width != sizeBefore
+                    || canvas.historyMutationCountForTesting != historyBefore
+                    || canvas.backdropPresetForTesting != .graphite {
+                    stabilityFailures.append(
+                        "resize-mutated \(canvas.image.cgImage.width)")
+                }
+                // A resize that still fits goes through.
+                wc.applyResizeFactor(0.5)
+                if canvas.image.cgImage.width >= sizeBefore {
+                    stabilityFailures.append("resize-blocked")
+                }
+                wc.window?.close()
+            }
+            SliceBExport.budgetOverrideForTesting = budgetBefore
+            check("sliceB-backdrop-validity-stable",
+                  stabilityFailures.isEmpty,
+                  stabilityFailures.joined(separator: " | "))
+
+
+
+            // B. A late OCR result never narrows a mask after a real edit, and
+            //    never leaves the annotation pending forever.
             let word = CGRect(x: 25, y: 25, width: 20, height: 10)
             var raceFailures: [String] = []
             var redrawCounts: [String: Int] = [:]
