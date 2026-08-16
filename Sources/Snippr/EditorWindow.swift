@@ -642,6 +642,7 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
     func windowWillClose(_ notification: Notification) {
         // Closing supersedes every OCR job in flight: a late result must not
         // touch annotations belonging to a window that is gone.
+        canvas.redactionRegistry.cancelAll()
         for blur in canvas.annotations.compactMap({ $0 as? BlurAnnotation }) {
             blur.bumpRedactionGeneration()
         }
@@ -670,7 +671,7 @@ final class CenteringClipView: NSClipView {
 
 // MARK: - Canvas
 
-final class EditorCanvasView: NSView {
+final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
     private(set) var image: CapturedImage
     private var pixellatedCache: CGImage?
 
@@ -734,6 +735,7 @@ final class EditorCanvasView: NSView {
         self.image = image
         super.init(frame: CGRect(origin: .zero, size: image.pointSize))
         wantsLayer = true
+        redactionDelegate = self
         addTrackingArea(NSTrackingArea(
             rect: .zero,
             options: [
@@ -776,8 +778,15 @@ final class EditorCanvasView: NSView {
     /// the lifecycle gate asserts on it and stays red until then.
     let redactionRegistry = RedactionJobRegistry()
 
-    /// Repaint target for a resolved redaction, weak by construction.
+    /// Repaint target for a resolved redaction, weak by construction. The
+    /// canvas is its own delegate in production; a gate can wrap it.
     weak var redactionDelegate: RedactionSurfaceDelegate?
+
+    func redactionDidChange() {
+        redactionDelegate?.surfaceNeedsRedactionRepaint()
+    }
+
+    func surfaceNeedsRedactionRepaint() { needsDisplay = true }
 
     /// Slice B seam: drives the SHARED regional-pixelation failure so the
     /// editor takes production's fail-closed path (no clean base on screen, no
@@ -993,6 +1002,7 @@ final class EditorCanvasView: NSView {
         // Any structural edit (delete, crop, resize, undo, redo) supersedes
         // every OCR job in flight: a late result must not narrow a mask on an
         // annotation the user has already changed.
+        redactionRegistry.cancelAll()
         for blur in annotations.compactMap({ $0 as? BlurAnnotation }) {
             blur.bumpRedactionGeneration()
         }
@@ -1096,6 +1106,28 @@ final class EditorCanvasView: NSView {
             let blur = BlurAnnotation(uiScale: pxScale)
             blur.rect = CGRect(origin: pp, size: .zero)
             drafting = blur
+        case .pixelateText:
+            // Text mode starts as a FULL mask and only narrows once a live OCR
+            // result lands, so the drag never shows unmasked pixels.
+            let blur = BlurAnnotation(uiScale: pxScale)
+            blur.rect = CGRect(origin: pp, size: .zero)
+            blur.redactionState = .pendingFull
+            drafting = blur
+        case .spotlight:
+            let spot = SpotlightAnnotation(uiScale: pxScale)
+            spot.rect = CGRect(origin: pp, size: .zero)
+            spot.baseBounds = CGRect(
+                x: 0, y: 0,
+                width: image.cgImage.width, height: image.cgImage.height)
+            drafting = spot
+        case .magnifier:
+            let mag = MagnifierAnnotation(uiScale: pxScale)
+            mag.sourceRect = CGRect(origin: pp, size: .zero)
+            mag.calloutRect = CGRect(origin: pp, size: .zero)
+            drafting = mag
+        case .backdrop:
+            // A canvas-level style, not a drag: the toolbar popover drives it.
+            selected = nil
         case .crop:
             selected = nil
             if event.clickCount >= 2, let crop = cropRect, crop.contains(vp) {
@@ -1177,7 +1209,7 @@ final class EditorCanvasView: NSView {
                 }
                 invalidate(pixelRect: rect)
             }
-        case .blur:
+        case .blur, .pixelateText:
             if let blur = drafting as? BlurAnnotation {
                 let before = blur.rect
                 blur.rect = CGRect(
@@ -1186,6 +1218,31 @@ final class EditorCanvasView: NSView {
                 )
                 invalidate(pixelRect: before.union(blur.rect))
             }
+        case .spotlight:
+            if let spot = drafting as? SpotlightAnnotation {
+                let before = spot.rect
+                spot.rect = CGRect(
+                    x: min(dragStartPoint.x, pp.x), y: min(dragStartPoint.y, pp.y),
+                    width: abs(pp.x - dragStartPoint.x),
+                    height: abs(pp.y - dragStartPoint.y))
+                invalidate(pixelRect: spot.baseBounds.union(before))
+            }
+        case .magnifier:
+            if let mag = drafting as? MagnifierAnnotation {
+                let before = mag.calloutRect
+                let source = CGRect(
+                    x: min(dragStartPoint.x, pp.x), y: min(dragStartPoint.y, pp.y),
+                    width: abs(pp.x - dragStartPoint.x),
+                    height: abs(pp.y - dragStartPoint.y))
+                mag.sourceRect = source
+                // Callout sits beside the source at 2x while dragging.
+                mag.calloutRect = CGRect(
+                    x: source.maxX + 8 * pxScale, y: source.minY,
+                    width: source.width * 2, height: source.height * 2)
+                invalidate(pixelRect: before.union(mag.calloutRect).union(source))
+            }
+        case .backdrop:
+            break
         case .crop:
             switch cropDrag {
             case .creating(let anchor):
@@ -1216,7 +1273,26 @@ final class EditorCanvasView: NSView {
             let big = draft.bounds.width > 2 || draft.bounds.height > 2 || draft is PenAnnotation
             if big {
                 registerUndoSnapshot()
-                annotations.append(draft)
+                if let spot = draft as? SpotlightAnnotation {
+                    // v1 is a singleton: darkness never stacks.
+                    annotations = SliceBCompositor.applySpotlight(
+                        existing: annotations, new: spot)
+                } else {
+                    annotations.append(draft)
+                }
+                if let mag = draft as? MagnifierAnnotation {
+                    // Sample the SANITIZED layer so the callout can never
+                    // resurrect pixels a redaction covers.
+                    mag.snapshot = SliceBCompositor.magnifierSnapshot(
+                        base: image.cgImage, sourceRect: mag.sourceRect,
+                        redactions: annotations.compactMap {
+                            $0 as? BlurAnnotation
+                        })
+                }
+                if let blur = draft as? BlurAnnotation,
+                   blur.redactionState == .pendingFull {
+                    startTextRedaction(for: blur)
+                }
             }
             drafting = nil
             needsDisplay = true
@@ -1229,6 +1305,19 @@ final class EditorCanvasView: NSView {
             window?.invalidateCursorRects(for: self)
         }
         isMovingSelection = false
+    }
+
+    /// Bounded OCR for one text redaction: the mask is already FULL, the job
+    /// is registered with this canvas, and the repaint goes through the weak
+    /// host protocol.
+    private func startTextRedaction(for blur: BlurAnnotation) {
+        guard let job = SliceBRedactionJob.start(
+            blur: blur, base: image.cgImage, host: self)
+        else {
+            needsDisplay = true
+            return
+        }
+        redactionRegistry.register(job, for: blur)
     }
 
     func applyCropSelection() {

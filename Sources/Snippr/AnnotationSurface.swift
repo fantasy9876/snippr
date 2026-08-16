@@ -24,6 +24,9 @@ enum OverlayAnnotationTool: String, CaseIterable {
     case highlight
     case counter
     case blur
+    // Appended at the END so the legacy tags 100-109 keep their meaning.
+    case spotlight
+    case pixelateText
 
     static let toolbarTagBase = 100
     static let colorToolbarTag = 200
@@ -74,7 +77,7 @@ enum OverlayAnnotationTool: String, CaseIterable {
     var adjustsStrokeWidth: Bool {
         switch self {
         case .pen, .arrow, .line, .rect, .oval: return true
-        default: return false
+        default: return false  // spotlight/pixelate cover regions, not strokes
         }
     }
 
@@ -90,6 +93,8 @@ enum OverlayAnnotationTool: String, CaseIterable {
         case .highlight: return "highlighter"
         case .counter: return "1.circle"
         case .blur: return "drop.halffull"
+        case .spotlight: return "rectangle.center.inset.filled"
+        case .pixelateText: return "text.redaction"
         }
     }
 
@@ -105,6 +110,9 @@ enum OverlayAnnotationTool: String, CaseIterable {
         case .highlight: return "Highlighter (H)"
         case .counter: return "Counter (N)"
         case .blur: return "Pixelate (B)"
+        case .spotlight: return "Spotlight (S)"
+        case .pixelateText:
+            return "Pixelate text (⇧B) — best-effort, review before sharing"
         }
     }
 }
@@ -139,6 +147,8 @@ final class AnnotationSurface: RedactionHost, RedactionJobObserver {
     private var activePen: PenAnnotation?
     private var activeBlur: BlurAnnotation?
     private var activeBlurAnchor: CGPoint?
+    private var activeSpotlight: SpotlightAnnotation?
+    private var activeSpotlightAnchor: CGPoint?
     private var strokeTrackpadAccum: CGFloat = 0
     private var redoAnnotations: [Annotation] = []
     /// Hosts install weak-owner callbacks so Undo/Redo enabled state follows
@@ -202,6 +212,8 @@ final class AnnotationSurface: RedactionHost, RedactionJobObserver {
         activePen = nil
         activeBlur = nil
         activeBlurAnchor = nil
+        activeSpotlight = nil
+        activeSpotlightAnchor = nil
     }
 
     /// A real new annotation forks history. Redo itself deliberately does
@@ -219,6 +231,20 @@ final class AnnotationSurface: RedactionHost, RedactionJobObserver {
         switch tool {
         case .select:
             return false
+        case .spotlight:
+            let spot = SpotlightAnnotation(uiScale: pixelScale)
+            spot.rect = CGRect(origin: p, size: .zero)
+            activeSpotlight = spot
+            activeSpotlightAnchor = p
+            return true
+        case .pixelateText:
+            // Text mode starts as a FULL mask and only ever narrows once a
+            // live OCR result lands.
+            let blur = BlurAnnotation(uiScale: pixelScale)
+            blur.redactionState = .pendingFull
+            activeBlur = blur
+            activeBlurAnchor = p
+            return true
         case .pen:
             let pen = PenAnnotation(uiScale: pixelScale)
             pen.color = color

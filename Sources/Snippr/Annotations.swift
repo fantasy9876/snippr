@@ -2,6 +2,8 @@ import AppKit
 
 enum EditorTool: String, CaseIterable {
     case select, arrow, line, rect, oval, highlight, pen, text, counter, blur, crop
+    // Slice B. Appended so existing raw values and toolbar order are untouched.
+    case backdrop, spotlight, magnifier, pixelateText
 
     var symbol: String {
         switch self {
@@ -16,6 +18,10 @@ enum EditorTool: String, CaseIterable {
         case .counter: return "1.circle"
         case .blur: return "drop.halffull"
         case .crop: return "crop"
+        case .backdrop: return "photo.artframe"
+        case .spotlight: return "rectangle.center.inset.filled"
+        case .magnifier: return "plus.magnifyingglass"
+        case .pixelateText: return "text.redaction"
         }
     }
 
@@ -32,6 +38,11 @@ enum EditorTool: String, CaseIterable {
         case .counter: return "Counter (N)"
         case .blur: return "Pixelate (B)"
         case .crop: return "Crop (C)"
+        case .backdrop: return "Backdrop (D)"
+        case .spotlight: return "Spotlight (S)"
+        case .magnifier: return "Magnifier (M)"
+        case .pixelateText:
+            return "Pixelate text (⇧B) — best-effort, review before sharing"
         }
     }
 }

@@ -6136,9 +6136,10 @@ enum SelfTest {
             // S2 production/catalog gate: Pixelate must be the SAME real
             // toolbar item/tag on area + scroll, and reverse-drag must create
             // the editor's BlurAnnotation model through live mouse handlers.
-            let s2Tools = OverlayAnnotationTool.allCases.filter {
-                $0.tooltip.hasPrefix("Pixelate")
-            }
+            // Identity, not a tooltip prefix: slice B adds a second tool whose
+            // name also starts with "Pixelate". The gate is about Pixelate
+            // having the SAME tag on both surfaces, which identity expresses.
+            let s2Tools = OverlayAnnotationTool.allCases.filter { $0 == .blur }
             var s2ToolbarFailures: [String] = []
             if s2Tools.count != 1 {
                 s2ToolbarFailures.append("catalog \(s2Tools.count)/1")
@@ -6153,7 +6154,7 @@ enum SelfTest {
                     width: 300, height: 200)
                 view.selectForTesting(rect: selection)
                 let areaPixelate = view.reviewToolbarButtonsForTesting.filter {
-                    $0.tooltip.hasPrefix("Pixelate")
+                    $0.tooltip == OverlayAnnotationTool.blur.tooltip
                 }
                 if areaPixelate.map(\.tag) != [expectedTag] {
                     s2ToolbarFailures.append(
@@ -6198,7 +6199,7 @@ enum SelfTest {
                         afterShow: true, afterCopy: false, afterSave: false),
                     screen: screen, dependencies: noopDeps())
                 let panelPixelate = panel.toolbarButtonsForTesting.filter {
-                    $0.tooltip.hasPrefix("Pixelate")
+                    $0.tooltip == OverlayAnnotationTool.blur.tooltip
                 }
                 if panelPixelate.map(\.tag) != [expectedTag] {
                     s2ToolbarFailures.append("panel tags \(panelPixelate.map(\.tag))")

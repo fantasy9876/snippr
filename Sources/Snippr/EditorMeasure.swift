@@ -19,6 +19,7 @@ enum SliceAHotkeys {
     static let editorToolKeys: [String: EditorTool] = [
         "v": .select, "a": .arrow, "l": .line, "r": .rect, "o": .oval,
         "h": .highlight, "p": .pen, "t": .text, "n": .counter, "b": .blur, "c": .crop,
+        "d": .backdrop, "s": .spotlight, "m": .magnifier,
     ]
 }
 
