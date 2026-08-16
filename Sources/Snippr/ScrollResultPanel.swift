@@ -367,6 +367,13 @@ final class ScrollResultPanel: NSPanel {
             dismiss()
             return
         }
+        // Nothing routes while a drag is live — including the terminal
+        // actions, which would otherwise export a half-drawn mark and then let
+        // mouseUp mutate the document after the handoff.
+        if annotationHost?.isAnnotationDragging == true {
+            super.keyDown(with: event)
+            return
+        }
         if event.keyCode == 36 || event.keyCode == 76 { // Return
             perform(intent: .copy)
             return
@@ -399,6 +406,9 @@ final class ScrollResultPanel: NSPanel {
 
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
         if annotationHost?.textEditingActive == true {
+            return super.performKeyEquivalent(with: event)
+        }
+        if annotationHost?.isAnnotationDragging == true {
             return super.performKeyEquivalent(with: event)
         }
         if event.modifierFlags.contains(.command),
@@ -549,6 +559,12 @@ final class AnnotationHostView: NSView, RedactionSurfaceDelegate {
     private let baseImage: CGImage
     private let pixelsPerPoint: CGFloat
     private var dragging = false
+
+    /// True between mouseDown and mouseUp on an annotation tool. Every route
+    /// that mutates history, tools or the document stands aside until then:
+    /// the draft is already in the document and its finalizing transaction is
+    /// only half-built.
+    var isAnnotationDragging: Bool { dragging }
     private var strokeHUD: StrokePreviewView?
     private var strokeHUDHide: DispatchWorkItem?
     /// The panel is deliberately wider than a tall/narrow stitched image so
@@ -617,8 +633,15 @@ final class AnnotationHostView: NSView, RedactionSurfaceDelegate {
 
     override func mouseUp(with event: NSEvent) {
         guard dragging else { return }
-        surface.endDrag()
-        surface.startPendingTextRedaction(base: baseImage)
+        // Locked between mouseDown and mouseUp: the image has already been
+        // handed off, so finalizing would add a mark that is not in it and
+        // start OCR for a session that is closing.
+        if isLocked() {
+            surface.abandonDrag()
+        } else {
+            surface.endDrag()
+            surface.startPendingTextRedaction(base: baseImage)
+        }
         dragging = false
         needsDisplay = true
     }

@@ -1064,10 +1064,18 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
         case .area:
             let p = convert(event.locationInWindow, from: nil)
             if annotationDragging {
-                annotationSurface?.endDrag()
-                if let frozen {
-                    annotationSurface?.startPendingTextRedaction(
-                        base: frozen.cgImage)
+                // A terminal action may have frozen the document while the
+                // mouse was still down. Finalizing now would add a mark the
+                // export never saw, and enqueue OCR against a session that is
+                // already closing, so the draft is dropped instead.
+                if isSaving {
+                    annotationSurface?.abandonDrag()
+                } else {
+                    annotationSurface?.endDrag()
+                    if let frozen {
+                        annotationSurface?.startPendingTextRedaction(
+                            base: frozen.cgImage)
+                    }
                 }
                 annotationDragging = false
                 needsDisplay = true
@@ -1107,6 +1115,15 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
         }
         if event.keyCode == 53 { // Esc
             handleEscape()
+            return
+        }
+        // NOTHING routes while a drag is live — Return and the digits and the
+        // tool map alike. The draft is already in the document and its
+        // finalizing transaction is half-built, so a route here can strand the
+        // spotlight being replaced, leave a zero-area draft behind, or export
+        // a half-drawn mark and let mouseUp mutate the document afterwards.
+        if annotationDragging {
+            super.keyDown(with: event)
             return
         }
         if isReviewing, (event.keyCode == 36 || event.keyCode == 76) {
@@ -1150,6 +1167,10 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
         if textEditingActive {
             // ⌘C/⌘Z/⌘V belong to the active text field
+            return super.performKeyEquivalent(with: event)
+        }
+        // Same rule as keyDown: a live drag owns the document until it ends.
+        if annotationDragging {
             return super.performKeyEquivalent(with: event)
         }
         let pickFlags = event.modifierFlags.intersection(

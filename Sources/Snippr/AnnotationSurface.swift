@@ -150,6 +150,15 @@ final class AnnotationSurface: RedactionHost, RedactionJobObserver {
     private var activeBlurAnchor: CGPoint?
     private var activeSpotlight: SpotlightAnnotation?
     private var activeSpotlightAnchor: CGPoint?
+    /// True between `beginDrag` and `endDrag`. A draft is already IN the
+    /// document at this point and the transaction that will finalize it is
+    /// half-built, so every route that mutates history, tools or the document
+    /// has to stand aside until the drag resolves.
+    var isDragging: Bool {
+        activeShape != nil || activePen != nil || activeBlur != nil
+            || activeSpotlight != nil
+    }
+
     /// The spotlight a drag is about to replace, held so a click can put it
     /// back and so undo can restore it.
     private var replacedSpotlight: (spot: SpotlightAnnotation, index: Int)?
@@ -351,6 +360,36 @@ final class AnnotationSurface: RedactionHost, RedactionJobObserver {
         }
     }
 
+    /// Drops an in-progress draft and restores whatever it displaced, without
+    /// touching history. Used when a terminal action has already frozen the
+    /// document underneath a live drag: finalizing then would add a mark the
+    /// export never saw.
+    func abandonDrag() {
+        if let shape = activeShape, annotations.last === shape {
+            annotations.removeLast()
+        }
+        if let pen = activePen, annotations.last === pen {
+            annotations.removeLast()
+        }
+        if let blur = activeBlur, annotations.last === blur {
+            annotations.removeLast()
+        }
+        if let spot = activeSpotlight, annotations.last === spot {
+            annotations.removeLast()
+            if let previous = replacedSpotlight {
+                let index = min(previous.index, annotations.count)
+                annotations.insert(previous.spot, at: index)
+            }
+        }
+        activeShape = nil
+        activePen = nil
+        activeBlur = nil
+        activeBlurAnchor = nil
+        activeSpotlight = nil
+        activeSpotlightAnchor = nil
+        replacedSpotlight = nil
+    }
+
     func endDrag() {
         if let blur = activeBlur, annotations.last === blur {
             if blur.rect.width <= 1 || blur.rect.height <= 1 {
@@ -401,6 +440,12 @@ final class AnnotationSurface: RedactionHost, RedactionJobObserver {
     /// Returns false when there is nothing to change.
     @discardableResult
     func setSpotlightDim(_ fraction: CGFloat) -> Bool {
+        // Not during a drag. The draft spotlight is the last one in the array,
+        // so this would clone the DRAFT and replace it while `activeSpotlight`
+        // still points at the object just detached — `endDrag` would then find
+        // its identity check failing and skip finalization entirely, losing
+        // the spotlight this was meant to adjust and stranding the prior one.
+        guard !isDragging else { return false }
         let clamped = max(0.1, min(0.9, fraction))
         guard let current = annotations.compactMap({
             $0 as? SpotlightAnnotation
