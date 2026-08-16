@@ -9306,16 +9306,13 @@ enum SelfTest {
             // feature's.
             var lockFailures: [String] = []
             // This loop sets the Esc preferences too, and the earlier restore
-            // already ran. Without its own save/restore it would leave the
-            // user's settings on whatever the last case used.
+            // already ran. Restored immediately after the loop, NOT by a defer:
+            // this whole slice is one enormous scope, so a defer here would
+            // fire long after every later gate had already run against
+            // escCopy/escSave left at whatever the last case used.
             let lockEscCopyBefore = Settings.shared.escCopy
             let lockEscSaveBefore = Settings.shared.escSave
             let lockStyleBefore = Settings.shared.confirmationStyle
-            defer {
-                Settings.shared.escCopy = lockEscCopyBefore
-                Settings.shared.escSave = lockEscSaveBefore
-                Settings.shared.confirmationStyle = lockStyleBefore
-            }
             let lockRoutes: [(String, Bool, Bool, (EditorWindowController) -> Void,
                               Int, Bool)] = [
                 // name, escCopy, escSave, action, dependency calls, closes
@@ -9421,6 +9418,9 @@ enum SelfTest {
                         + " repaints \(counting.repaints)")
                 }
             }
+            Settings.shared.escCopy = lockEscCopyBefore
+            Settings.shared.escSave = lockEscSaveBefore
+            Settings.shared.confirmationStyle = lockStyleBefore
             check("sliceB-backdrop-save-lock-order",
                   lockFailures.isEmpty, lockFailures.joined(separator: " | "))
 
