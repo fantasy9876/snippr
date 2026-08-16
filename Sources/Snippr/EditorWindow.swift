@@ -1511,10 +1511,19 @@ final class EditorCanvasView: NSView {
         needsDisplay = true
     }
 
-    /// Puts a real value in the live text field so a fingerprint can prove a
-    /// failed export did not swallow or commit it.
-    func setPendingTextForTesting(_ value: String) {
+    /// Puts a real, NON-DEFAULT pending edit in place: value, font and colour
+    /// on both the live field and its backing annotation. Setting only the
+    /// string left the style at production defaults, so a reset to defaults
+    /// would have been invisible to the fingerprint.
+    func setPendingTextForTesting(
+        _ value: String, font: NSFont, color: NSColor
+    ) {
         textField?.stringValue = value
+        textField?.font = font
+        textField?.textColor = color
+        editingTextAnnotation?.fontSizePt = font.pointSize
+        editingTextAnnotation?.color = color
+        needsDisplay = true
     }
 
     func beginTextEditingForTesting(at pixel: CGPoint) {
@@ -1535,6 +1544,16 @@ final class EditorCanvasView: NSView {
     var annotationRefsForTesting: [Annotation] { annotations }
     var selectedRefForTesting: Annotation? { selected }
     var editingTextRefForTesting: TextAnnotation? { editingTextAnnotation }
+
+    /// Style actually installed on the live field, so a preflight can prove the
+    /// pending edit is not sitting at production defaults.
+    var pendingTextFieldStyleForTesting: String {
+        guard let field = textField else { return "none" }
+        let rgba = field.textColor?.usingColorSpace(.sRGB).map {
+            "\($0.redComponent),\($0.greenComponent),\($0.blueComponent),\($0.alphaComponent)"
+        } ?? "-"
+        return "\(field.font?.fontName ?? "-")/\(field.font?.pointSize ?? -1)/\(rgba)"
+    }
 
     /// Live pointer state — part of what a ruler transient depends on.
     var pointerStateForTesting: String {

@@ -8590,9 +8590,26 @@ enum SelfTest {
                     canvas.setCropSelectionForTesting(
                         CGRect(x: 10, y: 10, width: 80, height: 60))
                     canvas.beginTextEditingForTesting(at: CGPoint(x: 40, y: 120))
-                    canvas.setPendingTextForTesting("pending value")
+                    canvas.setPendingTextForTesting(
+                        "pending value",
+                        font: NSFont.systemFont(ofSize: 27, weight: .light),
+                        color: NSColor.systemPurple.withAlphaComponent(0.65))
                 }
                 return (wc, canvas)
+            }
+
+            /// Esc goes through the REAL key path, not a direct call: the
+            /// gate is about the production route, not about escPressed().
+            func pressEscape(_ wc: EditorWindowController) {
+                let canvas = wc.canvasForTesting
+                guard let event = NSEvent.keyEvent(
+                    with: .keyDown, location: .zero, modifierFlags: [],
+                    timestamp: 0, windowNumber: wc.window?.windowNumber ?? 0,
+                    context: nil, characters: "\u{1b}",
+                    charactersIgnoringModifiers: "\u{1b}", isARepeat: false,
+                    keyCode: 53)
+                else { return }
+                canvas.keyDown(with: event)
             }
 
             /// The seed must really be what the gate claims, or every
@@ -8662,8 +8679,21 @@ enum SelfTest {
                         || canvas.pointerInsideForTesting != true {
                         problems.append("no-pointer")
                     }
-                    if canvas.editingTextRefForTesting == nil {
+                    if let backing = canvas.editingTextRefForTesting {
+                        // The pending edit must be non-default in style too, or
+                        // a reset to defaults would look identical.
+                        if abs(backing.fontSizePt - 27) > 0.01 {
+                            problems.append("pending-font-default")
+                        }
+                        let alpha = backing.color.usingColorSpace(.sRGB)?
+                            .alphaComponent ?? 1
+                        if alpha > 0.99 { problems.append("pending-color-default") }
+                    } else {
                         problems.append("no-pending-text")
+                    }
+                    if canvas.pendingTextFieldStyleForTesting
+                        .contains("systemFont") == false {
+                        problems.append("pending-field-font-default")
                     }
                     if !canvas.hasValidCropSelection { problems.append("no-crop") }
                 } else {
