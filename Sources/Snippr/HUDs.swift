@@ -20,7 +20,9 @@ final class ToastHUD {
         // Recorded synchronously, before the hop to main, so a headless gate
         // can assert WHICH failure the user was told about.
         messageLock.lock()
-        lastMessage = message
+        for recorder in recorders[ObjectIdentifier(Thread.current)] ?? [] {
+            recorder.messages.append(message)
+        }
         messageLock.unlock()
         DispatchQueue.main.async {
             showNow(message, symbol: symbol, duration: duration,
@@ -30,29 +32,38 @@ final class ToastHUD {
 
     static var panelForTesting: NSPanel? { panel }
 
-    nonisolated(unsafe) private static var lastMessage: String?
-    private static let messageLock = NSLock()
-
-    static var lastMessageForTesting: String? {
-        messageLock.lock()
-        defer { messageLock.unlock() }
-        return lastMessage
+    private final class MessageRecorder {
+        var messages: [String] = []
     }
 
-    /// Records what the user was actually told during `body`, and only during
-    /// `body`: an assertion about a message must not be able to read one left
-    /// behind by something else.
+    nonisolated(unsafe) private static var recorders:
+        [ObjectIdentifier: [MessageRecorder]] = [:]
+    private static let messageLock = NSLock()
+
+    /// EVERY message shown during `body`, in order, and only from this
+    /// thread's own scope. A single "last message" hides extra toasts, so a
+    /// run that showed the wrong one first and the right one second passed;
+    /// a save-and-restore global also loses messages when scopes overlap.
     static func recordingMessagesForTesting<T>(
         _ body: () -> T
-    ) -> (result: T, message: String?) {
+    ) -> (result: T, messages: [String]) {
+        let key = ObjectIdentifier(Thread.current)
+        let recorder = MessageRecorder()
         messageLock.lock()
-        let previous = lastMessage
-        lastMessage = nil
+        recorders[key, default: []].append(recorder)
         messageLock.unlock()
+        defer {
+            messageLock.lock()
+            if var stack = recorders[key],
+               let index = stack.lastIndex(where: { $0 === recorder }) {
+                stack.remove(at: index)
+                recorders[key] = stack.isEmpty ? nil : stack
+            }
+            messageLock.unlock()
+        }
         let result = body()
         messageLock.lock()
-        let captured = lastMessage
-        lastMessage = previous
+        let captured = recorder.messages
         messageLock.unlock()
         return (result, captured)
     }

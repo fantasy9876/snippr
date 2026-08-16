@@ -8561,6 +8561,45 @@ enum SelfTest {
             let p3Reference = SliceBBackdrop.compose(
                 image: p3Empty, preset: .sunset,
                 budgetBytes: SliceBExport.defaultBudgetBytes)
+            // The reference above is composed by the SAME production code, so
+            // it cannot answer whether the stops or the axis are right — both
+            // sides would be wrong together. This checks the two gradient
+            // endpoints against hard-coded Sunset values, in sRGB, at
+            // backdrop-only coordinates: the axis runs from top-left to
+            // bottom-right, so a swapped or rotated axis moves them.
+            var stopsOK = false
+            var stopsDetail = "no frame"
+            let sRGB = CGColorSpace(name: CGColorSpace.sRGB)!
+            let stopInner = makeSolidImage(
+                width: 200, height: 200, color: NSColor.white.cgColor)
+            if let stopFrame = SliceBBackdrop.compose(
+                image: stopInner, preset: .sunset,
+                budgetBytes: SliceBExport.defaultBudgetBytes) {
+                let w = stopFrame.width, h = stopFrame.height
+                var bytes = [UInt8](repeating: 0, count: w * h * 4)
+                let c = CGContext(
+                    data: &bytes, width: w, height: h, bitsPerComponent: 8,
+                    bytesPerRow: w * 4, space: sRGB,
+                    bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+                c?.interpolationQuality = .none
+                c?.draw(stopFrame, in: CGRect(x: 0, y: 0, width: w, height: h))
+                func pixel(_ x: Int, _ yBL: Int) -> (Int, Int, Int) {
+                    let i = ((h - 1 - yBL) * w + x) * 4
+                    return (Int(bytes[i]), Int(bytes[i + 1]), Int(bytes[i + 2]))
+                }
+                // Endpoints only: interpolation-free, so no assumption about
+                // how CoreGraphics blends between the stops.
+                let startPixel = pixel(0, h - 1)
+                let endPixel = pixel(w - 1, 0)
+                func near(_ a: (Int, Int, Int), _ b: (Int, Int, Int)) -> Bool {
+                    abs(a.0 - b.0) <= 2 && abs(a.1 - b.1) <= 2
+                        && abs(a.2 - b.2) <= 2
+                }
+                stopsOK = near(startPixel, (255, 138, 76))
+                    && near(endPixel, (232, 68, 127))
+                stopsDetail = "start \(startPixel) end \(endPixel)"
+            }
+
             var p3FramedOK = false
             var p3Detail = "framed nil"
             if let framed = p3Framed, let reference = p3Reference,
@@ -8638,8 +8677,10 @@ enum SelfTest {
                 }
             }
             check("sliceB2-backdrop-mapping",
-                  mapped == CGPoint(x: 50, y: 30) && p3Kept && p3FramedOK,
-                  "mapped \(mapped) p3 \(p3Kept) \(p3Detail)")
+                  mapped == CGPoint(x: 50, y: 30) && p3Kept && p3FramedOK
+                    && stopsOK,
+                  "mapped \(mapped) p3 \(p3Kept) \(p3Detail) "
+                    + "stops \(stopsDetail)")
 
             // 8. Spotlight stays a singleton and is hit by its hole
             let spot1 = SpotlightAnnotation(uiScale: 1)
@@ -9063,11 +9104,17 @@ enum SelfTest {
                 let beforeRefs = canvas.annotationRefsForTesting
                 let beforeSelected = canvas.selectedRefForTesting
                 let beforeEditing = canvas.editingTextRefForTesting
-                let innerToast = ToastHUD.recordingMessagesForTesting {
+                let innerToasts = ToastHUD.recordingMessagesForTesting {
                     AnnotationRenderer.withForcedRegionalFailure { action(wc) }
-                }.message
-                if innerToast != "Couldn't render the redaction — nothing was exported" {
-                    termFailures.append(name + ":toast(\(innerToast ?? "nil"))")
+                }.messages
+                let redactionToast =
+                    "Couldn't render the redaction — nothing was exported"
+                // esc-both attempts two exports, so it reports twice; every
+                // other route reports exactly once and says only this.
+                let expectedInner = name == "esc-both" ? 2 : 1
+                if innerToasts != Array(
+                    repeating: redactionToast, count: expectedInner) {
+                    termFailures.append(name + ":toast\(innerToasts)")
                 }
                 if vector(spy) != zeroVector {
                     termFailures.append(name + ":deps " + spy.description)
@@ -9122,14 +9169,32 @@ enum SelfTest {
                     wc.window?.close()
                     continue
                 }
+                // A redaction still resolving while the export is attempted:
+                // a failed outer compose must not cancel it, bump it, widen it
+                // or repaint it — the save-lock only takes effect on SUCCESS.
+                let pending = BlurAnnotation(uiScale: 1)
+                pending.rect = CGRect(x: 30, y: 30, width: 40, height: 30)
+                canvas.annotations.append(pending)
+                let counting = ForwardingRepaintDelegate(
+                    wrapping: canvas.redactionDelegate)
+                canvas.redactionDelegate = counting
+                let pendingGeneration = pending.redactionGeneration
+                let ownersBefore = MainActor.assumeIsolated {
+                    () -> Int in
+                    let base = SliceBRedactionJob.ownerCountForTesting
+                    let job = SliceBRedactionJob.pendingForTesting(
+                        blur: pending, host: canvas)
+                    canvas.redactionRegistry.register(job, for: pending)
+                    return base
+                }
                 let before = canvas.documentFingerprintForTesting
                 let beforeHistory = canvas.historyMutationCountForTesting
                 let beforeRefs = canvas.annotationRefsForTesting
                 let beforeSelected = canvas.selectedRefForTesting
                 let beforeEditing = canvas.editingTextRefForTesting
-                let outerToast = ToastHUD.recordingMessagesForTesting {
+                let outerToasts = ToastHUD.recordingMessagesForTesting {
                     ForcedOuterComposeFailure.scoped { action(wc) }
-                }.message
+                }.messages
                 if vector(spy) != zeroVector {
                     outerFailures.append(name + ":deps " + spy.description)
                 }
@@ -9153,16 +9218,28 @@ enum SelfTest {
                     || canvas.editingTextRefForTesting !== beforeEditing {
                     outerFailures.append(name + ":identity")
                 }
-                // EXACTLY the backdrop message. "Contains backdrop" would also
-                // accept the redaction text if someone appended a word to it.
+                // EXACTLY the backdrop message, exactly as often as an export
+                // was attempted. "Contains backdrop" would also accept the
+                // redaction text with a word appended, and a last-message-only
+                // check would hide a wrong first toast.
                 let backdropToast =
                     "Couldn't render the backdrop — nothing was exported"
-                let redactionToast =
-                    "Couldn't render the redaction — nothing was exported"
-                if outerToast != backdropToast {
-                    outerFailures.append(name + ":toast(\(outerToast ?? "nil"))")
+                let expectedOuter = name == "esc-both" ? 2 : 1
+                if outerToasts != Array(
+                    repeating: backdropToast, count: expectedOuter) {
+                    outerFailures.append(name + ":toast\(outerToasts)")
                 }
-                _ = redactionToast
+                if pending.redactionGeneration != pendingGeneration
+                    || pending.redactionState != .pendingFull
+                    || counting.repaints != 0
+                    || canvas.redactionRegistry.count != 1
+                    || MainActor.assumeIsolated({
+                        SliceBRedactionJob.ownerCountForTesting
+                    }) != ownersBefore + 1 {
+                    outerFailures.append(
+                        name + ":job "
+                        + String(describing: pending.redactionState))
+                }
                 wc.window?.close()
 
                 // Healthy twin on the SAME seeded state with the SAME preset:
@@ -9196,6 +9273,23 @@ enum SelfTest {
             final class CountingRedactionHost: RedactionHost {
                 var repaints = 0
                 func redactionDidChange() { repaints += 1 }
+            }
+
+            /// Sits where the canvas's own delegate sits and forwards to it, so
+            /// the count comes from the REAL path
+            /// (`canvas.redactionDidChange` -> delegate) instead of replacing
+            /// it. Counting on a synthetic host would have missed a repaint
+            /// regression in production entirely.
+            final class ForwardingRepaintDelegate: RedactionSurfaceDelegate {
+                var repaints = 0
+                private let wrapped: RedactionSurfaceDelegate?
+                init(wrapping wrapped: RedactionSurfaceDelegate?) {
+                    self.wrapped = wrapped
+                }
+                func surfaceNeedsRedactionRepaint() {
+                    repaints += 1
+                    wrapped?.surfaceNeedsRedactionRepaint()
+                }
             }
 
             // C. Backdrop as document state: what the real menu does, what the
@@ -9300,22 +9394,33 @@ enum SelfTest {
                 let neighbour = CounterAnnotation(uiScale: 1)
                 canvas.annotations = [blur, neighbour]
                 canvas.selectForTesting(blur)
+                // The canvas hosts the job, as in production; the counter is
+                // spliced in as its delegate so it observes the real path.
+                let counting = ForwardingRepaintDelegate(
+                    wrapping: canvas.redactionDelegate)
+                canvas.redactionDelegate = counting
                 let label = deliverFirst
                     ? "deliver-then-undo" : "undo-then-deliver"
-                let host = CountingRedactionHost()
                 let generation = blur.redactionGeneration
                 MainActor.assumeIsolated {
+                    let ownersBefore = SliceBRedactionJob.ownerCountForTesting
                     let job = SliceBRedactionJob.pendingForTesting(
-                        blur: blur, host: host)
+                        blur: blur, host: canvas)
                     canvas.redactionRegistry.register(job, for: blur)
+                    if SliceBRedactionJob.ownerCountForTesting
+                        != ownersBefore + 1 {
+                        applyFailures.append(label + ":owner-start")
+                    }
                     let historyBefore = canvas.historyMutationCountForTesting
+                    let repaintsBefore = counting.repaints
                     _ = canvas.applyBackdrop(.sunset)
                     if canvas.historyMutationCountForTesting != historyBefore + 1 {
                         applyFailures.append(label + ":history")
                     }
-                    if canvas.redactionRegistry.count != 1 {
-                        applyFailures.append(
-                            label + ":cancelled \(canvas.redactionRegistry.count)")
+                    if canvas.redactionRegistry.count != 1
+                        || SliceBRedactionJob.ownerCountForTesting
+                            != ownersBefore + 1 {
+                        applyFailures.append(label + ":cancelled")
                     }
                     if blur.redactionGeneration != generation {
                         applyFailures.append(label + ":generation")
@@ -9325,12 +9430,27 @@ enum SelfTest {
                             label + ":pending "
                             + String(describing: blur.redactionState))
                     }
+                    // A preset change is not a redaction event.
+                    if counting.repaints != repaintsBefore {
+                        applyFailures.append(label + ":apply-repaint")
+                    }
                     if deliverFirst {
                         job.deliver([backdropWord])
                         canvas.undoManager?.undo()
                     } else {
                         canvas.undoManager?.undo()
                         job.deliver([backdropWord])
+                    }
+                    // EXACTLY one repaint: the delivery. More would mean the
+                    // undo is repainting redactions it never touched.
+                    if counting.repaints != repaintsBefore + 1 {
+                        applyFailures.append(
+                            label + ":repaints \(counting.repaints - repaintsBefore)")
+                    }
+                    if SliceBRedactionJob.ownerCountForTesting != ownersBefore {
+                        applyFailures.append(
+                            label + ":owner-leak "
+                            + "\(SliceBRedactionJob.ownerCountForTesting)")
                     }
                 }
                 let refs = canvas.annotationRefsForTesting
@@ -9346,10 +9466,6 @@ enum SelfTest {
                     applyFailures.append(
                         label + ":" + String(describing: blur.redactionState))
                 }
-                if host.repaints < 1 {
-                    applyFailures.append(label + ":norepaint")
-                }
-                // The job finished, so the registry must have released it.
                 if canvas.redactionRegistry.count != 0 {
                     applyFailures.append(
                         label + ":leak \(canvas.redactionRegistry.count)")
@@ -9412,6 +9528,10 @@ enum SelfTest {
                     x: 0, y: 0, width: CGFloat(width), height: CGFloat(height))
                 canvas.annotations = [blur, counter, spot]
                 canvas.selectForTesting(counter)
+                // A real transient overlay, not a claim in a comment: a guide
+                // being placed must survive a refusal untouched.
+                canvas.setTransientGuideForTesting(
+                    axis: .vertical, position: 120)
                 return (wc, canvas)
             }
             func outerField(_ canvas: EditorCanvasView) -> String {
@@ -9441,9 +9561,8 @@ enum SelfTest {
                 if rejected.result || canvas.backdropPresetForTesting != .none {
                     stabilityFailures.append("crop-bypass")
                 }
-                if rejected.message != "This image is too large for a backdrop" {
-                    stabilityFailures.append(
-                        "reject-toast(\(rejected.message ?? "nil"))")
+                if rejected.messages != ["This image is too large for a backdrop"] {
+                    stabilityFailures.append("reject-toast\(rejected.messages)")
                 }
                 let afterRefs = canvas.annotationRefsForTesting
                 if canvas.documentFingerprintForTesting != before
@@ -9478,24 +9597,19 @@ enum SelfTest {
                 if !canvas.applyBackdrop(.graphite) {
                     stabilityFailures.append("apply-refused")
                 }
-                let cropped = canvas.prospectiveInnerPixelSize()
-                let croppedOuter = SliceBBackdrop.outerDimensions(
-                    innerWidth: cropped.width, innerHeight: cropped.height,
-                    preset: .graphite, pixelScale: 1)
-                if outerField(canvas)
-                    != "outer=\(croppedOuter?.width ?? -1)x\(croppedOuter?.height ?? -1)" {
+                // Hard-coded, not derived: an expectation that calls the same
+                // helper the production code calls agrees with it by
+                // construction. 80x60 pads by the 40 px floor to 160x140.
+                if outerField(canvas) != "outer=160x140" {
                     stabilityFailures.append(
                         "outer-pending " + outerField(canvas))
                 }
                 // Cancelling the crop must not invalidate what was accepted,
                 // and the reported size goes back to the full document.
                 canvas.currentTool = .select
-                let fullOuter = SliceBBackdrop.outerDimensions(
-                    innerWidth: 900, innerHeight: 900, preset: .graphite,
-                    pixelScale: 1)
+                // 900 pads by 6% = 54 to 1008 square.
                 if canvas.backdropPresetForTesting != .graphite
-                    || outerField(canvas)
-                        != "outer=\(fullOuter?.width ?? -1)x\(fullOuter?.height ?? -1)"
+                    || outerField(canvas) != "outer=1008x1008"
                     || !canvas.backdropPeakFits(
                         .graphite, width: 900, height: 900) {
                     stabilityFailures.append("cancel-crop " + outerField(canvas))
@@ -9503,61 +9617,87 @@ enum SelfTest {
                 // Committing a crop only shrinks the peak, so it stays valid.
                 canvas.cropForTesting(
                     pixels: CGRect(x: 5, y: 5, width: 600, height: 400))
-                let committed = SliceBBackdrop.outerDimensions(
-                    innerWidth: canvas.image.cgImage.width,
-                    innerHeight: canvas.image.cgImage.height,
-                    preset: .graphite, pixelScale: 1)
+                // 600x400 pads by the 40 px floor to 680x480.
                 if canvas.backdropPresetForTesting != .graphite
-                    || outerField(canvas)
-                        != "outer=\(committed?.width ?? -1)x\(committed?.height ?? -1)" {
-                    stabilityFailures.append("crop-commit " + outerField(canvas))
+                    || canvas.image.cgImage.width != 600
+                    || canvas.image.cgImage.height != 400
+                    || outerField(canvas) != "outer=680x480" {
+                    stabilityFailures.append(
+                        "crop-commit \(canvas.image.cgImage.width)x"
+                        + "\(canvas.image.cgImage.height) " + outerField(canvas))
                 }
                 canvas.undoManager?.undo()
                 if canvas.backdropPresetForTesting != .graphite
                     || canvas.image.cgImage.width != 900
-                    || outerField(canvas)
-                        != "outer=\(fullOuter?.width ?? -1)x\(fullOuter?.height ?? -1)" {
+                    || outerField(canvas) != "outer=1008x1008" {
                     stabilityFailures.append("crop-undo " + outerField(canvas))
                 }
+                // Undo cleared the selection, so re-establish a LIVE one: a
+                // refusal that preserves nothing is trivially unobservable.
+                let selection = canvas.annotationRefsForTesting.first
+                canvas.selectForTesting(selection)
+                canvas.setTransientGuideForTesting(
+                    axis: .horizontal, position: 200)
                 // Doubling would need 12.96 MB inside alone: refused with
                 // NOTHING allocated, not merely with the document unchanged.
                 let sizeBefore = canvas.image.cgImage.width
                 let historyBefore = canvas.historyMutationCountForTesting
                 let beforeFingerprint = canvas.documentFingerprintForTesting
                 let beforeRefs = canvas.annotationRefsForTesting
+                let beforeSelection = canvas.selectedRefForTesting
+                // Identity, not a hash: a replacement bitmap with identical
+                // pixels would hash the same and still be a new allocation.
+                let beforeImage = canvas.image.cgImage
                 let rejectTrace = RenderTrace.capture(
                     host: "gate", path: "resize-reject") {
                     ToastHUD.recordingMessagesForTesting {
                         wc.applyResizeFactor(2)
-                    }.message
+                    }.messages
                 }
                 if !rejectTrace.events.isEmpty {
                     stabilityFailures.append(
                         "resize-allocated \(rejectTrace.events.count)")
                 }
                 if rejectTrace.result
-                    != "This size is too large for the backdrop" {
+                    != ["This size is too large for the backdrop"] {
                     stabilityFailures.append(
-                        "resize-toast(\(rejectTrace.result ?? "nil"))")
+                        "resize-toast\(rejectTrace.result)")
                 }
                 let afterRefs = canvas.annotationRefsForTesting
-                if canvas.image.cgImage.width != sizeBefore
+                if canvas.image.cgImage !== beforeImage
+                    || canvas.image.cgImage.width != sizeBefore
                     || canvas.historyMutationCountForTesting != historyBefore
                     || canvas.backdropPresetForTesting != .graphite
                     || canvas.documentFingerprintForTesting != beforeFingerprint
                     || afterRefs.count != beforeRefs.count
-                    || !zip(afterRefs, beforeRefs).allSatisfy({ $0.0 === $0.1 }) {
+                    || !zip(afterRefs, beforeRefs).allSatisfy({ $0.0 === $0.1 })
+                    || canvas.selectedRefForTesting !== beforeSelection {
                     stabilityFailures.append(
                         "resize-mutated \(canvas.image.cgImage.width)")
                 }
-                // A resize that still fits goes through, and DOES allocate.
+                // A resize that still fits goes through and allocates EXACTLY
+                // one destination, of exactly the size it announced.
                 let acceptTrace = RenderTrace.capture(
                     host: "gate", path: "resize-accept") {
                     wc.applyResizeFactor(0.5)
                 }
-                if acceptTrace.events.isEmpty
-                    || canvas.image.cgImage.width >= sizeBefore {
-                    stabilityFailures.append("resize-blocked")
+                let allocations = acceptTrace.events.filter {
+                    $0.kind == "destination"
+                }
+                if allocations.count != 1
+                    || allocations.first?.host != "gate"
+                    || allocations.first?.path != "resize-accept"
+                    || allocations.first?.destination != "450x450"
+                    || allocations.first?.rect
+                        != CGRect(x: 0, y: 0, width: 450, height: 450) {
+                    stabilityFailures.append(
+                        "resize-alloc \(acceptTrace.events.count)")
+                }
+                if canvas.image.cgImage.width != 450
+                    || outerField(canvas) != "outer=530x530" {
+                    stabilityFailures.append(
+                        "resize-accepted \(canvas.image.cgImage.width) "
+                        + outerField(canvas))
                 }
                 wc.window?.close()
             }
@@ -9566,18 +9706,19 @@ enum SelfTest {
             SliceBExport.withBudgetForTesting(4_000_000) {
                 let (wc, canvas) = seedStabilityEditor(width: 900, height: 900)
                 let sizeBefore = canvas.image.cgImage.width
+                let imageBefore = canvas.image.cgImage
                 let trace = RenderTrace.capture(host: "gate", path: "none") {
                     ToastHUD.recordingMessagesForTesting {
                         wc.applyResizeFactor(2)
-                    }.message
+                    }.messages
                 }
                 if !trace.events.isEmpty
+                    || canvas.image.cgImage !== imageBefore
                     || canvas.image.cgImage.width != sizeBefore {
                     stabilityFailures.append("none-resize-allowed")
                 }
-                if trace.result != "This size is too large to export" {
-                    stabilityFailures.append(
-                        "none-toast(\(trace.result ?? "nil"))")
+                if trace.result != ["This size is too large to export"] {
+                    stabilityFailures.append("none-toast\(trace.result)")
                 }
                 wc.window?.close()
             }

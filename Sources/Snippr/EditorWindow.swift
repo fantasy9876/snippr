@@ -885,9 +885,11 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
     var backdropPresetForTesting: BackdropPreset { backdropPreset }
 
     /// The integral pixel rect a flatten would render right now, or nil when
-    /// no valid crop is pending. `flattened()` derives its base from this, so a
-    /// budget check or a fingerprint asking about the prospective size can
-    /// never disagree with the export about what that size is.
+    /// no valid crop is pending. `flattened()` derives its base from this, so
+    /// anything REPORTING the prospective export size — the fingerprint — can
+    /// never disagree with the export about what that size is. Acceptance is a
+    /// different question and asks about the full image instead, because a
+    /// pending crop can be taken away again.
     func prospectiveCropPixelRect() -> CGRect? {
         guard currentTool == .crop, let crop = cropRect, hasValidCropSelection
         else { return nil }
@@ -1975,6 +1977,14 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
     /// failed export changed NOTHING.
     func selectForTesting(_ annotation: Annotation?) {
         selected = annotation
+        needsDisplay = true
+    }
+
+    /// Seeds a transient overlay without a pointer, the way
+    /// `setCropSelectionForTesting` seeds a crop. State only — `beginGuide`
+    /// remains the production entry point.
+    func setTransientGuideForTesting(axis: MeasureAxis, position: CGFloat) {
+        transient = .guide(axis: axis, position: position)
         needsDisplay = true
     }
 

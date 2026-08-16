@@ -633,25 +633,30 @@ enum SliceBExport {
     /// Overridable so a gate can drive the REAL peak boundary — production
     /// apply, resize and export all read this — without a gigabyte fixture.
     /// Nothing in production ever sets the override.
-    nonisolated(unsafe) private static var budgetOverride: Int?
+    nonisolated(unsafe) private static var budgetStacks: [ObjectIdentifier: [Int]] = [:]
     private static let budgetLock = NSLock()
 
     static var defaultBudgetBytes: Int {
         budgetLock.lock()
         defer { budgetLock.unlock() }
-        return budgetOverride ?? 256 * 1_000_000 * 4
+        return budgetStacks[ObjectIdentifier(Thread.current)]?.last
+            ?? 256 * 1_000_000 * 4
     }
 
-    /// Scoped, so a gate cannot leave the budget lowered for everything that
-    /// runs after it — an earlier version set a global and restored it by hand.
+    /// Per-thread stack, like `RenderTrace`: a save-and-restore global is
+    /// correct only while nothing overlaps, and two scopes on two threads
+    /// would clobber each other's restore.
     static func withBudgetForTesting<T>(_ bytes: Int, _ body: () -> T) -> T {
+        let key = ObjectIdentifier(Thread.current)
         budgetLock.lock()
-        let previous = budgetOverride
-        budgetOverride = bytes
+        budgetStacks[key, default: []].append(bytes)
         budgetLock.unlock()
         defer {
             budgetLock.lock()
-            budgetOverride = previous
+            if var stack = budgetStacks[key], !stack.isEmpty {
+                stack.removeLast()
+                budgetStacks[key] = stack.isEmpty ? nil : stack
+            }
             budgetLock.unlock()
         }
         return body()
