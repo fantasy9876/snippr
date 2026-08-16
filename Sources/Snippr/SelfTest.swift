@@ -9723,20 +9723,21 @@ enum SelfTest {
                 var bleeding = 0
                 for py in 0..<viewShot.height {
                     for px in 0..<viewShot.width {
+                        // pixel CENTRE in points: half-open raster rule, so
+                        // every pixel lands in exactly one class.
                         let point = CGPoint(
-                            x: CGFloat(px) / backing,
-                            y: CGFloat(viewShot.height - 1 - py) / backing)
+                            x: (CGFloat(px) + 0.5) / backing,
+                            y: (CGFloat(viewShot.height - 1 - py) + 0.5) / backing)
                         let i = (py * viewShot.width + px) * 4
                         let value = Array(viewBytes[i..<(i + 4)])
-                        if hostMask.insetBy(dx: 1, dy: 1).contains(point) {
+                        if hostMask.contains(point) {
                             if value != cover { uncovered += 1 }
-                        } else if !hostMask.insetBy(dx: -2, dy: -2).contains(point) {
+                        } else if let baseBytes,
+                                  i + 4 <= baseBytes.count,
+                                  Array(baseBytes[i..<(i + 4)]) != value {
                             // Outside the mask the view must be byte-identical
                             // to the baseline taken moments earlier.
-                            if let baseBytes,
-                               Array(baseBytes[i..<(i + 4)]) != value {
-                                bleeding += 1
-                            }
+                            bleeding += 1
                         }
                     }
                 }
@@ -10161,8 +10162,11 @@ enum SelfTest {
                 }
                 if let destination = panelEvents.first(where: {
                     $0.kind == "destination"
-                }), destination.destination != "300x\(panelPixels)" {
-                    panelFailures.append("panel:dest \(destination.destination)")
+                }), destination.destination != "300x\(panelPixels)"
+                    || destination.rect != CGRect(
+                        x: 0, y: 0, width: 300, height: CGFloat(panelPixels)) {
+                    panelFailures.append(
+                        "panel:dest \(destination.destination) \(destination.rect)")
                 }
 
                 // Preview from the ACTUAL host view: mask exactly covered,
@@ -10182,19 +10186,20 @@ enum SelfTest {
                     var holes = 0, changed = 0
                     for py in 0..<shot.height {
                         for px in 0..<shot.width {
+                            // pixel CENTRE in points: half-open raster rule
                             let point = CGPoint(
-                                x: CGFloat(px) / backing,
-                                y: CGFloat(shot.height - 1 - py) / backing)
+                                x: (CGFloat(px) + 0.5) / backing,
+                                y: (CGFloat(shot.height - 1 - py) + 0.5) / backing)
                             let i = (py * shot.width + px) * 4
                             let value = Array(bytes[i..<(i + 4)])
-                            if maskInPoints.insetBy(dx: 1, dy: 1).contains(point) {
+                            // EVERY pixel is classified: its centre either
+                            // falls in the mask (exact cover) or it does not
+                            // (byte-identical baseline). No skipped band.
+                            if maskInPoints.contains(point) {
                                 if value != [31, 31, 31, 255] { holes += 1 }
-                            } else if !maskInPoints.insetBy(dx: -2, dy: -2)
-                                .contains(point) {
-                                if i + 4 <= baseBytes.count,
-                                   value != Array(baseBytes[i..<(i + 4)]) {
-                                    changed += 1
-                                }
+                            } else if i + 4 <= baseBytes.count,
+                                      value != Array(baseBytes[i..<(i + 4)]) {
+                                changed += 1
                             }
                         }
                     }
@@ -10210,24 +10215,70 @@ enum SelfTest {
                 // panel, the vector must be exact, and the panel dismisses
                 // ITSELF — a manual dismiss would hide a stuck terminal latch.
                 panelToasts = 0
-                panel.performActionForTesting(.copy)
+                let (_, retryEvents) = RenderTrace.capture(
+                    host: "scroll", path: "export"
+                ) {
+                    panel.performActionForTesting(.copy)
+                }
                 if panelCopies != 1 {
                     panelFailures.append("panel:retry-copies \(panelCopies)")
                 }
                 if panelToasts != 1 {
                     panelFailures.append("panel:retry-toasts \(panelToasts)")
                 }
-                if panelDeps.values.contains(where: { $0 != 0 }) {
+                // The production copy route legitimately records the capture;
+                // everything else must stay at zero.
+                let expectedPanelDeps = [
+                    "autoSave": 0, "saveAs": 0, "pin": 0, "ocr": 0,
+                    "openEditor": 0, "setLastCapture": 1,
+                    "setLastAreaRect": 0, "logEvent": 0,
+                ]
+                if panelDeps != expectedPanelDeps {
                     panelFailures.append("panel:retry-deps \(panelDeps)")
+                }
+                if panelExport?.cgImage.width != 300
+                    || panelExport?.cgImage.height != panelPixels {
+                    panelFailures.append("panel:retry-output")
+                }
+                let retryShape = retryEvents.map {
+                    "\($0.host)/\($0.path)/\($0.kind)"
+                }
+                if retryShape != [
+                    "scroll/export/destination", "scroll/export/regionalAttempt",
+                    "scroll/export/regionalMaterialized",
+                ] {
+                    panelFailures.append("panel:retry-seq \(retryShape)")
+                }
+                if let destination = retryEvents.first(where: {
+                    $0.kind == "destination"
+                }), destination.destination != "300x\(panelPixels)"
+                    || destination.rect != CGRect(
+                        x: 0, y: 0, width: 300, height: CGFloat(panelPixels)) {
+                    panelFailures.append(
+                        "panel:retry-dest \(destination.destination) \(destination.rect)")
+                }
+                if let materialized = retryEvents.first(where: {
+                    $0.kind == "regionalMaterialized"
+                }), materialized.rect != expectedRegion {
+                    panelFailures.append(
+                        "panel:retry-materialized \(materialized.rect)")
                 }
                 if ScrollResultPanel.current != nil {
                     panelFailures.append("panel:no-auto-dismiss")
                 }
                 if panel.isVisible { panelFailures.append("panel:still-visible") }
-                // A replay after the terminal action must be rejected.
+                // A replay after the terminal action must change NOTHING.
+                let frozenDeps = panelDeps
+                let frozenCopies = panelCopies
+                let frozenToasts = panelToasts
                 panel.performActionForTesting(.copy)
-                if panelCopies != 1 {
-                    panelFailures.append("panel:replay-accepted \(panelCopies)")
+                if panelCopies != frozenCopies || panelToasts != frozenToasts
+                    || panelDeps != frozenDeps {
+                    panelFailures.append(
+                        "panel:replay-accepted \(panelCopies) \(panelToasts) \(panelDeps)")
+                }
+                if ScrollResultPanel.current != nil || panel.isVisible {
+                    panelFailures.append("panel:replay-revived")
                 }
             }
             check("sliceB-scroll-host-failclosed",
@@ -10238,13 +10289,15 @@ enum SelfTest {
             //      a text redaction and registers its job yet. When the tool
             //      exists the gate drives the REAL host route on all three
             //      surfaces, so a correct GREEN2 turns it green.
-            final class ForwardingRepaintSpy: RedactionSurfaceDelegate {
+            final class ForwardingRepaintSpy: RedactionSurfaceDelegate,
+                                               RedactionHost {
                 var repaints = 0
                 weak var wrapped: RedactionSurfaceDelegate?
                 func surfaceNeedsRedactionRepaint() {
                     repaints += 1
                     wrapped?.surfaceNeedsRedactionRepaint()
                 }
+                func redactionDidChange() { surfaceNeedsRedactionRepaint() }
             }
             var lifecycleFailures: [String] = []
             let editorTextTool = EditorTool.allCases.first {
@@ -10381,6 +10434,11 @@ enum SelfTest {
                         name: "editor",
                         registryCount: { canvas.redactionRegistry.count },
                         installSpy: { spy in
+                            // The host must already have its own repaint
+                            // target; forwarding to nil would prove nothing.
+                            if canvas.redactionDelegate == nil {
+                                lifecycleFailures.append("editor:no-delegate")
+                            }
                             spy.wrapped = canvas.redactionDelegate
                             canvas.redactionDelegate = spy
                         },
@@ -10394,21 +10452,26 @@ enum SelfTest {
                     let frozen = CapturedImage(
                         cgImage: makeNoiseImage(width: 240, height: 180),
                         scale: 1)
-                    let overlay = SelectionOverlay(
+                    // Built through the production begin path so the view is
+                    // really owned by the overlay: a hand-made view is not
+                    // reachable from overlay.finish(), and the teardown
+                    // assertions would be meaningless.
+                    guard let overlay = SelectionOverlay.beginForTesting(
                         purpose: .areaReview,
                         inputs: OverlaySessionInputs(
                             afterShow: true, afterCopy: false, afterSave: false),
-                        completion: { _ in })
-                    overlay.routerDependenciesOverride =
-                        CaptureActionRouter.Dependencies(
+                        frozen: frozen, screen: hostScreen,
+                        dependencies: CaptureActionRouter.Dependencies(
                             copyToClipboard: { _ in }, autoSave: { _, _ in },
                             saveAs: { _, _ in }, pin: { _ in }, ocr: { _ in },
                             openEditor: { _ in }, toast: { _ in },
                             setLastCapture: { _ in },
-                            setLastAreaRect: { _ in }, logEvent: { _ in })
-                    let view = SelectionOverlayView(
-                        mode: .area, screen: hostScreen, frozen: frozen,
-                        windowList: [], owner: overlay)
+                            setLastAreaRect: { _ in }, logEvent: { _ in }),
+                        completion: { _ in }),
+                          let view = overlay.activeReviewViewForTesting else {
+                        lifecycleFailures.append("area:no-overlay")
+                        return
+                    }
                     view.selectForTesting(
                         rect: CGRect(x: 20, y: 20, width: 200, height: 140))
                     view.clickReviewToolbarButtonForTesting(
@@ -10476,7 +10539,11 @@ enum SelfTest {
                         y: min(from.y, to.y) * pixelsPerPoint,
                         width: abs(to.x - from.x) * pixelsPerPoint,
                         height: abs(to.y - from.y) * pixelsPerPoint)
-                    if abs(blur.rect.width - expected.width) > 2
+                    // Exact origin AND size: comparing only the size would
+                    // miss an offset or a flipped Y entirely.
+                    if abs(blur.rect.minX - expected.minX) > 2
+                        || abs(blur.rect.minY - expected.minY) > 2
+                        || abs(blur.rect.width - expected.width) > 2
                         || abs(blur.rect.height - expected.height) > 2 {
                         lifecycleFailures.append(
                             "scroll:mapping \(blur.rect) vs \(expected)")
@@ -10494,6 +10561,63 @@ enum SelfTest {
                         teardown: { panel.dismissForTesting() })
                 }
             }
+            // E12. The shared registry on the SUCCESS path: a resolved job
+            //      must remove its own entry through the completion observer,
+            //      apply the mask, repaint and leave nothing behind.
+            var registryFailures: [String] = []
+            MainActor.assumeIsolated {
+                let registry = RedactionJobRegistry()
+                let base = makeSolidImage(
+                    width: 80, height: 60, color: NSColor.white.cgColor)
+                let blur = BlurAnnotation(uiScale: 1)
+                blur.rect = CGRect(x: 10, y: 10, width: 40, height: 25)
+                let spy = ForwardingRepaintSpy()
+                let slotsBefore = SliceBRedactionJob.inFlight
+                SliceBOCR.recognizerForTesting = { _ in
+                    .success([
+                        RecognizedWord(
+                            rect: CGRect(x: 6, y: 6, width: 12, height: 8),
+                            confidence: 0.9),
+                    ])
+                }
+                guard let job = SliceBRedactionJob.start(
+                    blur: blur, base: base, host: spy) else {
+                    registryFailures.append("no-job")
+                    SliceBOCR.recognizerForTesting = nil
+                    return
+                }
+                registry.register(job, for: blur)
+                if registry.count != 1 { registryFailures.append("not-registered") }
+                let deadline = Date().addingTimeInterval(10)
+                while SliceBRedactionJob.inFlight > slotsBefore,
+                      Date() < deadline {
+                    RunLoop.current.run(until: Date().addingTimeInterval(0.02))
+                }
+                let expected = SliceBOCR.wordRects(base: base, region: blur.rect)
+                SliceBOCR.recognizerForTesting = nil
+                if case let .words(words) = blur.redactionState {
+                    if !expected.isEmpty && words != expected {
+                        registryFailures.append("mask \(words)")
+                    }
+                } else {
+                    registryFailures.append("state \(blur.redactionState)")
+                }
+                if registry.count != 0 { registryFailures.append("entry-leak") }
+                if SliceBRedactionJob.ownerCountForTesting != 0 {
+                    registryFailures.append("owner-leak")
+                }
+                if SliceBRedactionJob.inFlight != slotsBefore {
+                    registryFailures.append("slot-leak")
+                }
+                // one repaint for the immediate pending mask, one for the result
+                if spy.repaints != 2 {
+                    registryFailures.append("repaints \(spy.repaints)")
+                }
+            }
+            check("sliceB-registry-success-path",
+                  registryFailures.isEmpty,
+                  registryFailures.joined(separator: " | "))
+
             check("sliceB-text-redaction-lifecycle-wiring",
                   lifecycleFailures.isEmpty,
                   "GREEN2 wiring pending: "
