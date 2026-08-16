@@ -8524,21 +8524,59 @@ enum SelfTest {
                             if translate { spy.translate += 1 } else { spy.ocr += 1 }
                         })
                 let canvas = wc.canvasForTesting
+                // Every annotation kind, so each payload branch of the
+                // fingerprint is actually driven.
                 let blur = BlurAnnotation(uiScale: 1)
                 blur.rect = CGRect(x: 20, y: 20, width: 60, height: 40)
+                blur.redactionState = .words(
+                    [CGRect(x: 25, y: 25, width: 20, height: 12)])
                 let arrow = ShapeAnnotation(
                     kind: .arrow, start: CGPoint(x: 100, y: 100),
                     end: CGPoint(x: 150, y: 150), uiScale: 1)
-                canvas.annotations = [blur, arrow]
-                canvas.selectForTesting(arrow)
-                // Nonempty history AND redo stack, plus a live transient, so a
-                // fingerprint comparison cannot pass on empty/nil defaults.
+                let pen = PenAnnotation(uiScale: 1)
+                pen.points = [
+                    CGPoint(x: 10, y: 140), CGPoint(x: 20, y: 150),
+                    CGPoint(x: 30, y: 145),
+                ]
+                let text = TextAnnotation(uiScale: 1)
+                text.text = "committed"
+                text.origin = CGPoint(x: 120, y: 30)
+                let counter = CounterAnnotation(uiScale: 1)
+                counter.center = CGPoint(x: 170, y: 60)
+                counter.number = 3
+                let guide = GuideAnnotation(
+                    axis: .vertical, position: 90, length: 160, uiScale: 1)
+                let ruler = RulerAnnotation(
+                    span: EdgeRuler.Span(
+                        axis: .horizontal, start: 30, end: 90, cross: 70),
+                    uiScale: 1)
+                let spotlight = SpotlightAnnotation(uiScale: 1)
+                spotlight.rect = CGRect(x: 60, y: 60, width: 40, height: 30)
+                spotlight.baseBounds = CGRect(
+                    x: 0, y: 0, width: 200, height: 160)
+                let magnifier = MagnifierAnnotation(uiScale: 1)
+                magnifier.sourceRect = CGRect(x: 10, y: 10, width: 20, height: 20)
+                magnifier.calloutRect = CGRect(x: 150, y: 120, width: 40, height: 40)
+                magnifier.snapshot = makeSolidImage(
+                    width: 20, height: 20, color: NSColor.systemPink.cgColor)
+                canvas.annotations = [
+                    blur, arrow, pen, text, counter, guide, ruler,
+                    spotlight, magnifier,
+                ]
+                // TWO history mutations, then one undo: undo AND redo both
+                // non-empty. Selection is set AFTER the restore, which clears it.
                 canvas.registerUndoSnapshot()
-                canvas.annotations.append(
-                    CounterAnnotation(uiScale: 1))
+                canvas.annotations.append(CounterAnnotation(uiScale: 1))
+                canvas.registerUndoSnapshot()
+                canvas.annotations.append(CounterAnnotation(uiScale: 1))
                 canvas.undoManager?.undo()
-                canvas.beginRuler(.horizontal)
+                canvas.selectForTesting(canvas.annotations.first)
                 if seedEditing {
+                    // A ruler transient needs a live pointer; Esc would consume
+                    // the transient before reaching the terminal route, so only
+                    // the non-Esc fixtures carry one.
+                    canvas.notePointerForTesting(CGPoint(x: 60, y: 70))
+                    canvas.beginRuler(.horizontal)
                     wc.selectTool(.crop)
                     canvas.setCropSelectionForTesting(
                         CGRect(x: 10, y: 10, width: 80, height: 60))
@@ -8546,6 +8584,35 @@ enum SelfTest {
                     canvas.setPendingTextForTesting("pending value")
                 }
                 return (wc, canvas)
+            }
+
+            /// The seed must really be what the gate claims, or every
+            /// comparison below could pass on defaults.
+            func preflight(
+                _ canvas: EditorCanvasView, _ label: String, editing: Bool
+            ) {
+                var problems: [String] = []
+                if canvas.selectedIdentityForTesting == nil {
+                    problems.append("no-selection")
+                }
+                if canvas.undoManager?.canUndo != true { problems.append("no-undo") }
+                if canvas.undoManager?.canRedo != true { problems.append("no-redo") }
+                if canvas.annotations.count < 9 { problems.append("few-marks") }
+                if editing {
+                    if canvas.transientKindForTesting != "ruler" {
+                        problems.append("no-transient")
+                    }
+                    if canvas.editingTextIdentityForTesting == nil {
+                        problems.append("no-pending-text")
+                    }
+                    if !canvas.hasValidCropSelection { problems.append("no-crop") }
+                } else if canvas.transientKindForTesting != nil {
+                    problems.append("unexpected-transient")
+                }
+                if !problems.isEmpty {
+                    termFailures.append(
+                        label + ":seed " + problems.joined(separator: ","))
+                }
             }
 
             /// Esc goes through the REAL key path, not a direct call.
@@ -8595,7 +8662,11 @@ enum SelfTest {
                 let seedEditing = !name.hasPrefix("esc")
                 let spy = TerminalSpy()
                 let (wc, canvas) = makeSpiedEditor(spy, seedEditing: seedEditing)
+                preflight(canvas, name, editing: seedEditing)
                 let before = canvas.documentFingerprintForTesting
+                let beforeIds = canvas.annotationIdentitiesForTesting
+                let beforeSelected = canvas.selectedIdentityForTesting
+                let beforeEditing = canvas.editingTextIdentityForTesting
                 AnnotationRenderer.forceRegionalPixelateFailureForTesting = true
                 action(wc)
                 AnnotationRenderer.forceRegionalPixelateFailureForTesting = false
@@ -8608,6 +8679,11 @@ enum SelfTest {
                 if canvas.documentFingerprintForTesting != before {
                     termFailures.append(name + ":state")
                 }
+                if canvas.annotationIdentitiesForTesting != beforeIds
+                    || canvas.selectedIdentityForTesting != beforeSelected
+                    || canvas.editingTextIdentityForTesting != beforeEditing {
+                    termFailures.append(name + ":identity")
+                }
                 wc.window?.close()
 
                 // Healthy twin on the SAME complex seeded state: it must reach
@@ -8615,7 +8691,9 @@ enum SelfTest {
                 // "blocked" rather than "never wired" — including the
                 // prospective text/crop path.
                 let liveSpy = TerminalSpy()
-                let (liveWC, _) = makeSpiedEditor(liveSpy, seedEditing: seedEditing)
+                let (liveWC, liveCanvas) = makeSpiedEditor(
+                    liveSpy, seedEditing: seedEditing)
+                preflight(liveCanvas, name + "-live", editing: seedEditing)
                 action(liveWC)
                 var expectedVector = zeroVector
                 for (key, value) in expected { expectedVector[key] = value }

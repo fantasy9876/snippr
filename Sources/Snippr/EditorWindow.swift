@@ -1530,6 +1530,20 @@ final class EditorCanvasView: NSView {
             width: pixels.width / pxScale, height: pixels.height / pxScale))
     }
 
+    /// Reference identity of every mark, in order. Compared as references, not
+    /// hashes: two different objects can share a hash.
+    var annotationIdentitiesForTesting: [ObjectIdentifier] {
+        annotations.map { ObjectIdentifier($0) }
+    }
+
+    var selectedIdentityForTesting: ObjectIdentifier? {
+        selected.map { ObjectIdentifier($0) }
+    }
+
+    var editingTextIdentityForTesting: ObjectIdentifier? {
+        editingTextAnnotation.map { ObjectIdentifier($0) }
+    }
+
     /// Everything a terminal action must leave untouched when export fails.
     /// Deliberately deep: payload and ORDER of every mark, the identity of the
     /// selected one, the exact crop, the pending text's value/frame/style, the
@@ -1541,7 +1555,6 @@ final class EditorCanvasView: NSView {
             } ?? "?"
             var parts = [
                 "\(type(of: a))",
-                "id=\(UInt(bitPattern: ObjectIdentifier(a).hashValue))",
                 "b=\(a.bounds)",
                 "rgba=\(rgba)",
                 "w=\(a.strokeWidthPt)",
@@ -1567,7 +1580,8 @@ final class EditorCanvasView: NSView {
             case let guide as GuideAnnotation:
                 parts.append("axis=\(guide.axis) pos=\(guide.position) len=\(guide.length)")
             case let ruler as RulerAnnotation:
-                parts.append("span=\(ruler.span.start)->\(ruler.span.end)")
+                parts.append(
+                    "axis=\(ruler.span.axis) cross=\(ruler.span.cross) span=\(ruler.span.start)->\(ruler.span.end) len=\(ruler.span.length)")
             default:
                 break
             }
@@ -1577,9 +1591,9 @@ final class EditorCanvasView: NSView {
         let selectedIndex = selected.flatMap { sel in
             annotations.firstIndex { $0 === sel }
         }
-        let selectedIdentity = selected.map {
-            "\(UInt(bitPattern: ObjectIdentifier($0).hashValue))"
-        } ?? "nil"
+        // Identity is compared as references elsewhere; the string only needs
+        // to say WHICH mark, so a positional index is enough here and cannot
+        // collide the way a hash can.
         let pendingText = textField.map {
             "value=\($0.stringValue) frame=\($0.frame) font=\($0.font?.pointSize ?? -1) backing=\(editingTextAnnotation.map { "\($0.origin)/\($0.fontSizePt)" } ?? "nil")"
         } ?? "none"
@@ -1591,7 +1605,6 @@ final class EditorCanvasView: NSView {
             "cropValid=\(hasValidCropSelection)",
             "text=[\(pendingText)]",
             "selIdx=\(selectedIndex.map(String.init) ?? "nil")",
-            "selId=\(selectedIdentity)",
             "undo=\(undoManager?.canUndo == true)",
             "redo=\(undoManager?.canRedo == true)",
             "history=\(historyMutationCountForTesting)",
