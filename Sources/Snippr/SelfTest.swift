@@ -9385,6 +9385,20 @@ enum SelfTest {
                 canvas.selectForTesting(blur)
                 canvas.setTransientGuideForTesting(
                     axis: .vertical, position: 60)
+                // One real edit first, so `undo` is already true: otherwise
+                // the first legitimate preset change flips that flag too and
+                // the expected delta below would have to allow it, which makes
+                // the delta weaker rather than stronger.
+                //
+                // In its OWN group. NSUndoManager coalesces by event, so the
+                // seed and the preset change would land in one group and a
+                // single undo would revert both — the gate would then be
+                // measuring the fixture, not the feature.
+                let previousGrouping = canvas.undoManager?.groupsByEvent ?? true
+                canvas.undoManager?.groupsByEvent = false
+                canvas.undoManager?.beginUndoGrouping()
+                canvas.registerUndoSnapshot()
+                canvas.undoManager?.endUndoGrouping()
                 let toolBefore = canvas.currentTool
                 let historyBefore = canvas.historyMutationCountForTesting
                 let fingerprintBefore = canvas.documentFingerprintForTesting
@@ -9417,7 +9431,9 @@ enum SelfTest {
                 }
                 if let mintIndex = menu.items.firstIndex(
                     where: { $0.tag == presets.firstIndex(of: .mint) }) {
+                    canvas.undoManager?.beginUndoGrouping()
                     menu.performActionForItem(at: mintIndex)
+                    canvas.undoManager?.endUndoGrouping()
                 } else {
                     applyFailures.append("menu-mint-missing")
                 }
@@ -9433,24 +9449,53 @@ enum SelfTest {
                     || !canvas.hasValidCropSelection {
                     applyFailures.append("menu-side-effects")
                 }
-                if canvas.documentFingerprintForTesting
-                    != fingerprintBefore.replacingOccurrences(
-                        of: "backdrop=none", with: "backdrop=mint")
-                        .replacingOccurrences(
-                            of: "outer=none", with: "outer=160x140")
-                        .replacingOccurrences(
-                            of: "history=\(historyBefore)",
-                            with: "history=\(historyBefore + 1)") {
+                // Every field is compared; the deltas are named one by one and
+                // each substitution must actually apply, so a field that
+                // disappears from the fingerprint cannot pass as a no-op.
+                func expected(
+                    from base: String, _ edits: [(String, String)],
+                    _ label: String
+                ) -> String {
+                    var out = base
+                    for (from, to) in edits {
+                        guard out.contains(from) else {
+                            applyFailures.append("\(label)-missing(\(from))")
+                            continue
+                        }
+                        out = out.replacingOccurrences(of: from, with: to)
+                    }
+                    return out
+                }
+                let afterApply = expected(from: fingerprintBefore, [
+                    ("backdrop=none", "backdrop=mint"),
+                    ("outer=none", "outer=160x140"),
+                    ("history=\(historyBefore)", "history=\(historyBefore + 1)"),
+                ], "menu-apply")
+                if canvas.documentFingerprintForTesting != afterApply {
                     applyFailures.append(
-                        "menu-fingerprint " + canvas.documentFingerprintForTesting)
+                        "menu-fingerprint "
+                        + canvas.documentFingerprintForTesting)
                 }
                 canvas.undoManager?.undo()
+                // Undo restores the preset and registers its own inverse, so
+                // history moves again and redo becomes available. Nothing else
+                // may differ from the state before the menu was ever opened.
+                let afterUndo = expected(from: fingerprintBefore, [
+                    ("history=\(historyBefore)", "history=\(historyBefore + 2)"),
+                    ("redo=false", "redo=true"),
+                ], "menu-undo")
+                if canvas.documentFingerprintForTesting != afterUndo {
+                    applyFailures.append(
+                        "menu-undo-fingerprint "
+                        + canvas.documentFingerprintForTesting)
+                }
                 if canvas.backdropPresetForTesting != .none
                     || canvas.currentTool != toolBefore
                     || canvas.selectedRefForTesting !== selectionBefore
                     || canvas.transientDescriptionForTesting != transientBefore {
                     applyFailures.append("menu-undo")
                 }
+                canvas.undoManager?.groupsByEvent = previousGrouping
 
                 // A different preset is exactly one history entry; the same one
                 // is none at all.
