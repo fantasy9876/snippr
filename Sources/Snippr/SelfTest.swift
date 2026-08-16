@@ -8621,20 +8621,24 @@ enum SelfTest {
             ) {
                 var problems: [String] = []
                 let marks = canvas.annotationRefsForTesting
-                let census: [(String, Int)] = [
-                    ("Blur", marks.filter { $0 is BlurAnnotation }.count),
-                    ("Shape", marks.filter { $0 is ShapeAnnotation }.count),
-                    ("Pen", marks.filter { $0 is PenAnnotation }.count),
-                    ("Text", marks.filter { $0 is TextAnnotation }.count),
-                    ("Counter", marks.filter { $0 is CounterAnnotation }.count),
-                    ("Guide", marks.filter { $0 is GuideAnnotation }.count),
-                    ("Ruler", marks.filter { $0 is RulerAnnotation }.count),
-                    ("Spotlight", marks.filter { $0 is SpotlightAnnotation }.count),
-                    ("Magnifier", marks.filter { $0 is MagnifierAnnotation }.count),
+                // EXACT census. `>= 1` would let a duplicate or a stray extra
+                // mark through. After the seed's two snapshots and one undo the
+                // canvas holds ten marks, two of them counters.
+                let census: [(String, Int, Int)] = [
+                    ("Blur", marks.filter { $0 is BlurAnnotation }.count, 1),
+                    ("Shape", marks.filter { $0 is ShapeAnnotation }.count, 1),
+                    ("Pen", marks.filter { $0 is PenAnnotation }.count, 1),
+                    ("Text", marks.filter { $0 is TextAnnotation }.count, 1),
+                    ("Counter", marks.filter { $0 is CounterAnnotation }.count, 2),
+                    ("Guide", marks.filter { $0 is GuideAnnotation }.count, 1),
+                    ("Ruler", marks.filter { $0 is RulerAnnotation }.count, 1),
+                    ("Spotlight", marks.filter { $0 is SpotlightAnnotation }.count, 1),
+                    ("Magnifier", marks.filter { $0 is MagnifierAnnotation }.count, 1),
                 ]
-                for (name, count) in census where count < 1 {
-                    problems.append("missing-\(name)")
+                for (name, count, expected) in census where count != expected {
+                    problems.append("census-\(name)=\(count)")
                 }
+                if marks.count != 10 { problems.append("total=\(marks.count)") }
                 // Non-default sentinels: a reset to defaults must be visible.
                 if let blur = marks.compactMap({ $0 as? BlurAnnotation }).first {
                     if case .words = blur.redactionState {} else {
@@ -8649,10 +8653,7 @@ enum SelfTest {
                    pen.points.count < 3 {
                     problems.append("pen-points")
                 }
-                if let counter = marks.compactMap({ $0 as? CounterAnnotation }).first,
-                   counter.number == 1 {
-                    problems.append("counter-default")
-                }
+
                 if let spot = marks.compactMap({ $0 as? SpotlightAnnotation }).first,
                    abs(spot.dimFraction - 0.6) < 0.001 {
                     problems.append("spotlight-default-dim")
@@ -8661,10 +8662,30 @@ enum SelfTest {
                    mag.snapshot == nil {
                     problems.append("magnifier-no-snapshot")
                 }
-                if marks.contains(where: {
-                    ($0.color.usingColorSpace(.sRGB)?.alphaComponent ?? 1) < 1
-                }) == false, marks.allSatisfy({ $0.strokeWidthPt == 3 }) {
-                    problems.append("all-default-stroke")
+                // Independent sentinels. The old compound condition could
+                // never fire: one translucent text mark satisfied it no matter
+                // what happened to the pen's width.
+                if let pen = marks.compactMap({ $0 as? PenAnnotation }).first,
+                   abs(pen.strokeWidthPt - 5) > 0.01 {
+                    problems.append("pen-width=\(pen.strokeWidthPt)")
+                }
+                if let text = marks.compactMap({ $0 as? TextAnnotation }).first {
+                    if abs(text.fontSizePt - 22) > 0.01 {
+                        problems.append("text-size=\(text.fontSizePt)")
+                    }
+                    let alpha = text.color.usingColorSpace(.sRGB)?
+                        .alphaComponent ?? 1
+                    if abs(alpha - 0.8) > 0.05 {
+                        problems.append("text-alpha=\(alpha)")
+                    }
+                }
+                if let ruler = marks.compactMap({ $0 as? RulerAnnotation }).first,
+                   abs(ruler.strokeWidthPt - 1) > 0.01 {
+                    problems.append("ruler-width=\(ruler.strokeWidthPt)")
+                }
+                if let counter = marks.compactMap({ $0 as? CounterAnnotation }).first,
+                   counter.number != 3 {
+                    problems.append("counter-number=\(counter.number)")
                 }
                 if canvas.selectedRefForTesting == nil {
                     problems.append("no-selection")
@@ -8699,14 +8720,17 @@ enum SelfTest {
                 } else {
                     // Esc fixtures: the cancel-route state must be ABSENT, or
                     // Esc would consume it instead of running the terminal path.
+                    // keyDown routes on isEditingText and currentTool == .crop,
+                    // NOT on "is there a backing annotation" — assert the very
+                    // predicates production uses.
+                    if canvas.isEditingTextForTesting {
+                        problems.append("still-editing-text")
+                    }
+                    if canvas.currentTool == .crop {
+                        problems.append("still-crop-tool")
+                    }
                     if canvas.transientKindForTesting != nil {
                         problems.append("unexpected-transient")
-                    }
-                    if canvas.editingTextRefForTesting != nil {
-                        problems.append("unexpected-pending-text")
-                    }
-                    if canvas.hasValidCropSelection {
-                        problems.append("unexpected-crop")
                     }
                 }
                 if !problems.isEmpty {

@@ -1545,6 +1545,10 @@ final class EditorCanvasView: NSView {
     var selectedRefForTesting: Annotation? { selected }
     var editingTextRefForTesting: TextAnnotation? { editingTextAnnotation }
 
+    /// The exact predicate `keyDown` routes on, so a preflight cannot assert a
+    /// near-miss (a backing annotation without first responder, say).
+    var isEditingTextForTesting: Bool { isEditingText }
+
     /// Style actually installed on the live field, so a preflight can prove the
     /// pending edit is not sitting at production defaults.
     var pendingTextFieldStyleForTesting: String {
