@@ -9124,14 +9124,58 @@ enum SelfTest {
                         buttons.map { ($0.tool.rawValue, $0.button, toolRow) }
                         + actions.map { ($0.name, $0.button, actionRow) }
                         + chrome.map { ($0.0, $0.1, actionRow) }
+                    // Arranged membership and visual order: `superview` alone
+                    // does not say a view is arranged by the stack, nor where.
+                    if stack.arrangedSubviews.count != 2
+                        || stack.arrangedSubviews.first !== actionRow
+                        || stack.arrangedSubviews.last !== toolRow {
+                        toolbarFailures.append("\(phase):stack-order")
+                    }
+                    let arrangedTools = toolRow.arrangedSubviews
+                        .compactMap { view in
+                            buttons.first { $0.button === view }?.tool
+                        }
+                    if arrangedTools != EditorTool.allCases {
+                        toolbarFailures.append(
+                            "\(phase):tool-order \(arrangedTools.count)")
+                    }
+                    let arrangedActions = actionRow.arrangedSubviews
+                        .compactMap { view in
+                            actions.first { $0.button === view }?.name
+                        }
+                    if arrangedActions != actions.map(\.name) {
+                        toolbarFailures.append("\(phase):action-order")
+                    }
                     for (name, view, row) in members {
                         if view.superview !== row {
                             toolbarFailures.append("\(phase):\(name)-parent")
+                        }
+                        if !row.arrangedSubviews.contains(where: { $0 === view }) {
+                            toolbarFailures.append("\(phase):\(name)-arranged")
                         }
                         if view.isHidden || view.frame.width <= 0
                             || view.frame.height <= 0 {
                             toolbarFailures.append("\(phase):\(name)-hidden")
                             continue
+                        }
+                        // Not merely positive: an icon button squeezed to a
+                        // point would satisfy that while denying the very
+                        // reason there are two rows.
+                        if let control = view as? NSControl, !control.isEnabled {
+                            toolbarFailures.append("\(phase):\(name)-disabled")
+                        }
+                        if view is NSButton {
+                            if abs(view.frame.width - 30) > 0.5
+                                || abs(view.frame.height - 28) > 0.5 {
+                                toolbarFailures.append(
+                                    "\(phase):\(name)-size \(view.frame.size)")
+                            }
+                        } else if view === wc.colorWellForTesting {
+                            if abs(view.frame.width - 28) > 0.5
+                                || abs(view.frame.height - 24) > 0.5 {
+                                toolbarFailures.append(
+                                    "\(phase):\(name)-size \(view.frame.size)")
+                            }
                         }
                         if view.hasAmbiguousLayout {
                             toolbarFailures.append("\(phase):\(name)-ambiguous")
@@ -9157,12 +9201,44 @@ enum SelfTest {
                         let centre = CGPoint(
                             x: view.bounds.midX, y: view.bounds.midY)
                         let hit = content.hitTest(view.convert(centre, to: host))
-                        if hit !== view && hit?.isDescendant(of: view) != true {
+                        // A button must answer for ITSELF: a child sitting on
+                        // top of it would swallow the click while still being
+                        // a descendant. Only composite chrome — a colour well
+                        // draws through a subview — may answer with one.
+                        let reachable = view is NSButton
+                            ? hit === view
+                            : (hit === view
+                                || hit?.isDescendant(of: view) == true)
+                        if !reachable {
                             toolbarFailures.append("\(phase):\(name)-hit")
                         }
                     }
-                    // Disjoint WITHIN each row. The two rows overlap in x by
-                    // design, so that is not asked of them.
+                    // Rows tile the bar: same width as the stack, the stack
+                    // filling the bar, the bar filling the content width, and
+                    // the two rows not colliding. x overlap is by design; a
+                    // rect intersection needs BOTH axes, so asking for it
+                    // across the rows catches a vertical collision the earlier
+                    // wording waved away.
+                    if abs(bar.frame.width - content.bounds.width) > 0.5
+                        || abs(bar.frame.maxY - content.bounds.maxY) > 0.5 {
+                        toolbarFailures.append("\(phase):bar-frame")
+                    }
+                    if abs(stack.frame.width - bar.bounds.width) > 0.5
+                        || abs(stack.frame.height - bar.bounds.height) > 0.5 {
+                        toolbarFailures.append("\(phase):stack-frame")
+                    }
+                    if abs(toolRow.frame.width - stack.bounds.width) > 0.5
+                        || abs(actionRow.frame.width - stack.bounds.width) > 0.5 {
+                        toolbarFailures.append("\(phase):row-width")
+                    }
+                    if toolRow.frame.intersects(actionRow.frame) {
+                        toolbarFailures.append("\(phase):rows-collide")
+                    }
+                    if abs(toolRow.frame.height + actionRow.frame.height
+                            - stack.bounds.height) > 0.5 {
+                        toolbarFailures.append("\(phase):rows-do-not-tile")
+                    }
+                    // Disjoint WITHIN each row.
                     for row in [toolRow, actionRow] {
                         let frames = members
                             .filter { $0.2 === row && !$0.1.isHidden }
@@ -9260,7 +9336,7 @@ enum SelfTest {
                 // just the first one.
                 window.setContentSize(NSSize(width: 900, height: 600))
                 content.layoutSubtreeIfNeeded()
-                if content.bounds.width < 899 {
+                if abs(content.bounds.width - 900) > 0.5 {
                     toolbarFailures.append("no-expand \(content.bounds.width)")
                 }
                 verifyLayout("wide")
