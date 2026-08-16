@@ -9067,7 +9067,9 @@ enum SelfTest {
                       let actionRow = stack.arrangedSubviews.first
                         as? NSStackView,
                       let bar = stack.superview,
-                      let window = wc.window
+                      let window = wc.window,
+                      let content = window.contentView,
+                      let host = content.superview
                 else {
                     toolbarFailures.append("hierarchy")
                     return
@@ -9077,130 +9079,6 @@ enum SelfTest {
                     toolbarFailures.append(
                         "rows \(stack.arrangedSubviews.count)")
                 }
-                // setContentSize, not setFrame: a frame is applied verbatim
-                // and would sail past the minimum this is asking about.
-                window.setContentSize(NSSize(width: 200, height: 300))
-                window.contentView?.layoutSubtreeIfNeeded()
-                let width = window.contentView?.bounds.width ?? 0
-                if abs(width - 560) > 0.5 {
-                    toolbarFailures.append("min-width \(width)")
-                }
-                func verifyLayout(_ phase: String) {
-                    for (name, view) in [
-                        ("bar", bar), ("stack", stack as NSView),
-                        ("toolRow", toolRow as NSView),
-                        ("actionRow", actionRow as NSView),
-                    ] where view.hasAmbiguousLayout {
-                        toolbarFailures.append("\(phase)-\(name):ambiguous")
-                    }
-                    let frames = buttons.map {
-                        ($0.tool.rawValue, $0.button.convert(
-                            $0.button.bounds, to: toolRow))
-                    }
-                    for i in frames.indices {
-                        let frame = frames[i].1
-                        if frame.minX < -0.5
-                            || frame.maxX > toolRow.bounds.width + 0.5
-                            || frame.minY < -0.5
-                            || frame.maxY > toolRow.bounds.height + 0.5 {
-                            toolbarFailures.append(
-                                "\(phase)-\(frames[i].0):row")
-                        }
-                        for j in frames.indices where j > i {
-                            if frame.intersects(frames[j].1) {
-                                toolbarFailures.append(
-                                    "\(phase)-overlap \(frames[i].0)/"
-                                    + "\(frames[j].0)")
-                            }
-                        }
-                    }
-                }
-
-                // Two rows of equal height inside a 70 pt bar.
-                if abs(toolRow.frame.height - 35) > 0.5
-                    || abs(actionRow.frame.height - 35) > 0.5
-                    || abs(bar.frame.height - 70) > 0.5 {
-                    toolbarFailures.append(
-                        "row-heights \(actionRow.frame.height)/"
-                        + "\(toolRow.frame.height)/\(bar.frame.height)")
-                }
-                for (tool, button) in buttons {
-                    let inBar = button.convert(button.bounds, to: bar)
-                    if inBar.minX < -0.5 || inBar.maxX > bar.bounds.width + 0.5
-                        || inBar.minY < -0.5
-                        || inBar.maxY > bar.bounds.height + 0.5 {
-                        toolbarFailures.append("\(tool.rawValue):outside")
-                    }
-                    // A real label, not the symbol name echoed back.
-                    let label = button.accessibilityLabel() ?? ""
-                    if label != tool.tooltip {
-                        toolbarFailures.append(
-                            "\(tool.rawValue):label(\(label))")
-                    }
-                    // Exact wiring, not merely present: the identifier is
-                    // what toolTapped reads back to find the tool, and
-                    // Backdrop deliberately routes elsewhere.
-                    if button.identifier?.rawValue != tool.rawValue {
-                        toolbarFailures.append(
-                            "\(tool.rawValue):identifier")
-                    }
-                    let expectedSelector = tool == .backdrop
-                        ? NSSelectorFromString("showBackdropMenu:")
-                        : NSSelectorFromString("toolTapped:")
-                    if button.target !== wc || button.action != expectedSelector {
-                        toolbarFailures.append("\(tool.rawValue):action")
-                    }
-                    // The centre of every button belongs to that button, asked
-                    // through the WHOLE hierarchy rather than within the bar.
-                    // `hitTest` takes a point in the RECEIVER'S SUPERVIEW
-                    // space, so the point is converted into the content view's
-                    // parent — passing a receiver-local point would be wrong
-                    // for any view whose frame origin is not zero.
-                    let centre = CGPoint(
-                        x: button.bounds.midX, y: button.bounds.midY)
-                    if let content = window.contentView,
-                       let host = content.superview {
-                        let inHost = button.convert(centre, to: host)
-                        if content.hitTest(inHost) !== button {
-                            toolbarFailures.append("\(tool.rawValue):hit")
-                        }
-                    } else {
-                        toolbarFailures.append("\(tool.rawValue):no-content")
-                    }
-                }
-                // No two buttons may overlap.
-                let frames = buttons.map {
-                    ($0.tool, $0.button.convert($0.button.bounds, to: bar))
-                }
-                for i in frames.indices {
-                    for j in frames.indices where j > i {
-                        if frames[i].1.intersects(frames[j].1) {
-                            toolbarFailures.append(
-                                "overlap \(frames[i].0.rawValue)/"
-                                + "\(frames[j].0.rawValue)")
-                        }
-                    }
-                }
-                // A real click on a NON-Backdrop tool must select it: target
-                // and action being non-nil says they exist, not that they
-                // work. Backdrop, the terminal actions and the size badge are
-                // left alone — their menus run nested event loops.
-                let sentinel = EditorTool.rect
-                wc.selectTool(.select)
-                if let button = buttons.first(where: { $0.tool == sentinel })?
-                    .button {
-                    button.performClick(nil)
-                    if wc.canvasForTesting.currentTool != sentinel {
-                        toolbarFailures.append(
-                            "click \(wc.canvasForTesting.currentTool.rawValue)")
-                    }
-                } else {
-                    toolbarFailures.append("no-sentinel")
-                }
-                // The action row, by identity rather than by counting whatever
-                // happens to be visible: separators, spacers and padding would
-                // keep that count healthy while all five terminal buttons were
-                // hidden.
                 let actions = wc.actionButtonsForTesting
                 let expectedActions = [
                     ("copy", "Copy (⌘C)"), ("save", "Save (⌘S)"),
@@ -9216,91 +9094,118 @@ enum SelfTest {
                     ("sizeBadge", wc.sizeBadgeForTesting),
                     ("zoom", wc.zoomLabelForTesting),
                 ]
-                if wc.colorWellForTesting.target !== wc
-                    || wc.colorWellForTesting.action
-                        != NSSelectorFromString("colorChanged") {
-                    toolbarFailures.append("colorWell:action")
-                }
-                if wc.sizeBadgeForTesting.target !== wc
-                    || wc.sizeBadgeForTesting.action
-                        != NSSelectorFromString("sizeBadgeClicked") {
-                    toolbarFailures.append("sizeBadge:action")
-                }
-                // Nothing in the bar may be laid out ambiguously: an ambiguous
-                // frame can look right in one run and move in the next.
-                for (name, view) in [
-                    ("bar", bar), ("stack", stack as NSView),
-                    ("toolRow", toolRow as NSView),
-                    ("actionRow", actionRow as NSView),
-                ] where view.hasAmbiguousLayout {
-                    toolbarFailures.append("\(name):ambiguous")
-                }
-                // Action-row members: contained in THEIR row, and disjoint
-                // from each other. The two rows overlap in x by design, so
-                // that is not asked of them.
-                let actionFrames = (actions.map { ($0.name, $0.button as NSView) }
-                    + chrome).map {
-                    ($0.0, $0.1.convert($0.1.bounds, to: actionRow))
-                }
-                for i in actionFrames.indices {
-                    let frame = actionFrames[i].1
-                    if frame.minX < -0.5
-                        || frame.maxX > actionRow.bounds.width + 0.5
-                        || frame.minY < -0.5
-                        || frame.maxY > actionRow.bounds.height + 0.5 {
+
+                // ONE verifier over the LIVE hierarchy, run at both sizes.
+                // Everything geometric is re-asked after the resize, because a
+                // control can be fine at one width and overflow, overlap or go
+                // dead at another.
+                func verifyLayout(_ phase: String) {
+                    content.layoutSubtreeIfNeeded()
+                    // Rows and bar.
+                    if abs(toolRow.frame.height - 35) > 0.5
+                        || abs(actionRow.frame.height - 35) > 0.5
+                        || abs(bar.frame.height - 70) > 0.5 {
                         toolbarFailures.append(
-                            "\(actionFrames[i].0):row-containment")
+                            "\(phase):row-heights \(actionRow.frame.height)/"
+                            + "\(toolRow.frame.height)/\(bar.frame.height)")
                     }
-                    for j in actionFrames.indices where j > i {
-                        if frame.intersects(actionFrames[j].1) {
-                            toolbarFailures.append(
-                                "overlap \(actionFrames[i].0)/"
-                                + "\(actionFrames[j].0)")
+                    for (name, view) in [
+                        ("bar", bar), ("stack", stack as NSView),
+                        ("toolRow", toolRow as NSView),
+                        ("actionRow", actionRow as NSView),
+                    ] where view.hasAmbiguousLayout {
+                        toolbarFailures.append("\(phase):\(name)-ambiguous")
+                    }
+                    // Every exposed control: it belongs to its row DIRECTLY —
+                    // coordinates alone would let a reparented or nested view
+                    // pass — is inside that row and inside the bar, has a real
+                    // frame, is not ambiguous, and answers a hit at its centre.
+                    let members: [(String, NSView, NSStackView)] =
+                        buttons.map { ($0.tool.rawValue, $0.button, toolRow) }
+                        + actions.map { ($0.name, $0.button, actionRow) }
+                        + chrome.map { ($0.0, $0.1, actionRow) }
+                    for (name, view, row) in members {
+                        if view.superview !== row {
+                            toolbarFailures.append("\(phase):\(name)-parent")
                         }
-                    }
-                }
-                // Tools are contained in the TOOL row specifically.
-                for (tool, button) in buttons {
-                    let inRow = button.convert(button.bounds, to: toolRow)
-                    if inRow.minX < -0.5
-                        || inRow.maxX > toolRow.bounds.width + 0.5
-                        || inRow.minY < -0.5
-                        || inRow.maxY > toolRow.bounds.height + 0.5 {
-                        toolbarFailures.append(
-                            "\(tool.rawValue):row-containment")
-                    }
-                    if button.hasAmbiguousLayout {
-                        toolbarFailures.append("\(tool.rawValue):ambiguous")
-                    }
-                }
-                for (name, view) in actions.map({ ($0.name, $0.button as NSView) })
-                    + chrome {
-                    if view.isHidden || view.frame.width <= 0
-                        || view.frame.height <= 0 {
-                        toolbarFailures.append("\(name):hidden")
-                        continue
-                    }
-                    let inBar = view.convert(view.bounds, to: bar)
-                    if inBar.minX < -0.5 || inBar.maxX > bar.bounds.width + 0.5
-                        || inBar.minY < -0.5
-                        || inBar.maxY > bar.bounds.height + 0.5 {
-                        toolbarFailures.append("\(name):outside \(inBar)")
-                    }
-                    if let content = window.contentView,
-                       let host = content.superview {
+                        if view.isHidden || view.frame.width <= 0
+                            || view.frame.height <= 0 {
+                            toolbarFailures.append("\(phase):\(name)-hidden")
+                            continue
+                        }
+                        if view.hasAmbiguousLayout {
+                            toolbarFailures.append("\(phase):\(name)-ambiguous")
+                        }
+                        let inRow = view.convert(view.bounds, to: row)
+                        if inRow.minX < -0.5
+                            || inRow.maxX > row.bounds.width + 0.5
+                            || inRow.minY < -0.5
+                            || inRow.maxY > row.bounds.height + 0.5 {
+                            toolbarFailures.append("\(phase):\(name)-row")
+                        }
+                        let inBar = view.convert(view.bounds, to: bar)
+                        if inBar.minX < -0.5
+                            || inBar.maxX > bar.bounds.width + 0.5
+                            || inBar.minY < -0.5
+                            || inBar.maxY > bar.bounds.height + 0.5 {
+                            toolbarFailures.append("\(phase):\(name)-bar")
+                        }
+                        // hitTest takes a point in the RECEIVER'S superview
+                        // space, so the centre is converted into the content
+                        // view's parent. The chrome may answer with a subview
+                        // of its own, which still counts as reachable.
                         let centre = CGPoint(
                             x: view.bounds.midX, y: view.bounds.midY)
                         let hit = content.hitTest(view.convert(centre, to: host))
-                        // The chrome may hit a subview of itself (a colour
-                        // well draws through one), so reaching the control or
-                        // anything inside it counts.
                         if hit !== view && hit?.isDescendant(of: view) != true {
-                            toolbarFailures.append("\(name):hit")
+                            toolbarFailures.append("\(phase):\(name)-hit")
+                        }
+                    }
+                    // Disjoint WITHIN each row. The two rows overlap in x by
+                    // design, so that is not asked of them.
+                    for row in [toolRow, actionRow] {
+                        let frames = members
+                            .filter { $0.2 === row && !$0.1.isHidden }
+                            .map { ($0.0, $0.1.convert($0.1.bounds, to: row)) }
+                        for i in frames.indices {
+                            for j in frames.indices where j > i
+                                && frames[i].1.intersects(frames[j].1) {
+                                toolbarFailures.append(
+                                    "\(phase):overlap \(frames[i].0)/"
+                                    + "\(frames[j].0)")
+                            }
                         }
                     }
                 }
-                // Exact wiring on the five terminal buttons: same target as
-                // the tools, the action each one claims, and its own label.
+
+                // setContentSize, not setFrame: a frame is applied verbatim
+                // and would sail past the minimum this is asking about.
+                window.setContentSize(NSSize(width: 200, height: 300))
+                content.layoutSubtreeIfNeeded()
+                let width = content.bounds.width
+                if abs(width - 560) > 0.5 {
+                    toolbarFailures.append("min-width \(width)")
+                }
+                verifyLayout("min")
+
+                // Wiring is asked once: a resize does not change it.
+                for (tool, button) in buttons {
+                    if button.identifier?.rawValue != tool.rawValue {
+                        toolbarFailures.append("\(tool.rawValue):identifier")
+                    }
+                    let expectedSelector = tool == .backdrop
+                        ? NSSelectorFromString("showBackdropMenu:")
+                        : NSSelectorFromString("toolTapped:")
+                    if button.target !== wc
+                        || button.action != expectedSelector {
+                        toolbarFailures.append("\(tool.rawValue):action")
+                    }
+                    let label = button.accessibilityLabel() ?? ""
+                    if label != tool.tooltip {
+                        toolbarFailures.append(
+                            "\(tool.rawValue):label(\(label))")
+                    }
+                }
                 for ((name, tooltip), pair) in zip(expectedActions, actions) {
                     let button = pair.button
                     if button.target !== wc {
@@ -9323,30 +9228,67 @@ enum SelfTest {
                         toolbarFailures.append("\(name):image")
                     }
                 }
-                // And the tools carry the same target, so all twenty icon
-                // buttons are pinned by identity rather than by non-nil.
-                for (tool, button) in buttons where button.target !== wc {
-                    toolbarFailures.append("\(tool.rawValue):target")
+                if wc.colorWellForTesting.target !== wc
+                    || wc.colorWellForTesting.action
+                        != NSSelectorFromString("colorChanged") {
+                    toolbarFailures.append("colorWell:action")
                 }
-                // Re-expanding must not rebuild anything: same objects, same
-                // rows, still laid out.
+                if wc.sizeBadgeForTesting.target !== wc
+                    || wc.sizeBadgeForTesting.action
+                        != NSSelectorFromString("sizeBadgeClicked") {
+                    toolbarFailures.append("sizeBadge:action")
+                }
+                // A real click on a NON-Backdrop tool must select it: target
+                // and action being right says the wiring exists, not that it
+                // works. Backdrop, the terminal actions and the size badge are
+                // left alone — their menus run nested event loops.
+                let sentinel = EditorTool.rect
+                wc.selectTool(.select)
+                if let button = buttons.first(where: { $0.tool == sentinel })?
+                    .button {
+                    button.performClick(nil)
+                    if wc.canvasForTesting.currentTool != sentinel {
+                        toolbarFailures.append(
+                            "click \(wc.canvasForTesting.currentTool.rawValue)")
+                    }
+                } else {
+                    toolbarFailures.append("no-sentinel")
+                }
+
+                // Re-expand: the same geometry, hit and hierarchy questions,
+                // and every control re-acquired by identity and parent — not
+                // just the first one.
                 window.setContentSize(NSSize(width: 900, height: 600))
-                window.contentView?.layoutSubtreeIfNeeded()
-                // The whole verifier again at the larger size: re-expanding
-                // must not leave anything overlapping, out of its row, or
-                // ambiguously placed either.
-                verifyLayout("wide")
-                let after = wc.toolButtonsForTesting
-                if after.count != buttons.count
-                    || !zip(after, buttons).allSatisfy({
-                        $0.0.button === $0.1.button
-                    })
-                    || after.first?.button.superview !== toolRow {
-                    toolbarFailures.append("identity-after-resize")
+                content.layoutSubtreeIfNeeded()
+                if content.bounds.width < 899 {
+                    toolbarFailures.append("no-expand \(content.bounds.width)")
                 }
-                if window.contentView?.bounds.width ?? 0 < 899 {
-                    toolbarFailures.append(
-                        "no-expand \(window.contentView?.bounds.width ?? 0)")
+                verifyLayout("wide")
+                let afterTools = wc.toolButtonsForTesting
+                if afterTools.count != buttons.count
+                    || !zip(afterTools, buttons).allSatisfy({
+                        $0.0.button === $0.1.button
+                            && $0.0.button.superview === toolRow
+                    }) {
+                    toolbarFailures.append("tool-identity-after-resize")
+                }
+                let afterActions = wc.actionButtonsForTesting
+                if afterActions.count != actions.count
+                    || !zip(afterActions, actions).allSatisfy({
+                        $0.0.button === $0.1.button
+                            && $0.0.button.superview === actionRow
+                    }) {
+                    toolbarFailures.append("action-identity-after-resize")
+                }
+                let afterChrome: [(String, NSView)] = [
+                    ("colorWell", wc.colorWellForTesting),
+                    ("sizeBadge", wc.sizeBadgeForTesting),
+                    ("zoom", wc.zoomLabelForTesting),
+                ]
+                if !zip(afterChrome, chrome).allSatisfy({
+                    $0.0.1 === $0.1.1 && $0.0.1.superview === actionRow
+                }) {
+                    toolbarFailures.append("chrome-identity-after-resize")
                 }
             }
             runToolbarLayout()
