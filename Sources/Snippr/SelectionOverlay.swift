@@ -184,7 +184,12 @@ final class SelectionOverlay {
         guard !tornDown else { return }
         tornDown = true
         session.forceComplete()
-        for w in windows { w.orderOut(nil) }
+        for w in windows {
+            if let view = w.contentView as? SelectionOverlayView {
+                view.releaseSamplerCache()
+            }
+            w.orderOut(nil)
+        }
         windows.removeAll()
         NSCursor.arrow.set()
         if SelectionOverlay.current === self {
@@ -271,6 +276,9 @@ final class SelectionOverlayView: NSView {
     private var strokeHUD: StrokePreviewView?
     private var strokeHUDHide: DispatchWorkItem?
     private var mousePos: CGPoint = .zero
+    /// False after exit / screen change so Tab cannot reuse .zero or a
+    /// pixel from a previous visit. Updated on enter/move/down/drag/up.
+    private var pointerInside = false
     private var hoverWindow: WindowInfo?
 
     nonisolated(unsafe) static var frozenBlitCountForTesting = 0
@@ -302,7 +310,48 @@ final class SelectionOverlayView: NSView {
 
     required init?(coder: NSCoder) { fatalError() }
 
+    deinit {
+        NotificationCenter.default.removeObserver(self)
+        if let frozen { PixelSamplerCache.release(frozen.cgImage) }
+    }
+
     override var acceptsFirstResponder: Bool { true }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        NotificationCenter.default.removeObserver(
+            self, name: NSWindow.didChangeScreenNotification, object: nil)
+        guard let window else {
+            invalidatePointer()
+            return
+        }
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(overlayScreenDidChange),
+            name: NSWindow.didChangeScreenNotification,
+            object: window)
+    }
+
+    @objc private func overlayScreenDidChange(_ notification: Notification) {
+        invalidatePointer()
+    }
+
+    private func updatePointer(from event: NSEvent) {
+        mousePos = convert(event.locationInWindow, from: nil)
+        pointerInside = true
+    }
+
+    private func invalidatePointer() {
+        pointerInside = false
+    }
+
+    private func pointerViewPoint() -> CGPoint? {
+        pointerInside ? mousePos : nil
+    }
+
+    fileprivate func releaseSamplerCache() {
+        if let frozen { PixelSamplerCache.release(frozen.cgImage) }
+    }
 
     /// Without this the very first drag after a capture is swallowed just to
     /// activate Snippr, so the user has to select the area twice.
@@ -856,7 +905,7 @@ final class SelectionOverlayView: NSView {
     }
 
     override func mouseMoved(with event: NSEvent) {
-        mousePos = convert(event.locationInWindow, from: nil)
+        updatePointer(from: event)
         if mode == .windowPick {
             updateHover(at: mousePos)
         } else {
@@ -865,7 +914,16 @@ final class SelectionOverlayView: NSView {
         needsDisplay = true
     }
 
+    override func mouseEntered(with event: NSEvent) {
+        updatePointer(from: event)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        invalidatePointer()
+    }
+
     override func mouseDown(with event: NSEvent) {
+        updatePointer(from: event)
         let p = convert(event.locationInWindow, from: nil)
         guard mode == .area else { return }
         if isSaving { return }
@@ -924,6 +982,7 @@ final class SelectionOverlayView: NSView {
     }
 
     override func mouseDragged(with event: NSEvent) {
+        updatePointer(from: event)
         guard mode == .area else { return }
         let p = convert(event.locationInWindow, from: nil)
         if annotationDragging {
@@ -962,6 +1021,7 @@ final class SelectionOverlayView: NSView {
     }
 
     override func mouseUp(with event: NSEvent) {
+        updatePointer(from: event)
         switch mode {
         case .area:
             let p = convert(event.locationInWindow, from: nil)
@@ -1082,7 +1142,13 @@ final class SelectionOverlayView: NSView {
 
     private func pickColorAtMouse(darkest: Bool) {
         guard let frozen, !isSaving else { return }
-        let pixel = pixelPoint(fromView: mousePos)
+        guard let viewPt = pointerViewPoint() else {
+            ToastHUD.show(
+                "No pixel", symbol: "eyedropper",
+                on: screen, above: window?.level)
+            return
+        }
+        let pixel = pixelPoint(fromView: viewPt)
         let color = darkest
             ? PixelColorSampler.darkest(image: frozen.cgImage, around: pixel)
             : PixelColorSampler.sample(image: frozen.cgImage, at: pixel)
@@ -1107,6 +1173,9 @@ final class SelectionOverlayView: NSView {
             : PixelColorSampler.sample(image: frozen.cgImage, at: pixel)
         return color.map(PixelColorSampler.hexString(from:))
     }
+
+    var pointerInsideForTesting: Bool { pointerInside }
+    func mouseExitedForTesting() { invalidatePointer() }
 
     // MARK: text annotation entry
 

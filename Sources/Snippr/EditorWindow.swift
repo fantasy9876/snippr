@@ -563,6 +563,7 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
 
     func windowWillClose(_ notification: Notification) {
         NotificationCenter.default.removeObserver(self)
+        PixelSamplerCache.release(canvas.image.cgImage)
         EditorWindowController.controllers.removeAll { $0 === self }
     }
 }
@@ -660,6 +661,10 @@ final class EditorCanvasView: NSView {
     }
 
     required init?(coder: NSCoder) { fatalError() }
+
+    deinit {
+        PixelSamplerCache.release(image.cgImage)
+    }
 
     override var acceptsFirstResponder: Bool { true }
     override var isFlipped: Bool { false }
@@ -826,8 +831,15 @@ final class EditorCanvasView: NSView {
     }
 
     private func setImage(_ newImage: CapturedImage) {
+        if image.cgImage !== newImage.cgImage {
+            PixelSamplerCache.release(image.cgImage)
+        }
         image = newImage
         pixellatedCache = nil
+        // Crop / resize / undo-redo all change geometry. A cached pixel from
+        // the previous bitmap is stale; the next pick recomputes from the
+        // live pointer (or a later mouse event) in the new space.
+        lastMousePixel = nil
         setFrameSize(newImage.pointSize)
         needsDisplay = true
         onStateChange?()
@@ -1012,6 +1024,7 @@ final class EditorCanvasView: NSView {
     }
 
     override func mouseUp(with event: NSEvent) {
+        updatePointer(from: event)
         if let draft = drafting {
             let big = draft.bounds.width > 2 || draft.bounds.height > 2 || draft is PenAnnotation
             if big {
@@ -1299,9 +1312,6 @@ final class EditorCanvasView: NSView {
             transient = .ruler(next)
         } else if case .guide(let axis, let position) = transient {
             transient = .guide(axis: axis, position: position * factor)
-        }
-        if let last = lastMousePixel {
-            lastMousePixel = CGPoint(x: last.x * factor, y: last.y * factor)
         }
         setImage(scaled)
     }

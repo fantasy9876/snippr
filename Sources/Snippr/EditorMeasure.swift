@@ -158,15 +158,31 @@ enum ImageResizer {
 
 /// One RGBA decode per `CGImage` identity. `mouseMoved` / Tab / ruler all
 /// share it so a tall scroll shot is not recopied on every event.
+/// The image is held weakly; the buffer is released on image replacement
+/// and when the editor / overlay that owned it closes.
 enum PixelSamplerCache {
-    private static var image: CGImage?
+    private static weak var image: CGImage?
     private static var buffer: PixelBuffer?
     private(set) static var rebuildCount = 0
 
+    static var residentByteCount: Int { buffer?.byteCount ?? 0 }
+
+    static func isHolding(_ image: CGImage) -> Bool {
+        self.image === image && buffer != nil
+    }
+
     static func resetForTesting() {
+        releaseAll()
+        rebuildCount = 0
+    }
+
+    static func release(_ image: CGImage) {
+        if self.image === image { releaseAll() }
+    }
+
+    static func releaseAll() {
         image = nil
         buffer = nil
-        rebuildCount = 0
     }
 
     fileprivate static func buffer(for image: CGImage) -> PixelBuffer? {
@@ -205,6 +221,8 @@ private struct PixelBuffer {
         self.width = w
         self.height = h
     }
+
+    var byteCount: Int { bytes.count }
 
     func contains(x: Int, y: Int) -> Bool {
         x >= 0 && y >= 0 && x < width && y < height

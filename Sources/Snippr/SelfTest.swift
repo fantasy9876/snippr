@@ -7557,17 +7557,25 @@ enum SelfTest {
             let infS = ImageResizer.scale(srcR, by: .infinity)
             let negS = ImageResizer.scale(srcR, by: -2)
             let zeroS = ImageResizer.scale(srcR, by: 0)
-            let hugeDim = ImageResizer.scale(srcR, by: 100)
-            let hugePix = ImageResizer.scale(srcR, by: 40)
+            // Narrow: destW exceeds maxDimension only; pixel count stays under 256MP.
+            // 64×8 × 600 = 38400×4800 → dim 38400 > 32768, pixels 184.3MP < 256MP.
+            let narrow = CapturedImage(
+                cgImage: makeSolidImage(
+                    width: 64, height: 8, color: NSColor.blue.cgColor),
+                scale: 1)
+            let onlyDim = ImageResizer.scale(narrow, by: 600)
+            // Square: dest stays under maxDimension; pixels exceed 256MP.
+            // 512×512 × 40 = 20480×20480 → dim 20480 < 32768, pixels 419MP.
+            let onlyPix = ImageResizer.scale(srcR, by: 40)
             let halfS = ImageResizer.scale(srcR, by: 0.5)
             wc.applyResizeFactor(.infinity)
             wc.applyResizeFactor(-3)
             check("sliceA-resize-invalid",
                   nanS == nil && infS == nil && negS == nil && zeroS == nil
-                    && hugeDim == nil && hugePix == nil
+                    && onlyDim == nil && onlyPix == nil
                     && halfS?.cgImage.width == 256
                     && wc.canvasForTesting.image.cgImage.width == 80,
-                  "nan \(nanS != nil) inf \(infS != nil) dim \(hugeDim != nil) pix \(hugePix != nil) half \(halfS?.cgImage.width ?? -1)")
+                  "nan \(nanS != nil) inf \(infS != nil) dim \(onlyDim != nil) pix \(onlyPix != nil) half \(halfS?.cgImage.width ?? -1)")
 
             PixelSamplerCache.resetForTesting()
             let tall = makeSolidImage(
@@ -7589,10 +7597,15 @@ enum SelfTest {
                 }
             }
             let rebuildAfterMoves = PixelSamplerCache.rebuildCount
+            let bytesWhileOpen = PixelSamplerCache.residentByteCount
+            let heldWhileOpen = PixelSamplerCache.isHolding(tall)
             wcTall.window?.close()
             check("sliceA-sampler-cache-tall",
-                  rebuildAfterBegin == 1 && rebuildAfterMoves == 1,
-                  "begin \(rebuildAfterBegin) afterMoves \(rebuildAfterMoves)")
+                  rebuildAfterBegin == 1 && rebuildAfterMoves == 1
+                    && bytesWhileOpen > 0 && heldWhileOpen
+                    && PixelSamplerCache.residentByteCount == 0
+                    && !PixelSamplerCache.isHolding(tall),
+                  "begin \(rebuildAfterBegin) afterMoves \(rebuildAfterMoves) bytes \(bytesWhileOpen) held \(heldWhileOpen) afterClose \(PixelSamplerCache.residentByteCount)")
 
             let redCap = CapturedImage(
                 cgImage: makeSolidImage(
@@ -7644,6 +7657,115 @@ enum SelfTest {
                     && beforeScroll == CGPoint(x: 20, y: 20)
                     && afterScrollCache != CGPoint(x: 20, y: 20),
                   "oob \(oobClip ?? "nil") exitPix \(String(describing: afterExit)) exitClip \(exitClip ?? "nil") before \(String(describing: beforeScroll)) after \(String(describing: afterScrollCache))")
+
+            func makeSplitImage(
+                width: Int, height: Int, splitX: Int,
+                left: NSColor, right: NSColor
+            ) -> CGImage {
+                let c = ctx(width, height)
+                c.setFillColor(left.cgColor)
+                c.fill(CGRect(x: 0, y: 0, width: splitX, height: height))
+                c.setFillColor(right.cgColor)
+                c.fill(CGRect(
+                    x: splitX, y: 0, width: width - splitX, height: height))
+                return c.makeImage()!
+            }
+            let splitCG = makeSplitImage(
+                width: 200, height: 80, splitX: 100,
+                left: NSColor(srgbRed: 1, green: 0, blue: 0, alpha: 1),
+                right: NSColor(srgbRed: 0, green: 0, blue: 1, alpha: 1))
+            let splitOriginal: CGImage = splitCG
+            let wcSplit = EditorWindowController.open(
+                with: CapturedImage(cgImage: splitCG, scale: 1),
+                forceFitForTesting: true)
+            let cSplit = wcSplit.canvasForTesting
+            if let moved = sliceAMouse(
+                .mouseMoved, in: cSplit, at: CGPoint(x: 150, y: 40))
+            {
+                cSplit.mouseMoved(with: moved)
+            }
+            pb.clearContents()
+            pb.setString("SENTINEL-PRE-CROP", forType: .string)
+            if let tab = sliceAKey(48, characters: "\t") {
+                _ = cSplit.performKeyEquivalent(with: tab)
+            }
+            let preCropHex = pb.string(forType: .string)
+            let heldOriginal = PixelSamplerCache.isHolding(splitOriginal)
+            wcSplit.selectTool(.crop)
+            if let down = sliceAMouse(
+                .leftMouseDown, in: cSplit, at: CGPoint(x: 5, y: 5))
+            {
+                cSplit.mouseDown(with: down)
+            }
+            if let drag = sliceAMouse(
+                .leftMouseDragged, in: cSplit, at: CGPoint(x: 90, y: 70))
+            {
+                cSplit.mouseDragged(with: drag)
+            }
+            if let up = sliceAMouse(
+                .leftMouseUp, in: cSplit, at: CGPoint(x: 90, y: 70))
+            {
+                cSplit.mouseUp(with: up)
+            }
+            cSplit.applyCropSelection()
+            let afterCropPtr = cSplit.pointerPixelForTesting
+            let afterCropW = cSplit.image.cgImage.width
+            let heldOldAfterCrop = PixelSamplerCache.isHolding(splitOriginal)
+            if let moved = sliceAMouse(
+                .mouseMoved, in: cSplit, at: CGPoint(x: 20, y: 20))
+            {
+                cSplit.mouseMoved(with: moved)
+            }
+            pb.clearContents()
+            pb.setString("SENTINEL-CROP", forType: .string)
+            if let tab = sliceAKey(48, characters: "\t") {
+                _ = cSplit.performKeyEquivalent(with: tab)
+            }
+            let cropHex = pb.string(forType: .string)
+            wcSplit.window?.close()
+
+            let wcUndo = EditorWindowController.open(
+                with: CapturedImage(cgImage: splitCG, scale: 1),
+                forceFitForTesting: true)
+            let cUndo = wcUndo.canvasForTesting
+            if let moved = sliceAMouse(
+                .mouseMoved, in: cUndo, at: CGPoint(x: 150, y: 40))
+            {
+                cUndo.mouseMoved(with: moved)
+            }
+            wcUndo.applyResizeFactor(2)
+            let afterResizeW = cUndo.image.cgImage.width
+            let afterResizePtr = cUndo.pointerPixelForTesting
+            if let cmdZ = sliceAKey(6, characters: "z", modifiers: [.command]) {
+                _ = cUndo.performKeyEquivalent(with: cmdZ)
+            }
+            let afterUndoW = cUndo.image.cgImage.width
+            let afterUndoPtr = cUndo.pointerPixelForTesting
+            if let moved = sliceAMouse(
+                .mouseMoved, in: cUndo, at: CGPoint(x: 150, y: 40))
+            {
+                cUndo.mouseMoved(with: moved)
+            }
+            pb.clearContents()
+            pb.setString("SENTINEL-UNDO", forType: .string)
+            if let tab = sliceAKey(48, characters: "\t") {
+                _ = cUndo.performKeyEquivalent(with: tab)
+            }
+            let undoHex = pb.string(forType: .string)
+            wcUndo.window?.close()
+            check("sliceA-pointer-crop-resize-undo",
+                  preCropHex == "#0000FF"
+                    && heldOriginal
+                    && afterCropPtr == nil
+                    && afterCropW < 200
+                    && !heldOldAfterCrop
+                    && cropHex == "#FF0000"
+                    && afterResizeW == 400
+                    && afterResizePtr == nil
+                    && afterUndoW == 200
+                    && afterUndoPtr == nil
+                    && undoHex == "#0000FF",
+                  "pre \(preCropHex ?? "nil") heldOrig \(heldOriginal) cropPtr \(String(describing: afterCropPtr)) cropW \(afterCropW) heldOld \(heldOldAfterCrop) cropHex \(cropHex ?? "nil") resizeW \(afterResizeW) resizePtr \(String(describing: afterResizePtr)) undoW \(afterUndoW) undoPtr \(String(describing: afterUndoPtr)) undoHex \(undoHex ?? "nil")")
 
             let barBase = ctx(200, 100)
             barBase.setFillColor(NSColor.white.cgColor)
@@ -7736,16 +7858,121 @@ enum SelfTest {
                 pb.clearContents()
                 pb.setString("SENTINEL-SAVE", forType: .string)
                 let enteredSaving = overlay.session.transition(to: .saving)
+                var savingConsumed = false
                 if let tab = sliceAKey(48, characters: "\t") {
-                    let consumed = view.performKeyEquivalent(with: tab)
-                    _ = consumed
+                    savingConsumed = view.performKeyEquivalent(with: tab)
                 }
                 check("sliceA-overlay-saving-lock",
                       enteredSaving
                         && overlay.session.phase == .saving
-                        && pb.string(forType: .string) == "SENTINEL-SAVE",
-                      "phase \(overlay.session.phase) clip \(pb.string(forType: .string) ?? "nil")")
+                        && pb.string(forType: .string) == "SENTINEL-SAVE"
+                        && savingConsumed,
+                      "phase \(overlay.session.phase) clip \(pb.string(forType: .string) ?? "nil") consumed \(savingConsumed)")
                 _ = overlay.session.transition(to: .reviewing)
+
+                let splitFrozen = CapturedImage(
+                    cgImage: makeSplitImage(
+                        width: 200, height: 150, splitX: 100,
+                        left: NSColor(srgbRed: 1, green: 0, blue: 0, alpha: 1),
+                        right: NSColor(srgbRed: 0, green: 0, blue: 1, alpha: 1)),
+                    scale: 1)
+                let overlayPtr = SelectionOverlay(
+                    purpose: .areaReview,
+                    inputs: OverlaySessionInputs(
+                        afterShow: true, afterCopy: false, afterSave: false),
+                    completion: { _ in })
+                overlayPtr.routerDependenciesOverride =
+                    CaptureActionRouter.Dependencies(
+                        copyToClipboard: { _ in },
+                        autoSave: { _, _ in },
+                        saveAs: { _, _ in },
+                        pin: { _ in },
+                        ocr: { _ in },
+                        openEditor: { _ in },
+                        toast: { _ in },
+                        setLastCapture: { _ in },
+                        setLastAreaRect: { _ in },
+                        logEvent: { _ in })
+                let viewPtr = SelectionOverlayView(
+                    mode: .area, screen: screen, frozen: splitFrozen,
+                    windowList: [], owner: overlayPtr)
+                viewPtr.selectForTesting(
+                    rect: CGRect(x: 10, y: 10, width: 160, height: 90))
+                if let down = NSEvent.mouseEvent(
+                    with: .leftMouseDown, location: CGPoint(x: 40, y: 40),
+                    modifierFlags: [], timestamp: 0, windowNumber: 0,
+                    context: nil, eventNumber: 2, clickCount: 1, pressure: 1)
+                {
+                    viewPtr.mouseDown(with: down)
+                }
+                pb.clearContents()
+                pb.setString("SENTINEL-OV-DOWN", forType: .string)
+                if let tab = sliceAKey(48, characters: "\t") {
+                    _ = viewPtr.performKeyEquivalent(with: tab)
+                }
+                let downHex = pb.string(forType: .string)
+                if let drag = NSEvent.mouseEvent(
+                    with: .leftMouseDragged, location: CGPoint(x: 140, y: 40),
+                    modifierFlags: [], timestamp: 0, windowNumber: 0,
+                    context: nil, eventNumber: 3, clickCount: 1, pressure: 1)
+                {
+                    viewPtr.mouseDragged(with: drag)
+                }
+                if let up = NSEvent.mouseEvent(
+                    with: .leftMouseUp, location: CGPoint(x: 140, y: 40),
+                    modifierFlags: [], timestamp: 0, windowNumber: 0,
+                    context: nil, eventNumber: 4, clickCount: 1, pressure: 1)
+                {
+                    viewPtr.mouseUp(with: up)
+                }
+                pb.clearContents()
+                pb.setString("SENTINEL-OV-DRAG", forType: .string)
+                if let tab = sliceAKey(48, characters: "\t") {
+                    _ = viewPtr.performKeyEquivalent(with: tab)
+                }
+                let dragHex = pb.string(forType: .string)
+                if let exited = NSEvent.mouseEvent(
+                    with: .mouseExited, location: CGPoint(x: 140, y: 40),
+                    modifierFlags: [], timestamp: 0, windowNumber: 0,
+                    context: nil, eventNumber: 5, clickCount: 0, pressure: 0)
+                {
+                    viewPtr.mouseExited(with: exited)
+                }
+                pb.clearContents()
+                pb.setString("SENTINEL-OV-EXIT", forType: .string)
+                if let tab = sliceAKey(48, characters: "\t") {
+                    _ = viewPtr.performKeyEquivalent(with: tab)
+                }
+                let exitHex = pb.string(forType: .string)
+                if let moved = NSEvent.mouseEvent(
+                    with: .mouseMoved, location: CGPoint(x: 40, y: 40),
+                    modifierFlags: [], timestamp: 0, windowNumber: 0,
+                    context: nil, eventNumber: 6, clickCount: 0, pressure: 0)
+                {
+                    viewPtr.mouseMoved(with: moved)
+                }
+                let host = NSWindow(
+                    contentRect: NSRect(x: 0, y: 0, width: 200, height: 150),
+                    styleMask: .borderless, backing: .buffered, defer: false)
+                host.contentView = viewPtr
+                NotificationCenter.default.post(
+                    name: NSWindow.didChangeScreenNotification, object: host)
+                let afterScreenInside = viewPtr.pointerInsideForTesting
+                pb.clearContents()
+                pb.setString("SENTINEL-OV-SCREEN", forType: .string)
+                if let tab = sliceAKey(48, characters: "\t") {
+                    _ = viewPtr.performKeyEquivalent(with: tab)
+                }
+                let screenHex = pb.string(forType: .string)
+                host.orderOut(nil)
+                check("sliceA-overlay-pointer-events",
+                      overlayPtr.session.phase == .reviewing
+                        && downHex == "#FF0000"
+                        && dragHex == "#0000FF"
+                        && exitHex == "SENTINEL-OV-EXIT"
+                        && !afterScreenInside
+                        && screenHex == "SENTINEL-OV-SCREEN",
+                      "down \(downHex ?? "nil") drag \(dragHex ?? "nil") exit \(exitHex ?? "nil") screenInside \(afterScreenInside) screen \(screenHex ?? "nil")")
             }
         }
 
