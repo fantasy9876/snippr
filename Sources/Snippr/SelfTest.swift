@@ -8713,7 +8713,9 @@ enum SelfTest {
                 // The prior spotlight sits in the MIDDLE. With it last, an
                 // implementation that simply appends the restored spotlight
                 // would look correct while being wrong.
-                surface.annotations = [markA, oldSpot, markB]
+                surface.addAnnotationForTesting(markA)
+                surface.addAnnotationForTesting(oldSpot)
+                surface.addAnnotationForTesting(markB)
                 if !surface.setSpotlightDim(0.7) {
                     spotFailures.append("replace-refused")
                 }
@@ -8758,11 +8760,13 @@ enum SelfTest {
                 let oldSpot = SpotlightAnnotation(uiScale: 1)
                 oldSpot.rect = CGRect(x: 10, y: 10, width: 40, height: 30)
                 let markB = CounterAnnotation(uiScale: 1)
-                surface.annotations = [markA, oldSpot, markB]
+                surface.addAnnotationForTesting(markA)
+                surface.addAnnotationForTesting(oldSpot)
+                surface.addAnnotationForTesting(markB)
                 // Something on the redo branch, so the gate can tell whether a
                 // no-op wrongly cleared it.
                 let discarded = CounterAnnotation(uiScale: 1)
-                surface.annotations.append(discarded)
+                surface.addAnnotationForTesting(discarded)
                 _ = surface.undo()
                 let redoAvailableBefore = surface.canRedo
                 surface.tool = .spotlight
@@ -8818,7 +8822,8 @@ enum SelfTest {
                         toast: { _ in }, setLastCapture: { _ in },
                         setLastAreaRect: { _ in }, logEvent: { _ in })
                 let view = SelectionOverlayView(
-                    mode: .area, screen: screen, frozen: frozenImage,
+                    mode: .area, screen: screen,
+                    frozen: CapturedImage(cgImage: frozenImage, scale: 2),
                     windowList: [], owner: overlay)
                 view.selectForTesting(
                     rect: CGRect(x: 60, y: 60, width: 240, height: 180))
@@ -8829,7 +8834,7 @@ enum SelfTest {
                 let existing = SpotlightAnnotation(uiScale: 1)
                 existing.rect = CGRect(x: 70, y: 70, width: 60, height: 40)
                 existing.dimFraction = 0.3
-                surface?.annotations = [existing]
+                surface?.addAnnotationForTesting(existing)
                 surface?.tool = .spotlight
                 func key(_ chars: String) -> NSEvent? {
                     NSEvent.keyEvent(
@@ -8840,6 +8845,7 @@ enum SelfTest {
                 }
                 var midDragDim: CGFloat = 0
                 var midDragCopies = 0
+                var midDragCompletions = 0
                 view.annotationDragForTesting(
                     from: CGPoint(x: 100, y: 100),
                     to: CGPoint(x: 180, y: 160)
@@ -8847,16 +8853,21 @@ enum SelfTest {
                     // A digit, a tool switch and a terminal action, all in the
                     // window where the draft is live.
                     if let event = key("5") { view.keyDown(with: event) }
-                    if let event = key("m") { view.keyDown(with: event) }
+                    // A key this surface really maps: the overlay has no
+                    // Magnifier, so "m" would be a no-op even without the
+                    // guard and would prove nothing.
+                    if let event = key("l") { view.keyDown(with: event) }
                     view.performReviewActionForTesting(.copy)
                     midDragDim = existing.dimFraction
                     midDragCopies = spy.copies
+                    midDragCompletions = spy.completions
                 }
                 if midDragDim != 0.3 {
                     midDragFailures.append("digit-applied \(midDragDim)")
                 }
-                if midDragCopies != 0 {
-                    midDragFailures.append("terminal-ran \(midDragCopies)")
+                if midDragCopies != 0 || midDragCompletions != 0 {
+                    midDragFailures.append(
+                        "terminal-ran \(midDragCopies)/\(midDragCompletions)")
                 }
                 if surface?.tool != .spotlight {
                     midDragFailures.append(
@@ -8869,9 +8880,12 @@ enum SelfTest {
                 if spots.count != 1 || spots.first === existing {
                     midDragFailures.append("finalize \(spots.count)")
                 }
-                if spots.first?.dimFraction != 0.3 {
+                // A new spotlight starts at the DEFAULT darkness; it does not
+                // inherit the one it replaced, and the blocked digit must not
+                // have reached it either.
+                if spots.first?.dimFraction != 0.6 {
                     midDragFailures.append(
-                        "inherited-dim \(spots.first?.dimFraction ?? -1)")
+                        "new-dim \(spots.first?.dimFraction ?? -1)")
                 }
                 // And undo restores the one it replaced, in place.
                 _ = surface?.undo()
