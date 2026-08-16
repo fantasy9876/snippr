@@ -11516,59 +11516,112 @@ enum SelfTest {
             //    does. The spotlight cases carry replacement records, so they
             //    could pass on that machinery alone; this one has none.
             var branchFailures: [String] = []
-            do {
-                let surface = AnnotationSurface(pixelScale: 1)
-                let markA = CounterAnnotation(uiScale: 1)
-                let spot = SpotlightAnnotation(uiScale: 1)
-                spot.rect = CGRect(x: 10, y: 10, width: 40, height: 30)
-                let markB = CounterAnnotation(uiScale: 1)
-                surface.addAnnotationForTesting(markA)
-                surface.addAnnotationForTesting(spot)
-                surface.addAnnotationForTesting(markB)
-                _ = surface.undo()
-                _ = surface.undo()
-                // Redo branch holds the spotlight AND the mark above it.
-                if !surface.canRedo || surface.annotations.count != 1
-                    || surface.annotations.first !== markA {
-                    branchFailures.append("setup \(surface.annotations.count)")
+            // The drag lifecycle against an ORDINARY redo branch. Gate J uses
+            // a spotlight branch, which carries replacement records — so an
+            // implementation that only cleared or preserved correctly when a
+            // record existed would pass there and here alike, unless the
+            // branch itself has none.
+            for tool in [OverlayAnnotationTool.pen, .rect, .line, .arrow,
+                         .oval, .highlight] {
+                func freshSurface() -> (AnnotationSurface, Annotation, Annotation) {
+                    let surface = AnnotationSurface(pixelScale: 1)
+                    let keep = CounterAnnotation(uiScale: 1)
+                    let redoMark = CounterAnnotation(uiScale: 1)
+                    surface.addAnnotationForTesting(keep)
+                    surface.addAnnotationForTesting(redoMark)
+                    _ = surface.undo()
+                    surface.tool = tool
+                    return (surface, keep, redoMark)
                 }
-                // A plain counter — no replacement record anywhere near it.
-                let fresh = CounterAnnotation(uiScale: 1)
-                surface.addAnnotationForTesting(fresh)
-                if surface.canRedo {
-                    branchFailures.append("branch-survived")
+                let from = CGPoint(x: 20, y: 20)
+                let to = CGPoint(x: 90, y: 70)
+
+                // 1. Abandoned drag: the branch is untouched.
+                do {
+                    let (surface, keep, redoMark) = freshSurface()
+                    _ = surface.beginDrag(atPixel: from)
+                    surface.continueDrag(toPixel: to)
+                    surface.abandonDrag()
+                    if surface.annotations.count != 1
+                        || surface.annotations.first !== keep
+                        || !surface.canRedo || surface.isDragging {
+                        branchFailures.append("\(tool):abandon-shape")
+                    }
+                    _ = surface.redo()
+                    if surface.annotations.count != 2
+                        || surface.annotations[1] !== redoMark
+                        || surface.canRedo {
+                        branchFailures.append("\(tool):abandon-redo")
+                    }
                 }
-                if surface.annotations.count != 2
-                    || surface.annotations[0] !== markA
-                    || surface.annotations[1] !== fresh {
-                    branchFailures.append(
-                        "after-add \(surface.annotations.count)")
+
+                // 2. A press with no movement: same again.
+                do {
+                    let (surface, keep, redoMark) = freshSurface()
+                    _ = surface.beginDrag(atPixel: from)
+                    surface.continueDrag(toPixel: from)
+                    surface.endDrag()
+                    if surface.annotations.count != 1
+                        || surface.annotations.first !== keep
+                        || !surface.canRedo || surface.isDragging {
+                        branchFailures.append("\(tool):still-shape")
+                    }
+                    _ = surface.redo()
+                    if surface.annotations.count != 2
+                        || surface.annotations[1] !== redoMark
+                        || surface.canRedo {
+                        branchFailures.append("\(tool):still-redo")
+                    }
                 }
-                // Undo takes the new mark off and does NOT resurrect the
-                // abandoned branch.
-                _ = surface.undo()
-                if surface.annotations.count != 1
-                    || surface.annotations.first !== markA {
-                    branchFailures.append("undo-shape")
-                }
-                _ = surface.redo()
-                if surface.annotations.count != 2
-                    || surface.annotations[1] !== fresh || surface.canRedo {
-                    branchFailures.append("redo-shape")
-                }
-                // And a spotlight added afterwards must not reach back into
-                // the discarded records.
-                let laterSpot = SpotlightAnnotation(uiScale: 1)
-                laterSpot.rect = CGRect(x: 20, y: 20, width: 30, height: 20)
-                surface.addAnnotationForTesting(laterSpot)
-                _ = surface.undo()
-                if surface.annotations.count != 2
-                    || surface.annotations[1] !== fresh
-                    || surface.annotations.contains(where: { $0 === spot }) {
-                    branchFailures.append("stale-record")
+
+                // 3. A real drag: the branch goes, and the mark round-trips.
+                do {
+                    let (surface, keep, _) = freshSurface()
+                    var historyEvents = 0
+                    surface.historyDidChange = { historyEvents += 1 }
+                    _ = surface.beginDrag(atPixel: from)
+                    surface.continueDrag(toPixel: to)
+                    let beforeEnd = historyEvents
+                    surface.endDrag()
+                    guard let drawn = surface.annotations.last,
+                          surface.annotations.count == 2,
+                          surface.annotations.first === keep else {
+                        branchFailures.append(
+                            "\(tool):complete-shape "
+                            + "\(surface.annotations.count)")
+                        continue
+                    }
+                    if surface.canRedo || surface.isDragging
+                        || historyEvents != beforeEnd + 1 {
+                        branchFailures.append(
+                            "\(tool):complete-branch \(surface.canRedo)")
+                    }
+                    let geometryOK: Bool
+                    if tool == .pen {
+                        let points = (drawn as? PenAnnotation)?.points ?? []
+                        geometryOK = points.first == from && points.last == to
+                    } else {
+                        let shape = drawn as? ShapeAnnotation
+                        geometryOK = shape?.start == from && shape?.end == to
+                            && shape?.kind == expectedKind(tool)
+                    }
+                    if !geometryOK {
+                        branchFailures.append("\(tool):complete-geometry")
+                    }
+                    _ = surface.undo()
+                    if surface.annotations.count != 1
+                        || surface.annotations.first !== keep {
+                        branchFailures.append("\(tool):complete-undo")
+                    }
+                    _ = surface.redo()
+                    if surface.annotations.count != 2
+                        || surface.annotations[1] !== drawn
+                        || surface.canRedo {
+                        branchFailures.append("\(tool):complete-redo")
+                    }
                 }
             }
-            check("sliceB-ordinary-mark-forks-history",
+            check("sliceB-drag-lifecycle-ordinary-branch",
                   branchFailures.isEmpty,
                   branchFailures.joined(separator: " | "))
 
