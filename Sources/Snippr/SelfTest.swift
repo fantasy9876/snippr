@@ -9403,8 +9403,8 @@ enum SelfTest {
                     }
                 }
                 if exported != nil { hostFailures.append("area:exported") }
-                if overlay.session.phase == .finished {
-                    hostFailures.append("area:closed")
+                if overlay.session.phase != .reviewing {
+                    hostFailures.append("area:phase \(overlay.session.phase)")
                 }
                 let attempts = failEvents.filter { $0.kind == "regionalAttempt" }
                 if attempts.count != 1 {
@@ -9450,25 +9450,27 @@ enum SelfTest {
                     || shot.height != Int(hostSelection.height) {
                     hostFailures.append("area:dims \(shot.width)x\(shot.height)")
                 }
-                // The healthy export must NOT be the fail-closed cover, so the
-                // same scan runs against the forced-failure output instead.
-                AnnotationRenderer.withForcedRegionalFailure {
-                    if let cover = surface.flattened(
-                        base: hostFrozen.cgImage,
-                        cropPixels: CGRect(
-                            x: hostSelection.minX,
-                            y: CGFloat(hostFrozen.cgImage.height)
-                                - hostSelection.maxY,
-                            width: hostSelection.width,
-                            height: hostSelection.height)) {
-                        scanCover(
-                            output: cover, source: hostFrozen.cgImage,
-                            mask: hostMask,
-                            originInSource: hostSelection.origin,
-                            label: "area")
-                    } else {
-                        hostFailures.append("area:no-cover-image")
-                    }
+                // Two SEPARATE proofs. Export fail-closed was asserted above
+                // (nil out, dependencies at zero, session still reviewing).
+                // The cover pixels must come from the PREVIEW path, which keeps
+                // drawing even when it reports failure — using the nil export
+                // to look for cover pixels is why the scan never ran before.
+                let previewCtx = ctx(240, 180)
+                previewCtx.draw(
+                    hostFrozen.cgImage,
+                    in: CGRect(x: 0, y: 0, width: 240, height: 180))
+                let previewOK = AnnotationRenderer.withForcedRegionalFailure {
+                    surface.drawForPreview(
+                        in: previewCtx, base: hostFrozen.cgImage)
+                }
+                if previewOK { hostFailures.append("area:preview-claimed-ok") }
+                if let previewShot = previewCtx.makeImage() {
+                    scanCover(
+                        output: previewShot, source: hostFrozen.cgImage,
+                        mask: hostMask, originInSource: .zero,
+                        label: "area-preview")
+                } else {
+                    hostFailures.append("area:no-preview-image")
                 }
             }
             check("sliceB-hosts-failclosed",
