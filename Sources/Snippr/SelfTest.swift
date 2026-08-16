@@ -13101,8 +13101,11 @@ enum SelfTest {
             //     asserted as an exact event vector.
             var hostFailures: [String] = []
             guard let hostScreen = NSScreen.main ?? NSScreen.screens.first else {
+                // Bare: this is inside the section's MainActor closure, not in
+                // `run`. The failure is already recorded, and the run's own end
+                // prints the summary and derives the exit code.
                 check("sliceB-hosts-failclosed", false, "no screen")
-                return 1
+                return
             }
             // The overlay paints the frozen capture across the WHOLE screen, so
             // annotation pixels only line up with view points when the fixture
