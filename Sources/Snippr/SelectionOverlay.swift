@@ -941,6 +941,13 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
             surface.resetStrokeScrollAccumulator()
             return
         }
+        // A live drag owns the interaction: the wheel would otherwise change
+        // the persisted stroke width and show its HUD in the middle of a
+        // stroke the user has not finished. Consumed, not forwarded.
+        guard !annotationDragging, areaDrag == nil else {
+            surface.resetStrokeScrollAccumulator()
+            return
+        }
         guard owner?.session.phase == .reviewing,
               !textEditingActive,
               surface.adjustsStrokeWidth

@@ -712,6 +712,12 @@ final class AnnotationHostView: NSView, RedactionSurfaceDelegate {
             surface.resetStrokeScrollAccumulator()
             return
         }
+        // Same rule as every other route: nothing changes while a drag is in
+        // flight, including the persisted stroke width and its HUD.
+        guard !dragging else {
+            surface.resetStrokeScrollAccumulator()
+            return
+        }
         guard !textEditingActive, surface.adjustsStrokeWidth else {
             surface.resetStrokeScrollAccumulator()
             super.scrollWheel(with: event)
