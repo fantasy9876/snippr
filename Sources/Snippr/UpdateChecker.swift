@@ -297,6 +297,13 @@ enum UpdateChecker {
             DMG="$1"
             APP="$2"
             EXPECTED_EXECUTABLE="$APP/Contents/MacOS/Snippr"
+            physical_path() {
+              /bin/realpath -q "$1" 2>/dev/null || return 1
+            }
+            expected_physical() {
+              [ "$ACTIVATED" = "1" ] || return 1
+              physical_path "$EXPECTED_EXECUTABLE"
+            }
             cleanup_download() {
               CLEANUP_STATUS=0
               /bin/rm -f "$DMG" || CLEANUP_STATUS=1
@@ -318,9 +325,12 @@ enum UpdateChecker {
                   HEALTH_VERSION=$(/usr/bin/sed -n 's/^version=\\(.*\\)$/\\1/p' "$HEALTH_FILE" | /usr/bin/head -1)
                   HEALTH_BUILD=$(/usr/bin/sed -n 's/^build=\\(.*\\)$/\\1/p' "$HEALTH_FILE" | /usr/bin/head -1)
                   HEALTH_EXECUTABLE=$(/usr/bin/sed -n 's/^executable=\\(.*\\)$/\\1/p' "$HEALTH_FILE" | /usr/bin/head -1)
+                  HEALTH_PHYSICAL=$(physical_path "$HEALTH_EXECUTABLE") || HEALTH_PHYSICAL=""
+                  EXPECTED_PHYSICAL=$(expected_physical) || EXPECTED_PHYSICAL=""
                   if [ -n "$HEALTH_PID" ] && [ "$HEALTH_VERSION" = "$EXPECTED_VERSION" ] \
                     && [ "$HEALTH_BUILD" = "$CANDIDATE_BUILD" ] \
-                    && [ "$HEALTH_EXECUTABLE" = "$EXPECTED_EXECUTABLE" ] \
+                    && [ -n "$HEALTH_PHYSICAL" ] && [ -n "$EXPECTED_PHYSICAL" ] \
+                    && [ "$HEALTH_PHYSICAL" = "$EXPECTED_PHYSICAL" ] \
                     && candidate_pid_matches "$HEALTH_PID"; then
                     /bin/sleep 1
                     if candidate_pid_matches "$HEALTH_PID"; then
@@ -338,8 +348,17 @@ enum UpdateChecker {
               CANDIDATE_PID="$1"
               case "$CANDIDATE_PID" in *[!0-9]*|'') return 1 ;; esac
               /bin/kill -0 "$CANDIDATE_PID" 2>/dev/null || return 1
+              EXPECTED_PHYSICAL=$(expected_physical) || return 1
+              [ -n "$EXPECTED_PHYSICAL" ] || return 1
               /usr/sbin/lsof -a -p "$CANDIDATE_PID" -d txt -Fn 2>/dev/null \
-                | /usr/bin/grep -Fqx "n$EXPECTED_EXECUTABLE"
+                | /usr/bin/sed -n 's/^n//p' \
+                | while IFS= read -r LSOF_PATH; do
+                    [ -n "$LSOF_PATH" ] || continue
+                    LSOF_PHYSICAL=$(physical_path "$LSOF_PATH") || continue
+                    [ "$LSOF_PHYSICAL" = "$EXPECTED_PHYSICAL" ] \
+                      && /usr/bin/printf '%s\\n' HIT
+                  done \
+                | /usr/bin/grep -qx HIT
             }
             candidate_pids() {
               /usr/bin/pgrep -f 'Snippr' 2>/dev/null | while IFS= read -r CANDIDATE_PID; do
