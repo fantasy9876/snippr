@@ -9391,11 +9391,17 @@ enum SelfTest {
                 // Auto-close belongs to the same contract: a route that should
                 // close and does not is a regression an unconditional close
                 // in the gate would hide.
-                if (wc.window?.isVisible == true) == closes {
-                    lockFailures.append(
-                        name + ":visible \(wc.window?.isVisible == true)")
+                let stillOpen = wc.window?.isVisible == true
+                if stillOpen == closes {
+                    lockFailures.append(name + ":visible \(stillOpen)")
                 }
-                wc.window?.close()
+                // Only close what is still open. These windows are not
+                // released on close, so closing an already-closed one can make
+                // AppKit send windowWillClose again — and cancel(for:) bumps
+                // the generation whether or not the registry still holds the
+                // annotation, which would turn the expected count below into a
+                // question about AppKit rather than about this feature.
+                if stillOpen { wc.window?.close() }
                 // Whatever the route did, the close leaves nothing behind —
                 // and the job is superseded exactly once, whether the lock did
                 // it already or the close is doing it now.
