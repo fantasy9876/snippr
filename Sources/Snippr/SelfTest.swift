@@ -11061,6 +11061,15 @@ enum SelfTest {
                         "area:creating-forwarded "
                         + "\(spy.forwarded - forwardedBeforeDrag)")
                 }
+                // The crop drag really released: an idle wheel forwards again.
+                if let event = wheel(creatingView, deltaY: 3, precise: false) {
+                    creatingView.scrollWheel(with: event)
+                }
+                if spy.forwarded != forwardedBeforeDrag + 1 {
+                    wheelFailures.append(
+                        "area:post-drag-forward "
+                        + "\(spy.forwarded - forwardedBeforeDrag)")
+                }
                 creatingView.nextResponder = previousResponder
                 creatingOverlay.finish(.cancelled)
 
@@ -11104,10 +11113,11 @@ enum SelfTest {
                     from: CGPoint(x: 100, y: 100),
                     to: CGPoint(x: 180, y: 160)
                 ) {
-                    for precise in [false, true] {
-                        if let event = wheel(view, deltaY: 9, precise: precise) {
-                            view.scrollWheel(with: event)
-                        }
+                    // PRECISE ONLY. A line event on the blocked path calls the
+                    // same reset, so sending one first would mask whether the
+                    // precise path resets — the whole point of the sequence.
+                    if let event = wheel(view, deltaY: 9, precise: true) {
+                        view.scrollWheel(with: event)
                     }
                     midDragWrites = writes.count
                 }
@@ -11142,9 +11152,20 @@ enum SelfTest {
                     wheelFailures.append(
                         "area:precise-control \(writes.count - beforeControl)")
                 }
-                // The line branch on its own, so it cannot disturb the state
-                // the precise sequence depends on.
+                // The line branch, in a drag of its own so it cannot disturb
+                // the precise state the sequence above depends on.
                 beforeControl = writes.count
+                view.annotationDragForTesting(
+                    from: CGPoint(x: 100, y: 100), to: CGPoint(x: 170, y: 150)
+                ) {
+                    if let event = wheel(view, deltaY: 3, precise: false) {
+                        view.scrollWheel(with: event)
+                    }
+                }
+                if writes.count != beforeControl {
+                    wheelFailures.append(
+                        "area:line-mid-drag \(writes.count - beforeControl)")
+                }
                 if let event = wheel(view, deltaY: 3, precise: false) {
                     view.scrollWheel(with: event)
                 }
@@ -11182,22 +11203,24 @@ enum SelfTest {
                 if host.mouseDownCanMoveWindow {
                     wheelFailures.append("panel:drag-handle")
                 }
+                let panelBeforePrime = writes.count
                 if let event = wheel(host, deltaY: 9, precise: true) {
                     host.scrollWheel(with: event)
                 }
-                var panelMidWrites = 0
-                let panelBeforeDrag = writes.count
-                if panelBeforeDrag != writes.count {
+                // Baseline taken BEFORE the prime: comparing it with itself
+                // afterwards could never fail, and hid a prime that wrote.
+                if writes.count != panelBeforePrime {
                     wheelFailures.append("panel:prime-wrote")
                 }
+                var panelMidWrites = 0
+                let panelBeforeDrag = writes.count
                 panel.drawWithRealEventsForTesting(
                     fromView: CGPoint(x: 60, y: 60),
                     toView: CGPoint(x: 160, y: 140)
                 ) {
-                    for precise in [false, true] {
-                        if let event = wheel(host, deltaY: 9, precise: precise) {
-                            host.scrollWheel(with: event)
-                        }
+                    // Precise only, for the same reason as the area case.
+                    if let event = wheel(host, deltaY: 9, precise: true) {
+                        host.scrollWheel(with: event)
                     }
                     panelMidWrites = writes.count
                 }
@@ -11227,6 +11250,19 @@ enum SelfTest {
                         + "\(writes.count - beforePanelControl)")
                 }
                 beforePanelControl = writes.count
+                panel.drawWithRealEventsForTesting(
+                    fromView: CGPoint(x: 70, y: 70),
+                    toView: CGPoint(x: 150, y: 130)
+                ) {
+                    if let event = wheel(host, deltaY: 3, precise: false) {
+                        host.scrollWheel(with: event)
+                    }
+                }
+                if writes.count != beforePanelControl {
+                    wheelFailures.append(
+                        "panel:line-mid-drag "
+                        + "\(writes.count - beforePanelControl)")
+                }
                 if let event = wheel(host, deltaY: 3, precise: false) {
                     host.scrollWheel(with: event)
                 }
