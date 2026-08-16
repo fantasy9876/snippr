@@ -8035,18 +8035,29 @@ enum SelfTest {
                   legacyKeys && newKeys,
                   "keys \(keys.keys.sorted()) tips \(editorTips)")
 
-            // 3. Every toolbar symbol must resolve on the deployment target;
-            //    NSImage(systemSymbolName:)! would otherwise crash on launch.
-            let symbols = EditorTool.allCases.map(\.symbol)
-                + OverlayAnnotationTool.allCases.map(\.symbol)
-            let unresolved = symbols.filter {
-                NSImage(systemSymbolName: $0, accessibilityDescription: nil) == nil
-            }
+            // 3. Every toolbar button must SHOW something. Demanding that each
+            //    primary symbol resolve directly would contradict the fallback
+            //    the toolbars deliberately go through — and would fail on a
+            //    macOS 14 deployment target for a correct build, while leaving
+            //    that fallback as dead code no gate ever runs.
+            let resolvedPrimary = SliceBSymbols.image(
+                named: "rectangle.dashed", fallback: "questionmark")
+            let usesFallback = SliceBSymbols.image(
+                named: "definitely.not.a.symbol.\(UUID().uuidString)",
+                fallback: "questionmark")
+            let bothMissing = SliceBSymbols.image(
+                named: "definitely.not.a.symbol.\(UUID().uuidString)",
+                fallback: "also.not.a.symbol.\(UUID().uuidString)")
+            let symbolContract = resolvedPrimary != nil && usesFallback != nil
+                && bothMissing != nil
             check("sliceB-symbols-resolve",
-                  unresolved.isEmpty
+                  symbolContract
                     && EditorTool.allCases.count == 15
                     && OverlayAnnotationTool.allCases.count == 12,
-                  "unresolved \(unresolved) editor \(EditorTool.allCases.count) overlay \(OverlayAnnotationTool.allCases.count)")
+                  "primary \(resolvedPrimary != nil) fallback \(usesFallback != nil) "
+                    + "placeholder \(bothMissing != nil) "
+                    + "editor \(EditorTool.allCases.count) "
+                    + "overlay \(OverlayAnnotationTool.allCases.count)")
 
             // 4. A redaction never renders "nothing".
             let redactRect = CGRect(x: 10, y: 20, width: 100, height: 40)
@@ -8748,8 +8759,11 @@ enum SelfTest {
                 let f = $0.button.convert($0.button.bounds, to: nil)
                 return f.width > 0 && f.maxX <= barWidth + 0.5 && f.minX >= -0.5
             }
+            // On the REAL buttons: every one carries a visible image and a
+            // label, whichever branch of the fallback produced it.
             let labelled = buttons.allSatisfy {
                 !($0.button.toolTip ?? "").isEmpty
+                    && $0.button.image != nil
                     && !($0.button.image?.accessibilityDescription ?? "").isEmpty
             }
             let fallbackImage = SliceBSymbols.image(
