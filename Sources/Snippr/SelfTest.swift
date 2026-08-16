@@ -9792,12 +9792,15 @@ enum SelfTest {
             if seamUnsafe {
                 // Fail-stop. Continuing would feed invented OCR results to
                 // every later gate and shift their slot baselines, turning one
-                // real failure into a cascade of false ones. Leaves this
-                // block; the run's own end prints the summary once and turns
-                // the recorded failures into the exit code.
+                // real failure into a cascade of false ones. This `do` block
+                // is not a return scope, so returning here leaves `run`
+                // itself: the summary is printed first and the exit code says
+                // the run failed.
                 check("sliceB-seam-isolation", false,
                       "OCR seam left installed; remaining gates skipped")
-                return
+                print("\(failures) TEST(S) FAILED")
+                print("Artifacts: \(outputDir)")
+                return 1
             }
 
             // J. Abandoning a drag restores the redo branch. Pen and the
@@ -13101,11 +13104,8 @@ enum SelfTest {
             //     asserted as an exact event vector.
             var hostFailures: [String] = []
             guard let hostScreen = NSScreen.main ?? NSScreen.screens.first else {
-                // Bare: this is inside the section's MainActor closure, not in
-                // `run`. The failure is already recorded, and the run's own end
-                // prints the summary and derives the exit code.
                 check("sliceB-hosts-failclosed", false, "no screen")
-                return
+                return 1
             }
             // The overlay paints the frozen capture across the WHOLE screen, so
             // annotation pixels only line up with view points when the fixture
