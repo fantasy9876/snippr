@@ -9305,6 +9305,17 @@ enum SelfTest {
             // so the ordering it appears to prove is the fixture's, not the
             // feature's.
             var lockFailures: [String] = []
+            // This loop sets the Esc preferences too, and the earlier restore
+            // already ran. Without its own save/restore it would leave the
+            // user's settings on whatever the last case used.
+            let lockEscCopyBefore = Settings.shared.escCopy
+            let lockEscSaveBefore = Settings.shared.escSave
+            let lockStyleBefore = Settings.shared.confirmationStyle
+            defer {
+                Settings.shared.escCopy = lockEscCopyBefore
+                Settings.shared.escSave = lockEscSaveBefore
+                Settings.shared.confirmationStyle = lockStyleBefore
+            }
             let lockRoutes: [(String, Bool, Bool, (EditorWindowController) -> Void,
                               Int, Bool)] = [
                 // name, escCopy, escSave, action, dependency calls, closes
@@ -9388,13 +9399,26 @@ enum SelfTest {
                         name + ":visible \(wc.window?.isVisible == true)")
                 }
                 wc.window?.close()
-                // Whatever the route did, the close leaves nothing behind.
+                // Whatever the route did, the close leaves nothing behind —
+                // and the job is superseded exactly once, whether the lock did
+                // it already or the close is doing it now.
+                // Save bumps twice: once for the save-lock, once when the
+                // close sweeps the annotation — the registry is empty by then
+                // but cancel(for:) bumps regardless. Every other route bumps
+                // only at the close.
+                let expectedBumps = expectsLock ? 2 : 1
                 if blur.redactionState != .fallbackFull
+                    || blur.redactionGeneration != generation + expectedBumps
+                    || counting.repaints != 1
                     || canvas.redactionRegistry.count != 0
                     || MainActor.assumeIsolated({
                         SliceBRedactionJob.ownerCountForTesting
                     }) != ownersBefore {
-                    lockFailures.append(name + ":cleanup")
+                    lockFailures.append(
+                        name + ":cleanup "
+                        + String(describing: blur.redactionState)
+                        + " gen \(blur.redactionGeneration)"
+                        + " repaints \(counting.repaints)")
                 }
             }
             check("sliceB-backdrop-save-lock-order",
@@ -9460,6 +9484,7 @@ enum SelfTest {
                 let fingerprintBefore = canvas.documentFingerprintForTesting
                 let selectionBefore = canvas.selectedRefForTesting
                 let transientBefore = canvas.transientDescriptionForTesting
+                let refsBefore = canvas.annotationRefsForTesting
                 // The real menu, built by production. `popUp` runs a nested
                 // event loop and cannot run headlessly, so the gate stops at
                 // construction and then fires the item's OWN target/action.
@@ -9566,9 +9591,28 @@ enum SelfTest {
                     applyFailures.append("menu-check-undo")
                 }
                 canvas.undoManager?.redo()
+                // Pinned against the state from BEFORE the menu, not against
+                // whatever the redo produced: capturing the no-op baseline
+                // after the redo would let the redo itself corrupt the
+                // selection, tool, crop or marks and still look clean.
+                let afterRedo = expected(from: fingerprintBefore, [
+                    ("backdrop=none", "backdrop=mint"),
+                    ("outer=none", "outer=160x140"),
+                    ("history=\(historyBefore)", "history=\(historyBefore + 3)"),
+                ], "menu-redo")
                 if canvas.backdropPresetForTesting != .mint
-                    || checkedTag("after-redo") != presets.firstIndex(of: .mint) {
-                    applyFailures.append("menu-check-redo")
+                    || checkedTag("after-redo") != presets.firstIndex(of: .mint)
+                    || canvas.documentFingerprintForTesting != afterRedo
+                    || canvas.currentTool != toolBefore
+                    || canvas.selectedRefForTesting !== selectionBefore
+                    || canvas.transientDescriptionForTesting != transientBefore
+                    || !canvas.hasValidCropSelection
+                    || canvas.annotationRefsForTesting.count != refsBefore.count
+                    || !zip(canvas.annotationRefsForTesting, refsBefore)
+                        .allSatisfy({ $0.0 === $0.1 }) {
+                    applyFailures.append(
+                        "menu-check-redo "
+                        + canvas.documentFingerprintForTesting)
                 }
                 let beforeNoop = canvas.documentFingerprintForTesting
                 let reopened = wc.backdropMenu()
@@ -9777,13 +9821,16 @@ enum SelfTest {
                     workerDepth = SliceBExport.budgetScopeDepthForTesting
                 }
                 if other.wait(timeout: .now() + 5) == .timedOut {
+                    // The worker may still be writing these, so they are not
+                    // read at all on this path — a timeout is a failure, not a
+                    // reason to race it for a second one.
                     scopeFailures.append("cross-timeout")
-                }
-                // After the worker's scope unwinds it must see the real budget
-                // again and hold no open scope: pinning only before and inside
-                // would let a pop that never happens go unnoticed.
-                if seen != realBudget || seenInner != 2_000_000
+                } else if seen != realBudget || seenInner != 2_000_000
                     || seenAfter != realBudget || workerDepth != 0 {
+                    // After the worker's scope unwinds it must see the real
+                    // budget again and hold no open scope: pinning only before
+                    // and inside would let a pop that never happens go
+                    // unnoticed.
                     scopeFailures.append(
                         "cross \(seen) \(seenInner) \(seenAfter) \(workerDepth)")
                 }
@@ -9829,19 +9876,19 @@ enum SelfTest {
                     recorderTimedOut = true
                 }
                 ToastHUD.show("here")
-                return otherThread
+                // Nil on timeout: the worker may still be assigning to this.
+                return recorderTimedOut ? nil : otherThread
             }
             // Neither thread's recorder may pick up the other's message, and
             // both stacks must be empty again afterwards.
             if recorderTimedOut {
                 scopeFailures.append("toast-timeout")
-            }
-            if threadRecord.result != ["elsewhere"]
+            } else if threadRecord.result != ["elsewhere"]
                 || threadRecord.messages != ["here"]
                 || workerRecorderDepth != 0
                 || ToastHUD.recorderDepthForTesting != 0 {
                 scopeFailures.append(
-                    "toast-thread \(threadRecord.result) "
+                    "toast-thread \(threadRecord.result ?? []) "
                     + "\(threadRecord.messages) \(workerRecorderDepth) "
                     + "\(ToastHUD.recorderDepthForTesting)")
             }
