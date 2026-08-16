@@ -9112,9 +9112,12 @@ enum SelfTest {
                 func verifyLayout(_ phase: String) {
                     content.layoutSubtreeIfNeeded()
                     // Rows and bar.
-                    if !near(toolRow.frame.height, 35)
-                        || !near(actionRow.frame.height, 35)
-                        || !near(bar.frame.height, 70) {
+                    // 0.01: production constrains these to exactly 35, 35
+                    // and 70, so half a point of slack is room a real gap can
+                    // hide in rather than tolerance for rounding.
+                    if !near(toolRow.frame.height, 35, 0.01)
+                        || !near(actionRow.frame.height, 35, 0.01)
+                        || !near(bar.frame.height, 70, 0.01) {
                         toolbarFailures.append(
                             "\(phase):row-heights \(actionRow.frame.height)/"
                             + "\(toolRow.frame.height)/\(bar.frame.height)")
@@ -9286,11 +9289,11 @@ enum SelfTest {
                     // BOTH: a shared edge alone still allows a matching gap
                     // at each outer edge — two rows of 34.5 inside 70 meet
                     // exactly and leave 0.5 top and bottom.
-                    if !near(rowsUnion.minY, stack.bounds.minY)
-                        || !near(rowsUnion.maxY, stack.bounds.maxY)
+                    if !near(rowsUnion.minY, stack.bounds.minY, 0.01)
+                        || !near(rowsUnion.maxY, stack.bounds.maxY, 0.01)
                         || !near(lower.maxY, upper.minY, 0.01)
                         || !near(toolRow.frame.height + actionRow.frame.height,
-                                 stack.bounds.height) {
+                                 stack.bounds.height, 0.01) {
                         toolbarFailures.append(
                             "\(phase):rows-do-not-tile \(rowsUnion)")
                     }
@@ -9347,8 +9350,16 @@ enum SelfTest {
                         || button.action != expectedSelector {
                         toolbarFailures.append("\(tool.rawValue):action")
                     }
+                    // All three semantic strings, exactly. makeButton sets
+                    // the tooltip, the accessibility label and the image
+                    // description from one string on purpose, so checking one
+                    // of them — or merely that they are non-empty — would let
+                    // two tools swap their descriptions unnoticed.
                     let label = button.accessibilityLabel() ?? ""
-                    if label != tool.tooltip {
+                    if label != tool.tooltip || button.toolTip != tool.tooltip
+                        || button.image == nil
+                        || button.image?.accessibilityDescription
+                            != tool.tooltip {
                         toolbarFailures.append(
                             "\(tool.rawValue):label(\(label))")
                     }
@@ -9367,7 +9378,8 @@ enum SelfTest {
                         toolbarFailures.append("\(name):action")
                     }
                     if button.accessibilityLabel() != tooltip
-                        || button.toolTip != tooltip {
+                        || button.toolTip != tooltip
+                        || button.image?.accessibilityDescription != tooltip {
                         toolbarFailures.append(
                             "\(name):label(\(button.accessibilityLabel() ?? "nil"))")
                     }
