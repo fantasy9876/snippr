@@ -9535,16 +9535,14 @@ enum SelfTest {
 
                 // -- forced failure through the REAL action wrapper
                 // Baseline of the LIVE reviewing view, captured before any
-                // action: comparing after the healthy copy would compare
-                // against a completed session.
-                view.needsDisplay = true
-                view.display()
-                let baselineShot: CGImage? = view
-                    .bitmapImageRepForCachingDisplay(in: view.bounds)
-                    .flatMap { rep -> CGImage? in
-                        view.cacheDisplay(in: view.bounds, to: rep)
-                        return rep.cgImage
-                    }
+                // action, through the REAL draw path.
+                if view.isFlipped {
+                    hostFailures.append("area:view-flipped")
+                }
+                if view.bounds.origin != .zero {
+                    hostFailures.append("area:view-origin \(view.bounds.origin)")
+                }
+                let baselineShot = SelfTest.snapshotViewForTesting(view)
                 if baselineShot == nil {
                     hostFailures.append("area:no-baseline")
                 }
@@ -9614,14 +9612,33 @@ enum SelfTest {
                 // (nil out, dependencies at zero, session still reviewing).
                 // The cover pixels come from the ACTUAL view: its own draw,
                 // its own backing scale, its own selection clip.
-                let viewShot = AnnotationRenderer.withForcedRegionalFailure {
-                    () -> CGImage? in
-                    view.needsDisplay = true
-                    view.display()
-                    guard let rep = view.bitmapImageRepForCachingDisplay(
-                        in: view.bounds) else { return nil }
-                    view.cacheDisplay(in: view.bounds, to: rep)
-                    return rep.cgImage
+                let drawsBefore = view.drawCallsForTesting
+                let (viewShot, previewEvents) = RenderTrace.capture(
+                    host: "area", path: "preview"
+                ) { () -> CGImage? in
+                    AnnotationRenderer.withForcedRegionalFailure {
+                        SelfTest.snapshotViewForTesting(view)
+                    }
+                }
+                // Independent evidence the production draw really ran.
+                if view.drawCallsForTesting <= drawsBefore {
+                    hostFailures.append("area:no-draw")
+                }
+                let previewShape = previewEvents.map {
+                    "\($0.host)/\($0.path)/\($0.kind)"
+                }
+                if previewShape != ["area/preview/regionalAttempt"] {
+                    hostFailures.append("area:preview-seq \(previewShape)")
+                }
+                if let attempt = previewEvents.first,
+                   attempt.rect != hostMask.standardized.integral
+                    || attempt.destination != "-" {
+                    hostFailures.append("area:preview-attempt \(attempt.rect)")
+                }
+                if let baselineShot, let viewShot,
+                   baselineShot.width != viewShot.width
+                    || baselineShot.height != viewShot.height {
+                    hostFailures.append("area:snapshot-size")
                 }
                 guard let viewShot, view.bounds.width > 0 else {
                     hostFailures.append("area:no-view-shot")
@@ -10131,14 +10148,11 @@ enum SelfTest {
                     panelFailures.append("panel:no-repaint-delegate")
                 }
                 // Baseline of the live host BEFORE anything is drawn on it.
-                host.needsDisplay = true
-                host.display()
-                let panelBaseline: CGImage? = host
-                    .bitmapImageRepForCachingDisplay(in: host.bounds)
-                    .flatMap { rep -> CGImage? in
-                        host.cacheDisplay(in: host.bounds, to: rep)
-                        return rep.cgImage
-                    }
+                if host.isFlipped { panelFailures.append("panel:host-flipped") }
+                if host.bounds.origin != .zero {
+                    panelFailures.append("panel:host-origin \(host.bounds.origin)")
+                }
+                let panelBaseline = SelfTest.snapshotViewForTesting(host)
                 if panelBaseline == nil { panelFailures.append("panel:no-baseline") }
 
                 // The mask is an integral SOURCE rect (what the compositor
@@ -10212,14 +10226,31 @@ enum SelfTest {
 
                 // Preview from the ACTUAL host view: mask exactly covered,
                 // everything else byte-identical to the baseline.
-                let shot = AnnotationRenderer.withForcedRegionalFailure {
-                    () -> CGImage? in
-                    host.needsDisplay = true
-                    host.display()
-                    guard let rep = host.bitmapImageRepForCachingDisplay(
-                        in: host.bounds) else { return nil }
-                    host.cacheDisplay(in: host.bounds, to: rep)
-                    return rep.cgImage
+                let panelDrawsBefore = host.drawCallsForTesting
+                let (shot, panelPreviewEvents) = RenderTrace.capture(
+                    host: "scroll", path: "preview"
+                ) { () -> CGImage? in
+                    AnnotationRenderer.withForcedRegionalFailure {
+                        SelfTest.snapshotViewForTesting(host)
+                    }
+                }
+                if host.drawCallsForTesting <= panelDrawsBefore {
+                    panelFailures.append("panel:no-draw")
+                }
+                let panelPreviewShape = panelPreviewEvents.map {
+                    "\($0.host)/\($0.path)/\($0.kind)"
+                }
+                if panelPreviewShape != ["scroll/preview/regionalAttempt"] {
+                    panelFailures.append("panel:preview-seq \(panelPreviewShape)")
+                }
+                if let attempt = panelPreviewEvents.first,
+                   attempt.rect != expectedRegion || attempt.destination != "-" {
+                    panelFailures.append("panel:preview-attempt \(attempt.rect)")
+                }
+                if let panelBaseline, let shot,
+                   panelBaseline.width != shot.width
+                    || panelBaseline.height != shot.height {
+                    panelFailures.append("panel:snapshot-size")
                 }
                 if let shot, let panelBaseline, host.bounds.width > 0 {
                     // The cached rep rounds each axis independently, so the
@@ -11301,6 +11332,35 @@ enum SelfTest {
             if !found { return nil }
         }
         return true
+    }
+
+    /// Renders a view through the REAL AppKit draw path into a fresh bitmap.
+    /// `cacheDisplay` hands back the layer cache on a layer-backed view, which
+    /// is why an earlier gate saw a snapshot with no annotation in it at all.
+    @MainActor
+    static func snapshotViewForTesting(_ view: NSView) -> CGImage? {
+        let bounds = view.bounds
+        guard bounds.width >= 1, bounds.height >= 1 else { return nil }
+        // The rep is used ONLY to read the authoritative backing dimensions —
+        // never cacheDisplay, which is what returned a stale layer before.
+        guard let rep = view.bitmapImageRepForCachingDisplay(in: bounds)
+        else { return nil }
+        let pixelWidth = max(1, rep.pixelsWide)
+        let pixelHeight = max(1, rep.pixelsHigh)
+        guard let ctx = CGContext(
+            data: nil, width: pixelWidth, height: pixelHeight,
+            bitsPerComponent: 8, bytesPerRow: 0,
+            space: CGColorSpace(name: CGColorSpace.sRGB)!,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        else { return nil }
+        // Independent scale per axis, then move the view's origin to zero.
+        ctx.scaleBy(
+            x: CGFloat(pixelWidth) / bounds.width,
+            y: CGFloat(pixelHeight) / bounds.height)
+        ctx.translateBy(x: -bounds.minX, y: -bounds.minY)
+        let graphics = NSGraphicsContext(cgContext: ctx, flipped: false)
+        view.displayIgnoringOpacity(bounds, in: graphics)
+        return ctx.makeImage()
     }
 
     /// Cheap content hash so a gate can assert "not one pixel moved".

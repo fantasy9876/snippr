@@ -739,7 +739,12 @@ final class SelectionOverlayView: NSView {
 
     // MARK: Drawing
 
+    /// Independent evidence that production drawing really ran during a gate's
+    /// snapshot, rather than a cached layer being handed back.
+    private(set) var drawCallsForTesting = 0
+
     override func draw(_ dirtyRect: NSRect) {
+        drawCallsForTesting += 1
         guard let ctx = NSGraphicsContext.current?.cgContext else { return }
 
         // The frozen screen lives in the cached background layer set up
