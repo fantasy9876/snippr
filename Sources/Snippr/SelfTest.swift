@@ -9109,13 +9109,22 @@ enum SelfTest {
                     if button.target == nil || button.action == nil {
                         toolbarFailures.append("\(tool.rawValue):action")
                     }
-                    // The centre of every button belongs to that button.
-                    let centre = button.convert(
-                        CGPoint(x: button.bounds.midX, y: button.bounds.midY),
-                        to: bar)
-                    if bar.hitTest(bar.convert(centre, to: bar.superview))
-                        !== button {
-                        toolbarFailures.append("\(tool.rawValue):hit")
+                    // The centre of every button belongs to that button, asked
+                    // through the WHOLE hierarchy rather than within the bar.
+                    // `hitTest` takes a point in the RECEIVER'S SUPERVIEW
+                    // space, so the point is converted into the content view's
+                    // parent — passing a receiver-local point would be wrong
+                    // for any view whose frame origin is not zero.
+                    let centre = CGPoint(
+                        x: button.bounds.midX, y: button.bounds.midY)
+                    if let content = window.contentView,
+                       let host = content.superview {
+                        let inHost = button.convert(centre, to: host)
+                        if content.hitTest(inHost) !== button {
+                            toolbarFailures.append("\(tool.rawValue):hit")
+                        }
+                    } else {
+                        toolbarFailures.append("\(tool.rawValue):no-content")
                     }
                 }
                 // No two buttons may overlap.
