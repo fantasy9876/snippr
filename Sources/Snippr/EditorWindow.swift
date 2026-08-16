@@ -795,8 +795,12 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
     }
 
     func surfaceNeedsRedactionRepaint() {
-        // A resolved or cancelled redaction can invalidate a magnifier patch.
-        refreshMagnifierSnapshotsAfterDocumentChange(force: false)
+        // FORCE, not needsRebuild: a resolution can also make a mask STOP
+        // overlapping a magnifier's source (pending covered it, the resolved
+        // word boxes do not). Testing only the new mask returns false there and
+        // the callout would keep showing the old, fully-masked patch while the
+        // document beneath it has narrowed.
+        refreshMagnifierSnapshotsAfterDocumentChange()
         needsDisplay = true
     }
 
