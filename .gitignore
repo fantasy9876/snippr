@@ -6,6 +6,8 @@ build/
 site/*.dmg
 windows/bin/
 windows/obj/
+windows/**/bin/
+windows/**/obj/
 windows/*.zip
 windows/SnipprSetup-*.exe
 windows/zip-stage/

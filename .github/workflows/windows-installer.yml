@@ -3,10 +3,22 @@ name: Windows installer
 on:
   workflow_dispatch:
     inputs:
+      ref:
+        description: "Exact git SHA or ref to checkout and build (empty = selected branch HEAD)"
+        required: false
+        default: ""
       tag:
-        description: "Existing release tag to upload the installer to"
-        required: true
-        default: "v1.0.2"
+        description: "Existing release tag to upload the installer to (empty = gate+build only, no upload)"
+        required: false
+        default: ""
+  pull_request:
+    paths:
+      - "windows/**"
+      - ".github/workflows/windows-installer.yml"
+  push:
+    paths:
+      - "windows/**"
+      - ".github/workflows/windows-installer.yml"
 
 permissions:
   contents: write
@@ -18,14 +30,39 @@ jobs:
       # Signing turns on automatically once the Azure Trusted Signing
       # secrets are added in repo Settings → Secrets and variables → Actions.
       ENABLE_SIGNING: ${{ secrets.AZURE_TENANT_ID != '' }}
+      CHECKOUT_REF: ${{ inputs.ref || github.sha }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.CHECKOUT_REF }}
+
+      - name: Pin exact checkout
+        shell: pwsh
+        run: |
+          $head = git rev-parse HEAD
+          $want = $env:CHECKOUT_REF
+          Write-Host "requested=$want"
+          Write-Host "HEAD=$head"
+          git log -1 --oneline
+          # A 40-char hex request must land on that exact commit.
+          if ($want -match '^[0-9a-fA-F]{40}$' -and $head -ne $want.ToLower()) {
+            throw "checkout HEAD $head != requested $want"
+          }
 
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: "8.0.x"
 
+      - name: Stitcher gate (animated-band + majority fail-closed)
+        run: >
+          dotnet run --project windows/Snippr.Win.StitcherGate/Snippr.Win.StitcherGate.csproj
+          -c Release --no-launch-profile
+
+      - name: Build Win app (Release)
+        run: dotnet build windows/Snippr.Win.csproj -c Release
+
       - name: Publish self-contained exe
+        if: github.event_name == 'workflow_dispatch'
         # ReadyToRun precompiles IL to native code: the tray app and the
         # editor open without paying JIT cost on first use.
         run: >
@@ -37,6 +74,7 @@ jobs:
           -p:TieredPGO=true
 
       - name: Stage exe next to installer script
+        if: github.event_name == 'workflow_dispatch'
         shell: pwsh
         run: |
           $exe = Get-ChildItem -Recurse -Path windows -Filter Snippr.exe |
@@ -46,7 +84,7 @@ jobs:
           Copy-Item $exe.FullName windows/Snippr.exe
 
       - name: Sign Snippr.exe (Azure Trusted Signing)
-        if: env.ENABLE_SIGNING == 'true'
+        if: github.event_name == 'workflow_dispatch' && env.ENABLE_SIGNING == 'true'
         uses: azure/trusted-signing-action@v0.5.1
         with:
           azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
@@ -62,15 +100,17 @@ jobs:
           timestamp-digest: SHA256
 
       - name: Install NSIS
+        if: github.event_name == 'workflow_dispatch'
         run: choco install nsis -y --no-progress
 
       - name: Build NSIS installer
+        if: github.event_name == 'workflow_dispatch'
         shell: pwsh
         working-directory: windows
         run: '& "C:\Program Files (x86)\NSIS\makensis.exe" installer.nsi'
 
       - name: Sign installer (Azure Trusted Signing)
-        if: env.ENABLE_SIGNING == 'true'
+        if: github.event_name == 'workflow_dispatch' && env.ENABLE_SIGNING == 'true'
         uses: azure/trusted-signing-action@v0.5.1
         with:
           azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
@@ -86,12 +126,14 @@ jobs:
           timestamp-digest: SHA256
 
       - name: Portable ZIP
+        if: github.event_name == 'workflow_dispatch'
         shell: pwsh
         run: >
           Compress-Archive -Path windows/Snippr.exe
           -DestinationPath windows/Snippr-portable-win-x64.zip -Force
 
       - name: Upload to release
+        if: github.event_name == 'workflow_dispatch' && inputs.tag != ''
         env:
           GH_TOKEN: ${{ github.token }}
         shell: pwsh

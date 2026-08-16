@@ -1,24 +1,22 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <OutputType>WinExe</OutputType>
+    <OutputType>Exe</OutputType>
     <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
     <TargetPlatformMinVersion>10.0.17763.0</TargetPlatformMinVersion>
     <UseWindowsForms>true</UseWindowsForms>
     <EnableWindowsTargeting>true</EnableWindowsTargeting>
-    <RootNamespace>Snippr</RootNamespace>
-    <AssemblyName>Snippr</AssemblyName>
-    <ApplicationIcon>snippr.ico</ApplicationIcon>
-    <Version>1.2.7</Version>
-    <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
-    <InvariantGlobalization>true</InvariantGlobalization>
+    <Nullable>enable</Nullable>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <AssemblyName>Snippr.Win.StitcherGate</AssemblyName>
+    <RootNamespace>Snippr.Tests</RootNamespace>
+    <IsPackable>false</IsPackable>
   </PropertyGroup>
 
   <ItemGroup>
-    <Compile Remove="Snippr.Win.StitcherGate/**" />
-    <None Include="Snippr.Win.StitcherGate/**" />
+    <Compile Include="..\WinStitcher.cs" Link="WinStitcher.cs" />
   </ItemGroup>
 
 </Project>
