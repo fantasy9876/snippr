@@ -161,7 +161,12 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
 
         var toolViews: [NSView] = []
         for tool in EditorTool.allCases {
-            let b = makeButton(symbol: tool.symbol, tooltip: tool.tooltip, action: #selector(toolTapped(_:)))
+            // Backdrop is a document style, so its button opens the preset
+            // menu rather than entering a drawing mode.
+            let action = tool == .backdrop
+                ? #selector(showBackdropMenu(_:))
+                : #selector(toolTapped(_:))
+            let b = makeButton(symbol: tool.symbol, tooltip: tool.tooltip, action: action)
             b.identifier = NSUserInterfaceItemIdentifier(tool.rawValue)
             toolButtons[tool] = b
             toolViews.append(b)
@@ -488,11 +493,40 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
 
     // MARK: actions
 
-    /// Applies a backdrop preset from the popover. Kept separate from tool
-    /// selection so picking the tool is never itself an edit.
+    /// Applies a backdrop preset. Kept separate from tool selection so picking
+    /// the tool is never itself an edit.
     func applyBackdropPresetForTesting(_ preset: BackdropPreset) {
         canvas.applyBackdrop(preset)
     }
+
+    /// The real preset menu. Opening it changes nothing; only choosing an item
+    /// applies a preset, and choosing the current one is a no-op.
+    @objc func showBackdropMenu(_ sender: NSButton) {
+        let menu = NSMenu(title: "Backdrop")
+        for (index, preset) in BackdropPreset.allCases.enumerated() {
+            let item = NSMenuItem(
+                title: preset == .none ? "None" : preset.rawValue.capitalized,
+                action: #selector(backdropPresetChosen(_:)), keyEquivalent: "")
+            item.target = self
+            item.tag = index
+            item.state = preset == canvas.backdropPreset ? .on : .off
+            menu.addItem(item)
+        }
+        backdropMenuForTesting = menu
+        menu.popUp(
+            positioning: nil,
+            at: NSPoint(x: 0, y: sender.bounds.height), in: sender)
+    }
+
+    /// Sender is an NSMenuItem, so the preset travels as an Int tag rather than
+    /// a Swift enum, which is not representable in Objective-C.
+    @objc func backdropPresetChosen(_ sender: NSMenuItem) {
+        let presets = BackdropPreset.allCases
+        guard presets.indices.contains(sender.tag) else { return }
+        canvas.applyBackdrop(presets[sender.tag])
+    }
+
+    private(set) var backdropMenuForTesting: NSMenu?
 
     @objc private func toolTapped(_ sender: NSButton) {
         guard let id = sender.identifier?.rawValue, let tool = EditorTool(rawValue: id) else { return }
@@ -947,7 +981,8 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
         else { return nil }
         guard let cg = SliceBBackdrop.compose(
             image: inner, preset: backdropPreset,
-            budgetBytes: SliceBExport.defaultBudgetBytes)
+            budgetBytes: SliceBExport.defaultBudgetBytes,
+            pixelScale: pxScale)
         else { return nil }
 
         // Render succeeded — now, and only now, make it real. Commit the very
@@ -2093,7 +2128,17 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
             return
         }
         if flags.isEmpty, let tool = SliceAHotkeys.editorToolKeys[chars] {
-            (window?.windowController as? EditorWindowController)?.selectTool(tool)
+            let controller = window?.windowController as? EditorWindowController
+            if tool == .backdrop {
+                // Opening the chooser is not an edit.
+                controller?.selectTool(.backdrop)
+                if let button = controller?.toolButtonsForTesting
+                    .first(where: { $0.tool == .backdrop })?.button {
+                    controller?.showBackdropMenu(button)
+                }
+                return
+            }
+            controller?.selectTool(tool)
             return
         }
         super.keyDown(with: event)

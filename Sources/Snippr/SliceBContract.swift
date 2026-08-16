@@ -705,8 +705,16 @@ enum SliceBBackdrop {
 
     /// `.none` is byte-identical to the input; anything over budget fails
     /// closed instead of allocating.
+    /// Corner radius and shadow are POINT metrics; padding is pixels. On a
+    /// Retina document a fixed pixel radius would render at half the intended
+    /// size, so the caller passes the document's scale.
+    static let cornerRadiusPt: CGFloat = 12
+    static let shadowOffsetPt: CGFloat = -8
+    static let shadowBlurPt: CGFloat = 24
+
     static func compose(
-        image: CGImage, preset: BackdropPreset, budgetBytes: Int
+        image: CGImage, preset: BackdropPreset, budgetBytes: Int,
+        pixelScale: CGFloat = 1
     ) -> CGImage? {
         guard preset != .none else { return image }
         let pad = padding(
@@ -735,11 +743,14 @@ enum SliceBBackdrop {
         let target = CGRect(
             x: pad, y: pad,
             width: CGFloat(image.width), height: CGFloat(image.height))
+        let scale = max(1, pixelScale)
         ctx.setShadow(
-            offset: CGSize(width: 0, height: -8), blur: 24,
+            offset: CGSize(width: 0, height: shadowOffsetPt * scale),
+            blur: shadowBlurPt * scale,
             color: NSColor.black.withAlphaComponent(0.35).cgColor)
+        let radius = cornerRadiusPt * scale
         let rounded = CGPath(
-            roundedRect: target, cornerWidth: 12, cornerHeight: 12,
+            roundedRect: target, cornerWidth: radius, cornerHeight: radius,
             transform: nil)
         ctx.addPath(rounded)
         ctx.setFillColor(NSColor.black.cgColor)
