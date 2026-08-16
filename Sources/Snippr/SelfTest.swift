@@ -9459,6 +9459,7 @@ enum SelfTest {
                 surface.addAnnotationForTesting(blur)
 
                 // -- forced failure through the REAL action wrapper
+                let toastsBeforeFail = toasts
                 let (_, failEvents) = RenderTrace.capture(
                     host: "area", path: "export"
                 ) {
@@ -9467,6 +9468,12 @@ enum SelfTest {
                     }
                 }
                 if exported != nil { hostFailures.append("area:exported") }
+                // Delta, not a running total: a cumulative check would let the
+                // healthy run's toast cover a missing warning here.
+                if toasts - toastsBeforeFail != 1 {
+                    hostFailures.append(
+                        "area:fail-toasts \(toasts - toastsBeforeFail)")
+                }
                 if overlay.session.phase != .reviewing {
                     hostFailures.append("area:phase \(overlay.session.phase)")
                 }
@@ -9498,6 +9505,7 @@ enum SelfTest {
 
                 // -- healthy run: exactly one materialization inside the mask
                 exported = nil
+                let toastsBeforeOK = toasts
                 let (_, okEvents) = RenderTrace.capture(
                     host: "area", path: "export"
                 ) {
@@ -9529,7 +9537,10 @@ enum SelfTest {
                 }) {
                     hostFailures.append("area:ok-attribution")
                 }
-                if toasts < 1 { hostFailures.append("area:no-toast") }
+                if toasts - toastsBeforeOK != 1 {
+                    hostFailures.append(
+                        "area:ok-toasts \(toasts - toastsBeforeOK)")
+                }
                 if overlay.session.phase != .completed {
                     hostFailures.append("area:not-completed \(overlay.session.phase)")
                 }
@@ -9540,6 +9551,41 @@ enum SelfTest {
                 if shot.width != Int(hostSelection.width)
                     || shot.height != Int(hostSelection.height) {
                     hostFailures.append("area:dims \(shot.width)x\(shot.height)")
+                }
+                // Dimensions alone cannot see a top-left / bottom-left swap
+                // because the selection is asymmetric only in ORIGIN. Compare
+                // the pixels outside the mask against the crop we expect, and
+                // assert the destination rect the renderer actually allocated.
+                let expectedTopLeft = CGRect(
+                    x: hostSelection.minX,
+                    y: CGFloat(hostFrozen.cgImage.height) - hostSelection.maxY,
+                    width: hostSelection.width, height: hostSelection.height)
+                if let reference = hostFrozen.cgImage.cropping(to: expectedTopLeft) {
+                    let out = rgba(shot), ref = rgba(reference)
+                    var mismatch = 0
+                    for y in 0..<shot.height {
+                        for x in 0..<shot.width {
+                            let pixel = CGPoint(
+                                x: hostSelection.minX + CGFloat(x),
+                                y: hostSelection.minY
+                                    + CGFloat(shot.height - 1 - y))
+                            if hostMask.contains(pixel) { continue }
+                            let i = (y * shot.width + x) * 4
+                            if Array(out[i..<(i + 4)]) != Array(ref[i..<(i + 4)]) {
+                                mismatch += 1
+                            }
+                        }
+                    }
+                    if mismatch != 0 {
+                        hostFailures.append("area:crop-origin \(mismatch)")
+                    }
+                } else {
+                    hostFailures.append("area:no-reference-crop")
+                }
+                if let destination = okEvents.first(where: {
+                    $0.kind == "destination"
+                }), destination.rect != expectedTopLeft {
+                    hostFailures.append("area:destination-rect \(destination.rect)")
                 }
                 // Two SEPARATE proofs. Export fail-closed was asserted above
                 // (nil out, dependencies at zero, session still reviewing).
