@@ -942,14 +942,11 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
         guard preset != backdropPreset else { return false }
         // Validate the PEAK here, not at export: a preset the document cannot
         // afford must be refused while the user is choosing it, with a message
-        // about the backdrop rather than a redaction error much later.
+        // about the backdrop rather than a redaction error much later. The
+        // peak is inner AND outer together, judged on the FULL image so a
+        // pending crop cannot make a preset look affordable and then take that
+        // affordability away when it is cancelled.
         //
-        // The peak is inner AND outer together, measured against the same
-        // dimensions the export will use — an active crop shrinks both. Only
-        // the reserve was checked before, so a document whose two buffers each
-        // fit but together do not was accepted here and failed at export.
-        // Removing a backdrop is always allowed: it can only shrink the peak,
-        // and a document must never be stuck wearing a frame it cannot export.
         // Removing a frame is always allowed: it only lowers the peak, and a
         // document must never be stuck wearing one it cannot export.
         guard preset == .none || backdropPeakFits(

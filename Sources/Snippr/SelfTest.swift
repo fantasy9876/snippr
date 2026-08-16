@@ -8778,6 +8778,10 @@ enum SelfTest {
             final class TerminalSpy {
                 var copies = 0, saveAs = 0, autoSaves = 0, pins = 0
                 var ocr = 0, translate = 0
+                /// Runs INSIDE a dependency, which is the only vantage point
+                /// from which the order between the save-lock and the export
+                /// handoff is observable at all.
+                var onDependency: (() -> Void)?
                 var total: Int {
                     copies + saveAs + autoSaves + pins + ocr + translate
                 }
@@ -8798,15 +8802,26 @@ enum SelfTest {
                     forceFitForTesting: true)
                 wc.terminalDependencies = EditorWindowController
                     .TerminalDependencies(
-                        copyToClipboard: { _ in spy.copies += 1 },
-                        saveAs: { _, _, _ in spy.saveAs += 1 },
+                        copyToClipboard: { _ in
+                            spy.copies += 1
+                            spy.onDependency?()
+                        },
+                        saveAs: { _, _, _ in
+                            spy.saveAs += 1
+                            spy.onDependency?()
+                        },
                         autoSave: { _, done in
                             spy.autoSaves += 1
+                            spy.onDependency?()
                             done(nil)
                         },
-                        pin: { _ in spy.pins += 1 },
+                        pin: { _ in
+                            spy.pins += 1
+                            spy.onDependency?()
+                        },
                         recognize: { _, translate in
                             if translate { spy.translate += 1 } else { spy.ocr += 1 }
+                            spy.onDependency?()
                         })
                 let canvas = wc.canvasForTesting
                 // Every annotation kind, so each payload branch of the
@@ -9238,6 +9253,21 @@ enum SelfTest {
                         + String(describing: pending.redactionState))
                 }
                 wc.window?.close()
+                // Closing is what finally supersedes the job. Checking only
+                // before the close would let a leak accumulate and then hide
+                // inside the next route's baseline.
+                if pending.redactionState != .fallbackFull
+                    || pending.redactionGeneration != pendingGeneration + 1
+                    || counting.repaints != 1
+                    || canvas.redactionRegistry.count != 0
+                    || MainActor.assumeIsolated({
+                        SliceBRedactionJob.ownerCountForTesting
+                    }) != ownersBefore {
+                    outerFailures.append(
+                        name + ":close "
+                        + String(describing: pending.redactionState)
+                        + " repaints \(counting.repaints)")
+                }
 
                 // Healthy twin on the SAME seeded state with the SAME preset:
                 // it must hit its dependencies EXACTLY — the named ones once,
@@ -9251,7 +9281,54 @@ enum SelfTest {
                 if !liveCanvas.applyBackdrop(.ocean) {
                     outerFailures.append(name + ":live-apply")
                 }
+                // Save takes the save-lock: on a SUCCESSFUL export every job
+                // in flight is superseded BEFORE the panel opens, so a late
+                // result cannot narrow a mask that has already been written
+                // out. Every other route leaves jobs alone — asserting the
+                // difference is what makes the lock's placement observable,
+                // and the dependency is the only vantage point that sees it.
+                let expectsSaveLock = name == "save" || name == "saveAs"
+                let livePending = BlurAnnotation(uiScale: 1)
+                livePending.rect = CGRect(x: 30, y: 30, width: 40, height: 30)
+                liveCanvas.annotations.append(livePending)
+                let liveCounting = ForwardingRepaintDelegate(
+                    wrapping: liveCanvas.redactionDelegate)
+                liveCanvas.redactionDelegate = liveCounting
+                let liveGeneration = livePending.redactionGeneration
+                let liveOwners = MainActor.assumeIsolated { () -> Int in
+                    let base = SliceBRedactionJob.ownerCountForTesting
+                    let job = SliceBRedactionJob.pendingForTesting(
+                        blur: livePending, host: liveCanvas)
+                    liveCanvas.redactionRegistry.register(job, for: livePending)
+                    return base
+                }
+                var lockObserved: String?
+                liveSpy.onDependency = {
+                    guard lockObserved == nil else { return }
+                    let owners = MainActor.assumeIsolated {
+                        SliceBRedactionJob.ownerCountForTesting
+                    }
+                    let cleaned = livePending.redactionState == .fallbackFull
+                        && livePending.redactionGeneration == liveGeneration + 1
+                        && liveCanvas.redactionRegistry.count == 0
+                        && owners == liveOwners
+                    let untouched = livePending.redactionState == .pendingFull
+                        && livePending.redactionGeneration == liveGeneration
+                        && liveCanvas.redactionRegistry.count == 1
+                        && owners == liveOwners + 1
+                    if expectsSaveLock ? !cleaned : !untouched {
+                        lockObserved = "state "
+                            + String(describing: livePending.redactionState)
+                            + " gen \(livePending.redactionGeneration)"
+                            + " registry \(liveCanvas.redactionRegistry.count)"
+                            + " owners \(owners)"
+                    }
+                }
                 action(liveWC)
+                liveSpy.onDependency = nil
+                if let lockObserved {
+                    outerFailures.append(name + ":live-lock " + lockObserved)
+                }
                 var expectedVector = zeroVector
                 for (key, value) in expected { expectedVector[key] = value }
                 if vector(liveSpy) != expectedVector {
@@ -9303,9 +9380,16 @@ enum SelfTest {
                 canvas.currentTool = .crop
 
                 // Opening the chooser is not an edit — from EITHER entry point.
+                canvas.setCropSelectionForTesting(
+                    CGRect(x: 10, y: 10, width: 80, height: 60))
+                canvas.selectForTesting(blur)
+                canvas.setTransientGuideForTesting(
+                    axis: .vertical, position: 60)
                 let toolBefore = canvas.currentTool
                 let historyBefore = canvas.historyMutationCountForTesting
                 let fingerprintBefore = canvas.documentFingerprintForTesting
+                let selectionBefore = canvas.selectedRefForTesting
+                let transientBefore = canvas.transientDescriptionForTesting
                 // The real menu, built by production. `popUp` runs a nested
                 // event loop and cannot run headlessly, so the gate stops at
                 // construction and then fires the item's OWN target/action.
@@ -9337,11 +9421,34 @@ enum SelfTest {
                 } else {
                     applyFailures.append("menu-mint-missing")
                 }
+                // Choosing a preset changes the PRESET and nothing else: not
+                // the active tool, not the selection, not the pending crop or
+                // the transient overlay the user was in the middle of.
                 if canvas.backdropPresetForTesting != .mint {
                     applyFailures.append("menu-apply")
                 }
+                if canvas.currentTool != toolBefore
+                    || canvas.selectedRefForTesting !== selectionBefore
+                    || canvas.transientDescriptionForTesting != transientBefore
+                    || !canvas.hasValidCropSelection {
+                    applyFailures.append("menu-side-effects")
+                }
+                if canvas.documentFingerprintForTesting
+                    != fingerprintBefore.replacingOccurrences(
+                        of: "backdrop=none", with: "backdrop=mint")
+                        .replacingOccurrences(
+                            of: "outer=none", with: "outer=160x140")
+                        .replacingOccurrences(
+                            of: "history=\(historyBefore)",
+                            with: "history=\(historyBefore + 1)") {
+                    applyFailures.append(
+                        "menu-fingerprint " + canvas.documentFingerprintForTesting)
+                }
                 canvas.undoManager?.undo()
-                if canvas.backdropPresetForTesting != .none {
+                if canvas.backdropPresetForTesting != .none
+                    || canvas.currentTool != toolBefore
+                    || canvas.selectedRefForTesting !== selectionBefore
+                    || canvas.transientDescriptionForTesting != transientBefore {
                     applyFailures.append("menu-undo")
                 }
 
@@ -9500,6 +9607,87 @@ enum SelfTest {
                     innerWidth: Int.max, innerHeight: 4, preset: .ocean) == nil
                 && SliceBBackdrop.reservedBytes(
                     forInnerWidth: 100, height: 100, preset: .none) == 0
+            // The gate scopes themselves: a save-and-restore global passed
+            // every test above while silently clobbering any overlapping
+            // scope, so the scoping is asserted directly — nested and across
+            // threads, for both the budget and the toast recorder.
+            var scopeFailures: [String] = []
+            let realBudget = SliceBExport.defaultBudgetBytes
+            SliceBExport.withBudgetForTesting(5_000_000) {
+                if SliceBExport.defaultBudgetBytes != 5_000_000 {
+                    scopeFailures.append("outer")
+                }
+                SliceBExport.withBudgetForTesting(1_000_000) {
+                    if SliceBExport.defaultBudgetBytes != 1_000_000 {
+                        scopeFailures.append("nested")
+                    }
+                }
+                if SliceBExport.defaultBudgetBytes != 5_000_000 {
+                    scopeFailures.append("unwind")
+                }
+                // A second thread must see the real budget, not this scope's,
+                // and its own scope must not disturb this one.
+                let other = DispatchSemaphore(value: 0)
+                var seen = 0
+                var seenInner = 0
+                DispatchQueue.global().async {
+                    seen = SliceBExport.defaultBudgetBytes
+                    SliceBExport.withBudgetForTesting(2_000_000) {
+                        seenInner = SliceBExport.defaultBudgetBytes
+                    }
+                    other.signal()
+                }
+                other.wait()
+                if seen != realBudget || seenInner != 2_000_000 {
+                    scopeFailures.append("cross \(seen) \(seenInner)")
+                }
+                if SliceBExport.defaultBudgetBytes != 5_000_000 {
+                    scopeFailures.append("cross-clobber")
+                }
+            }
+            if SliceBExport.defaultBudgetBytes != realBudget {
+                scopeFailures.append("restore")
+            }
+            let styleForScope = Settings.shared.confirmationStyle
+            Settings.shared.confirmationStyle = .custom
+            let outerRecord = ToastHUD.recordingMessagesForTesting {
+                ToastHUD.show("one")
+                let innerRecord = ToastHUD.recordingMessagesForTesting {
+                    ToastHUD.show("two")
+                }.messages
+                ToastHUD.show("three")
+                return innerRecord
+            }
+            // The nested scope sees only its own message; the outer one sees
+            // every message including the nested one, in order.
+            if outerRecord.result != ["two"]
+                || outerRecord.messages != ["one", "two", "three"] {
+                scopeFailures.append(
+                    "toast-nested \(outerRecord.result) \(outerRecord.messages)")
+            }
+            let threadRecord = ToastHUD.recordingMessagesForTesting {
+                let done = DispatchSemaphore(value: 0)
+                var otherThread: [String] = []
+                DispatchQueue.global().async {
+                    otherThread = ToastHUD.recordingMessagesForTesting {
+                        ToastHUD.show("elsewhere")
+                    }.messages
+                    done.signal()
+                }
+                done.wait()
+                ToastHUD.show("here")
+                return otherThread
+            }
+            // Neither thread's recorder may pick up the other's message.
+            if threadRecord.result != ["elsewhere"]
+                || threadRecord.messages != ["here"] {
+                scopeFailures.append(
+                    "toast-thread \(threadRecord.result) \(threadRecord.messages)")
+            }
+            Settings.shared.confirmationStyle = styleForScope
+            check("sliceB-gate-scopes-isolated",
+                  scopeFailures.isEmpty, scopeFailures.joined(separator: " | "))
+
             check("sliceB-backdrop-peak-arithmetic",
                   peakRejects && overflowSafe,
                   "inner \(innerOnly ?? -1) outer \(outerOnly) total \(total) "
@@ -9687,17 +9875,15 @@ enum SelfTest {
                     host: "gate", path: "resize-accept") {
                     wc.applyResizeFactor(0.5)
                 }
-                let allocations = acceptTrace.events.filter {
-                    $0.kind == "destination"
-                }
-                if allocations.count != 1
-                    || allocations.first?.host != "gate"
-                    || allocations.first?.path != "resize-accept"
-                    || allocations.first?.destination != "450x450"
-                    || allocations.first?.rect
-                        != CGRect(x: 0, y: 0, width: 450, height: 450) {
+                // The WHOLE trace, not the destination events within it: a
+                // filter would let a stray regional attempt or a wrong-kind
+                // event through unnoticed.
+                if acceptTrace.events != [RenderTraceEvent(
+                    host: "gate", path: "resize-accept", kind: "destination",
+                    destination: "450x450",
+                    rect: CGRect(x: 0, y: 0, width: 450, height: 450))] {
                     stabilityFailures.append(
-                        "resize-alloc \(acceptTrace.events.count)")
+                        "resize-alloc \(acceptTrace.events)")
                 }
                 if canvas.image.cgImage.width != 450
                     || outerField(canvas) != "outer=530x530" {
