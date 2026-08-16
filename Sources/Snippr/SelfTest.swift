@@ -9516,8 +9516,10 @@ enum SelfTest {
                 }
                 _ = surface.undo()
                 if surface.annotations.count != 3
+                    || surface.annotations[0] !== markA
                     || surface.annotations[1] !== spot0
-                    || surface.annotations[2] !== markB {
+                    || surface.annotations[2] !== markB
+                    || !surface.canRedo {
                     abortFailures.append("\(tool):undo-chain")
                 }
 
@@ -9543,7 +9545,10 @@ enum SelfTest {
                 }
                 _ = surface.redo()
                 if surface.annotations.count != 3
-                    || surface.annotations[2] !== spot1 || surface.canRedo {
+                    || surface.annotations[0] !== markA
+                    || surface.annotations[1] !== markB
+                    || surface.annotations[2] !== spot1
+                    || surface.canRedo || surface.isDragging {
                     abortFailures.append("\(tool):degenerate-redo")
                 }
                 _ = surface.undo()
@@ -9699,6 +9704,7 @@ enum SelfTest {
                 }
 
                 // --- scroll panel
+                var copies = 0
                 let panelImage = CapturedImage(
                     cgImage: makeSolidImage(
                         width: 600, height: 400, color: NSColor.white.cgColor),
@@ -9709,14 +9715,31 @@ enum SelfTest {
                         afterShow: true, afterCopy: false, afterSave: false),
                     screen: screen,
                     dependencies: CaptureActionRouter.Dependencies(
-                        copyToClipboard: { _ in }, autoSave: { _, _ in },
+                        copyToClipboard: { _ in copies += 1 },
+                        autoSave: { _, _ in },
                         saveAs: { _, _ in }, pin: { _ in }, ocr: { _ in },
                         openEditor: { _ in }, toast: { _ in },
                         setLastCapture: { _ in }, setLastAreaRect: { _ in },
                         logEvent: { _ in }))
                 let surface = panel.annotationSurface
                 var historyEvents = 0
-                surface.historyDidChange = { historyEvents += 1 }
+                // FORWARD the production callback rather than replacing it:
+                // that closure is what re-enables the Undo and Redo buttons,
+                // so overwriting it would disable the very thing this gate
+                // then clicks.
+                let productionHistory = surface.historyDidChange
+                surface.historyDidChange = {
+                    historyEvents += 1
+                    productionHistory?()
+                }
+                func clickUndo() {
+                    panel.clickToolbarButtonForTesting(
+                        tag: OverlayAnnotationTool.undoToolbarTag)
+                }
+                func clickRedo() {
+                    panel.clickToolbarButtonForTesting(
+                        tag: OverlayAnnotationTool.redoToolbarTag)
+                }
                 // No spotlight yet: a digit must do nothing at all.
                 let beforeNoSpot = historyEvents
                 if let event = digitEvent("5") { panel.keyDown(with: event) }
@@ -9743,7 +9766,10 @@ enum SelfTest {
                 // 1 -> 5 -> 9: each is one clone, one history event, and the
                 // spotlight stays the only one.
                 var previous = firstSpot
-                for (digit, expected) in [("1", 0.1), ("5", 0.5), ("9", 0.9)] {
+                let digitSteps: [(String, CGFloat)] = [
+                    ("1", 0.1), ("5", 0.5), ("9", 0.9),
+                ]
+                for (digit, expected) in digitSteps {
                     let before = historyEvents
                     if let event = digitEvent(digit) {
                         panel.keyDown(with: event)
@@ -9778,42 +9804,91 @@ enum SelfTest {
                 ] {
                     let before = historyEvents
                     let dim = previous.dimFraction
+                    let arrayBefore = surface.annotations
+                    let toolBefore = surface.tool
+                    let redoBefore = surface.canRedo
                     if let event { panel.keyDown(with: event) }
+                    // The exact objects, in the exact order: cloning a
+                    // spotlight to the same darkness would keep every count
+                    // and every number identical.
+                    let arrayAfter = surface.annotations
                     if historyEvents != before
                         || previous.dimFraction != dim
-                        || surface.annotations
-                            .compactMap({ $0 as? SpotlightAnnotation })
-                            .count != 1 {
+                        || arrayAfter.count != arrayBefore.count
+                        || !zip(arrayAfter, arrayBefore).allSatisfy({
+                            $0.0 === $0.1
+                        })
+                        || surface.tool != toolBefore
+                        || surface.canRedo != redoBefore {
                         digitFailures.append("panel:\(label)-mutated")
                     }
                 }
+                // The keypad digits are the same shortcut.
+                let beforeKeypad = historyEvents
+                if let event = digitEvent("3", keypad: true) {
+                    panel.keyDown(with: event)
+                }
+                let keypadSpot = surface.annotations
+                    .compactMap { $0 as? SpotlightAnnotation }.last
+                if abs((keypadSpot?.dimFraction ?? 0) - 0.3) > 0.0001
+                    || historyEvents != beforeKeypad + 1 {
+                    digitFailures.append(
+                        "panel:keypad \(keypadSpot?.dimFraction ?? -1)")
+                }
+                clickUndo()
+                previous = surface.annotations
+                    .compactMap { $0 as? SpotlightAnnotation }.last ?? previous
                 // Undo walks back through every step, redo returns.
-                _ = surface.undo()
+                // Through the REAL buttons, which is also what proves the
+                // production history callback still runs.
+                let historyBeforeUndo = historyEvents
+                clickUndo()
                 let afterOneUndo = surface.annotations
                     .compactMap { $0 as? SpotlightAnnotation }.first
                 if afterOneUndo == nil
-                    || abs((afterOneUndo?.dimFraction ?? 0) - 0.5) > 0.0001 {
+                    || abs((afterOneUndo?.dimFraction ?? 0) - 0.5) > 0.0001
+                    || surface.annotations.count != 1
+                    || !surface.canRedo
+                    || historyEvents != historyBeforeUndo + 1 {
                     digitFailures.append(
-                        "panel:undo1 \(afterOneUndo?.dimFraction ?? -1)")
+                        "panel:undo1 \(afterOneUndo?.dimFraction ?? -1) "
+                        + "count \(surface.annotations.count)")
                 }
-                _ = surface.undo()
-                _ = surface.undo()
+                clickUndo()
+                clickUndo()
                 let afterThree = surface.annotations
                     .compactMap { $0 as? SpotlightAnnotation }.first
-                if afterThree !== firstSpot {
-                    digitFailures.append("panel:undo3")
+                if afterThree !== firstSpot || !surface.canRedo
+                    || surface.annotations.count != 1
+                    || surface.annotations.first !== firstSpot {
+                    digitFailures.append(
+                        "panel:undo3 \(surface.annotations.count)")
                 }
-                _ = surface.redo()
-                _ = surface.redo()
-                _ = surface.redo()
+                clickRedo()
+                clickRedo()
+                clickRedo()
                 let afterRedo = surface.annotations
                     .compactMap { $0 as? SpotlightAnnotation }.first
-                if abs((afterRedo?.dimFraction ?? 0) - 0.9) > 0.0001 {
+                // A singleton again, at the last darkness, with nothing left
+                // on the redo branch.
+                if abs((afterRedo?.dimFraction ?? 0) - 0.9) > 0.0001
+                    || surface.canRedo
+                    || surface.annotations.count != 1
+                    || surface.annotations.first !== afterRedo {
                     digitFailures.append(
-                        "panel:redo3 \(afterRedo?.dimFraction ?? -1)")
+                        "panel:redo3 \(afterRedo?.dimFraction ?? -1) "
+                        + "count \(surface.annotations.count)")
                 }
-                // Frozen once a terminal action has claimed the image.
+                // Frozen once a terminal action has claimed the image — and
+                // the route has to have actually run, otherwise "digits are
+                // inert" would only mean the claim flag was set early.
                 panel.performActionForTesting(.copy)
+                if copies != 1 {
+                    digitFailures.append("panel:terminal-route \(copies)")
+                }
+                if ScrollResultPanel.current === panel || panel.isVisible {
+                    digitFailures.append("panel:terminal-open")
+                }
                 let frozenDim = afterRedo?.dimFraction ?? 0
                 let beforeFrozen = historyEvents
                 if let event = digitEvent("1") { panel.keyDown(with: event) }
