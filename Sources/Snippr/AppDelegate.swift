@@ -65,6 +65,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 name: UserDefaults.didChangeNotification, object: nil
             )
         }
+        if !isDevTool {
+            // Before asking for permissions: a second Snippr with a different
+            // signature is the #1 reason grants "disappear". Name it now.
+            BundleIntegrity.warnOnLaunchIfNeeded()
+        }
         if needsCaptureServices, !CGPreflightScreenCaptureAccess() {
             CGRequestScreenCaptureAccess()
         }
