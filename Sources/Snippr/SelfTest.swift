@@ -9281,54 +9281,7 @@ enum SelfTest {
                 if !liveCanvas.applyBackdrop(.ocean) {
                     outerFailures.append(name + ":live-apply")
                 }
-                // Save takes the save-lock: on a SUCCESSFUL export every job
-                // in flight is superseded BEFORE the panel opens, so a late
-                // result cannot narrow a mask that has already been written
-                // out. Every other route leaves jobs alone — asserting the
-                // difference is what makes the lock's placement observable,
-                // and the dependency is the only vantage point that sees it.
-                let expectsSaveLock = name == "save" || name == "saveAs"
-                let livePending = BlurAnnotation(uiScale: 1)
-                livePending.rect = CGRect(x: 30, y: 30, width: 40, height: 30)
-                liveCanvas.annotations.append(livePending)
-                let liveCounting = ForwardingRepaintDelegate(
-                    wrapping: liveCanvas.redactionDelegate)
-                liveCanvas.redactionDelegate = liveCounting
-                let liveGeneration = livePending.redactionGeneration
-                let liveOwners = MainActor.assumeIsolated { () -> Int in
-                    let base = SliceBRedactionJob.ownerCountForTesting
-                    let job = SliceBRedactionJob.pendingForTesting(
-                        blur: livePending, host: liveCanvas)
-                    liveCanvas.redactionRegistry.register(job, for: livePending)
-                    return base
-                }
-                var lockObserved: String?
-                liveSpy.onDependency = {
-                    guard lockObserved == nil else { return }
-                    let owners = MainActor.assumeIsolated {
-                        SliceBRedactionJob.ownerCountForTesting
-                    }
-                    let cleaned = livePending.redactionState == .fallbackFull
-                        && livePending.redactionGeneration == liveGeneration + 1
-                        && liveCanvas.redactionRegistry.count == 0
-                        && owners == liveOwners
-                    let untouched = livePending.redactionState == .pendingFull
-                        && livePending.redactionGeneration == liveGeneration
-                        && liveCanvas.redactionRegistry.count == 1
-                        && owners == liveOwners + 1
-                    if expectsSaveLock ? !cleaned : !untouched {
-                        lockObserved = "state "
-                            + String(describing: livePending.redactionState)
-                            + " gen \(livePending.redactionGeneration)"
-                            + " registry \(liveCanvas.redactionRegistry.count)"
-                            + " owners \(owners)"
-                    }
-                }
                 action(liveWC)
-                liveSpy.onDependency = nil
-                if let lockObserved {
-                    outerFailures.append(name + ":live-lock " + lockObserved)
-                }
                 var expectedVector = zeroVector
                 for (key, value) in expected { expectedVector[key] = value }
                 if vector(liveSpy) != expectedVector {
@@ -9343,6 +9296,109 @@ enum SelfTest {
                   termFailures.isEmpty, termFailures.joined(separator: " | "))
             check("sliceB-backdrop-terminal-fail-closed",
                   outerFailures.isEmpty, outerFailures.joined(separator: " | "))
+
+            // The save-lock's PLACEMENT, on a fixture with no pending text and
+            // no crop. The complex twin above cannot answer this: a successful
+            // flatten commits that text and crop, and each commit calls
+            // registerUndoSnapshot, which supersedes every job in flight before
+            // any dependency runs. On that fixture every route looks locked,
+            // so the ordering it appears to prove is the fixture's, not the
+            // feature's.
+            var lockFailures: [String] = []
+            let lockRoutes: [(String, Bool, Bool, (EditorWindowController) -> Void,
+                              Int, Bool)] = [
+                // name, escCopy, escSave, action, dependency calls, closes
+                ("copy", false, false, { $0.copyImage() }, 1, true),
+                ("save", false, false, { $0.saveImage() }, 1, false),
+                ("saveAs", false, false, { $0.saveImageAs() }, 1, false),
+                ("pin", false, false, { $0.pinImage() }, 1, true),
+                ("ocr", false, false, { $0.runOCR() }, 1, false),
+                ("translate", false, false, { $0.runTranslate() }, 1, false),
+                ("esc-copy", true, false, pressEscape, 1, true),
+                ("esc-save", false, true, pressEscape, 1, true),
+                ("esc-both", true, true, pressEscape, 2, true),
+            ]
+            for (name, escCopy, escSave, action, calls, closes) in lockRoutes {
+                Settings.shared.escCopy = escCopy
+                Settings.shared.escSave = escSave
+                let spy = TerminalSpy()
+                let (wc, canvas) = makeSpiedEditor(spy, seedEditing: false)
+                // Nothing pending: one blur with a job, nothing else that a
+                // successful flatten would commit.
+                let blur = BlurAnnotation(uiScale: 1)
+                blur.rect = CGRect(x: 20, y: 20, width: 60, height: 40)
+                canvas.annotations = [blur]
+                let counting = ForwardingRepaintDelegate(
+                    wrapping: canvas.redactionDelegate)
+                canvas.redactionDelegate = counting
+                let generation = blur.redactionGeneration
+                let ownersBefore = MainActor.assumeIsolated { () -> Int in
+                    let base = SliceBRedactionJob.ownerCountForTesting
+                    let job = SliceBRedactionJob.pendingForTesting(
+                        blur: blur, host: canvas)
+                    canvas.redactionRegistry.register(job, for: blur)
+                    return base
+                }
+                // Only Save takes the lock, and it takes it before the panel
+                // opens. Every other route must leave the job alone — the
+                // contrast is what makes the placement observable.
+                let expectsLock = name == "save" || name == "saveAs"
+                var observations = 0
+                var mismatch: String?
+                spy.onDependency = {
+                    observations += 1
+                    let owners = MainActor.assumeIsolated {
+                        SliceBRedactionJob.ownerCountForTesting
+                    }
+                    let locked = blur.redactionState == .fallbackFull
+                        && blur.redactionGeneration == generation + 1
+                        && canvas.redactionRegistry.count == 0
+                        && owners == ownersBefore
+                        && counting.repaints == 1
+                    let untouched = blur.redactionState == .pendingFull
+                        && blur.redactionGeneration == generation
+                        && canvas.redactionRegistry.count == 1
+                        && owners == ownersBefore + 1
+                        && counting.repaints == 0
+                    guard mismatch == nil else { return }
+                    if expectsLock ? !locked : !untouched {
+                        mismatch = String(describing: blur.redactionState)
+                            + " gen \(blur.redactionGeneration)"
+                            + " registry \(canvas.redactionRegistry.count)"
+                            + " owners \(owners)"
+                            + " repaints \(counting.repaints)"
+                    }
+                }
+                action(wc)
+                spy.onDependency = nil
+                // A silent zero would otherwise read as "correct": the check
+                // above only runs if a dependency actually ran.
+                if observations != calls {
+                    lockFailures.append(
+                        name + ":observations \(observations)")
+                }
+                if let mismatch {
+                    lockFailures.append(name + ":" + mismatch)
+                }
+                // Auto-close belongs to the same contract: a route that should
+                // close and does not is a regression an unconditional close
+                // in the gate would hide.
+                if (wc.window?.isVisible == true) == closes {
+                    lockFailures.append(
+                        name + ":visible \(wc.window?.isVisible == true)")
+                }
+                wc.window?.close()
+                // Whatever the route did, the close leaves nothing behind.
+                if blur.redactionState != .fallbackFull
+                    || canvas.redactionRegistry.count != 0
+                    || MainActor.assumeIsolated({
+                        SliceBRedactionJob.ownerCountForTesting
+                    }) != ownersBefore {
+                    lockFailures.append(name + ":cleanup")
+                }
+            }
+            check("sliceB-backdrop-save-lock-order",
+                  lockFailures.isEmpty, lockFailures.joined(separator: " | "))
 
             final class CountingRedactionHost: RedactionHost {
                 var repaints = 0
@@ -9494,6 +9550,35 @@ enum SelfTest {
                     || canvas.selectedRefForTesting !== selectionBefore
                     || canvas.transientDescriptionForTesting != transientBefore {
                     applyFailures.append("menu-undo")
+                }
+                // Reopening must show the CURRENT preset ticked at each step,
+                // and choosing the already-current item must do nothing at all
+                // — the menu is a view of state, not a second source of it.
+                func checkedTag(_ label: String) -> Int? {
+                    let items = wc.backdropMenu().items
+                    let on = items.filter { $0.state == .on }
+                    if on.count != 1 {
+                        applyFailures.append("\(label)-checks \(on.count)")
+                    }
+                    return on.first?.tag
+                }
+                if checkedTag("after-undo") != presets.firstIndex(of: .none) {
+                    applyFailures.append("menu-check-undo")
+                }
+                canvas.undoManager?.redo()
+                if canvas.backdropPresetForTesting != .mint
+                    || checkedTag("after-redo") != presets.firstIndex(of: .mint) {
+                    applyFailures.append("menu-check-redo")
+                }
+                let beforeNoop = canvas.documentFingerprintForTesting
+                let reopened = wc.backdropMenu()
+                if let currentIndex = reopened.items.firstIndex(
+                    where: { $0.tag == presets.firstIndex(of: .mint) }) {
+                    reopened.performActionForItem(at: currentIndex)
+                }
+                if canvas.documentFingerprintForTesting != beforeNoop
+                    || canvas.backdropPresetForTesting != .mint {
+                    applyFailures.append("menu-current-noop")
                 }
                 canvas.undoManager?.groupsByEvent = previousGrouping
 
@@ -9675,23 +9760,38 @@ enum SelfTest {
                 let other = DispatchSemaphore(value: 0)
                 var seen = 0
                 var seenInner = 0
+                var seenAfter = 0
+                var workerDepth = -1
                 DispatchQueue.global().async {
+                    // Signal on EVERY exit: a deadlock in the seam must fail
+                    // this gate, not hang the whole selftest.
+                    defer { other.signal() }
                     seen = SliceBExport.defaultBudgetBytes
                     SliceBExport.withBudgetForTesting(2_000_000) {
                         seenInner = SliceBExport.defaultBudgetBytes
                     }
-                    other.signal()
+                    seenAfter = SliceBExport.defaultBudgetBytes
+                    workerDepth = SliceBExport.budgetScopeDepthForTesting
                 }
-                other.wait()
-                if seen != realBudget || seenInner != 2_000_000 {
-                    scopeFailures.append("cross \(seen) \(seenInner)")
+                if other.wait(timeout: .now() + 5) == .timedOut {
+                    scopeFailures.append("cross-timeout")
+                }
+                // After the worker's scope unwinds it must see the real budget
+                // again and hold no open scope: pinning only before and inside
+                // would let a pop that never happens go unnoticed.
+                if seen != realBudget || seenInner != 2_000_000
+                    || seenAfter != realBudget || workerDepth != 0 {
+                    scopeFailures.append(
+                        "cross \(seen) \(seenInner) \(seenAfter) \(workerDepth)")
                 }
                 if SliceBExport.defaultBudgetBytes != 5_000_000 {
                     scopeFailures.append("cross-clobber")
                 }
             }
-            if SliceBExport.defaultBudgetBytes != realBudget {
-                scopeFailures.append("restore")
+            if SliceBExport.defaultBudgetBytes != realBudget
+                || SliceBExport.budgetScopeDepthForTesting != 0 {
+                scopeFailures.append(
+                    "restore \(SliceBExport.budgetScopeDepthForTesting)")
             }
             let styleForScope = Settings.shared.confirmationStyle
             Settings.shared.confirmationStyle = .custom
@@ -9710,24 +9810,37 @@ enum SelfTest {
                 scopeFailures.append(
                     "toast-nested \(outerRecord.result) \(outerRecord.messages)")
             }
+            var recorderTimedOut = false
+            var workerRecorderDepth = -1
             let threadRecord = ToastHUD.recordingMessagesForTesting {
                 let done = DispatchSemaphore(value: 0)
                 var otherThread: [String] = []
                 DispatchQueue.global().async {
+                    defer { done.signal() }
                     otherThread = ToastHUD.recordingMessagesForTesting {
                         ToastHUD.show("elsewhere")
                     }.messages
-                    done.signal()
+                    workerRecorderDepth = ToastHUD.recorderDepthForTesting
                 }
-                done.wait()
+                if done.wait(timeout: .now() + 5) == .timedOut {
+                    recorderTimedOut = true
+                }
                 ToastHUD.show("here")
                 return otherThread
             }
-            // Neither thread's recorder may pick up the other's message.
+            // Neither thread's recorder may pick up the other's message, and
+            // both stacks must be empty again afterwards.
+            if recorderTimedOut {
+                scopeFailures.append("toast-timeout")
+            }
             if threadRecord.result != ["elsewhere"]
-                || threadRecord.messages != ["here"] {
+                || threadRecord.messages != ["here"]
+                || workerRecorderDepth != 0
+                || ToastHUD.recorderDepthForTesting != 0 {
                 scopeFailures.append(
-                    "toast-thread \(threadRecord.result) \(threadRecord.messages)")
+                    "toast-thread \(threadRecord.result) "
+                    + "\(threadRecord.messages) \(workerRecorderDepth) "
+                    + "\(ToastHUD.recorderDepthForTesting)")
             }
             Settings.shared.confirmationStyle = styleForScope
             check("sliceB-gate-scopes-isolated",

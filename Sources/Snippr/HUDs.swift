@@ -40,6 +40,13 @@ final class ToastHUD {
         [ObjectIdentifier: [MessageRecorder]] = [:]
     private static let messageLock = NSLock()
 
+    /// Open recorders on this thread, for the same reason as the budget's.
+    static var recorderDepthForTesting: Int {
+        messageLock.lock()
+        defer { messageLock.unlock() }
+        return recorders[ObjectIdentifier(Thread.current)]?.count ?? 0
+    }
+
     /// EVERY message shown during `body`, in order, and only from this
     /// thread's own scope. A single "last message" hides extra toasts, so a
     /// run that showed the wrong one first and the right one second passed;

@@ -643,6 +643,14 @@ enum SliceBExport {
             ?? 256 * 1_000_000 * 4
     }
 
+    /// Open scopes on this thread. A gate that only checks the value before
+    /// and inside a scope cannot see a pop that never happened.
+    static var budgetScopeDepthForTesting: Int {
+        budgetLock.lock()
+        defer { budgetLock.unlock() }
+        return budgetStacks[ObjectIdentifier(Thread.current)]?.count ?? 0
+    }
+
     /// Per-thread stack, like `RenderTrace`: a save-and-restore global is
     /// correct only while nothing overlaps, and two scopes on two threads
     /// would clobber each other's restore.
