@@ -412,6 +412,10 @@ final class ScrollResultPanel: NSPanel {
         if let up = event(.leftMouseUp, b) { host.mouseUp(with: up) }
     }
 
+    /// Production teardown, exposed so a gate tears the panel down the way the
+    /// app does (clearing `current`) instead of just ordering the window out.
+    func dismissForTesting() { dismiss() }
+
     private func dismiss() {
         terminalActionClaimed = true
         if ScrollResultPanel.current === self { ScrollResultPanel.current = nil }

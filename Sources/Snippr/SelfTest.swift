@@ -9686,25 +9686,47 @@ enum SelfTest {
                 }
                 // Two SEPARATE proofs. Export fail-closed was asserted above
                 // (nil out, dependencies at zero, session still reviewing).
-                // The cover pixels must come from the PREVIEW path, which keeps
-                // drawing even when it reports failure — using the nil export
-                // to look for cover pixels is why the scan never ran before.
-                let previewCtx = ctx(240, 180)
-                previewCtx.draw(
-                    hostFrozen.cgImage,
-                    in: CGRect(x: 0, y: 0, width: 240, height: 180))
-                let previewOK = AnnotationRenderer.withForcedRegionalFailure {
-                    surface.drawForPreview(
-                        in: previewCtx, base: hostFrozen.cgImage)
+                // The cover pixels come from the ACTUAL view: its own draw,
+                // its own backing scale, its own selection clip.
+                let viewShot = AnnotationRenderer.withForcedRegionalFailure {
+                    () -> CGImage? in
+                    view.needsDisplay = true
+                    view.display()
+                    guard let rep = view.bitmapImageRepForCachingDisplay(
+                        in: view.bounds) else { return nil }
+                    view.cacheDisplay(in: view.bounds, to: rep)
+                    return rep.cgImage
                 }
-                if previewOK { hostFailures.append("area:preview-claimed-ok") }
-                if let previewShot = previewCtx.makeImage() {
-                    scanCover(
-                        output: previewShot, source: hostFrozen.cgImage,
-                        mask: hostMask, originInSource: .zero,
-                        label: "area-preview")
-                } else {
-                    hostFailures.append("area:no-preview-image")
+                guard let viewShot, view.bounds.width > 0 else {
+                    hostFailures.append("area:no-view-shot")
+                    return
+                }
+                let backing = CGFloat(viewShot.width) / view.bounds.width
+                let viewBytes = rgba(viewShot)
+                let cover: [UInt8] = [31, 31, 31, 255]
+                var uncovered = 0
+                var bleeding = 0
+                for py in 0..<viewShot.height {
+                    for px in 0..<viewShot.width {
+                        let point = CGPoint(
+                            x: CGFloat(px) / backing,
+                            y: CGFloat(viewShot.height - 1 - py) / backing)
+                        let i = (py * viewShot.width + px) * 4
+                        let value = Array(viewBytes[i..<(i + 4)])
+                        if hostMask.insetBy(dx: 1, dy: 1).contains(point) {
+                            if value != cover { uncovered += 1 }
+                        } else if !hostMask.insetBy(dx: -2, dy: -2).contains(point),
+                                  value == cover {
+                            // the opaque cover must not extend past the mask
+                            bleeding += 1
+                        }
+                    }
+                }
+                if uncovered != 0 {
+                    hostFailures.append("area:view-uncovered \(uncovered)")
+                }
+                if bleeding != 0 {
+                    hostFailures.append("area:view-bleed \(bleeding)")
                 }
             }
             check("sliceB-hosts-failclosed",
@@ -9935,30 +9957,27 @@ enum SelfTest {
                 sliverFailures.append("sliver:export-not-checked")
             }
             if let shot = sliverCtx.makeImage() {
+                let out = rgba(shot), src = rgba(sliverBase)
                 let overlap = sliverBlur.rect.intersection(sliverVisible)
-                let scanned = overlap.integral.intersection(sliverVisible)
-                var x = Int(scanned.minX)
-                while x < Int(scanned.maxX) {   // upper-EXCLUSIVE
-                    var y = Int(scanned.minY)
-                    while y < Int(scanned.maxY) {
-                        let p = probe3(shot, x, y)
-                        if p.0 >= 0, p == probe3(sliverBase, x, y) {
-                            sliverFailures.append("sliver:clean@\(x),\(y)")
-                            y = Int(scanned.maxY)
-                            x = Int(scanned.maxX)
-                            continue
+                    .integral.intersection(sliverVisible)
+                for py in 0..<shot.height {
+                    for px in 0..<shot.width {
+                        let point = CGPoint(
+                            x: CGFloat(px), y: CGFloat(shot.height - 1 - py))
+                        let i = (py * shot.width + px) * 4
+                        let value = Array(out[i..<(i + 4)])
+                        if overlap.contains(point) {
+                            if value != [31, 31, 31, 255] {
+                                sliverFailures.append("sliver:cover@\(px),\(py)")
+                            }
+                        } else if sliverVisible.contains(point) {
+                            if value != Array(src[i..<(i + 4)]) {
+                                sliverFailures.append("sliver:outside@\(px),\(py)")
+                            }
                         }
-                        y += 1
+                        if sliverFailures.count > 3 { break }
                     }
-                    x += 1
-                }
-                for px in stride(from: 2, to: 38, by: 6) {
-                    for py in stride(from: 2, to: 58, by: 6)
-                    where !sliverBlur.rect.contains(CGPoint(x: px, y: py)) {
-                        if probe3(shot, px, py) != probe3(sliverBase, px, py) {
-                            sliverFailures.append("sliver:outside@\(px),\(py)")
-                        }
-                    }
+                    if sliverFailures.count > 3 { break }
                 }
             } else {
                 sliverFailures.append("sliver:no-image")
@@ -10012,6 +10031,7 @@ enum SelfTest {
             var panelFailures: [String] = []
             MainActor.assumeIsolated {
                 var panelExport: CapturedImage?
+                var panelCopies = 0
                 var panelToasts = 0
                 var panelDeps = [
                     "autoSave": 0, "saveAs": 0, "pin": 0, "ocr": 0,
@@ -10025,7 +10045,7 @@ enum SelfTest {
                         afterShow: true, afterCopy: false, afterSave: false),
                     screen: hostScreen,
                     dependencies: CaptureActionRouter.Dependencies(
-                        copyToClipboard: { panelExport = $0 },
+                        copyToClipboard: { panelExport = $0; panelCopies += 1 },
                         autoSave: { _, _ in panelDeps["autoSave"]! += 1 },
                         saveAs: { _, _ in panelDeps["saveAs"]! += 1 },
                         pin: { _ in panelDeps["pin"]! += 1 },
@@ -10055,7 +10075,16 @@ enum SelfTest {
                     }
                 }
                 if panelExport != nil { panelFailures.append("panel:exported") }
+                if panelCopies != 0 { panelFailures.append("panel:copies") }
                 if !panel.isVisible { panelFailures.append("panel:closed") }
+                if ScrollResultPanel.current !== panel {
+                    panelFailures.append("panel:not-current")
+                }
+                if panel.annotationSurface.annotations.count != 1
+                    || panel.annotationSurface.annotations.first !== panelBlur
+                    || panelBlur.rect != CGRect(x: 40, y: 300, width: 80, height: 50) {
+                    panelFailures.append("panel:state-mutated")
+                }
                 if panelDeps.values.contains(where: { $0 != 0 }) {
                     panelFailures.append("panel:deps \(panelDeps)")
                 }
@@ -10086,7 +10115,7 @@ enum SelfTest {
                     }
                     guard let shot, host.bounds.width > 0 else {
                         panelFailures.append("panel:no-preview")
-                        panel.orderOut(nil)
+                        panel.dismissForTesting()
                         return
                     }
                     // points -> backing pixels, whatever the device does
@@ -10111,7 +10140,11 @@ enum SelfTest {
                     }
                     if holes != 0 { panelFailures.append("panel:holes \(holes)") }
                 }
-                panel.orderOut(nil)
+                // Production teardown, not just ordering the window out.
+                panel.dismissForTesting()
+                if ScrollResultPanel.current != nil {
+                    panelFailures.append("panel:current-leak")
+                }
             }
             check("sliceB-scroll-host-failclosed",
                   panelFailures.isEmpty,
@@ -10133,7 +10166,29 @@ enum SelfTest {
             // nothing: drive the production route and require the whole
             // lifecycle. A GREEN2 that adds an enum case and a button but never
             // starts or registers a job must still fail here.
+            // A blocking recognizer makes the assertions deterministic: the
+            // annotation must be pendingFull with a job really in flight, not
+            // a fallbackFull that an implementation which never OCRs would also
+            // produce, and not a race with a fast real recognizer.
+            let lifecycleStarted = DispatchSemaphore(value: 0)
+            let lifecycleRelease = DispatchSemaphore(value: 0)
+            SliceBOCR.recognizerForTesting = { _ in
+                lifecycleStarted.signal()
+                lifecycleRelease.wait()
+                return .success([
+                    RecognizedWord(
+                        rect: CGRect(x: 4, y: 4, width: 10, height: 8),
+                        confidence: 0.9),
+                ])
+            }
+            defer {
+                lifecycleRelease.signal()
+                SliceBOCR.recognizerForTesting = nil
+            }
             if let editorTextTool {
+                let baseline = MainActor.assumeIsolated {
+                    SliceBRedactionJob.inFlight
+                }
                 MainActor.assumeIsolated {
                     let wc = EditorWindowController.open(
                         with: CapturedImage(
@@ -10150,18 +10205,39 @@ enum SelfTest {
                         wc.window?.close()
                         return
                     }
-                    // The mask must be FULL the moment the drag ends.
-                    if blur.redactionState != .pendingFull
-                        && blur.redactionState != .fallbackFull {
+                    if blur.redactionState != .pendingFull {
                         lifecycleFailures.append(
-                            "editor:not-masked \(blur.redactionState)")
+                            "editor:not-pending \(blur.redactionState)")
                     }
-                    if blur.redactionState == .pendingFull,
-                       SliceBRedactionJob.inFlight == 0 {
+                    if SliceBRedactionJob.inFlight != baseline + 1 {
                         lifecycleFailures.append("editor:no-job")
                     }
+                    // Closing must invalidate: after the worker is released the
+                    // late result may neither apply nor leave a slot behind.
                     wc.window?.close()
                 }
+                lifecycleRelease.signal()
+                let deadline = Date().addingTimeInterval(10)
+                while MainActor.assumeIsolated({
+                    SliceBRedactionJob.inFlight
+                }) > baseline, Date() < deadline {
+                    RunLoop.current.run(until: Date().addingTimeInterval(0.02))
+                }
+                if MainActor.assumeIsolated({
+                    SliceBRedactionJob.inFlight
+                }) != baseline {
+                    lifecycleFailures.append("editor:slot-leak")
+                }
+                if MainActor.assumeIsolated({
+                    SliceBRedactionJob.ownerCountForTesting
+                }) != 0 {
+                    lifecycleFailures.append("editor:owner-leak")
+                }
+            }
+            if overlayTextTool != nil {
+                // The area overlay and the scroll panel must route the tool the
+                // same way; catalogue presence is not wiring.
+                lifecycleFailures.append("area-scroll:not-driven")
             }
             check("sliceB-text-redaction-lifecycle-wiring",
                   lifecycleFailures.isEmpty,
