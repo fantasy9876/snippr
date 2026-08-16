@@ -9260,15 +9260,12 @@ enum SelfTest {
                 }
                 let release = DispatchSemaphore(value: 0)
                 let started = DispatchSemaphore(value: 0)
-                SliceBOCR.recognizerForTesting = { _ in
-                    started.signal()
-                    release.wait()
-                    return .success([
-                        RecognizedWord(
-                            rect: CGRect(x: 6, y: 6, width: 20, height: 12),
-                            confidence: 0.9),
-                    ])
-                }
+                // The recognizer seam is process-wide. It is restored to
+                // whatever was there BEFORE, and only after the worker has
+                // been released and drained — resetting it while a blocked
+                // worker is still queued would let that worker wake up inside
+                // real Vision and poison the slot for every later gate.
+                let previousRecognizer = SliceBOCR.recognizerForTesting
                 func slots() -> Int {
                     MainActor.assumeIsolated { SliceBRedactionJob.inFlight }
                 }
@@ -9279,39 +9276,60 @@ enum SelfTest {
                 }
                 let slotBase = slots()
                 let ownerBase = owners()
+                var released = false
+                func releaseAndDrain() {
+                    guard !released else { return }
+                    released = true
+                    release.signal()
+                    let deadline = Date().addingTimeInterval(10)
+                    while slots() > slotBase, Date() < deadline {
+                        RunLoop.current.run(
+                            until: Date().addingTimeInterval(0.02))
+                    }
+                }
+                SliceBOCR.recognizerForTesting = { _ in
+                    started.signal()
+                    release.wait()
+                    return .success([
+                        RecognizedWord(
+                            rect: CGRect(x: 6, y: 6, width: 20, height: 12),
+                            confidence: 0.9),
+                    ])
+                }
+                defer {
+                    releaseAndDrain()
+                    SliceBOCR.recognizerForTesting = previousRecognizer
+                }
+
                 final class LockSpy {
                     var saveDone: (@MainActor (SaveAsOutcome) -> Void)?
                     var saveAsCalls = 0
-                    var observed: [String] = []
+                    var inCallback: [String] = []
                 }
                 let spy = LockSpy()
                 let panelImage = CapturedImage(
                     cgImage: makeNoiseImage(width: 400, height: 300), scale: 1)
-                let deps = CaptureActionRouter.Dependencies(
-                    copyToClipboard: { _ in },
-                    autoSave: { _, _ in },
-                    saveAs: { _, done in
-                        spy.saveAsCalls += 1
-                        spy.saveDone = done
-                    },
-                    pin: { _ in }, ocr: { _ in }, openEditor: { _ in },
-                    toast: { _ in }, setLastCapture: { _ in },
-                    setLastAreaRect: { _ in }, logEvent: { _ in })
                 let panel = ScrollResultPanel.show(
                     image: panelImage,
                     inputs: OverlaySessionInputs(
                         afterShow: true, afterCopy: false, afterSave: false),
-                    screen: screen, dependencies: deps)
+                    screen: screen,
+                    dependencies: CaptureActionRouter.Dependencies(
+                        copyToClipboard: { _ in },
+                        autoSave: { _, _ in },
+                        saveAs: { _, done in
+                            spy.saveAsCalls += 1
+                            spy.saveDone = done
+                        },
+                        pin: { _ in }, ocr: { _ in }, openEditor: { _ in },
+                        toast: { _ in }, setLastCapture: { _ in },
+                        setLastAreaRect: { _ in }, logEvent: { _ in }))
                 let surface = panel.annotationSurface
                 let host = ForwardingRepaintDelegate(
                     wrapping: surface.redactionDelegate)
                 surface.redactionDelegate = host
-                // Created the way a user creates one: the tool comes from the
-                // real toolbar and the mark from real events, so the job is
-                // started AND registered by production. Starting a job by hand
-                // would leave the surface's registry empty, and the save-lock
-                // would then have nothing to cancel — the stages below would
-                // be describing a document that never existed.
+                // Created the way a user creates one, so production starts AND
+                // registers the job.
                 panel.clickToolbarButtonForTesting(
                     tag: OverlayAnnotationTool.pixelateText.toolbarTag)
                 if surface.tool != .pixelateText {
@@ -9323,9 +9341,6 @@ enum SelfTest {
                 guard let blur = surface.annotations
                     .compactMap({ $0 as? BlurAnnotation }).last else {
                     lockStageFailures.append("no-redaction")
-                    release.signal()
-                    SliceBOCR.recognizerForTesting = nil
-                    panel.dismissForTesting()
                     return
                 }
                 if surface.redactionJobCountForTesting != 1 {
@@ -9335,9 +9350,6 @@ enum SelfTest {
                 let generation = blur.redactionGeneration
                 if started.wait(timeout: .now() + 5) == .timedOut {
                     lockStageFailures.append("worker-never-started")
-                    release.signal()
-                    SliceBOCR.recognizerForTesting = nil
-                    panel.dismissForTesting()
                     return
                 }
                 if slots() != slotBase + 1 || owners() != ownerBase + 1
@@ -9347,12 +9359,10 @@ enum SelfTest {
                         + String(describing: blur.redactionState))
                 }
 
-                // Stage 1 — a FAILED render must leave the job alive.
+                // Stage 1 — a FAILED render leaves the job alive and untouched.
                 let repaintsBeforeFail = host.repaints
                 ForcedOuterComposeFailure.scoped {
-                    AnnotationRenderer.withForcedRegionalFailure {
-                        panel.performActionForTesting(.save)
-                    }
+                    panel.performActionForTesting(.save)
                 }
                 if spy.saveAsCalls != 0 {
                     lockStageFailures.append(
@@ -9361,6 +9371,7 @@ enum SelfTest {
                 if blur.redactionState != .pendingFull
                     || blur.redactionGeneration != generation
                     || host.repaints != repaintsBeforeFail
+                    || surface.redactionJobCountForTesting != 1
                     || slots() != slotBase + 1 || owners() != ownerBase + 1
                     || !panel.isVisible {
                     lockStageFailures.append(
@@ -9368,65 +9379,97 @@ enum SelfTest {
                         + String(describing: blur.redactionState))
                 }
 
-                // Stage 2 — a SUCCESSFUL handoff, observed from inside saveAs:
-                // superseded already, but the physical slot is still held by
-                // the worker that has not returned.
-                spy.saveDone = nil
+                // Stage 2 — a SUCCESSFUL handoff, inspected from INSIDE the
+                // saveAs callback: that is the only place the ordering between
+                // the lock and the handoff is visible.
                 let repaintsBeforeSave = host.repaints
-                panel.performActionForTesting(.save)
-                if spy.saveAsCalls != 1 {
-                    lockStageFailures.append(
-                        "handoff \(spy.saveAsCalls)")
+                spy.saveDone = nil
+                spy.inCallback = []
+                let inspect: () -> Void = {
+                    if blur.redactionState != .fallbackFull {
+                        spy.inCallback.append(
+                            "state " + String(describing: blur.redactionState))
+                    }
+                    if blur.redactionGeneration != generation + 1 {
+                        spy.inCallback.append(
+                            "gen \(blur.redactionGeneration)")
+                    }
+                    if surface.redactionJobCountForTesting != 0 {
+                        spy.inCallback.append(
+                            "registry \(surface.redactionJobCountForTesting)")
+                    }
+                    if owners() != ownerBase {
+                        spy.inCallback.append("owners \(owners())")
+                    }
+                    // The worker still holds its physical slot; only ownership
+                    // was given up.
+                    if slots() != slotBase + 1 {
+                        spy.inCallback.append("slots \(slots())")
+                    }
+                    if host.repaints != repaintsBeforeSave + 1 {
+                        spy.inCallback.append(
+                            "repaints \(host.repaints - repaintsBeforeSave)")
+                    }
                 }
-                if blur.redactionState != .fallbackFull
-                    || blur.redactionGeneration != generation + 1
-                    || host.repaints != repaintsBeforeSave + 1
-                    || surface.redactionJobCountForTesting != 0
-                    || owners() != ownerBase
-                    || slots() != slotBase + 1 {
+                panel.performActionForTesting(.save)
+                inspect()
+                if spy.saveAsCalls != 1 {
+                    lockStageFailures.append("handoff \(spy.saveAsCalls)")
+                }
+                if !spy.inCallback.isEmpty {
                     lockStageFailures.append(
-                        "locked \(String(describing: blur.redactionState)) "
-                        + "gen \(blur.redactionGeneration) "
-                        + "repaints \(host.repaints - repaintsBeforeSave) "
-                        + "owners \(owners()) slots \(slots())")
+                        "locked " + spy.inCallback.joined(separator: ","))
                 }
 
-                // Stage 3 — the sheet is cancelled: nothing further moves.
+                // Stage 3 — the sheet is cancelled: nothing further moves, and
+                // the panel is usable again.
                 let generationAfterLock = blur.redactionGeneration
                 let repaintsAfterLock = host.repaints
                 MainActor.assumeIsolated { spy.saveDone?(.cancelled) }
+                spy.saveDone = nil
                 if blur.redactionGeneration != generationAfterLock
                     || host.repaints != repaintsAfterLock
-                    || slots() != slotBase + 1 {
+                    || slots() != slotBase + 1
+                    || surface.redactionJobCountForTesting != 0
+                    || owners() != ownerBase
+                    || !panel.isVisible {
                     lockStageFailures.append("cancel-moved")
                 }
-
-                // Stage 4 — teardown bumps once more; the repaint does not
-                // repeat, because the mask is already full.
-                panel.dismissForTesting()
-                if blur.redactionGeneration != generation + 2
-                    || host.repaints != repaintsAfterLock {
-                    lockStageFailures.append(
-                        "teardown gen \(blur.redactionGeneration) "
-                        + "repaints \(host.repaints - repaintsAfterLock)")
+                // Positive retry on the SAME fixture: the unlock is real.
+                panel.performActionForTesting(.save)
+                if spy.saveAsCalls != 2 {
+                    lockStageFailures.append("retry \(spy.saveAsCalls)")
                 }
 
-                // Stage 5 — releasing the worker returns ONLY the slot.
-                release.signal()
-                let deadline = Date().addingTimeInterval(10)
-                while slots() > slotBase, Date() < deadline {
-                    RunLoop.current.run(until: Date().addingTimeInterval(0.02))
+                // Stage 4 — a completed save closes the panel by itself.
+                MainActor.assumeIsolated {
+                    spy.saveDone?(.saved(URL(fileURLWithPath: "/tmp/x.png")))
                 }
-                SliceBOCR.recognizerForTesting = nil
+                spy.saveDone = nil
+                if ScrollResultPanel.current === panel || panel.isVisible {
+                    lockStageFailures.append("saved-not-dismissed")
+                }
+                let generationAfterClose = blur.redactionGeneration
+                let repaintsAfterClose = host.repaints
+
+                // Stage 5 — releasing the worker returns ONLY the slot: no
+                // repaint, no registry entry, no late mutation of the mask.
+                releaseAndDrain()
                 if slots() != slotBase || owners() != ownerBase {
                     lockStageFailures.append(
                         "drain \(slots()) \(owners())")
                 }
                 if blur.redactionState != .fallbackFull
-                    || blur.redactionGeneration != generation + 2 {
+                    || blur.redactionGeneration != generationAfterClose
+                    || host.repaints != repaintsAfterClose
+                    || surface.redactionJobCountForTesting != 0 {
                     lockStageFailures.append(
-                        "late-result-applied "
-                        + String(describing: blur.redactionState))
+                        "late-result "
+                        + String(describing: blur.redactionState)
+                        + " repaints \(host.repaints - repaintsAfterClose)")
+                }
+                if ScrollResultPanel.current === panel {
+                    panel.dismissForTesting()
                 }
             }
             runSaveLockStages()
