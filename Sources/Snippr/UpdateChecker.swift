@@ -81,6 +81,12 @@ enum UpdateChecker {
         }
     }
 
+    /// The updater only runs for the canonical /Applications/Snippr.app.
+    /// RED stub — the GREEN commit refuses non-canonical copies.
+    nonisolated static func updateAllowed(for verdict: BundleIntegrity.Verdict) -> Bool {
+        true
+    }
+
     static func isNewer(_ a: String, than b: String) -> Bool {
         let pa = a.split(separator: ".").compactMap { Int($0) }
         let pb = b.split(separator: ".").compactMap { Int($0) }

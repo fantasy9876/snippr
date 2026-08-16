@@ -35,6 +35,63 @@ enum SelfTest {
             }
         }
 
+        // 0a. Bundle integrity: one canonical Snippr, duplicates are named ------
+        // A second bundle with our identifier (ad-hoc dev copy in
+        // ~/Applications, a mounted DMG, Downloads) shares the TCC subject but
+        // not the designated requirement; LaunchServices may open it first and
+        // the user is asked to grant Screen Recording "again". The verdict is a
+        // pure function of paths so it is provable headlessly.
+        do {
+            let canonical = URL(fileURLWithPath: "/Applications/Snippr.app")
+            let home = URL(fileURLWithPath: "/Users/tester/Applications/Snippr.app")
+            let dmg = URL(fileURLWithPath: "/Volumes/Snippr/Snippr.app")
+            let messy = URL(fileURLWithPath: "/Applications/./Snippr.app/")
+            let clean = BundleIntegrity.evaluate(
+                running: canonical, discovered: [canonical], canonical: canonical)
+            let withDup = BundleIntegrity.evaluate(
+                running: canonical, discovered: [canonical, home, dmg], canonical: canonical)
+            let nonCanonical = BundleIntegrity.evaluate(
+                running: home, discovered: [canonical, home], canonical: canonical)
+            let orphan = BundleIntegrity.evaluate(
+                running: home, discovered: [home], canonical: canonical)
+            let normalized = BundleIntegrity.evaluate(
+                running: messy, discovered: [messy, canonical], canonical: canonical)
+            check("integrity-verdict-canonical-clean",
+                  clean == .canonical(duplicates: [])
+                    && BundleIntegrity.isCanonical(canonical, canonical: canonical),
+                  "\(clean)")
+            check("integrity-verdict-duplicates-named",
+                  withDup == .canonical(duplicates: [home, dmg]),
+                  "\(withDup)")
+            check("integrity-verdict-noncanonical-blocked",
+                  nonCanonical == .runningNonCanonical(
+                    running: home, canonicalExists: true, duplicates: [canonical])
+                    && orphan == .runningNonCanonical(
+                        running: home, canonicalExists: false, duplicates: [])
+                    && !BundleIntegrity.isCanonical(home, canonical: canonical),
+                  "\(nonCanonical) / \(orphan)")
+            check("integrity-verdict-path-normalized",
+                  normalized == .canonical(duplicates: [])
+                    && BundleIntegrity.isCanonical(messy, canonical: canonical),
+                  "\(normalized)")
+            // The updater must refuse to run from a non-canonical copy: it
+            // would swap /Applications/Snippr.app while the user is running
+            // something else, and the relaunch would open the wrong app.
+            check("integrity-updater-refuses-noncanonical",
+                  UpdateChecker.updateAllowed(for: clean)
+                    && UpdateChecker.updateAllowed(for: withDup)
+                    && !UpdateChecker.updateAllowed(for: nonCanonical)
+                    && !UpdateChecker.updateAllowed(for: orphan),
+                  "clean \(UpdateChecker.updateAllowed(for: clean)) nonCanonical \(UpdateChecker.updateAllowed(for: nonCanonical))")
+            // Live discovery must not crash headless; from a bare binary the
+            // verdict is nil (no bundle to judge).
+            let live = BundleIntegrity.discoveredBundles()
+            check("integrity-live-discovery-headless",
+                  Bundle.main.bundleURL.pathExtension == "app"
+                    || BundleIntegrity.currentVerdict() == nil,
+                  "live \(live.count) verdict \(String(describing: BundleIntegrity.currentVerdict()))")
+        }
+
         // 0. Updater detached-shell regression ----------------------------------
         let uppercaseHash = String(repeating: "AB", count: 32)
         let normalizedUppercase = UpdateChecker.normalizedSHA256(uppercaseHash)
