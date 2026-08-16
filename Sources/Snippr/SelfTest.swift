@@ -8936,8 +8936,12 @@ enum SelfTest {
                 // POSITIVE CONTROL. Without it the zeros above could simply
                 // mean this fixture can never route a terminal action at all.
                 view.performReviewActionForTesting(.copy)
-                if spy.copies != 1 {
-                    midDragFailures.append("control-copies \(spy.copies)")
+                // The whole route, not just its dependency: the session has to
+                // finish too, or "completions == 0" mid-drag would still be a
+                // negative with nothing positive behind it.
+                if spy.copies != 1 || spy.completions != 1 {
+                    midDragFailures.append(
+                        "control \(spy.copies)/\(spy.completions)")
                 }
             }
 
@@ -9015,12 +9019,18 @@ enum SelfTest {
                     || surface.annotations.first !== existing {
                     midDragFailures.append("panel-undo-prior")
                 }
-                // Same positive control on the panel's own route.
+                // Same positive control on the panel's own route — including
+                // the teardown. Dismissing by hand afterwards would hide a
+                // Copy that stopped closing the panel.
                 panel.performActionForTesting(.copy)
                 if spy.copies != 1 {
                     midDragFailures.append("panel-control \(spy.copies)")
                 }
-                panel.dismissForTesting()
+                if ScrollResultPanel.current === panel || panel.isVisible {
+                    midDragFailures.append(
+                        "panel-not-dismissed \(panel.isVisible)")
+                    panel.dismissForTesting()
+                }
             }
             runPanelMidDrag()
             check("sliceB-mid-drag-routes-blocked",
