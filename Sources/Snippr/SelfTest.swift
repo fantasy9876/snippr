@@ -7390,17 +7390,6 @@ enum SelfTest {
 
         // MARK: slice A — picker / ruler / guides / resize / scroll hint
         do {
-            let keys = SliceAHotkeys.editorToolKeys
-            check("sliceA-keys-leave-slice-b",
-                  SliceAHotkeys.reservedForSliceB.isDisjoint(with: Set(keys.keys))
-                    && keys["c"] == .crop
-                    && keys["b"] == .blur
-                    && keys["v"] == .select
-                    && !keys.keys.contains("d")
-                    && !keys.keys.contains("s")
-                    && !keys.keys.contains("m"),
-                  "keys \(keys.keys.sorted())")
-
             let hint = SliceAHotkeys.bidirectionalScrollHint.lowercased()
             check("sliceA-scroll-hint-bidirectional",
                   hint.contains("lên") && hint.contains("xuống")
@@ -7408,11 +7397,10 @@ enum SelfTest {
                         == SliceAHotkeys.bidirectionalScrollHint,
                   hint)
 
-            check("sliceA-overlay-catalog-untouched",
+            check("sliceA-overlay-actions-untouched",
                   OverlayActionCatalog.items.map(\.intent)
-                    == [.copy, .save, .pin, .ocr, .translate, .openEditor]
-                    && OverlayAnnotationTool.allCases.count == 10,
-                  "actions \(OverlayActionCatalog.items.map(\.intent)) tools \(OverlayAnnotationTool.allCases.count)")
+                    == [.copy, .save, .pin, .ocr, .translate, .openEditor],
+                  "actions \(OverlayActionCatalog.items.map(\.intent))")
 
             let red = makeSolidImage(
                 width: 40, height: 30, color: NSColor.red.cgColor)
@@ -7975,6 +7963,249 @@ enum SelfTest {
                         && screenHex == "SENTINEL-OV-SCREEN",
                       "down \(downHex ?? "nil") drag \(dragHex ?? "nil") exit \(exitHex ?? "nil") screenInside \(afterScreenInside) screen \(screenHex ?? "nil")")
             }
+        }
+
+        // MARK: slice B RED — redaction / spotlight / magnifier / backdrop
+        //
+        // Fail-first gates for the contract in
+        // PLANS/SNIPPR_SLICE_B_BACKDROP_TEXTBLUR_SPOTLIGHT_SPEC.md. They compile
+        // against the inert declarations in SliceBContract.swift and stay red
+        // until the real compositor lands. The two slice A transition gates
+        // (catalog == 10 tools, D/S/M unowned) are replaced by the final
+        // invariants below, as agreed with Fizz.
+        do {
+            /// Bottom-left origin probe, matching annotation pixel space.
+            func probe(_ image: CGImage, _ x: Int, _ yBL: Int) -> (Int, Int, Int) {
+                var bytes = [UInt8](
+                    repeating: 0, count: image.width * image.height * 4)
+                guard let c = CGContext(
+                    data: &bytes, width: image.width, height: image.height,
+                    bitsPerComponent: 8, bytesPerRow: image.width * 4,
+                    space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                    bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+                else { return (-1, -1, -1) }
+                c.interpolationQuality = .none
+                c.draw(image, in: CGRect(
+                    x: 0, y: 0, width: image.width, height: image.height))
+                let y = image.height - 1 - yBL
+                guard x >= 0, x < image.width, y >= 0, y < image.height
+                else { return (-1, -1, -1) }
+                let i = (y * image.width + x) * 4
+                return (Int(bytes[i]), Int(bytes[i + 1]), Int(bytes[i + 2]))
+            }
+            func luma(_ p: (Int, Int, Int)) -> Int {
+                (p.0 * 299 + p.1 * 587 + p.2 * 114) / 1000
+            }
+
+            // 1. Overlay catalog: legacy tags frozen, two tools appended.
+            let tools = OverlayAnnotationTool.allCases
+            let legacyTips = [
+                "Select / Resize frame (V)", "Pen (P)", "Arrow (A)",
+                "Rectangle (R)", "Text (T)", "Line (L)", "Oval (O)",
+                "Highlighter (H)", "Counter (N)", "Pixelate (B)",
+            ]
+            let legacyFrozen = tools.count >= 10
+                && tools.prefix(10).map(\.tooltip) == legacyTips
+                && tools.prefix(10).map(\.toolbarTag) == Array(100..<110)
+            let appended = tools.count == 12
+                && tools.dropFirst(10).first?.tooltip.hasPrefix("Spotlight") == true
+                && tools.dropFirst(10).first?.toolbarTag == 110
+                && tools.last?.tooltip.hasPrefix("Pixelate text") == true
+                && tools.last?.toolbarTag == 111
+            check("sliceB-overlay-catalog-final",
+                  legacyFrozen && appended,
+                  "count \(tools.count) tips \(tools.map(\.tooltip))")
+
+            // 2. Editor keys: old letters untouched, D/S/M/⇧B owned by B.
+            let keys = SliceAHotkeys.editorToolKeys
+            let legacyKeys = keys["v"] == .select && keys["a"] == .arrow
+                && keys["l"] == .line && keys["r"] == .rect && keys["o"] == .oval
+                && keys["h"] == .highlight && keys["p"] == .pen
+                && keys["t"] == .text && keys["n"] == .counter
+                && keys["b"] == .blur && keys["c"] == .crop
+            let editorTips = EditorTool.allCases.map(\.tooltip)
+            let newKeys = keys["d"] != nil && keys["s"] != nil && keys["m"] != nil
+                && editorTips.contains { $0.hasPrefix("Backdrop (D)") }
+                && editorTips.contains { $0.hasPrefix("Spotlight (S)") }
+                && editorTips.contains { $0.hasPrefix("Magnifier (M)") }
+                && editorTips.contains { $0.hasPrefix("Pixelate text (⇧B)") }
+            check("sliceB-editor-keys-final",
+                  legacyKeys && newKeys,
+                  "keys \(keys.keys.sorted()) tips \(editorTips)")
+
+            // 3. Every toolbar symbol must resolve on the deployment target;
+            //    NSImage(systemSymbolName:)! would otherwise crash on launch.
+            let symbols = EditorTool.allCases.map(\.symbol)
+                + OverlayAnnotationTool.allCases.map(\.symbol)
+            let unresolved = symbols.filter {
+                NSImage(systemSymbolName: $0, accessibilityDescription: nil) == nil
+            }
+            check("sliceB-symbols-resolve",
+                  unresolved.isEmpty
+                    && EditorTool.allCases.count == 15
+                    && OverlayAnnotationTool.allCases.count == 12,
+                  "unresolved \(unresolved) editor \(EditorTool.allCases.count) overlay \(OverlayAnnotationTool.allCases.count)")
+
+            // 4. A redaction never renders "nothing".
+            let redactRect = CGRect(x: 10, y: 20, width: 100, height: 40)
+            let wordA = CGRect(x: 12, y: 22, width: 20, height: 10)
+            let wordB = CGRect(x: 40, y: 22, width: 30, height: 10)
+            let fullStates: [RedactionState] = [.rect, .pendingFull, .fallbackFull]
+            let masksFull = fullStates.allSatisfy {
+                SliceBRedaction.maskRects(state: $0, rect: redactRect) == [redactRect]
+            }
+            let masksWords = SliceBRedaction.maskRects(
+                state: .words([wordA, wordB]), rect: redactRect) == [wordA, wordB]
+            let emptyIsFallback = RedactionState.resolvedWords([]) == .fallbackFull
+                && RedactionState.resolvedWords([wordA]) == .words([wordA])
+                && !SliceBRedaction.maskRects(
+                    state: .words([]), rect: redactRect).isEmpty
+            check("sliceB-mask-never-empty",
+                  masksFull && masksWords && emptyIsFallback,
+                  "full \(masksFull) words \(masksWords) empty \(emptyIsFallback)")
+
+            // 5. Async OCR landing on a superseded annotation is dropped.
+            let staleApply = SliceBRedaction.applyWords(
+                [wordA], to: .pendingFull, generation: 1, current: 2)
+            let liveApply = SliceBRedaction.applyWords(
+                [wordA], to: .pendingFull, generation: 3, current: 3)
+            let emptyApply = SliceBRedaction.applyWords(
+                [], to: .pendingFull, generation: 3, current: 3)
+            check("sliceB-ocr-race",
+                  staleApply == .pendingFull
+                    && liveApply == .words([wordA])
+                    && emptyApply == .fallbackFull,
+                  "stale \(staleApply) live \(liveApply) empty \(emptyApply)")
+
+            // 6. Phase order: redaction -> spotlight -> foreground (stable).
+            let phaseBlur = BlurAnnotation(uiScale: 1)
+            phaseBlur.rect = CGRect(x: 0, y: 0, width: 10, height: 10)
+            let phaseSpot = SpotlightAnnotation(uiScale: 1)
+            let phaseArrow = ShapeAnnotation(
+                kind: .arrow, start: .zero, end: CGPoint(x: 5, y: 5), uiScale: 1)
+            let phaseMag = MagnifierAnnotation(uiScale: 1)
+            let ordered = SliceBCompositor.phaseOrder(
+                [phaseArrow, phaseSpot, phaseBlur, phaseMag])
+            let orderOK = ordered.count == 4
+                && ordered[0] === phaseBlur && ordered[1] === phaseSpot
+                && ordered[2] === phaseArrow && ordered[3] === phaseMag
+            let phaseOK = SliceBCompositor.phase(of: phaseBlur) == .redaction
+                && SliceBCompositor.phase(of: phaseSpot) == .spotlight
+                && SliceBCompositor.phase(of: phaseArrow) == .foreground
+                && SliceBCompositor.phase(of: phaseMag) == .foreground
+            check("sliceB-phase-order", orderOK && phaseOK,
+                  "order \(ordered.map { type(of: $0) }) phases ok \(phaseOK)")
+
+            // 7. Pixels: pixelate must not erase the dim layer, and the render
+            //    must not depend on insertion order.
+            let phaseBase = makeNoiseImage(width: 120, height: 80)
+            let phasePix = AnnotationRenderer.pixellate(phaseBase, scale: 1)
+            let spot = SpotlightAnnotation(uiScale: 1)
+            spot.rect = CGRect(x: 70, y: 20, width: 30, height: 30)
+            spot.baseBounds = CGRect(x: 0, y: 0, width: 120, height: 80)
+            spot.dimFraction = 0.7
+            let wide = BlurAnnotation(uiScale: 1)
+            wide.rect = CGRect(x: 0, y: 0, width: 60, height: 80)
+            let spotFirst = AnnotationRenderer.render(
+                base: phaseBase, annotations: [spot, wide], pixellated: phasePix)
+            let blurFirst = AnnotationRenderer.render(
+                base: phaseBase, annotations: [wide, spot], pixellated: phasePix)
+            let noSpot = AnnotationRenderer.render(
+                base: phaseBase, annotations: [wide], pixellated: phasePix)
+            let orderIndependent = imagesEqual(spotFirst, blurFirst)
+            // inside the blur AND outside the spotlight: dim must survive
+            let dimOverBlur = luma(probe(spotFirst, 20, 40)) < luma(probe(noSpot, 20, 40))
+            // inside the spotlight: untouched
+            let brightInside = luma(probe(spotFirst, 85, 35)) == luma(probe(noSpot, 85, 35))
+            check("sliceB-phase-pixels",
+                  orderIndependent && dimOverBlur && brightInside,
+                  "orderIndep \(orderIndependent) dimOverBlur \(dimOverBlur) brightInside \(brightInside)")
+
+            // 8. A magnifier must sample the SANITIZED layer.
+            let magCtx = ctx(60, 40)
+            magCtx.setFillColor(NSColor.white.cgColor)
+            magCtx.fill(CGRect(x: 0, y: 0, width: 60, height: 40))
+            magCtx.setFillColor(NSColor.black.cgColor)
+            magCtx.fill(CGRect(x: 14, y: 14, width: 4, height: 4))
+            let magBase = magCtx.makeImage()!
+            let source = CGRect(x: 8, y: 8, width: 16, height: 16)
+            let covering = BlurAnnotation(uiScale: 1)
+            covering.rect = CGRect(x: 6, y: 6, width: 24, height: 24)
+            let sanitized = SliceBCompositor.magnifierSnapshot(
+                base: magBase, sourceRect: source, redactions: [covering])
+            let untouched = SliceBCompositor.magnifierSnapshot(
+                base: magBase, sourceRect: source, redactions: [])
+            func hasPureBlack(_ image: CGImage?) -> Bool {
+                guard let image else { return false }
+                for y in 0..<image.height where y % 2 == 0 {
+                    for x in 0..<image.width where x % 2 == 0 {
+                        if luma(probe(image, x, y)) < 24 { return true }
+                    }
+                }
+                return false
+            }
+            check("sliceB-magnifier-vs-redaction",
+                  sanitized != nil && untouched != nil
+                    && !hasPureBlack(sanitized) && hasPureBlack(untouched),
+                  "sanitized \(sanitized != nil) untouched \(untouched != nil)")
+
+            // 9. Export fails closed instead of handing back a clean base.
+            let exportBase = makeSolidImage(
+                width: 40, height: 30, color: NSColor.green.cgColor)
+            let exportOK = SliceBExport.checkedRender(
+                base: exportBase, annotations: [], pixellated: nil,
+                budgetBytes: SliceBExport.defaultBudgetBytes)
+            let exportStarved = SliceBExport.checkedRender(
+                base: exportBase, annotations: [], pixellated: nil,
+                budgetBytes: 16)
+            check("sliceB-export-fail-closed",
+                  exportOK?.width == 40 && exportStarved == nil,
+                  "ok \(exportOK?.width ?? -1) starved \(exportStarved == nil)")
+
+            // 10. Backdrop padding cap + None parity + budget fail-closed.
+            let padOK = SliceBBackdrop.padding(forLongEdge: 1000) == 60
+                && SliceBBackdrop.padding(forLongEdge: 400) == 40
+                && SliceBBackdrop.padding(forLongEdge: 40000) == 320
+            let backdropBase = makeSolidImage(
+                width: 50, height: 40, color: NSColor.systemTeal.cgColor)
+            let plain = SliceBBackdrop.compose(
+                image: backdropBase, preset: .none,
+                budgetBytes: SliceBExport.defaultBudgetBytes)
+            let plainParity = plain.map { imagesEqual($0, backdropBase) } == true
+            let framed = SliceBBackdrop.compose(
+                image: backdropBase, preset: .ocean,
+                budgetBytes: SliceBExport.defaultBudgetBytes)
+            let framedOK = framed?.width == 50 + 2 * Int(SliceBBackdrop.minPadding)
+            let backdropStarved = SliceBBackdrop.compose(
+                image: backdropBase, preset: .ocean, budgetBytes: 16)
+            check("sliceB-backdrop-budget",
+                  padOK && plainParity && framedOK && backdropStarved == nil,
+                  "pad \(padOK) none \(plainParity) framed \(framed?.width ?? -1) starved \(backdropStarved == nil)")
+
+            // 11. New types survive copy / move / resize like every other mark.
+            let sp = SpotlightAnnotation(uiScale: 1)
+            sp.rect = CGRect(x: 10, y: 10, width: 20, height: 20)
+            sp.baseBounds = CGRect(x: 0, y: 0, width: 100, height: 100)
+            let spCopy = sp.copyAnnotation() as? SpotlightAnnotation
+            spCopy?.move(by: CGPoint(x: 5, y: 0))
+            let spOK = spCopy != nil && spCopy !== sp
+                && sp.rect.origin.x == 10 && spCopy?.rect.origin.x == 15
+            sp.scaleCoordinates(by: 2)
+            let spScaled = sp.rect == CGRect(x: 20, y: 20, width: 40, height: 40)
+                && sp.baseBounds.width == 200
+            let mg = MagnifierAnnotation(uiScale: 1)
+            mg.sourceRect = CGRect(x: 10, y: 10, width: 10, height: 10)
+            mg.calloutRect = CGRect(x: 40, y: 40, width: 30, height: 30)
+            mg.move(by: CGPoint(x: 3, y: 4))
+            // dragging the callout must not re-aim the source
+            let mgMoved = mg.calloutRect.origin == CGPoint(x: 43, y: 44)
+                && mg.sourceRect.origin == CGPoint(x: 10, y: 10)
+            mg.scaleCoordinates(by: 2)
+            let mgScaled = mg.sourceRect == CGRect(x: 20, y: 20, width: 20, height: 20)
+                && mg.calloutRect == CGRect(x: 86, y: 88, width: 60, height: 60)
+            check("sliceB-annotation-copy-move-scale",
+                  spOK && spScaled && mgMoved && mgScaled,
+                  "spot \(spOK)/\(spScaled) mag \(mgMoved)/\(mgScaled)")
         }
 
         print(failures == 0 ? "ALL TESTS PASSED" : "\(failures) TEST(S) FAILED")
