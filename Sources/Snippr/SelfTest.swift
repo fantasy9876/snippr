@@ -10178,7 +10178,13 @@ enum SelfTest {
             // E11. INTENTIONAL RED until GREEN2: there is still no production
             //      caller that creates a text redaction and registers its job.
             //      Editor, area overlay and scroll panel must each do it.
+            final class RepaintCounter: RedactionSurfaceDelegate {
+                var repaints = 0
+                func surfaceNeedsRedactionRepaint() { repaints += 1 }
+            }
             var lifecycleFailures: [String] = []
+            var lifecycleAfterRelease:
+                [(String, BlurAnnotation, RepaintCounter, Int)] = []
             let editorTextTool = EditorTool.allCases.first {
                 $0.tooltip.hasPrefix("Pixelate text")
             }
@@ -10262,6 +10268,50 @@ enum SelfTest {
             // Area and scroll are DRIVEN when the tool exists, so a correct
             // GREEN2 turns this gate green instead of tripping on a hard-coded
             // failure. Only the absence of wiring keeps it red.
+            @MainActor
+            func assertJobLifecycle(
+                surface: AnnotationSurface, blur: BlurAnnotation,
+                label: String, baseline: Int
+            ) {
+                let counter = RepaintCounter()
+                surface.redactionDelegate = counter
+                if blur.redactionState != .pendingFull {
+                    lifecycleFailures.append(
+                        label + ":not-pending \(blur.redactionState)")
+                }
+                if surface.redactionJobCountForTesting != 1 {
+                    lifecycleFailures.append(label + ":not-registered")
+                }
+                if SliceBRedactionJob.inFlight != baseline + 1 {
+                    lifecycleFailures.append(label + ":no-slot")
+                }
+                let generationBefore = blur.redactionGeneration
+                surface.cancelRedactionJob(for: blur)
+                // BEFORE the worker is released: the mask is normalized, the
+                // registry and owner map are empty, the repaint happened once,
+                // and the physical slot is still held by the running worker.
+                if blur.redactionState != .fallbackFull {
+                    lifecycleFailures.append(
+                        label + ":not-normalized \(blur.redactionState)")
+                }
+                if blur.redactionGeneration <= generationBefore {
+                    lifecycleFailures.append(label + ":no-generation-bump")
+                }
+                if surface.redactionJobCountForTesting != 0 {
+                    lifecycleFailures.append(label + ":registry-leak")
+                }
+                if SliceBRedactionJob.ownerCountForTesting != 0 {
+                    lifecycleFailures.append(label + ":owner-leak")
+                }
+                if counter.repaints != 1 {
+                    lifecycleFailures.append(
+                        label + ":repaints \(counter.repaints)")
+                }
+                if SliceBRedactionJob.inFlight != baseline + 1 {
+                    lifecycleFailures.append(label + ":slot-freed-early")
+                }
+                lifecycleAfterRelease.append((label, blur, counter, baseline))
+            }
             if let overlayTextTool {
                 MainActor.assumeIsolated {
                     let frozen = CapturedImage(
@@ -10284,52 +10334,83 @@ enum SelfTest {
                         windowList: [], owner: overlay)
                     view.selectForTesting(
                         rect: CGRect(x: 20, y: 20, width: 200, height: 140))
+                    let baseline = SliceBRedactionJob.inFlight
                     view.clickReviewToolbarButtonForTesting(
                         tag: overlayTextTool.toolbarTag)
                     view.annotationDragForTesting(
                         from: CGPoint(x: 40, y: 40), to: CGPoint(x: 110, y: 90))
-                    guard let blur = view.annotationSurface?.annotations
-                        .compactMap({ $0 as? BlurAnnotation }).last else {
+                    guard let surface = view.annotationSurface,
+                          let blur = surface.annotations
+                            .compactMap({ $0 as? BlurAnnotation }).last else {
                         lifecycleFailures.append("area:no-redaction")
                         return
                     }
-                    if blur.redactionState != .pendingFull {
-                        lifecycleFailures.append(
-                            "area:not-pending \(blur.redactionState)")
+                    if lifecycleStarted.wait(timeout: .now() + 10) == .timedOut {
+                        lifecycleFailures.append("area:worker-never-started")
                     }
-                    if view.annotationSurface?.redactionJobCountForTesting != 1 {
-                        lifecycleFailures.append("area:not-registered")
-                    }
-                    view.annotationSurface?.cancelAllRedactionJobs()
+                    assertJobLifecycle(
+                        surface: surface, blur: blur, label: "area",
+                        baseline: baseline)
                 }
                 MainActor.assumeIsolated {
+                    // A deliberately TALL stitch so the panel must fit it at a
+                    // scale other than 1:1 — a 1:1 fixture would never exercise
+                    // the point/pixel conversion.
                     let panel = ScrollResultPanel.show(
                         image: CapturedImage(
-                            cgImage: makeNoiseImage(width: 200, height: 400),
+                            cgImage: makeNoiseImage(width: 300, height: 4000),
                             scale: 1),
                         inputs: OverlaySessionInputs(
                             afterShow: true, afterCopy: false, afterSave: false),
                         screen: hostScreen)
+                    if let host = panel.annotationHostForTesting,
+                       abs(host.bounds.height - 4000) < 1 {
+                        lifecycleFailures.append("scroll:fixture-is-1to1")
+                    }
+                    let baseline = SliceBRedactionJob.inFlight
                     panel.clickToolbarButtonForTesting(
                         tag: overlayTextTool.toolbarTag)
                     panel.drawWithRealEventsForTesting(
                         fromView: CGPoint(x: 30, y: 40),
                         toView: CGPoint(x: 90, y: 90))
-                    if let blur = panel.annotationSurface.annotations
-                        .compactMap({ $0 as? BlurAnnotation }).last {
-                        if blur.redactionState != .pendingFull {
-                            lifecycleFailures.append(
-                                "scroll:not-pending \(blur.redactionState)")
-                        }
-                        if panel.annotationSurface
-                            .redactionJobCountForTesting != 1 {
-                            lifecycleFailures.append("scroll:not-registered")
-                        }
-                    } else {
+                    guard let blur = panel.annotationSurface.annotations
+                        .compactMap({ $0 as? BlurAnnotation }).last else {
                         lifecycleFailures.append("scroll:no-redaction")
+                        panel.dismissForTesting()
+                        return
                     }
-                    panel.annotationSurface.cancelAllRedactionJobs()
+                    if lifecycleStarted.wait(timeout: .now() + 10) == .timedOut {
+                        lifecycleFailures.append("scroll:worker-never-started")
+                    }
+                    assertJobLifecycle(
+                        surface: panel.annotationSurface, blur: blur,
+                        label: "scroll", baseline: baseline)
                     panel.dismissForTesting()
+                }
+            }
+            // AFTER releasing the workers: a cancelled job may not mutate the
+            // annotation again, may not repaint, and must give its slot back.
+            lifecycleRelease.signal()
+            lifecycleRelease.signal()
+            for (label, blur, counter, baseline) in lifecycleAfterRelease {
+                let stateBefore = blur.redactionState
+                let repaintsBefore = counter.repaints
+                let deadline = Date().addingTimeInterval(10)
+                while MainActor.assumeIsolated({
+                    SliceBRedactionJob.inFlight
+                }) > baseline, Date() < deadline {
+                    RunLoop.current.run(until: Date().addingTimeInterval(0.02))
+                }
+                if MainActor.assumeIsolated({
+                    SliceBRedactionJob.inFlight
+                }) != baseline {
+                    lifecycleFailures.append(label + ":slot-leak")
+                }
+                if blur.redactionState != stateBefore {
+                    lifecycleFailures.append(label + ":late-mutation")
+                }
+                if counter.repaints != repaintsBefore {
+                    lifecycleFailures.append(label + ":late-repaint")
                 }
             }
             check("sliceB-text-redaction-lifecycle-wiring",
