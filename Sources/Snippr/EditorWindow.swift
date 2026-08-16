@@ -479,8 +479,23 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
         Settings.shared.lastAnnotationColor = colorWell.color
     }
 
+    /// Every terminal action is transactional: if the flatten fails we keep
+    /// the session exactly as it was — nothing exported, nothing closed — and
+    /// tell the user. Silently writing the un-redacted base would be the worst
+    /// possible outcome here.
+    private func flattenedOrWarn() -> CapturedImage? {
+        guard let flat = canvas.flattened() else {
+            ToastHUD.show(
+                "Couldn't render the redaction — nothing was exported",
+                symbol: "exclamationmark.triangle.fill")
+            return nil
+        }
+        return flat
+    }
+
     @objc func copyImage() {
-        SaveService.shared.copyToClipboard(canvas.flattened())
+        guard let flat = flattenedOrWarn() else { return }
+        SaveService.shared.copyToClipboard(flat)
         ToastHUD.show("Copied to clipboard")
         window?.close()
     }
@@ -490,7 +505,8 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
     /// behavior cannot drift between the two surfaces.
     @objc func saveImage() {
         guard let window else { return }
-        SaveService.shared.saveAs(canvas.flattened(), for: window) { outcome in
+        guard let flat = flattenedOrWarn() else { return }
+        SaveService.shared.saveAs(flat, for: window) { outcome in
             switch outcome {
             case let .saved(url):
                 ToastHUD.show(
@@ -508,7 +524,8 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
     @objc func saveImageAs() { saveImage() }
 
     @objc func pinImage() {
-        PinWindow.pin(canvas.flattened())
+        guard let flat = flattenedOrWarn() else { return }
+        PinWindow.pin(flat)
         window?.close()
     }
 
@@ -516,7 +533,7 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
     @objc func runTranslate() { recognizeText(autoTranslate: true) }
 
     private func recognizeText(autoTranslate: Bool) {
-        let flat = canvas.flattened()
+        guard let flat = flattenedOrWarn() else { return }
         Task {
             let result = await OCRService.shared.recognize(flat.cgImage)
             await MainActor.run {
@@ -536,7 +553,7 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
         if s.escCopy || s.escSave {
             // flatten ONCE and share it — escCopy+escSave used to render the
             // whole image twice back to back
-            let flat = canvas.flattened()
+            guard let flat = flattenedOrWarn() else { return }
             if s.escCopy {
                 SaveService.shared.copyToClipboard(flat)
                 ToastHUD.show("Copied to clipboard")
@@ -571,6 +588,11 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
     }
 
     func windowWillClose(_ notification: Notification) {
+        // Closing supersedes every OCR job in flight: a late result must not
+        // touch annotations belonging to a window that is gone.
+        for blur in canvas.annotations.compactMap({ $0 as? BlurAnnotation }) {
+            blur.bumpRedactionGeneration()
+        }
         NotificationCenter.default.removeObserver(self)
         PixelSamplerCache.release(canvas.image.cgImage)
         EditorWindowController.controllers.removeAll { $0 === self }
@@ -690,6 +712,14 @@ final class EditorCanvasView: NSView {
         CGPoint(x: viewPoint.x * pxScale, y: viewPoint.y * pxScale)
     }
 
+    /// Field bezel/inset -> pixel origin. Pure and shared by the prospective
+    /// export and the real commit so the two cannot drift.
+    static func textOrigin(
+        forFieldFrame frame: CGRect, scale: CGFloat
+    ) -> CGPoint {
+        CGPoint(x: (frame.minX + 2) * scale, y: (frame.minY + 4) * scale)
+    }
+
     /// Slice B seam: simulates a pixelation/render failure so the gates can
     /// prove the editor fails CLOSED (no clean base on screen, no export, no
     /// close) instead of quietly dropping the redaction.
@@ -703,13 +733,81 @@ final class EditorCanvasView: NSView {
         return pixellatedCache
     }
 
-    func flattened() -> CapturedImage {
+    /// Fail-CLOSED export. Returns nil when any redaction could not be
+    /// rendered: handing back a clean base would silently publish the very
+    /// pixels the user asked to cover. Every terminal action checks this.
+    /// Fail-CLOSED, transactional export.
+    ///
+    /// The flatten runs on a PROSPECTIVE document — clones of the annotations,
+    /// plus the in-progress text and the pending crop materialized into those
+    /// clones. The live document (annotations, image, undo stack, text field,
+    /// crop chrome, tool, pointer cache) is only committed after the render has
+    /// actually succeeded, so a failed export cannot leave the editor changed —
+    /// and can never hand back a clean base with the redactions dropped.
+    func flattened() -> CapturedImage? {
+        var marks = annotations.map { $0.copyAnnotation() }
+        if let pending = editingTextAnnotation, let field = textField {
+            let typed = field.stringValue.trimmingCharacters(
+                in: .whitespacesAndNewlines)
+            if !typed.isEmpty {
+                let text = TextAnnotation(uiScale: pxScale)
+                text.text = typed
+                // Same pure conversion the commit uses, so the exported image
+                // and the committed document cannot disagree by a few points.
+                text.origin = Self.textOrigin(
+                    forFieldFrame: field.frame, scale: pxScale)
+                text.color = pending.color
+                text.fontSizePt = pending.fontSizePt
+                marks.append(text)
+            }
+        }
+
+        var base = image.cgImage
+        var croppedBase: CGImage?
+        if currentTool == .crop, let crop = cropRect, hasValidCropSelection {
+            let viewRect = crop.intersection(bounds)
+            let requested = EditableSelectionGeometry.pixelCropRect(
+                for: viewRect, in: bounds, scale: pxScale)
+            let imageBounds = CGRect(
+                x: 0, y: 0, width: base.width, height: base.height)
+            let px = requested.intersection(imageBounds)
+            // FAIL CLOSED: if the crop cannot be materialized we must NOT fall
+            // back to the full base — that would export the pixels the user
+            // just cropped away.
+            guard !viewRect.isNull, viewRect.width >= 4, viewRect.height >= 4,
+                  !px.isNull, px.width >= 1, px.height >= 1,
+                  let cropped = base.cropping(to: px),
+                  let owned = cropped.materialized()
+            else { return nil }
+            let offset = EditableSelectionGeometry.annotationOffset(
+                forPixelCrop: px, imageHeight: CGFloat(base.height))
+            for mark in marks {
+                mark.move(by: CGPoint(x: -offset.x, y: -offset.y))
+            }
+            base = owned
+            croppedBase = owned
+        }
+
+        let injected = Self.forcePixellateFailureForTesting
+            && marks.contains { $0 is BlurAnnotation }
+        guard !injected, let cg = SliceBExport.checkedRender(
+            base: base, annotations: marks, pixellated: nil,
+            budgetBytes: SliceBExport.defaultBudgetBytes, pixelScale: pxScale)
+        else { return nil }
+
+        // Render succeeded — now, and only now, make it real. Commit the very
+        // base/marks that were rendered: cropping a second time could fail at
+        // a higher peak and leave the export cropped while the document is not.
         commitTextEditing()
-        if currentTool == .crop { applyCropSelection() }
-        let cg = AnnotationRenderer.render(
-            base: image.cgImage, annotations: annotations,
-            pixellated: annotations.contains(where: { $0 is BlurAnnotation }) ? pixellated : nil
-        )
+        if croppedBase != nil {
+            registerUndoSnapshot()
+            annotations = marks
+            cropRect = nil
+            notifyCropSelectionChange()
+            setImage(CapturedImage(cgImage: base, scale: pxScale))
+            (window?.windowController as? EditorWindowController)?
+                .selectTool(.select)
+        }
         return CapturedImage(cgImage: cg, scale: pxScale)
     }
 
@@ -725,12 +823,31 @@ final class EditorCanvasView: NSView {
         ctx.scaleBy(x: 1 / pxScale, y: 1 / pxScale)
         let needsPixellated = annotations.contains(where: { $0 is BlurAnnotation })
             || drafting is BlurAnnotation
-        if !needsPixellated && pixellatedCache != nil {
-            pixellatedCache = nil // last blur removed — free the full-size copy
+        if pixellatedCache != nil {
+            pixellatedCache = nil // regional pixelation replaced the full copy
         }
-        let pix = needsPixellated ? pixellated : nil
-        for a in annotations { a.draw(in: ctx, pixellated: pix) }
-        drafting?.draw(in: ctx, pixellated: pix)
+        // Preview goes through the SAME compositor as export: phases, regional
+        // pixelation, and an opaque cover when a redaction cannot render.
+        var previewAnnotations = annotations
+        if let drafting { previewAnnotations.append(drafting) }
+        if needsPixellated, Self.forcePixellateFailureForTesting {
+            let rects = previewAnnotations.compactMap { $0 as? BlurAnnotation }
+                .flatMap {
+                    SliceBRedaction.maskRects(
+                        state: $0.redactionState, rect: $0.rect)
+                }
+            for a in previewAnnotations where !(a is BlurAnnotation) {
+                a.draw(in: ctx, pixellated: nil)
+            }
+            SliceBCompositor.drawFailedRedaction(rects, in: ctx)
+        } else {
+            SliceBCompositor.draw(
+                previewAnnotations, in: ctx, base: image.cgImage,
+                visiblePixels: CGRect(
+                    x: 0, y: 0,
+                    width: image.cgImage.width, height: image.cgImage.height),
+                pixelScale: pxScale)
+        }
 
         if let sel = selected {
             drawSelectionChrome(around: sel.bounds, in: ctx)
@@ -824,6 +941,12 @@ final class EditorCanvasView: NSView {
     }
 
     func registerUndoSnapshot() {
+        // Any structural edit (delete, crop, resize, undo, redo) supersedes
+        // every OCR job in flight: a late result must not narrow a mask on an
+        // annotation the user has already changed.
+        for blur in annotations.compactMap({ $0 as? BlurAnnotation }) {
+            blur.bumpRedactionGeneration()
+        }
         let snap = snapshot()
         undoManager?.registerUndo(withTarget: self) { canvas in
             // Symmetric: registrations made during undo land on the redo stack
@@ -1135,7 +1258,8 @@ final class EditorCanvasView: NSView {
             // Align the committed annotation with the text the user just saw
             // in the field (bezel + inset offsets) — using the raw click point
             // made the text visibly jump ~10 pt up-left on every commit.
-            ann.origin = toPixel(CGPoint(x: field.frame.minX + 2, y: field.frame.minY + 4))
+            ann.origin = Self.textOrigin(
+                forFieldFrame: field.frame, scale: pxScale)
             annotations.append(ann)
         }
         needsDisplay = true
@@ -1329,6 +1453,52 @@ final class EditorCanvasView: NSView {
             transient = .guide(axis: axis, position: position * factor)
         }
         setImage(scaled)
+    }
+
+    /// Slice B seams: a gate needs to put the canvas into a realistic state
+    /// (live crop selection, live text edit, a selected mark) and then prove a
+    /// failed export changed NOTHING.
+    func selectForTesting(_ annotation: Annotation?) {
+        selected = annotation
+        needsDisplay = true
+    }
+
+    func setCropSelectionForTesting(_ rect: CGRect) {
+        cropRect = rect
+        notifyCropSelectionChange()
+        needsDisplay = true
+    }
+
+    func beginTextEditingForTesting(at pixel: CGPoint) {
+        beginTextEditing(
+            atViewPoint: CGPoint(x: pixel.x / pxScale, y: pixel.y / pxScale),
+            pixelPoint: pixel)
+    }
+
+    func cropForTesting(pixels: CGRect) {
+        performCrop(viewRect: CGRect(
+            x: pixels.minX / pxScale, y: pixels.minY / pxScale,
+            width: pixels.width / pxScale, height: pixels.height / pxScale))
+    }
+
+    /// Everything a terminal action must leave untouched when export fails.
+    var documentFingerprintForTesting: String {
+        let marks = annotations.map {
+            "\(type(of: $0))@\($0.bounds.integral)"
+        }.joined(separator: ",")
+        let generations = annotations.compactMap { $0 as? BlurAnnotation }
+            .map { "\($0.redactionGeneration)/\($0.redactionState)" }
+            .joined(separator: ",")
+        return [
+            "size=\(image.cgImage.width)x\(image.cgImage.height)",
+            "tool=\(currentTool.rawValue)",
+            "crop=\(cropRect.map { "\($0.integral)" } ?? "nil")",
+            "text=\(textField != nil)",
+            "sel=\(selected.map { "\(type(of: $0))" } ?? "nil")",
+            "undo=\(undoManager?.canUndo == true)",
+            "marks=[\(marks)]",
+            "gen=[\(generations)]",
+        ].joined(separator: " ")
     }
 
     func pickColorHexForTesting(at pixel: CGPoint, darkest: Bool) -> String? {

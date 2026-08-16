@@ -299,9 +299,37 @@ final class AnnotationSurface {
 
     /// Annotation-only two-stack history. The exact model object moves between
     /// stacks; no clone is needed because overlays do not edit old marks.
+    /// Jobs owned by this surface, keyed by the annotation they answer.
+    private var redactionJobs: [ObjectIdentifier: SliceBRedactionJob] = [:]
+
+    func registerRedactionJob(
+        _ job: SliceBRedactionJob, for annotation: Annotation
+    ) {
+        redactionJobs[ObjectIdentifier(annotation)] = job
+    }
+
+    /// Undo/redo/dismiss/save-lock all supersede work in flight. Cancel the
+    /// job AND invalidate the annotation, so a late result can neither mutate
+    /// an object sitting on the redo stack nor leave it pending forever.
+    func cancelRedactionJob(for annotation: Annotation) {
+        if let job = redactionJobs.removeValue(forKey: ObjectIdentifier(annotation)) {
+            job.cancel()
+        }
+        if let blur = annotation as? BlurAnnotation {
+            blur.bumpRedactionGeneration()
+        }
+    }
+
+    func cancelAllRedactionJobs() {
+        for annotation in annotations + redoAnnotations {
+            cancelRedactionJob(for: annotation)
+        }
+    }
+
     @discardableResult
     func undo() -> Bool {
         guard let annotation = annotations.popLast() else { return false }
+        cancelRedactionJob(for: annotation)
         redoAnnotations.append(annotation)
         clearActiveDraft()
         historyDidChange?()
@@ -311,6 +339,8 @@ final class AnnotationSurface {
     @discardableResult
     func redo() -> Bool {
         guard let annotation = redoAnnotations.popLast() else { return false }
+        // Redo restores a NORMALIZED state: never an orphan pending mask.
+        cancelRedactionJob(for: annotation)
         annotations.append(annotation)
         clearActiveDraft()
         historyDidChange?()
@@ -334,35 +364,30 @@ final class AnnotationSurface {
     private func drawAnnotations(
         in ctx: CGContext, base: CGImage, visiblePixels: CGRect
     ) -> Bool {
-        let baseBounds = CGRect(
-            x: 0, y: 0, width: base.width, height: base.height)
-        var renderedAll = true
-        for annotation in annotations {
-            guard let blur = annotation as? BlurAnnotation else {
-                annotation.draw(in: ctx, pixellated: nil)
-                continue
+        // One renderer for every surface: phases, regional pixelation and the
+        // opaque fail-closed cover all live in SliceBCompositor.
+        guard !forceRegionalPixelateFailureForTesting else {
+            let baseBounds = CGRect(
+                x: 0, y: 0, width: base.width, height: base.height)
+            for annotation in SliceBCompositor.phaseOrder(annotations) {
+                guard let blur = annotation as? BlurAnnotation else {
+                    annotation.draw(in: ctx, pixellated: nil)
+                    continue
+                }
+                let masks = SliceBRedaction.maskRects(
+                    state: blur.redactionState, rect: blur.rect)
+                    .map {
+                        $0.standardized.intersection(visiblePixels)
+                            .intersection(baseBounds)
+                    }
+                    .filter { $0.width > 1 && $0.height > 1 }
+                SliceBCompositor.drawFailedRedaction(masks, in: ctx)
             }
-            let requested = blur.rect.standardized
-                .intersection(visiblePixels)
-                .intersection(baseBounds)
-            guard requested.width > 1, requested.height > 1 else { continue }
-            let region = requested.integral.intersection(baseBounds)
-            guard !forceRegionalPixelateFailureForTesting else {
-                renderedAll = false
-                continue
-            }
-            guard let pixelated = AnnotationRenderer.pixellateRegion(
-                base, rect: region, scale: pixelScale)
-            else {
-                renderedAll = false
-                continue
-            }
-            ctx.saveGState()
-            ctx.clip(to: blur.rect)
-            ctx.draw(pixelated, in: region)
-            ctx.restoreGState()
+            return false
         }
-        return renderedAll
+        return SliceBCompositor.draw(
+            annotations, in: ctx, base: base, visiblePixels: visiblePixels,
+            pixelScale: pixelScale)
     }
 
     /// Allocation spy for the export path: exactly ONE full-size destination

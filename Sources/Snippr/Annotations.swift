@@ -355,7 +355,17 @@ final class BlurAnnotation: Annotation {
     /// it is answering a question nobody is asking any more.
     private(set) var redactionGeneration = 0
 
-    func bumpRedactionGeneration() { redactionGeneration += 1 }
+    func bumpRedactionGeneration() {
+        redactionGeneration += 1
+        normalizePendingRedaction()
+    }
+
+    /// An edit supersedes any OCR job in flight. Pending must collapse to the
+    /// FULL mask rather than linger: an orphan `pendingFull` would keep the
+    /// area covered but never resolve, and the user could not tell why.
+    func normalizePendingRedaction() {
+        if redactionState == .pendingFull { redactionState = .fallbackFull }
+    }
 
     override var bounds: CGRect { rect }
 
@@ -372,11 +382,22 @@ final class BlurAnnotation: Annotation {
     override func move(by delta: CGPoint) {
         rect.origin.x += delta.x
         rect.origin.y += delta.y
+        // The word boxes are absolute image pixels: leaving them behind would
+        // slide the mask off the glyphs it is covering.
+        if case let .words(words) = redactionState {
+            redactionState = .words(
+                words.map { $0.offsetBy(dx: delta.x, dy: delta.y) })
+        }
+        bumpRedactionGeneration()
     }
 
     override func copyAnnotation() -> Annotation {
         let c = BlurAnnotation(uiScale: uiScale)
         c.rect = rect
+        // The copy owns no OCR job, so a pending mask would never resolve on
+        // it. Clone it as the FULL mask instead of an orphan pending.
+        c.redactionState = redactionState == .pendingFull
+            ? .fallbackFull : redactionState
         return c
     }
 
@@ -385,6 +406,14 @@ final class BlurAnnotation: Annotation {
         rect = CGRect(
             x: rect.origin.x * factor, y: rect.origin.y * factor,
             width: rect.width * factor, height: rect.height * factor)
+        if case let .words(words) = redactionState {
+            redactionState = .words(words.map {
+                CGRect(
+                    x: $0.origin.x * factor, y: $0.origin.y * factor,
+                    width: $0.width * factor, height: $0.height * factor)
+            })
+        }
+        bumpRedactionGeneration()
     }
 }
 
@@ -590,6 +619,10 @@ func drawRuler(
 
 enum AnnotationRenderer {
     /// Flatten base image + annotations into a single CGImage (pixel space).
+    /// Preview-grade flatten. Redactions render through the shared compositor
+    /// (phases + regional pixelation), so a failure paints an opaque cover
+    /// instead of leaving the pixels underneath visible. Export must use
+    /// `SliceBExport.checkedRender`, which fails closed.
     static func render(base: CGImage, annotations: [Annotation], pixellated: CGImage?) -> CGImage {
         let w = base.width, h = base.height
         guard let ctx = CGContext(
@@ -598,9 +631,9 @@ enum AnnotationRenderer {
             bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
         ) else { return base }
         ctx.draw(base, in: CGRect(x: 0, y: 0, width: w, height: h))
-        for a in annotations {
-            a.draw(in: ctx, pixellated: pixellated)
-        }
+        SliceBCompositor.draw(
+            annotations, in: ctx, base: base,
+            visiblePixels: CGRect(x: 0, y: 0, width: w, height: h))
         return ctx.makeImage() ?? base
     }
 
@@ -608,8 +641,13 @@ enum AnnotationRenderer {
     /// ~50-150 ms of Metal pipeline setup again after every crop/undo.
     private static let ciContext = CIContext()
 
+    /// Spy for the gates: a full-image pixelate is exactly the allocation the
+    /// slice B compositor must never make on a tall stitch.
+    nonisolated(unsafe) static var fullImagePixellateCallsForTesting = 0
+
     /// CIPixellate over the whole image; BlurAnnotation clips regions out of this.
     static func pixellate(_ image: CGImage, scale: CGFloat) -> CGImage? {
+        fullImagePixellateCallsForTesting += 1
         guard let out = pixelatedCIImage(image, scale: scale) else { return nil }
         return ciContext.createCGImage(
             out, from: CGRect(

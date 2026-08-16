@@ -7781,14 +7781,15 @@ enum SelfTest {
             }
             let imprinted = cBar.annotations.contains { $0 is RulerAnnotation }
                 && cBar.transientKindForTesting == nil
-            let exported = cBar.flattened().cgImage
+            let exported = cBar.flattened()?.cgImage ?? barCG
             let exportChanged = !imagesEqual(barCG, exported)
             let canUndo = cBar.undoManager?.canUndo == true
             if let cmdZ = sliceAKey(6, characters: "z", modifiers: [.command]) {
                 _ = cBar.performKeyEquivalent(with: cmdZ)
             }
             let undone = cBar.annotations.isEmpty
-            let exportRestored = imagesEqual(barCG, cBar.flattened().cgImage)
+            let exportRestored = imagesEqual(
+                barCG, cBar.flattened()?.cgImage ?? barCG)
             wcBar.window?.close()
             check("sliceA-ruler-imprint-undo-export",
                   previewOn && imprinted && exportChanged && canUndo
@@ -8462,6 +8463,296 @@ enum SelfTest {
             check("sliceB2-ui-keys-toolbar",
                   keyRouting && allVisible && labelled && fallbackImage != nil,
                   "keys d=\(dTool) s=\(sTool) m=\(mTool) shiftB=\(shiftBTool) b=\(bTool) buttons \(buttons.count) visible \(allVisible) labelled \(labelled) fallback \(fallbackImage != nil)")
+        }
+
+        // MARK: slice B GREEN1 — terminal actions, OCR lifecycle, tall memory
+        do {
+            func probe3(_ image: CGImage, _ x: Int, _ yBL: Int) -> (Int, Int, Int) {
+                var bytes = [UInt8](
+                    repeating: 0, count: image.width * image.height * 4)
+                guard let c = CGContext(
+                    data: &bytes, width: image.width, height: image.height,
+                    bitsPerComponent: 8, bytesPerRow: image.width * 4,
+                    space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                    bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+                else { return (-1, -1, -1) }
+                c.interpolationQuality = .none
+                c.draw(image, in: CGRect(
+                    x: 0, y: 0, width: image.width, height: image.height))
+                let y = image.height - 1 - yBL
+                guard x >= 0, x < image.width, y >= 0, y < image.height
+                else { return (-1, -1, -1) }
+                let i = (y * image.width + x) * 4
+                return (Int(bytes[i]), Int(bytes[i + 1]), Int(bytes[i + 2]))
+            }
+
+            // A. Every terminal action is transactional, with a live crop
+            //    selection, a live text edit and a selected annotation in play.
+            let termBase = makeNoiseImage(width: 200, height: 160)
+            var termFailures: [String] = []
+            let actions: [(String, (EditorWindowController) -> Void)] = [
+                ("copy", { $0.copyImage() }),
+                ("save", { $0.saveImage() }),
+                ("pin", { $0.pinImage() }),
+                ("ocr", { $0.runOCR() }),
+                ("esc", { $0.escPressed() }),
+            ]
+            let escCopyBefore = Settings.shared.escCopy
+            let escSaveBefore = Settings.shared.escSave
+            Settings.shared.escCopy = true
+            Settings.shared.escSave = false
+            for (name, action) in actions {
+                let wc = EditorWindowController.open(
+                    with: CapturedImage(cgImage: termBase, scale: 1),
+                    forceFitForTesting: true)
+                let canvas = wc.canvasForTesting
+                let blur = BlurAnnotation(uiScale: 1)
+                blur.rect = CGRect(x: 20, y: 20, width: 60, height: 40)
+                let arrow = ShapeAnnotation(
+                    kind: .arrow, start: CGPoint(x: 100, y: 100),
+                    end: CGPoint(x: 150, y: 150), uiScale: 1)
+                canvas.annotations = [blur, arrow]
+                canvas.selectForTesting(arrow)
+                wc.selectTool(.crop)
+                canvas.setCropSelectionForTesting(
+                    CGRect(x: 10, y: 10, width: 80, height: 60))
+                canvas.beginTextEditingForTesting(at: CGPoint(x: 40, y: 120))
+                let before = canvas.documentFingerprintForTesting
+                let pb = NSPasteboard.general
+                pb.clearContents()
+                pb.setString("SENTINEL-TERM-" + name, forType: .string)
+                EditorCanvasView.forcePixellateFailureForTesting = true
+                action(wc)
+                EditorCanvasView.forcePixellateFailureForTesting = false
+                if pb.string(forType: .string) != "SENTINEL-TERM-" + name {
+                    termFailures.append(name + ":exported")
+                }
+                if wc.window?.isVisible != true { termFailures.append(name + ":closed") }
+                if canvas.documentFingerprintForTesting != before {
+                    termFailures.append(
+                        name + ":mutated " + canvas.documentFingerprintForTesting
+                            + " was " + before)
+                }
+                wc.window?.close()
+            }
+            Settings.shared.escCopy = escCopyBefore
+            Settings.shared.escSave = escSaveBefore
+            check("sliceB-terminal-actions-transactional",
+                  termFailures.isEmpty, termFailures.joined(separator: " | "))
+
+            // B. A late OCR result never narrows a mask after a real edit, and
+            //    never leaves the annotation pending forever.
+            let word = CGRect(x: 25, y: 25, width: 20, height: 10)
+            var raceFailures: [String] = []
+            var redrawCounts: [String: Int] = [:]
+            func lateResult(
+                _ label: String,
+                mutate: (EditorWindowController, EditorCanvasView, BlurAnnotation) -> Void
+            ) -> RedactionState {
+                let wc = EditorWindowController.open(
+                    with: CapturedImage(cgImage: termBase, scale: 1),
+                    forceFitForTesting: true)
+                let canvas = wc.canvasForTesting
+                let blur = BlurAnnotation(uiScale: 1)
+                blur.rect = CGRect(x: 20, y: 20, width: 60, height: 40)
+                canvas.annotations = [blur]
+                return MainActor.assumeIsolated { () -> RedactionState in
+                    var redraws = 0
+                    let job = SliceBRedactionJob.pendingForTesting(
+                        blur: blur, redraw: { redraws += 1 })
+                    mutate(wc, canvas, blur)
+                    job.deliver([word])
+                    redrawCounts[label] = redraws
+                    let state = blur.redactionState
+                    wc.window?.close()
+                    return state
+                }
+            }
+            let routes: [(String, (EditorWindowController, EditorCanvasView, BlurAnnotation) -> Void)] = [
+                ("undo", { _, canvas, _ in
+                    canvas.registerUndoSnapshot()
+                    canvas.annotations = []
+                    canvas.undoManager?.undo() }),
+                ("redo", { _, canvas, _ in
+                    canvas.registerUndoSnapshot()
+                    canvas.annotations = []
+                    canvas.undoManager?.undo()
+                    canvas.undoManager?.redo() }),
+                ("delete", { _, canvas, blur in
+                    canvas.registerUndoSnapshot()
+                    canvas.annotations.removeAll { $0 === blur } }),
+                ("move", { _, _, blur in blur.move(by: CGPoint(x: 12, y: 8)) }),
+                ("crop", { _, canvas, _ in
+                    canvas.cropForTesting(
+                        pixels: CGRect(x: 10, y: 10, width: 120, height: 100)) }),
+                ("resize", { wc, _, _ in wc.applyResizeFactor(0.5) }),
+                ("close", { wc, _, _ in wc.window?.close() }),
+            ]
+            for (label, mutate) in routes {
+                let state = lateResult(label, mutate: mutate)
+                if state != .fallbackFull {
+                    raceFailures.append(label + ":" + String(describing: state))
+                }
+                // A dropped result must be silent: no mutation, and no redraw
+                // of an owner that has already moved on (or closed).
+                if (redrawCounts[label] ?? 0) != 0 {
+                    raceFailures.append(label + ":lateredraw")
+                }
+            }
+            let liveState = lateResult("live") { _, _, _ in }
+            if liveState != .words([word]) {
+                raceFailures.append("live:" + String(describing: liveState))
+            }
+            if (redrawCounts["live"] ?? 0) < 1 {
+                raceFailures.append("live:noredraw")
+            }
+            check("sliceB-ocr-late-result-dropped",
+                  raceFailures.isEmpty, raceFailures.joined(separator: " | "))
+
+            // C. Job queue bounded; a refused job stays fully masked.
+            let queueBase = makeSolidImage(
+                width: 80, height: 60, color: NSColor.white.cgColor)
+            let queued = MainActor.assumeIsolated { () -> [RedactionState] in
+                SliceBOCR.recognizerForTesting = { _ in [] }
+                defer { SliceBOCR.recognizerForTesting = nil }
+                var states: [RedactionState] = []
+                var held: [SliceBRedactionJob] = []
+                for _ in 0..<(SliceBOCR.maxConcurrentJobs + 1) {
+                    let blur = BlurAnnotation(uiScale: 1)
+                    blur.rect = CGRect(x: 5, y: 5, width: 40, height: 20)
+                    if let job = SliceBRedactionJob.start(
+                        blur: blur, base: queueBase, redraw: {}) {
+                        held.append(job)
+                    }
+                    states.append(blur.redactionState)
+                }
+                for job in held { job.deliver([]) }
+                return states
+            }
+            check("sliceB-ocr-job-cap",
+                  queued.count == SliceBOCR.maxConcurrentJobs + 1
+                    && queued.last == .fallbackFull
+                    && queued.dropLast().allSatisfy { $0 == .pendingFull },
+                  "states \(queued)")
+
+            // D. Word boxes travel with the annotation. Geometry is proven
+            //    with the forced-failure opaque cover (a known colour) instead
+            //    of pixelate output, whose block averages depend on the image.
+            let glyphBlur = BlurAnnotation(uiScale: 1)
+            glyphBlur.rect = CGRect(x: 20, y: 30, width: 70, height: 40)
+            glyphBlur.redactionState = .words(
+                [CGRect(x: 28, y: 38, width: 46, height: 20)])
+            glyphBlur.move(by: CGPoint(x: 60, y: 30))
+            let (newCovered, oldCovered) = MainActor.assumeIsolated {
+                () -> (Bool, Bool) in
+                let surface = AnnotationSurface(pixelScale: 1)
+                surface.addAnnotationForTesting(glyphBlur)
+                surface.forceRegionalPixelateFailureForTesting = true
+                let white = makeSolidImage(
+                    width: 200, height: 120, color: NSColor.white.cgColor)
+                let c = ctx(200, 120)
+                c.draw(white, in: CGRect(x: 0, y: 0, width: 200, height: 120))
+                _ = surface.drawForPreview(in: c, base: white)
+                surface.forceRegionalPixelateFailureForTesting = false
+                guard let shot = c.makeImage() else { return (false, true) }
+                func isCover(_ x: Int, _ y: Int) -> Bool {
+                    let p = probe3(shot, x, y)
+                    return p.0 >= 0 && p.0 < 60 && p.1 < 60 && p.2 < 60
+                }
+                var newOK = true
+                for x in stride(from: 89, to: 133, by: 4) {
+                    for y in stride(from: 69, to: 87, by: 4) where !isCover(x, y) {
+                        newOK = false
+                    }
+                }
+                var oldHit = false
+                for x in stride(from: 29, to: 73, by: 4) {
+                    for y in stride(from: 39, to: 57, by: 4) where isCover(x, y) {
+                        oldHit = true
+                    }
+                }
+                return (newOK, oldHit)
+            }
+            check("sliceB-word-boxes-follow-move",
+                  newCovered && !oldCovered,
+                  "new \(newCovered) old \(oldCovered) state \(glyphBlur.redactionState)")
+
+            // E. Partial OCR mapping is fail-closed; duplicates map to their
+            //    own occurrence.
+            let dupCtx = ctx(320, 120)
+            dupCtx.setFillColor(NSColor.white.cgColor)
+            dupCtx.fill(CGRect(x: 0, y: 0, width: 320, height: 120))
+            let dupAttrs: [NSAttributedString.Key: Any] = [
+                .font: NSFont.boldSystemFont(ofSize: 28),
+                .foregroundColor: NSColor.black,
+            ]
+            let dupNS = NSGraphicsContext(cgContext: dupCtx, flipped: false)
+            NSGraphicsContext.saveGraphicsState()
+            NSGraphicsContext.current = dupNS
+            ("mail mail 42" as NSString).draw(
+                at: CGPoint(x: 30, y: 50), withAttributes: dupAttrs)
+            NSGraphicsContext.restoreGraphicsState()
+            let dupImage = dupCtx.makeImage()!
+            let dupWords = SliceBOCR.wordRects(
+                base: dupImage, region: CGRect(x: 10, y: 30, width: 300, height: 60))
+            let distinctX = Set(dupWords.map { Int($0.minX / 5) }).count
+            let dupOK = dupWords.count >= 2 && distinctX >= 2
+            let partial = MainActor.assumeIsolated { () -> RedactionState in
+                SliceBOCR.recognizerForTesting = { _ in [] }
+                defer { SliceBOCR.recognizerForTesting = nil }
+                let blur = BlurAnnotation(uiScale: 1)
+                blur.rect = CGRect(x: 10, y: 10, width: 60, height: 30)
+                let job = SliceBRedactionJob.pendingForTesting(blur: blur)
+                job.deliver(SliceBOCR.wordRects(
+                    base: dupImage, region: blur.rect))
+                return blur.redactionState
+            }
+            check("sliceB-ocr-partial-failclosed",
+                  dupOK && partial == .fallbackFull,
+                  "dupWords \(dupWords.count) distinct \(distinctX) partial \(partial)")
+
+            // F. Tall images never allocate a full-size pixelated intermediate,
+            //    in the editor or in a magnifier patch.
+            let tallEditorBase = makeNoiseImage(width: 400, height: 4000)
+            let tallWordRect = CGRect(x: 60, y: 3810, width: 40, height: 14)
+            let tallEditorOK = MainActor.assumeIsolated { () -> Bool in
+                let wc = EditorWindowController.open(
+                    with: CapturedImage(cgImage: tallEditorBase, scale: 1),
+                    forceFitForTesting: true)
+                let canvas = wc.canvasForTesting
+                let blur = BlurAnnotation(uiScale: 1)
+                blur.rect = CGRect(x: 50, y: 3800, width: 160, height: 40)
+                blur.redactionState = .words([tallWordRect])
+                canvas.annotations = [blur]
+                AnnotationRenderer.fullImagePixellateCallsForTesting = 0
+                AnnotationSurface.lastRegionalPixelateRectForTesting = nil
+                let flat = canvas.flattened()
+                let rect = AnnotationSurface.lastRegionalPixelateRectForTesting
+                let area = (rect?.width ?? 0) * (rect?.height ?? 0)
+                let fullCalls = AnnotationRenderer
+                    .fullImagePixellateCallsForTesting
+                wc.window?.close()
+                return flat != nil && fullCalls == 0
+                    && area <= tallWordRect.width * tallWordRect.height * 4
+            }
+            let magBlur = BlurAnnotation(uiScale: 1)
+            magBlur.rect = CGRect(x: 40, y: 3790, width: 120, height: 60)
+            AnnotationRenderer.fullImagePixellateCallsForTesting = 0
+            AnnotationSurface.lastRegionalPixelateRectForTesting = nil
+            let magSource = CGRect(x: 50, y: 3800, width: 40, height: 30)
+            let magPatch = SliceBCompositor.magnifierSnapshot(
+                base: tallEditorBase, sourceRect: magSource,
+                redactions: [magBlur])
+            let magRect = AnnotationSurface.lastRegionalPixelateRectForTesting
+            let magArea = (magRect?.width ?? 0) * (magRect?.height ?? 0)
+            let magFullCalls = AnnotationRenderer
+                .fullImagePixellateCallsForTesting
+            check("sliceB-tall-no-full-intermediate",
+                  tallEditorOK && magPatch != nil
+                    && magPatch?.width == Int(magSource.width)
+                    && magFullCalls == 0
+                    && magArea <= magSource.width * magSource.height * 4,
+                  "editor \(tallEditorOK) patch \(magPatch?.width ?? -1) magArea \(magArea) fullCalls \(magFullCalls)")
         }
 
         print(failures == 0 ? "ALL TESTS PASSED" : "\(failures) TEST(S) FAILED")
