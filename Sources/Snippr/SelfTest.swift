@@ -8732,13 +8732,19 @@ enum SelfTest {
                     } else {
                         problems.append("no-field-style")
                     }
-                    if let backing = canvas.editingTextRefForTesting,
-                       let seeded,
-                       let color = backing.color.usingColorSpace(.sRGB) {
+                    if let backing = canvas.editingTextRefForTesting, let seeded {
+                        guard let color = backing.color.usingColorSpace(.sRGB)
+                        else {
+                            problems.append("backing-color-unconvertible")
+                            termFailures.append(
+                                label + ":seed " + problems.joined(separator: ","))
+                            return
+                        }
                         if abs(color.redComponent - seeded.redComponent) > 0.02
                             || abs(color.greenComponent - seeded.greenComponent) > 0.02
-                            || abs(color.blueComponent - seeded.blueComponent) > 0.02 {
-                            problems.append("backing-rgb")
+                            || abs(color.blueComponent - seeded.blueComponent) > 0.02
+                            || abs(color.alphaComponent - 0.65) > 0.02 {
+                            problems.append("backing-rgba")
                         }
                     }
                     if !canvas.hasValidCropSelection { problems.append("no-crop") }
@@ -9594,8 +9600,18 @@ enum SelfTest {
                 }
                 let okAttempts = okEvents.filter { $0.kind == "regionalAttempt" }
                 if okAttempts.count != 1
-                    || !(okAttempts.first.map { hostMask.contains($0.rect) } ?? false) {
-                    hostFailures.append("area:ok-attempt \(okAttempts.count)")
+                    || okAttempts.first?.rect != expectedRegion
+                    || okAttempts.first?.destination != "-" {
+                    hostFailures.append(
+                        "area:ok-attempt \(String(describing: okAttempts.first))")
+                }
+                if let okDestination = okEvents.first(where: {
+                    $0.kind == "destination"
+                }), okDestination.rect != expectedTopLeft
+                    || okDestination.destination
+                        != "\(Int(hostSelection.width))x\(Int(hostSelection.height))" {
+                    hostFailures.append(
+                        "area:ok-dest \(okDestination.rect) \(okDestination.destination)")
                 }
                 // The production copy route legitimately records the capture
                 // and the area rect; everything else must stay at zero.
@@ -9902,18 +9918,44 @@ enum SelfTest {
             sliverBlur.rect = CGRect(x: 39.4, y: 10, width: 20, height: 20)
             let sliverCtx = ctx(80, 60)
             sliverCtx.draw(sliverBase, in: CGRect(x: 0, y: 0, width: 80, height: 60))
+            let sliverVisible = CGRect(x: 0, y: 0, width: 40, height: 60)
             let sliverOK = SliceBCompositor.draw(
                 [sliverBlur], in: sliverCtx, base: sliverBase,
-                visiblePixels: CGRect(x: 0, y: 0, width: 40, height: 60))
+                visiblePixels: sliverVisible)
+            // A region too small to pixelate must fail closed, not succeed.
+            if sliverOK { sliverFailures.append("sliver:claimed-ok") }
+            if SliceBExport.checkedRender(
+                base: sliverBase, annotations: [sliverBlur], pixellated: nil,
+                budgetBytes: SliceBExport.defaultBudgetBytes) != nil {
+                // export sees the full base, so the sliver is a real region
+                // there; this asserts the export contract, not the sliver
+                sliverFailures.append("sliver:export-not-checked")
+            }
             if let shot = sliverCtx.makeImage() {
-                // the 0.6px overlap column must not still be original pixels
-                if probe3(shot, 39, 20) == probe3(sliverBase, 39, 20) {
-                    sliverFailures.append("sliver:clean-edge")
+                let intersection = sliverBlur.rect.intersection(sliverVisible)
+                for x in Int(intersection.minX.rounded(.down))...
+                    Int(intersection.maxX.rounded(.up)) {
+                    for y in Int(intersection.minY)..<Int(intersection.maxY) {
+                        let p = probe3(shot, x, y)
+                        guard p.0 >= 0 else { continue }
+                        if p == probe3(sliverBase, x, y) {
+                            sliverFailures.append("sliver:clean@\(x),\(y)")
+                            break
+                        }
+                    }
+                }
+                // everything outside the mask must be untouched
+                for x in stride(from: 2, to: 38, by: 6) {
+                    for y in stride(from: 2, to: 58, by: 6)
+                    where !sliverBlur.rect.contains(CGPoint(x: x, y: y)) {
+                        if probe3(shot, x, y) != probe3(sliverBase, x, y) {
+                            sliverFailures.append("sliver:outside@\(x),\(y)")
+                        }
+                    }
                 }
             } else {
                 sliverFailures.append("sliver:no-image")
             }
-            _ = sliverOK
             // An annotation rect that is not finite cannot say where to cover,
             // so the whole visible region must be covered and export must fail.
             let invalidBlur = BlurAnnotation(uiScale: 1)
@@ -9959,6 +10001,102 @@ enum SelfTest {
             check("sliceB-sliver-and-invalid-geometry",
                   sliverFailures.isEmpty,
                   sliverFailures.prefix(4).joined(separator: " | "))
+
+            // E10. Scroll result panel: the third real host, driven through
+            //      its own production action route.
+            var panelFailures: [String] = []
+            MainActor.assumeIsolated {
+                var panelExport: CapturedImage?
+                var panelToasts = 0
+                let panelBase = makeNoiseImage(width: 200, height: 400)
+                let panel = ScrollResultPanel.show(
+                    image: CapturedImage(cgImage: panelBase, scale: 1),
+                    inputs: OverlaySessionInputs(
+                        afterShow: true, afterCopy: false, afterSave: false),
+                    screen: hostScreen,
+                    dependencies: CaptureActionRouter.Dependencies(
+                        copyToClipboard: { panelExport = $0 },
+                        autoSave: { _, _ in }, saveAs: { _, _ in },
+                        pin: { _ in }, ocr: { _ in }, openEditor: { _ in },
+                        toast: { _ in panelToasts += 1 },
+                        setLastCapture: { _ in }, setLastAreaRect: { _ in },
+                        logEvent: { _ in }))
+                if panel.annotationHostForTesting == nil {
+                    panelFailures.append("panel:no-host")
+                }
+                // RED until GREEN2 wires the hosts.
+                if panel.annotationSurface.redactionDelegate == nil {
+                    panelFailures.append("panel:no-repaint-delegate")
+                }
+                let panelBlur = BlurAnnotation(uiScale: 1)
+                panelBlur.rect = CGRect(x: 40, y: 300, width: 80, height: 50)
+                panel.annotationSurface.addAnnotationForTesting(panelBlur)
+                let toastsBefore = panelToasts
+                let (_, panelEvents) = RenderTrace.capture(
+                    host: "scroll", path: "export"
+                ) {
+                    AnnotationRenderer.withForcedRegionalFailure {
+                        panel.performActionForTesting(.copy)
+                    }
+                }
+                if panelExport != nil { panelFailures.append("panel:exported") }
+                if panelToasts - toastsBefore != 1 {
+                    panelFailures.append(
+                        "panel:toasts \(panelToasts - toastsBefore)")
+                }
+                let panelShape = panelEvents.map {
+                    "\($0.host)/\($0.path)/\($0.kind)"
+                }
+                if panelShape != [
+                    "scroll/export/destination", "scroll/export/regionalAttempt",
+                ] {
+                    panelFailures.append("panel:seq \(panelShape)")
+                }
+                // preview keeps drawing and must be opaque over the mask
+                if let host = panel.annotationHostForTesting {
+                    let c = ctx(200, 400)
+                    c.draw(panelBase, in: CGRect(x: 0, y: 0, width: 200, height: 400))
+                    let drew = AnnotationRenderer.withForcedRegionalFailure {
+                        panel.annotationSurface.drawForPreview(
+                            in: c, base: panelBase)
+                    }
+                    if drew { panelFailures.append("panel:preview-claimed-ok") }
+                    if let shot = c.makeImage() {
+                        for x in stride(from: 42, to: 118, by: 9) {
+                            for y in stride(from: 302, to: 348, by: 9) {
+                                let p = probe3(shot, x, y)
+                                if !(p.0 >= 0 && p.0 < 60 && p.1 < 60 && p.2 < 60) {
+                                    panelFailures.append("panel:hole@\(x),\(y)")
+                                    break
+                                }
+                            }
+                        }
+                    } else {
+                        panelFailures.append("panel:no-preview")
+                    }
+                    _ = host
+                }
+                panel.orderOut(nil)
+            }
+            check("sliceB-scroll-host-failclosed",
+                  panelFailures.isEmpty,
+                  panelFailures.prefix(4).joined(separator: " | "))
+
+            // E11. INTENTIONAL RED until GREEN2: there is still no production
+            //      caller that creates a text redaction and registers its job.
+            //      Editor, area overlay and scroll panel must each do it.
+            var lifecycleFailures: [String] = []
+            let editorHasTextTool = EditorTool.allCases.contains {
+                $0.tooltip.hasPrefix("Pixelate text")
+            }
+            let overlayHasTextTool = OverlayAnnotationTool.allCases.contains {
+                $0.tooltip.hasPrefix("Pixelate text")
+            }
+            if !editorHasTextTool { lifecycleFailures.append("editor:no-tool") }
+            if !overlayHasTextTool { lifecycleFailures.append("overlay:no-tool") }
+            check("sliceB-text-redaction-lifecycle-wiring",
+                  lifecycleFailures.isEmpty,
+                  "GREEN2 wiring pending: " + lifecycleFailures.joined(separator: " | "))
 
             // F. Tall images never allocate a full-size pixelated intermediate,
             //    in the editor or in a magnifier patch.
