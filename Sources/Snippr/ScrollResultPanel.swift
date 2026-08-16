@@ -441,7 +441,11 @@ final class ScrollResultPanel: NSPanel {
 
     /// Drives the REAL mouse handlers with constructed events — the gate
     /// draws through production input, not the surface API.
-    func drawWithRealEventsForTesting(fromView a: CGPoint, toView b: CGPoint) {
+    /// Same seam as the area overlay's: pause between the drag and the
+    /// release so a gate can run the real routes mid-drag.
+    func drawWithRealEventsForTesting(
+        fromView a: CGPoint, toView b: CGPoint, whileDown: (() -> Void)? = nil
+    ) {
         guard let host = annotationHost, let content = contentView else { return }
         func event(_ type: NSEvent.EventType, _ p: CGPoint) -> NSEvent? {
             let inWindow = content.convert(p, from: host)
@@ -452,6 +456,7 @@ final class ScrollResultPanel: NSPanel {
         }
         if let down = event(.leftMouseDown, a) { host.mouseDown(with: down) }
         if let drag = event(.leftMouseDragged, b) { host.mouseDragged(with: drag) }
+        whileDown?()
         if let up = event(.leftMouseUp, b) { host.mouseUp(with: up) }
     }
 

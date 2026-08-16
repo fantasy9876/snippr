@@ -418,7 +418,11 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
     }
     /// Drives a real drag through the production mouse handlers of this view,
     /// so a gate can create an annotation the way a user does.
-    func annotationDragForTesting(from a: CGPoint, to b: CGPoint) {
+    /// A drag that stops between the drag and the release, so a gate can run
+    /// the real routes while the mouse is still down and then finish.
+    func annotationDragForTesting(
+        from a: CGPoint, to b: CGPoint, whileDown: (() -> Void)? = nil
+    ) {
         func event(_ type: NSEvent.EventType, _ p: CGPoint) -> NSEvent? {
             NSEvent.mouseEvent(
                 with: type, location: convert(p, to: nil), modifierFlags: [],
@@ -427,6 +431,7 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
         }
         if let down = event(.leftMouseDown, a) { mouseDown(with: down) }
         if let drag = event(.leftMouseDragged, b) { mouseDragged(with: drag) }
+        whileDown?()
         if let up = event(.leftMouseUp, b) { mouseUp(with: up) }
     }
 

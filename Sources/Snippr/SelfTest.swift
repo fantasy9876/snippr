@@ -8700,6 +8700,193 @@ enum SelfTest {
             spot2.rect = CGRect(x: 60, y: 60, width: 20, height: 20)
             let afterSecond = SliceBCompositor.applySpotlight(
                 existing: [spot1], new: spot2)
+            // E. Spotlight replacement is one transaction, and it puts the
+            //    previous one back WHERE it was.
+            var spotFailures: [String] = []
+            do {
+                let surface = AnnotationSurface(pixelScale: 1)
+                let markA = CounterAnnotation(uiScale: 1)
+                let oldSpot = SpotlightAnnotation(uiScale: 1)
+                oldSpot.rect = CGRect(x: 10, y: 10, width: 40, height: 30)
+                oldSpot.dimFraction = 0.3
+                let markB = CounterAnnotation(uiScale: 1)
+                // The prior spotlight sits in the MIDDLE. With it last, an
+                // implementation that simply appends the restored spotlight
+                // would look correct while being wrong.
+                surface.annotations = [markA, oldSpot, markB]
+                if !surface.setSpotlightDim(0.7) {
+                    spotFailures.append("replace-refused")
+                }
+                let newSpot = surface.annotations
+                    .compactMap { $0 as? SpotlightAnnotation }.last
+                if surface.annotations.count != 3
+                    || surface.annotations[0] !== markA
+                    || surface.annotations[1] !== markB
+                    || surface.annotations[2] !== newSpot
+                    || newSpot === oldSpot
+                    || newSpot?.dimFraction != 0.7 {
+                    spotFailures.append(
+                        "after-replace \(surface.annotations.count)")
+                }
+                _ = surface.undo()
+                // Back to the ORIGINAL order and the original object.
+                if surface.annotations.count != 3
+                    || surface.annotations[0] !== markA
+                    || surface.annotations[1] !== oldSpot
+                    || surface.annotations[2] !== markB
+                    || oldSpot.dimFraction != 0.3 {
+                    spotFailures.append(
+                        "after-undo \(surface.annotations.map { type(of: $0) })")
+                }
+                _ = surface.redo()
+                if surface.annotations.count != 3
+                    || surface.annotations[0] !== markA
+                    || surface.annotations[1] !== markB
+                    || surface.annotations[2] !== newSpot {
+                    spotFailures.append("after-redo")
+                }
+            }
+            check("sliceB-spotlight-prior-index",
+                  spotFailures.isEmpty, spotFailures.joined(separator: " | "))
+
+            // F. A click — a zero-area drag — is not a mutation: the previous
+            //    spotlight comes back untouched and the redo branch survives.
+            var zeroFailures: [String] = []
+            do {
+                let surface = AnnotationSurface(pixelScale: 1)
+                let markA = CounterAnnotation(uiScale: 1)
+                let oldSpot = SpotlightAnnotation(uiScale: 1)
+                oldSpot.rect = CGRect(x: 10, y: 10, width: 40, height: 30)
+                let markB = CounterAnnotation(uiScale: 1)
+                surface.annotations = [markA, oldSpot, markB]
+                // Something on the redo branch, so the gate can tell whether a
+                // no-op wrongly cleared it.
+                let discarded = CounterAnnotation(uiScale: 1)
+                surface.annotations.append(discarded)
+                _ = surface.undo()
+                let redoAvailableBefore = surface.canRedo
+                surface.tool = .spotlight
+                _ = surface.beginDrag(atPixel: CGPoint(x: 80, y: 80))
+                surface.continueDrag(toPixel: CGPoint(x: 80, y: 80))
+                surface.endDrag()
+                if surface.annotations.count != 3
+                    || surface.annotations[0] !== markA
+                    || surface.annotations[1] !== oldSpot
+                    || surface.annotations[2] !== markB {
+                    zeroFailures.append(
+                        "order \(surface.annotations.count)")
+                }
+                if !redoAvailableBefore || !surface.canRedo {
+                    zeroFailures.append(
+                        "redo \(redoAvailableBefore) -> "
+                        + "\(surface.canRedo)")
+                }
+                // And redo still restores the same object it always would.
+                _ = surface.redo()
+                if surface.annotations.last !== discarded {
+                    zeroFailures.append("redo-object")
+                }
+            }
+            // G. Nothing routes while the mouse is down. Driven through the
+            //    REAL hosts with real events, with the key pressed BETWEEN the
+            //    drag and the release — the window where the draft is already
+            //    in the document and its transaction is half-built.
+            var midDragFailures: [String] = []
+            do {
+                let screen = NSScreen.screens.first!
+                let frozenImage = makeSolidImage(
+                    width: Int(screen.frame.width * 2),
+                    height: Int(screen.frame.height * 2),
+                    color: NSColor.white.cgColor)
+                final class MidDragSpy {
+                    var copies = 0
+                    var saveDone: (@MainActor (SaveAsOutcome) -> Void)?
+                    var completions = 0
+                }
+                let spy = MidDragSpy()
+                let overlay = SelectionOverlay(
+                    purpose: .areaReview,
+                    inputs: OverlaySessionInputs(
+                        afterShow: true, afterCopy: false, afterSave: false),
+                    completion: { _ in spy.completions += 1 })
+                overlay.routerDependenciesOverride =
+                    CaptureActionRouter.Dependencies(
+                        copyToClipboard: { _ in spy.copies += 1 },
+                        autoSave: { _, _ in },
+                        saveAs: { _, done in spy.saveDone = done },
+                        pin: { _ in }, ocr: { _ in }, openEditor: { _ in },
+                        toast: { _ in }, setLastCapture: { _ in },
+                        setLastAreaRect: { _ in }, logEvent: { _ in })
+                let view = SelectionOverlayView(
+                    mode: .area, screen: screen, frozen: frozenImage,
+                    windowList: [], owner: overlay)
+                view.selectForTesting(
+                    rect: CGRect(x: 60, y: 60, width: 240, height: 180))
+                let surface = view.annotationSurface
+                if surface == nil { midDragFailures.append("no-surface") }
+                // An existing spotlight, so a mid-drag digit has something to
+                // corrupt: it used to clone the DRAFT and strand this one.
+                let existing = SpotlightAnnotation(uiScale: 1)
+                existing.rect = CGRect(x: 70, y: 70, width: 60, height: 40)
+                existing.dimFraction = 0.3
+                surface?.annotations = [existing]
+                surface?.tool = .spotlight
+                func key(_ chars: String) -> NSEvent? {
+                    NSEvent.keyEvent(
+                        with: .keyDown, location: .zero, modifierFlags: [],
+                        timestamp: 0, windowNumber: 0, context: nil,
+                        characters: chars, charactersIgnoringModifiers: chars,
+                        isARepeat: false, keyCode: 0)
+                }
+                var midDragDim: CGFloat = 0
+                var midDragCopies = 0
+                view.annotationDragForTesting(
+                    from: CGPoint(x: 100, y: 100),
+                    to: CGPoint(x: 180, y: 160)
+                ) {
+                    // A digit, a tool switch and a terminal action, all in the
+                    // window where the draft is live.
+                    if let event = key("5") { view.keyDown(with: event) }
+                    if let event = key("m") { view.keyDown(with: event) }
+                    view.performReviewActionForTesting(.copy)
+                    midDragDim = existing.dimFraction
+                    midDragCopies = spy.copies
+                }
+                if midDragDim != 0.3 {
+                    midDragFailures.append("digit-applied \(midDragDim)")
+                }
+                if midDragCopies != 0 {
+                    midDragFailures.append("terminal-ran \(midDragCopies)")
+                }
+                if surface?.tool != .spotlight {
+                    midDragFailures.append(
+                        "tool-switched \(String(describing: surface?.tool))")
+                }
+                // The drag still completes normally afterwards: one spotlight,
+                // the new one, with the prior recorded rather than stranded.
+                let spots = (surface?.annotations ?? [])
+                    .compactMap { $0 as? SpotlightAnnotation }
+                if spots.count != 1 || spots.first === existing {
+                    midDragFailures.append("finalize \(spots.count)")
+                }
+                if spots.first?.dimFraction != 0.3 {
+                    midDragFailures.append(
+                        "inherited-dim \(spots.first?.dimFraction ?? -1)")
+                }
+                // And undo restores the one it replaced, in place.
+                _ = surface?.undo()
+                if surface?.annotations.count != 1
+                    || surface?.annotations.first !== existing {
+                    midDragFailures.append("undo-prior")
+                }
+            }
+            check("sliceB-mid-drag-routes-blocked",
+                  midDragFailures.isEmpty,
+                  midDragFailures.joined(separator: " | "))
+
+            check("sliceB-spotlight-zero-area",
+                  zeroFailures.isEmpty, zeroFailures.joined(separator: " | "))
+
             check("sliceB2-spotlight-singleton",
                   afterSecond.count == 1 && afterSecond.first === spot2
                     && spot2.hitTest(CGPoint(x: 70, y: 70))
