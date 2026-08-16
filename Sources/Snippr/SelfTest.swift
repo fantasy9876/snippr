@@ -11523,32 +11523,80 @@ enum SelfTest {
             // branch itself has none.
             for tool in [OverlayAnnotationTool.pen, .rect, .line, .arrow,
                          .oval, .highlight] {
-                func freshSurface() -> (AnnotationSurface, Annotation, Annotation) {
+                let from = CGPoint(x: 20, y: 20)
+                let to = CGPoint(x: 90, y: 70)
+                func matchesDrawn(_ annotation: Annotation?) -> Bool {
+                    if tool == .pen {
+                        let points = (annotation as? PenAnnotation)?.points ?? []
+                        return points.first == from && points.last == to
+                    }
+                    let shape = annotation as? ShapeAnnotation
+                    return shape?.start == from && shape?.end == to
+                        && shape?.kind == expectedKind(tool)
+                }
+                // Every Bool is read: the hosts set their drag state from
+                // these return values, so a begin that reports false while
+                // still appending would leave the first two cases green here
+                // and the host wedged in production.
+                func freshSurface(
+                    _ label: String
+                ) -> (AnnotationSurface, Annotation, Annotation, () -> Int)? {
                     let surface = AnnotationSurface(pixelScale: 1)
+                    var events = 0
                     let keep = CounterAnnotation(uiScale: 1)
                     let redoMark = CounterAnnotation(uiScale: 1)
                     surface.addAnnotationForTesting(keep)
                     surface.addAnnotationForTesting(redoMark)
-                    _ = surface.undo()
+                    guard surface.undo() else {
+                        branchFailures.append("\(tool):\(label)-setup-undo")
+                        return nil
+                    }
+                    guard surface.annotations.count == 1,
+                          surface.annotations.first === keep,
+                          surface.canRedo else {
+                        branchFailures.append("\(tool):\(label)-setup-shape")
+                        return nil
+                    }
                     surface.tool = tool
-                    return (surface, keep, redoMark)
+                    surface.historyDidChange = { events += 1 }
+                    return (surface, keep, redoMark, { events })
                 }
-                let from = CGPoint(x: 20, y: 20)
-                let to = CGPoint(x: 90, y: 70)
+                func startDrag(
+                    _ surface: AnnotationSurface, _ keep: Annotation,
+                    _ events: () -> Int, _ label: String
+                ) -> Bool {
+                    guard surface.beginDrag(atPixel: from) else {
+                        branchFailures.append("\(tool):\(label)-not-started")
+                        return false
+                    }
+                    // Draft in the document, drag live, branch untouched, and
+                    // exactly one notification for the append.
+                    if !surface.isDragging || surface.annotations.count != 2
+                        || surface.annotations.first !== keep
+                        || !surface.canRedo || events() != 1 {
+                        branchFailures.append(
+                            "\(tool):\(label)-begin \(events())")
+                    }
+                    return true
+                }
 
                 // 1. Abandoned drag: the branch is untouched.
-                do {
-                    let (surface, keep, redoMark) = freshSurface()
-                    _ = surface.beginDrag(atPixel: from)
+                if let (surface, keep, redoMark, events) = freshSurface("abandon"),
+                   startDrag(surface, keep, events, "abandon") {
                     surface.continueDrag(toPixel: to)
+                    if events() != 1 {
+                        branchFailures.append(
+                            "\(tool):abandon-continue \(events())")
+                    }
                     surface.abandonDrag()
                     if surface.annotations.count != 1
                         || surface.annotations.first !== keep
-                        || !surface.canRedo || surface.isDragging {
-                        branchFailures.append("\(tool):abandon-shape")
+                        || !surface.canRedo || surface.isDragging
+                        || events() != 2 {
+                        branchFailures.append(
+                            "\(tool):abandon-shape \(events())")
                     }
-                    _ = surface.redo()
-                    if surface.annotations.count != 2
+                    if !surface.redo() || surface.annotations.count != 2
                         || surface.annotations[1] !== redoMark
                         || surface.canRedo {
                         branchFailures.append("\(tool):abandon-redo")
@@ -11556,18 +11604,22 @@ enum SelfTest {
                 }
 
                 // 2. A press with no movement: same again.
-                do {
-                    let (surface, keep, redoMark) = freshSurface()
-                    _ = surface.beginDrag(atPixel: from)
+                if let (surface, keep, redoMark, events) = freshSurface("still"),
+                   startDrag(surface, keep, events, "still") {
                     surface.continueDrag(toPixel: from)
+                    if events() != 1 {
+                        branchFailures.append(
+                            "\(tool):still-continue \(events())")
+                    }
                     surface.endDrag()
                     if surface.annotations.count != 1
                         || surface.annotations.first !== keep
-                        || !surface.canRedo || surface.isDragging {
-                        branchFailures.append("\(tool):still-shape")
+                        || !surface.canRedo || surface.isDragging
+                        || events() != 2 {
+                        branchFailures.append(
+                            "\(tool):still-shape \(events())")
                     }
-                    _ = surface.redo()
-                    if surface.annotations.count != 2
+                    if !surface.redo() || surface.annotations.count != 2
                         || surface.annotations[1] !== redoMark
                         || surface.canRedo {
                         branchFailures.append("\(tool):still-redo")
@@ -11575,49 +11627,41 @@ enum SelfTest {
                 }
 
                 // 3. A real drag: the branch goes, and the mark round-trips.
-                do {
-                    let (surface, keep, _) = freshSurface()
-                    var historyEvents = 0
-                    surface.historyDidChange = { historyEvents += 1 }
-                    _ = surface.beginDrag(atPixel: from)
+                if let (surface, keep, _, events) = freshSurface("complete"),
+                   startDrag(surface, keep, events, "complete") {
                     surface.continueDrag(toPixel: to)
-                    let beforeEnd = historyEvents
                     surface.endDrag()
-                    guard let drawn = surface.annotations.last,
-                          surface.annotations.count == 2,
-                          surface.annotations.first === keep else {
+                    let drawn = surface.annotations.last
+                    if surface.annotations.count != 2
+                        || surface.annotations.first !== keep
+                        || surface.canRedo || surface.isDragging
+                        || events() != 2 || !matchesDrawn(drawn) {
                         branchFailures.append(
-                            "\(tool):complete-shape "
-                            + "\(surface.annotations.count)")
-                        continue
+                            "\(tool):complete \(surface.annotations.count) "
+                            + "\(events())")
                     }
-                    if surface.canRedo || surface.isDragging
-                        || historyEvents != beforeEnd + 1 {
-                        branchFailures.append(
-                            "\(tool):complete-branch \(surface.canRedo)")
-                    }
-                    let geometryOK: Bool
-                    if tool == .pen {
-                        let points = (drawn as? PenAnnotation)?.points ?? []
-                        geometryOK = points.first == from && points.last == to
-                    } else {
-                        let shape = drawn as? ShapeAnnotation
-                        geometryOK = shape?.start == from && shape?.end == to
-                            && shape?.kind == expectedKind(tool)
-                    }
-                    if !geometryOK {
-                        branchFailures.append("\(tool):complete-geometry")
-                    }
-                    _ = surface.undo()
-                    if surface.annotations.count != 1
-                        || surface.annotations.first !== keep {
+                    if !surface.undo() || surface.annotations.count != 1
+                        || surface.annotations.first !== keep
+                        || !surface.canRedo || events() != 3 {
                         branchFailures.append("\(tool):complete-undo")
                     }
-                    _ = surface.redo()
-                    if surface.annotations.count != 2
+                    // Identity alone would miss a mutation while it sat on the
+                    // redo branch, so the geometry is re-read here and again
+                    // after the redo.
+                    if !matchesDrawn(drawn) {
+                        branchFailures.append("\(tool):mutated-in-branch")
+                    }
+                    if !surface.redo() || surface.annotations.count != 2
                         || surface.annotations[1] !== drawn
-                        || surface.canRedo {
+                        || surface.canRedo || events() != 4
+                        || !matchesDrawn(drawn) {
                         branchFailures.append("\(tool):complete-redo")
+                    }
+                    // Exhausted: no state and no notification.
+                    if surface.redo() || surface.annotations.count != 2
+                        || surface.annotations[1] !== drawn
+                        || events() != 4 {
+                        branchFailures.append("\(tool):redo-exhausted")
                     }
                 }
             }
