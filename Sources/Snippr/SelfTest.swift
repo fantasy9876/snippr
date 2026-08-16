@@ -9854,6 +9854,61 @@ enum SelfTest {
             check("sliceB-job-completion-orders",
                   orderFailures.isEmpty, orderFailures.joined(separator: " | "))
 
+            // E9. Slivers and invalid geometry must fail CLOSED.
+            var sliverFailures: [String] = []
+            let sliverBase = makeNoiseImage(width: 80, height: 60)
+            // A mask that overlaps the visible region by well under a pixel in
+            // one axis: skipping it and returning success left clean pixels
+            // along the redaction edge.
+            let sliverBlur = BlurAnnotation(uiScale: 1)
+            sliverBlur.rect = CGRect(x: 39.4, y: 10, width: 20, height: 20)
+            let sliverCtx = ctx(80, 60)
+            sliverCtx.draw(sliverBase, in: CGRect(x: 0, y: 0, width: 80, height: 60))
+            let sliverOK = SliceBCompositor.draw(
+                [sliverBlur], in: sliverCtx, base: sliverBase,
+                visiblePixels: CGRect(x: 0, y: 0, width: 40, height: 60))
+            if let shot = sliverCtx.makeImage() {
+                // the 0.6px overlap column must not still be original pixels
+                if probe3(shot, 39, 20) == probe3(sliverBase, 39, 20) {
+                    sliverFailures.append("sliver:clean-edge")
+                }
+            } else {
+                sliverFailures.append("sliver:no-image")
+            }
+            _ = sliverOK
+            // An annotation rect that is not finite cannot say where to cover,
+            // so the whole visible region must be covered and export must fail.
+            let invalidBlur = BlurAnnotation(uiScale: 1)
+            invalidBlur.rect = CGRect(
+                x: CGFloat.nan, y: 10, width: 20, height: 20)
+            let invalidCtx = ctx(80, 60)
+            invalidCtx.draw(
+                sliverBase, in: CGRect(x: 0, y: 0, width: 80, height: 60))
+            let invalidOK = SliceBCompositor.draw(
+                [invalidBlur], in: invalidCtx, base: sliverBase,
+                visiblePixels: CGRect(x: 0, y: 0, width: 80, height: 60))
+            if invalidOK { sliverFailures.append("invalid:claimed-ok") }
+            if let shot = invalidCtx.makeImage() {
+                for x in stride(from: 4, to: 76, by: 9) {
+                    for y in stride(from: 4, to: 56, by: 9) {
+                        let p = probe3(shot, x, y)
+                        if !(p.0 >= 0 && p.0 < 60 && p.1 < 60 && p.2 < 60) {
+                            sliverFailures.append("invalid:uncovered@\(x),\(y)")
+                            break
+                        }
+                    }
+                }
+            } else {
+                sliverFailures.append("invalid:no-image")
+            }
+            let invalidExport = SliceBExport.checkedRender(
+                base: sliverBase, annotations: [invalidBlur], pixellated: nil,
+                budgetBytes: SliceBExport.defaultBudgetBytes)
+            if invalidExport != nil { sliverFailures.append("invalid:exported") }
+            check("sliceB-sliver-and-invalid-geometry",
+                  sliverFailures.isEmpty,
+                  sliverFailures.prefix(4).joined(separator: " | "))
+
             // F. Tall images never allocate a full-size pixelated intermediate,
             //    in the editor or in a magnifier patch.
             let tallEditorBase = makeNoiseImage(width: 400, height: 4000)

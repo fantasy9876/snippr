@@ -416,6 +416,15 @@ enum SliceBCompositor {
                 annotation.draw(in: ctx, pixellated: nil)
                 continue
             }
+            // A redaction whose own rect is not finite and positive tells us
+            // nothing about WHERE to cover, so cover everything visible rather
+            // than skip it and claim success.
+            guard blur.rect.isValidMaskRect else {
+                renderedAll = false
+                drawFailedRedaction(
+                    [visiblePixels.intersection(baseBounds)], in: ctx)
+                continue
+            }
             let masks = SliceBRedaction.maskRects(
                 state: blur.redactionState, rect: blur.rect)
             var failed: [CGRect] = []
@@ -423,13 +432,21 @@ enum SliceBCompositor {
                 let requested = mask.standardized
                     .intersection(visiblePixels)
                     .intersection(baseBounds)
-                guard requested.width > 1, requested.height > 1 else { continue }
+                // No overlap at all is fine; ANY overlap must be covered, even
+                // a sliver under a pixel. Skipping a 1px intersection and
+                // returning success left clean pixels along the mask edge.
+                guard !requested.isNull,
+                      requested.width > 0, requested.height > 0
+                else { continue }
                 let region = requested.integral.intersection(baseBounds)
-                guard let pixelated = AnnotationRenderer.pixellateRegion(
-                    base, rect: region, scale: pixelScale)
+                guard region.width >= 1, region.height >= 1,
+                      let pixelated = AnnotationRenderer.pixellateRegion(
+                        base, rect: region, scale: pixelScale)
                 else {
                     renderedAll = false
-                    failed.append(region)
+                    failed.append(
+                        region.width >= 1 && region.height >= 1
+                            ? region : requested)
                     continue
                 }
                 ctx.saveGState()
