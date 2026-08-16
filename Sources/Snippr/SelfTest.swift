@@ -9149,12 +9149,24 @@ enum SelfTest {
                         toolbarFailures.append(
                             "\(phase):tool-order \(arrangedTools.count)")
                     }
+                    // The WHOLE exposed sequence, chrome included: pinning
+                    // only the five buttons would let the colour well, the
+                    // badge or the zoom label move around them.
+                    let exposedNames = Set(
+                        actions.map(\.name) + chrome.map(\.0))
                     let arrangedActions = actionRow.arrangedSubviews
-                        .compactMap { view in
-                            actions.first { $0.button === view }?.name
+                        .compactMap { view -> String? in
+                            if let match = actions.first(
+                                where: { $0.button === view }) {
+                                return match.name
+                            }
+                            return chrome.first { $0.1 === view }?.0
                         }
-                    if arrangedActions != actions.map(\.name) {
-                        toolbarFailures.append("\(phase):action-order")
+                        .filter { exposedNames.contains($0) }
+                    if arrangedActions != actions.map(\.name)
+                        + chrome.map(\.0) {
+                        toolbarFailures.append(
+                            "\(phase):action-order \(arrangedActions)")
                     }
                     for (name, view, row) in members {
                         if view.superview !== row {
@@ -9271,18 +9283,26 @@ enum SelfTest {
                         ? toolRow.frame : actionRow.frame
                     let upper = lower == toolRow.frame
                         ? actionRow.frame : toolRow.frame
+                    // BOTH: a shared edge alone still allows a matching gap
+                    // at each outer edge — two rows of 34.5 inside 70 meet
+                    // exactly and leave 0.5 top and bottom.
                     if !near(rowsUnion.minY, stack.bounds.minY)
                         || !near(rowsUnion.maxY, stack.bounds.maxY)
-                        || !near(lower.maxY, upper.minY, 0.01) {
+                        || !near(lower.maxY, upper.minY, 0.01)
+                        || !near(toolRow.frame.height + actionRow.frame.height,
+                                 stack.bounds.height) {
                         toolbarFailures.append(
                             "\(phase):rows-do-not-tile \(rowsUnion)")
                     }
                     // Nothing actionable in either row that this gate has not
                     // accounted for; spacers and separators are not controls
                     // and are ignored by design.
+                    // `subviews`, not `arrangedSubviews`: a control added
+                    // directly to a row is not arranged by the stack but is
+                    // still on screen and still clickable.
                     let known = Set(members.map { ObjectIdentifier($0.1) })
                     for row in [toolRow, actionRow] {
-                        for view in row.arrangedSubviews
+                        for view in row.subviews
                         where view is NSControl
                             && !known.contains(ObjectIdentifier(view)) {
                             toolbarFailures.append(
