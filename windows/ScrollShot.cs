@@ -389,4 +389,3 @@ sealed class ScrollPreviewControl : Control
         g.DrawRectangle(pen, 0, Math.Max(0, y), Width - 1, Math.Min(dh, Height) - 1);
     }
 }
-
