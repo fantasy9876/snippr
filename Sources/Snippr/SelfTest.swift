@@ -8488,23 +8488,44 @@ enum SelfTest {
 
             // A. Every terminal action is transactional, with a live crop
             //    selection, a live text edit and a selected annotation in play.
+            //    Dependencies are injected and COUNTED: "nothing exported" is
+            //    proven per dependency, not inferred from the clipboard.
+            final class TerminalSpy {
+                var copies = 0, saveAs = 0, autoSaves = 0, pins = 0, ocr = 0
+                var total: Int { copies + saveAs + autoSaves + pins + ocr }
+                var description: String {
+                    "copy=\(copies) saveAs=\(saveAs) autoSave=\(autoSaves) pin=\(pins) ocr=\(ocr)"
+                }
+            }
             let termBase = makeNoiseImage(width: 200, height: 160)
             var termFailures: [String] = []
             let actions: [(String, (EditorWindowController) -> Void)] = [
                 ("copy", { $0.copyImage() }),
                 ("save", { $0.saveImage() }),
+                ("saveAs", { $0.saveImageAs() }),
                 ("pin", { $0.pinImage() }),
                 ("ocr", { $0.runOCR() }),
+                ("translate", { $0.runTranslate() }),
                 ("esc", { $0.escPressed() }),
             ]
             let escCopyBefore = Settings.shared.escCopy
             let escSaveBefore = Settings.shared.escSave
-            Settings.shared.escCopy = true
-            Settings.shared.escSave = false
-            for (name, action) in actions {
+            func seedEditor(
+                _ spy: TerminalSpy
+            ) -> (EditorWindowController, EditorCanvasView, BlurAnnotation) {
                 let wc = EditorWindowController.open(
                     with: CapturedImage(cgImage: termBase, scale: 1),
                     forceFitForTesting: true)
+                wc.terminalDependencies = EditorWindowController
+                    .TerminalDependencies(
+                        copyToClipboard: { _ in spy.copies += 1 },
+                        saveAs: { _, _, _ in spy.saveAs += 1 },
+                        autoSave: { _, done in
+                            spy.autoSaves += 1
+                            done(nil)
+                        },
+                        pin: { _ in spy.pins += 1 },
+                        recognize: { _, _ in spy.ocr += 1 })
                 let canvas = wc.canvasForTesting
                 let blur = BlurAnnotation(uiScale: 1)
                 blur.rect = CGRect(x: 20, y: 20, width: 60, height: 40)
@@ -8517,24 +8538,41 @@ enum SelfTest {
                 canvas.setCropSelectionForTesting(
                     CGRect(x: 10, y: 10, width: 80, height: 60))
                 canvas.beginTextEditingForTesting(at: CGPoint(x: 40, y: 120))
+                return (wc, canvas, blur)
+            }
+            for (name, action) in actions {
+                // esc exercises copy+save together, the worst case
+                Settings.shared.escCopy = true
+                Settings.shared.escSave = true
+                let spy = TerminalSpy()
+                let (wc, canvas, _) = seedEditor(spy)
                 let before = canvas.documentFingerprintForTesting
-                let pb = NSPasteboard.general
-                pb.clearContents()
-                pb.setString("SENTINEL-TERM-" + name, forType: .string)
+                let beforePixels = imageHashForTesting(canvas.image.cgImage)
                 EditorCanvasView.forcePixellateFailureForTesting = true
                 action(wc)
                 EditorCanvasView.forcePixellateFailureForTesting = false
-                if pb.string(forType: .string) != "SENTINEL-TERM-" + name {
-                    termFailures.append(name + ":exported")
+                if spy.total != 0 {
+                    termFailures.append(name + ":deps " + spy.description)
                 }
                 if wc.window?.isVisible != true { termFailures.append(name + ":closed") }
                 if canvas.documentFingerprintForTesting != before {
                     termFailures.append(
-                        name + ":mutated " + canvas.documentFingerprintForTesting
-                            + " was " + before)
+                        name + ":state " + canvas.documentFingerprintForTesting)
+                }
+                if imageHashForTesting(canvas.image.cgImage) != beforePixels {
+                    termFailures.append(name + ":pixels")
                 }
                 wc.window?.close()
             }
+            // Non-vacuous: with rendering healthy the same route DOES call its
+            // dependency, so a zero above means "blocked", not "never wired".
+            let liveSpy = TerminalSpy()
+            let (liveWC, _, _) = seedEditor(liveSpy)
+            liveWC.copyImage()
+            if liveSpy.copies != 1 {
+                termFailures.append("live-copy:" + liveSpy.description)
+            }
+            liveWC.window?.close()
             Settings.shared.escCopy = escCopyBefore
             Settings.shared.escSave = escSaveBefore
             check("sliceB-terminal-actions-transactional",
@@ -9456,6 +9494,15 @@ enum SelfTest {
             if !found { return nil }
         }
         return true
+    }
+
+    /// Cheap content hash so a gate can assert "not one pixel moved".
+    static func imageHashForTesting(_ image: CGImage) -> Int {
+        var hasher = Hasher()
+        hasher.combine(image.width)
+        hasher.combine(image.height)
+        hasher.combine(rgbaBytes(image))
+        return hasher.finalize()
     }
 
     private static func imagesEqual(_ a: CGImage, _ b: CGImage) -> Bool {

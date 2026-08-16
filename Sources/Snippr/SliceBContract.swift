@@ -807,6 +807,6 @@ final class SliceBRedactionJob {
         owners[ObjectIdentifier(blur)]?.cancel()
         owners[ObjectIdentifier(blur)] = job
         return job
-        
+
     }
 }

@@ -483,6 +483,29 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
     /// the session exactly as it was — nothing exported, nothing closed — and
     /// tell the user. Silently writing the un-redacted base would be the worst
     /// possible outcome here.
+    /// Terminal-action dependencies, injectable exactly like the overlay
+    /// action router. A gate counts real calls instead of inferring "nothing
+    /// happened" from the clipboard alone.
+    struct TerminalDependencies {
+        var copyToClipboard: @MainActor (CapturedImage) -> Void = {
+            SaveService.shared.copyToClipboard($0)
+        }
+        var saveAs: @MainActor (
+            CapturedImage, NSWindow, @escaping @MainActor (SaveOutcome) -> Void
+        ) -> Void = { image, window, done in
+            SaveService.shared.saveAs(image, for: window, completion: done)
+        }
+        var autoSave: @MainActor (
+            CapturedImage, @escaping @MainActor (URL?) -> Void
+        ) -> Void = { image, done in
+            SaveService.shared.save(image, completion: done)
+        }
+        var pin: @MainActor (CapturedImage) -> Void = { PinWindow.pin($0) }
+        var recognize: @MainActor (CapturedImage, Bool) -> Void = { _, _ in }
+    }
+
+    var terminalDependencies = TerminalDependencies()
+
     private func flattenedOrWarn() -> CapturedImage? {
         guard let flat = canvas.flattened() else {
             ToastHUD.show(
@@ -495,7 +518,7 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
 
     @objc func copyImage() {
         guard let flat = flattenedOrWarn() else { return }
-        SaveService.shared.copyToClipboard(flat)
+        terminalDependencies.copyToClipboard(flat)
         ToastHUD.show("Copied to clipboard")
         window?.close()
     }
@@ -506,7 +529,7 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
     @objc func saveImage() {
         guard let window else { return }
         guard let flat = flattenedOrWarn() else { return }
-        SaveService.shared.saveAs(flat, for: window) { outcome in
+        terminalDependencies.saveAs(flat, window) { outcome in
             switch outcome {
             case let .saved(url):
                 ToastHUD.show(
@@ -525,7 +548,7 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
 
     @objc func pinImage() {
         guard let flat = flattenedOrWarn() else { return }
-        PinWindow.pin(flat)
+        terminalDependencies.pin(flat)
         window?.close()
     }
 
@@ -534,6 +557,7 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
 
     private func recognizeText(autoTranslate: Bool) {
         guard let flat = flattenedOrWarn() else { return }
+        terminalDependencies.recognize(flat, autoTranslate)
         Task {
             let result = await OCRService.shared.recognize(flat.cgImage)
             await MainActor.run {
@@ -555,12 +579,12 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
             // whole image twice back to back
             guard let flat = flattenedOrWarn() else { return }
             if s.escCopy {
-                SaveService.shared.copyToClipboard(flat)
+                terminalDependencies.copyToClipboard(flat)
                 ToastHUD.show("Copied to clipboard")
             }
             if s.escSave {
                 let announce = !s.escCopy
-                SaveService.shared.save(flat) { url in
+                terminalDependencies.autoSave(flat) { url in
                     // toast only when the save actually landed (or failed)
                     if let url {
                         if announce { ToastHUD.show("Saved \(url.lastPathComponent)") }
