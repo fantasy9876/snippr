@@ -10105,32 +10105,52 @@ enum SelfTest {
                     }
                 if panelBaseline == nil { panelFailures.append("panel:no-baseline") }
 
-                // Mask expressed in POINTS, converted the way production does,
-                // and SNAPPED to backing-pixel boundaries: a fractional edge
-                // is antialiased, so a boundary pixel could be neither exactly
-                // the cover nor exactly the baseline and the gate would be
-                // non-deterministic across displays.
+                // The mask is built in SOURCE pixels first, integral, with
+                // each edge a multiple of srcDim / gcd(srcDim, backingDim).
+                // That makes the same edge land on an integer boundary in BOTH
+                // domains: the compositor takes an integral source rect, and
+                // the scan projects it to whole backing pixels. Snapping the
+                // point rect instead left a fractional source rect, so the
+                // compositor covered an expanded region and the scan saw that
+                // expansion as bleed.
                 let panelBacking = host.window?.backingScaleFactor
                     ?? hostScreen.backingScaleFactor
-                func snap(_ value: CGFloat) -> CGFloat {
-                    (value * panelBacking).rounded() / panelBacking
+                func gcd(_ a: Int, _ b: Int) -> Int {
+                    var x = abs(a), y = abs(b)
+                    while y != 0 { (x, y) = (y, x % y) }
+                    return max(1, x)
                 }
-                let maskInPoints = CGRect(
-                    x: snap(host.bounds.width * 0.2),
-                    y: snap(host.bounds.height * 0.3),
-                    width: snap(host.bounds.width * 0.5),
-                    height: snap(host.bounds.height * 0.2))
+                let srcWidth = 300
+                let srcHeight = panelPixels
+                let backingWidth = max(
+                    1, Int((host.bounds.width * panelBacking).rounded()))
+                let backingHeight = max(
+                    1, Int((host.bounds.height * panelBacking).rounded()))
+                let stepX = max(1, srcWidth / gcd(srcWidth, backingWidth))
+                let stepY = max(1, srcHeight / gcd(srcHeight, backingHeight))
+                func alignedDown(_ value: Int, _ step: Int) -> Int {
+                    max(step, (value / step) * step)
+                }
+                let regionX = alignedDown(srcWidth / 5, stepX)
+                let regionW = alignedDown(srcWidth / 2, stepX)
+                let regionY = alignedDown(srcHeight * 3 / 10, stepY)
+                let regionH = alignedDown(srcHeight / 5, stepY)
+                let expectedRegion = CGRect(
+                    x: CGFloat(regionX), y: CGFloat(regionY),
+                    width: CGFloat(min(regionW, srcWidth - regionX)),
+                    height: CGFloat(min(regionH, srcHeight - regionY)))
                 let panelBlur = BlurAnnotation(uiScale: pixelsPerPoint)
-                panelBlur.rect = CGRect(
-                    x: maskInPoints.minX * pixelsPerPoint,
-                    y: maskInPoints.minY * pixelsPerPoint,
-                    width: maskInPoints.width * pixelsPerPoint,
-                    height: maskInPoints.height * pixelsPerPoint)
-                panel.annotationSurface.addAnnotationForTesting(panelBlur)
-                if abs(panelBlur.rect.height
-                        - maskInPoints.height * pixelsPerPoint) > 1 {
-                    panelFailures.append("panel:mapping")
+                panelBlur.rect = expectedRegion
+                // The scan works in points: project the SAME rect back.
+                let maskInPoints = CGRect(
+                    x: expectedRegion.minX / pixelsPerPoint,
+                    y: expectedRegion.minY / pixelsPerPoint,
+                    width: expectedRegion.width / pixelsPerPoint,
+                    height: expectedRegion.height / pixelsPerPoint)
+                if expectedRegion.width < 4 || expectedRegion.height < 4 {
+                    panelFailures.append("panel:degenerate-mask")
                 }
+                panel.annotationSurface.addAnnotationForTesting(panelBlur)
 
                 let (_, panelEvents) = RenderTrace.capture(
                     host: "scroll", path: "export"
@@ -10157,7 +10177,6 @@ enum SelfTest {
                 }
                 // Exact trace payload: one destination for the full stitch and
                 // one attempt over the mask, in that order, nothing else.
-                let expectedRegion = panelBlur.rect.standardized.integral
                 let panelShape = panelEvents.map {
                     "\($0.host)/\($0.path)/\($0.kind)"
                 }
