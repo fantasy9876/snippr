@@ -9588,6 +9588,55 @@ enum SelfTest {
                 }
                 if copyCount != 0 { hostFailures.append("area:fail-copies") }
 
+                // Two SEPARATE proofs. Export fail-closed was asserted above
+                // (nil out, dependencies at zero, session still reviewing).
+                // The cover pixels come from the ACTUAL view: its own draw,
+                // its own backing scale, its own selection clip.
+                let viewShot = AnnotationRenderer.withForcedRegionalFailure {
+                    () -> CGImage? in
+                    view.needsDisplay = true
+                    view.display()
+                    guard let rep = view.bitmapImageRepForCachingDisplay(
+                        in: view.bounds) else { return nil }
+                    view.cacheDisplay(in: view.bounds, to: rep)
+                    return rep.cgImage
+                }
+                guard let viewShot, view.bounds.width > 0 else {
+                    hostFailures.append("area:no-view-shot")
+                    return
+                }
+                let backing = CGFloat(viewShot.width) / view.bounds.width
+                let viewBytes = rgba(viewShot)
+                let baseBytes = baselineShot.map { rgba($0) }
+                let cover: [UInt8] = [31, 31, 31, 255]
+                var uncovered = 0
+                var bleeding = 0
+                for py in 0..<viewShot.height {
+                    for px in 0..<viewShot.width {
+                        // pixel CENTRE in points: half-open raster rule, so
+                        // every pixel lands in exactly one class.
+                        let point = CGPoint(
+                            x: (CGFloat(px) + 0.5) / backing,
+                            y: (CGFloat(viewShot.height - 1 - py) + 0.5) / backing)
+                        let i = (py * viewShot.width + px) * 4
+                        let value = Array(viewBytes[i..<(i + 4)])
+                        if hostMask.contains(point) {
+                            if value != cover { uncovered += 1 }
+                        } else if let baseBytes,
+                                  i + 4 <= baseBytes.count,
+                                  Array(baseBytes[i..<(i + 4)]) != value {
+                            // Outside the mask the view must be byte-identical
+                            // to the baseline taken moments earlier.
+                            bleeding += 1
+                        }
+                    }
+                }
+                if uncovered != 0 {
+                    hostFailures.append("area:view-uncovered \(uncovered)")
+                }
+                if bleeding != 0 {
+                    hostFailures.append("area:view-outside-changed \(bleeding)")
+                }
                 // -- healthy run: exactly one materialization inside the mask
                 exported = nil
                 let toastsBeforeOK = toasts
@@ -9697,55 +9746,6 @@ enum SelfTest {
                     $0.kind == "destination"
                 }), destination.rect != expectedTopLeft {
                     hostFailures.append("area:destination-rect \(destination.rect)")
-                }
-                // Two SEPARATE proofs. Export fail-closed was asserted above
-                // (nil out, dependencies at zero, session still reviewing).
-                // The cover pixels come from the ACTUAL view: its own draw,
-                // its own backing scale, its own selection clip.
-                let viewShot = AnnotationRenderer.withForcedRegionalFailure {
-                    () -> CGImage? in
-                    view.needsDisplay = true
-                    view.display()
-                    guard let rep = view.bitmapImageRepForCachingDisplay(
-                        in: view.bounds) else { return nil }
-                    view.cacheDisplay(in: view.bounds, to: rep)
-                    return rep.cgImage
-                }
-                guard let viewShot, view.bounds.width > 0 else {
-                    hostFailures.append("area:no-view-shot")
-                    return
-                }
-                let backing = CGFloat(viewShot.width) / view.bounds.width
-                let viewBytes = rgba(viewShot)
-                let baseBytes = baselineShot.map { rgba($0) }
-                let cover: [UInt8] = [31, 31, 31, 255]
-                var uncovered = 0
-                var bleeding = 0
-                for py in 0..<viewShot.height {
-                    for px in 0..<viewShot.width {
-                        // pixel CENTRE in points: half-open raster rule, so
-                        // every pixel lands in exactly one class.
-                        let point = CGPoint(
-                            x: (CGFloat(px) + 0.5) / backing,
-                            y: (CGFloat(viewShot.height - 1 - py) + 0.5) / backing)
-                        let i = (py * viewShot.width + px) * 4
-                        let value = Array(viewBytes[i..<(i + 4)])
-                        if hostMask.contains(point) {
-                            if value != cover { uncovered += 1 }
-                        } else if let baseBytes,
-                                  i + 4 <= baseBytes.count,
-                                  Array(baseBytes[i..<(i + 4)]) != value {
-                            // Outside the mask the view must be byte-identical
-                            // to the baseline taken moments earlier.
-                            bleeding += 1
-                        }
-                    }
-                }
-                if uncovered != 0 {
-                    hostFailures.append("area:view-uncovered \(uncovered)")
-                }
-                if bleeding != 0 {
-                    hostFailures.append("area:view-outside-changed \(bleeding)")
                 }
             }
             check("sliceB-hosts-failclosed",
@@ -10257,11 +10257,22 @@ enum SelfTest {
                     panelFailures.append(
                         "panel:retry-dest \(destination.destination) \(destination.rect)")
                 }
+                if let attempt = retryEvents.first(where: {
+                    $0.kind == "regionalAttempt"
+                }), attempt.rect != expectedRegion || attempt.destination != "-" {
+                    panelFailures.append(
+                        "panel:retry-attempt \(attempt.rect) \(attempt.destination)")
+                }
+                // Derived from the region itself: hard-coding the patch size
+                // would break the moment fitting or rounding changes.
+                let expectedPatch =
+                    "\(Int(expectedRegion.width))x\(Int(expectedRegion.height))"
                 if let materialized = retryEvents.first(where: {
                     $0.kind == "regionalMaterialized"
-                }), materialized.rect != expectedRegion {
+                }), materialized.rect != expectedRegion
+                    || materialized.destination != expectedPatch {
                     panelFailures.append(
-                        "panel:retry-materialized \(materialized.rect)")
+                        "panel:retry-materialized \(materialized.rect) \(materialized.destination)")
                 }
                 if ScrollResultPanel.current != nil {
                     panelFailures.append("panel:no-auto-dismiss")
