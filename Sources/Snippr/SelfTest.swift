@@ -10996,11 +10996,22 @@ enum SelfTest {
                         forwarded += 1
                     }
                 }
+                // No-op dependencies BEFORE any selection or drag: the real
+                // mouse-up runs `.initialCapture`, which with live
+                // dependencies would write lastCapture and the event log of
+                // whatever machine runs the selftest.
+                let inertDependencies = CaptureActionRouter.Dependencies(
+                    copyToClipboard: { _ in }, autoSave: { _, _ in },
+                    saveAs: { _, _ in }, pin: { _ in }, ocr: { _ in },
+                    openEditor: { _ in }, toast: { _ in },
+                    setLastCapture: { _ in }, setLastAreaRect: { _ in },
+                    logEvent: { _ in })
                 let creatingOverlay = SelectionOverlay(
                     purpose: .areaReview,
                     inputs: OverlaySessionInputs(
                         afterShow: true, afterCopy: false, afterSave: false),
                     completion: { _ in })
+                creatingOverlay.routerDependenciesOverride = inertDependencies
                 let creatingView = SelectionOverlayView(
                     mode: .area, screen: screen,
                     frozen: CapturedImage(
@@ -11048,6 +11059,7 @@ enum SelfTest {
                     inputs: OverlaySessionInputs(
                         afterShow: true, afterCopy: false, afterSave: false),
                     completion: { _ in })
+                overlay.routerDependenciesOverride = inertDependencies
                 let view = SelectionOverlayView(
                     mode: .area, screen: screen,
                     frozen: CapturedImage(
@@ -11139,6 +11151,12 @@ enum SelfTest {
                     wheelFailures.append("panel:no-host")
                     panel.dismissForTesting()
                     return
+                }
+                // The drawing area must not double as a window-drag handle:
+                // the panel is movable by its background, and a nonopaque view
+                // is draggable by default.
+                if host.mouseDownCanMoveWindow {
+                    wheelFailures.append("panel:drag-handle")
                 }
                 var panelMidWrites = 0
                 let panelBeforeDrag = writes.count

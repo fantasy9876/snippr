@@ -577,6 +577,13 @@ final class AnnotationHostView: NSView, RedactionSurfaceDelegate {
     private let pixelsPerPoint: CGFloat
     private var dragging = false
 
+    /// The panel is movable by its background, and an NSView is nonopaque by
+    /// default — which makes `mouseDownCanMoveWindow` true. The drawing area
+    /// would therefore double as a window-drag handle whenever a tool is
+    /// active. Select still moves the panel, because `hitTest` returns nil for
+    /// this view then and the background takes the gesture.
+    override var mouseDownCanMoveWindow: Bool { false }
+
     /// True between mouseDown and mouseUp on an annotation tool. Every route
     /// that mutates history, tools or the document stands aside until then:
     /// the draft is already in the document and its finalizing transaction is
