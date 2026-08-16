@@ -792,7 +792,11 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
         redactionDelegate?.surfaceNeedsRedactionRepaint()
     }
 
-    func surfaceNeedsRedactionRepaint() { needsDisplay = true }
+    func surfaceNeedsRedactionRepaint() {
+        // A resolved or cancelled redaction can invalidate a magnifier patch.
+        refreshMagnifierSnapshotsAfterDocumentChange(force: false)
+        needsDisplay = true
+    }
 
     /// Slice B seam: drives the SHARED regional-pixelation failure so the
     /// editor takes production's fail-closed path (no clean base on screen, no
@@ -862,6 +866,14 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
                     by: CGPoint(x: -offset.x, y: -offset.y))
             }
             base = owned
+            // The clones' sanitized patches were built against the UNCROPPED
+            // image; rebuild them against what is actually being rendered.
+            let clonedRedactions = marks.compactMap { $0 as? BlurAnnotation }
+            for mag in marks.compactMap({ $0 as? MagnifierAnnotation }) {
+                mag.snapshot = SliceBCompositor.magnifierSnapshot(
+                    base: owned, sourceRect: mag.sourceRect,
+                    redactions: clonedRedactions)
+            }
             croppedBase = owned
         }
 
@@ -1032,6 +1044,7 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
         if snap.1.cgImage !== image.cgImage {
             setImage(snap.1)
         }
+        refreshMagnifierSnapshotsAfterDocumentChange()
         selected = nil
         needsDisplay = true
         onStateChange?()
@@ -1284,9 +1297,11 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
             if big {
                 registerUndoSnapshot()
                 if let spot = draft as? SpotlightAnnotation {
-                    // v1 is a singleton: darkness never stacks.
+                    // v1 is a singleton: darkness never stacks. Select the new
+                    // one, or the digit keys would target a detached object.
                     annotations = SliceBCompositor.applySpotlight(
                         existing: annotations, new: spot)
+                    selected = spot
                 } else {
                     annotations.append(draft)
                 }
@@ -1299,9 +1314,13 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
                             $0 as? BlurAnnotation
                         })
                 }
-                if let blur = draft as? BlurAnnotation,
-                   blur.redactionState == .pendingFull {
-                    startTextRedaction(for: blur)
+                if let blur = draft as? BlurAnnotation {
+                    // A new redaction can cover a magnifier's source, so every
+                    // patch that overlaps it must be rebuilt.
+                    refreshMagnifierSnapshotsAfterDocumentChange(force: false)
+                    if blur.redactionState == .pendingFull {
+                        startTextRedaction(for: blur)
+                    }
                 }
             }
             drafting = nil
@@ -1317,12 +1336,17 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
         isMovingSelection = false
     }
 
-    /// After a crop or resize the sanitized patch a magnifier holds may no
-    /// longer match what is under it, so rebuild — and if the rebuild fails,
-    /// clear it rather than keep stale pixels.
-    func refreshMagnifierSnapshotsAfterDocumentChange() {
+    /// A magnifier holds a SANITIZED patch. Anything that changes the document
+    /// or the redactions can make that patch stale, and a stale patch shows
+    /// pixels a redaction now covers — so every such change funnels through
+    /// here. A failed rebuild clears the patch rather than keeping old pixels.
+    func refreshMagnifierSnapshotsAfterDocumentChange(force: Bool = true) {
         let redactions = annotations.compactMap { $0 as? BlurAnnotation }
-        for mag in annotations.compactMap({ $0 as? MagnifierAnnotation }) {
+        let magnifiers = annotations.compactMap { $0 as? MagnifierAnnotation }
+        guard !magnifiers.isEmpty else { return }
+        for mag in magnifiers {
+            guard force || SliceBCompositor.needsRebuild(
+                source: mag.sourceRect, redactions: redactions) else { continue }
             mag.snapshot = SliceBCompositor.magnifierSnapshot(
                 base: image.cgImage, sourceRect: mag.sourceRect,
                 redactions: redactions)
@@ -1391,8 +1415,10 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
         for a in annotations {
             a.translateForDocumentChange(by: CGPoint(x: -offset.x, y: -offset.y))
         }
-        refreshMagnifierSnapshotsAfterDocumentChange()
+        // AFTER the new bitmap is installed: rebuilding first would sample the
+        // old image with the new geometry.
         setImage(CapturedImage(cgImage: owned, scale: pxScale))
+        refreshMagnifierSnapshotsAfterDocumentChange()
     }
 
     // MARK: text tool
@@ -1624,6 +1650,9 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
             transient = .guide(axis: axis, position: position * factor)
         }
         setImage(scaled)
+        // Geometry moved and the bitmap changed, so every sanitized patch is
+        // stale until it is rebuilt against the new image.
+        refreshMagnifierSnapshotsAfterDocumentChange()
     }
 
     /// Slice B seams: a gate needs to put the canvas into a realistic state
@@ -1898,6 +1927,7 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
                 registerUndoSnapshot()
                 annotations.removeAll { $0 === sel }
                 selected = nil
+                refreshMagnifierSnapshotsAfterDocumentChange()
                 needsDisplay = true
             }
             return
@@ -1912,7 +1942,11 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
         }
         // 1-9 set the selected spotlight's darkness, through undo.
         if flags.isEmpty, let digit = Int(chars), (1...9).contains(digit),
-           let spot = selected as? SpotlightAnnotation {
+           let selectedSpot = selected as? SpotlightAnnotation,
+           // Only a spotlight still in the document may be adjusted; a
+           // replaced one is detached and mutating it would do nothing visible.
+           let spot = annotations.compactMap({ $0 as? SpotlightAnnotation })
+               .first(where: { $0 === selectedSpot }) {
             registerUndoSnapshot()
             spot.dimFraction = CGFloat(digit) / 10
             needsDisplay = true
