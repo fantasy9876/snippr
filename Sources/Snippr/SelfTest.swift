@@ -10127,10 +10127,17 @@ enum SelfTest {
                     })
                     || areaSurface.tool != savingTool
                     || areaSurface.canRedo != savingRedo
-                    || areaHistory != beforeSaving {
-                    digitFailures.append("area:saving-mutated")
+                    || areaHistory != beforeSaving
+                    // Still saving AFTER the blocked key: a route that moved
+                    // the session back to reviewing without touching the
+                    // document would otherwise pass here, and would then make
+                    // the cancel and the retry below pass too.
+                    || overlay.session.phase != .saving {
+                    digitFailures.append(
+                        "area:saving-mutated \(overlay.session.phase)")
                 }
                 MainActor.assumeIsolated { areaSpy.saveDone?(.cancelled) }
+                areaSpy.saveDone = nil
                 if overlay.session.phase != .reviewing {
                     digitFailures.append(
                         "area:unlock-phase \(overlay.session.phase)")
@@ -10143,7 +10150,12 @@ enum SelfTest {
                 let unlocked = areaSurface.annotations
                     .compactMap { $0 as? SpotlightAnnotation }.first
                 if abs((unlocked?.dimFraction ?? 0) - 0.2) > 0.0001
-                    || areaHistory != beforeUnlocked + 1 {
+                    || areaHistory != beforeUnlocked + 1
+                    || areaSurface.annotations.count != 1
+                    || areaSurface.annotations.first !== unlocked
+                    || unlocked === saving
+                    || areaSurface.tool != savingTool
+                    || areaSurface.canRedo {
                     digitFailures.append(
                         "area:unlocked \(unlocked?.dimFraction ?? -1)")
                 }
