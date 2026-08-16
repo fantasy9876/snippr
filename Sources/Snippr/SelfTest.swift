@@ -35,6 +35,299 @@ enum SelfTest {
             }
         }
 
+        // 0a. Bundle integrity: one canonical Snippr, duplicates are named ------
+        // A second bundle with our identifier (ad-hoc dev copy in
+        // ~/Applications, a mounted DMG, Downloads) shares the TCC subject but
+        // not the designated requirement; LaunchServices may open it first and
+        // the user is asked to grant Screen Recording "again". The verdict is a
+        // pure function of paths so it is provable headlessly.
+        do {
+            let canonical = URL(fileURLWithPath: "/Applications/Snippr.app")
+            let home = URL(fileURLWithPath: "/Users/tester/Applications/Snippr.app")
+            let dmg = URL(fileURLWithPath: "/Volumes/Snippr/Snippr.app")
+            let messy = URL(fileURLWithPath: "/Applications/./Snippr.app/")
+            let clean = BundleIntegrity.evaluate(
+                running: canonical, discovered: [canonical], canonical: canonical)
+            let withDup = BundleIntegrity.evaluate(
+                running: canonical, discovered: [canonical, home, dmg], canonical: canonical)
+            let nonCanonical = BundleIntegrity.evaluate(
+                running: home, discovered: [canonical, home], canonical: canonical)
+            let orphan = BundleIntegrity.evaluate(
+                running: home, discovered: [home], canonical: canonical)
+            let normalized = BundleIntegrity.evaluate(
+                running: messy, discovered: [messy, canonical], canonical: canonical)
+            check("integrity-verdict-canonical-clean",
+                  clean == .canonical(duplicates: [])
+                    && BundleIntegrity.isCanonical(canonical, canonical: canonical),
+                  "\(clean)")
+            check("integrity-verdict-duplicates-named",
+                  withDup == .canonical(duplicates: [home, dmg]),
+                  "\(withDup)")
+            check("integrity-verdict-noncanonical-blocked",
+                  nonCanonical == .runningNonCanonical(
+                    running: home, canonicalExists: true, duplicates: [canonical])
+                    && orphan == .runningNonCanonical(
+                        running: home, canonicalExists: false, duplicates: [])
+                    && !BundleIntegrity.isCanonical(home, canonical: canonical),
+                  "\(nonCanonical) / \(orphan)")
+            check("integrity-verdict-path-normalized",
+                  normalized == .canonical(duplicates: [])
+                    && BundleIntegrity.isCanonical(messy, canonical: canonical),
+                  "\(normalized)")
+            // The updater must refuse to run from a non-canonical copy: it
+            // would swap /Applications/Snippr.app while the user is running
+            // something else, and the relaunch would open the wrong app.
+            check("integrity-updater-refuses-noncanonical",
+                  UpdateChecker.updateAllowed(for: clean)
+                    && UpdateChecker.updateAllowed(for: withDup)
+                    && !UpdateChecker.updateAllowed(for: nonCanonical)
+                    && !UpdateChecker.updateAllowed(for: orphan),
+                  "clean \(UpdateChecker.updateAllowed(for: clean)) nonCanonical \(UpdateChecker.updateAllowed(for: nonCanonical))")
+            // Launch disposition is decided BEFORE status item / hotkeys /
+            // launch status / TCC prompt: a wrong copy blocks — production
+            // has no "continue"; only the explicit debug override proceeds.
+            let dispClean = BundleIntegrity.launchDisposition(for: clean)
+            let dispDup = BundleIntegrity.launchDisposition(for: withDup)
+            let dispWrong = BundleIntegrity.launchDisposition(for: nonCanonical)
+            let dispOrphan = BundleIntegrity.launchDisposition(for: orphan)
+            let dispDebug = BundleIntegrity.launchDisposition(
+                for: nonCanonical, allowNonCanonical: true)
+            let dispNoBundle = BundleIntegrity.launchDisposition(for: nil)
+            check("integrity-launch-blocks-wrong-copy",
+                  dispClean == .proceed(warnDuplicates: [])
+                    && dispDup == .proceed(warnDuplicates: [home, dmg])
+                    && dispWrong == .blockWrongCopy(running: home, canonicalExists: true)
+                    && dispOrphan == .blockWrongCopy(running: home, canonicalExists: false)
+                    && dispDebug == .proceed(warnDuplicates: [canonical])
+                    && dispNoBundle == .proceed(warnDuplicates: []),
+                  "wrong \(dispWrong) orphan \(dispOrphan) debug \(dispDebug)")
+            // Handoff ordering, run for real: the helper must wait for the
+            // wrong-copy pid to be gone BEFORE opening the canonical app
+            // (`open -n`, quoted path) — otherwise the canonical
+            // single-instance guard sees the wrong copy and exits, leaving no
+            // Snippr at all. A fake "wrong copy" (sleep 1) stands in for our
+            // pid; /bin/echo stands in for /usr/bin/open.
+            var handoffOK = false
+            var handoffDetail = "not run"
+            do {
+                let fake = Process()
+                fake.executableURL = URL(fileURLWithPath: "/bin/sleep")
+                fake.arguments = ["1"]
+                try fake.run()
+                let argv = BundleIntegrity.handoffCommand(
+                    canonical: URL(fileURLWithPath: "/Applications/Snippr's Test.app"),
+                    waitForPID: fake.processIdentifier, timeoutSeconds: 5,
+                    openTool: "/bin/echo")
+                let helper = Process()
+                helper.executableURL = URL(fileURLWithPath: argv[0])
+                helper.arguments = Array(argv.dropFirst())
+                let pipe = Pipe()
+                helper.standardOutput = pipe
+                let started = Date()
+                try helper.run()
+                helper.waitUntilExit()
+                let elapsed = Date().timeIntervalSince(started)
+                let out = String(
+                    data: pipe.fileHandleForReading.readDataToEndOfFile(),
+                    encoding: .utf8) ?? ""
+                // /bin/echo -n <path> prints the path without newline: the
+                // helper reached `open -n` only after the fake pid ended.
+                handoffOK = !fake.isRunning
+                    && out == "/Applications/Snippr's Test.app"
+                    && elapsed >= 0.9 && elapsed < 4.5
+                    && argv[0] == "/bin/sh"
+                    && argv[2].range(of: "kill -0")!.lowerBound
+                        < argv[2].range(of: " -n ")!.lowerBound
+                handoffDetail = "out '\(out)' elapsed \(String(format: "%.2f", elapsed)) fakeRunning \(fake.isRunning)"
+            } catch {
+                handoffDetail = "error \(error)"
+            }
+            check("integrity-handoff-waits-then-opens-canonical", handoffOK, handoffDetail)
+
+            // Timeout fixture: the wrong-copy pid outlives the helper's
+            // budget → the helper must exit non-zero and open NOTHING
+            // (a second instance next to a live wrong copy is the failure
+            // mode this whole slice exists to prevent).
+            var timeoutOK = false
+            var timeoutDetail = "not run"
+            do {
+                let stubborn = Process()
+                stubborn.executableURL = URL(fileURLWithPath: "/bin/sleep")
+                stubborn.arguments = ["30"]
+                try stubborn.run()
+                defer { stubborn.terminate() }
+                let argv = BundleIntegrity.handoffCommand(
+                    canonical: URL(fileURLWithPath: "/Applications/Snippr.app"),
+                    waitForPID: stubborn.processIdentifier, timeoutSeconds: 1,
+                    openTool: "/bin/echo")
+                let helper = Process()
+                helper.executableURL = URL(fileURLWithPath: argv[0])
+                helper.arguments = Array(argv.dropFirst())
+                let pipe = Pipe()
+                helper.standardOutput = pipe
+                try helper.run()
+                helper.waitUntilExit()
+                let out = String(
+                    data: pipe.fileHandleForReading.readDataToEndOfFile(),
+                    encoding: .utf8) ?? ""
+                timeoutOK = helper.terminationStatus != 0 && out.isEmpty && stubborn.isRunning
+                timeoutDetail = "status \(helper.terminationStatus) out '\(out)' stubbornRunning \(stubborn.isRunning)"
+            } catch {
+                timeoutDetail = "error \(error)"
+            }
+            check("integrity-handoff-timeout-fails-closed", timeoutOK, timeoutDetail)
+
+            // Instance arbitration (main.swift): canonical evicts wrong
+            // copies; a wrong copy never blocks the canonical; a second
+            // canonical (double launch) yields.
+            let arbNone = BundleIntegrity.instanceArbitration(
+                selfIsCanonical: true, others: [], canonical: canonical)
+            let arbEvict = BundleIntegrity.instanceArbitration(
+                selfIsCanonical: true, others: [(pid_t(4242), home)], canonical: canonical)
+            let arbEvictUnknown = BundleIntegrity.instanceArbitration(
+                selfIsCanonical: true, others: [(pid_t(4243), nil)], canonical: canonical)
+            let arbDouble = BundleIntegrity.instanceArbitration(
+                selfIsCanonical: true, others: [(pid_t(4244), canonical)], canonical: canonical)
+            let arbWrong = BundleIntegrity.instanceArbitration(
+                selfIsCanonical: false, others: [(pid_t(4245), canonical)], canonical: canonical)
+            let arbWrongVsWrong = BundleIntegrity.instanceArbitration(
+                selfIsCanonical: false, others: [(pid_t(4246), home)], canonical: canonical)
+            check("integrity-instance-arbitration-canonical-wins",
+                  arbNone == .proceed
+                    && arbEvict == .evictThenProceed(pids: [4242])
+                    && arbEvictUnknown == .evictThenProceed(pids: [4243])
+                    && arbDouble == .exitOtherRunning
+                    && arbWrong == .exitOtherRunning
+                    && arbWrongVsWrong == .exitOtherRunning,
+                  "evict \(arbEvict) double \(arbDouble) wrong \(arbWrong)")
+
+            // Launch plan: wrong copy touches nothing; canonical writes the
+            // launch status / health breadcrumb and finishes hotkeys + TCC
+            // BEFORE the (deferred) duplicates warning — the updater's
+            // health wait must never see a modal in front of the breadcrumb.
+            let planWrong = BundleIntegrity.launchPlan(
+                for: dispWrong, isDevTool: false, needsCaptureServices: true)
+            let planDup = BundleIntegrity.launchPlan(
+                for: dispDup, isDevTool: false, needsCaptureServices: true)
+            let planClean = BundleIntegrity.launchPlan(
+                for: dispClean, isDevTool: false, needsCaptureServices: true)
+            let planDev = BundleIntegrity.launchPlan(
+                for: dispDup, isDevTool: true, needsCaptureServices: false)
+            let statusIndex = planDup.firstIndex(of: .writeLaunchStatus)
+            let tccIndex = planDup.firstIndex(of: .requestScreenCapture)
+            let warnIndex = planDup.firstIndex(of: .warnDuplicatesDeferred([home, dmg]))
+            check("integrity-launch-plan-health-before-duplicate-warning",
+                  planWrong == [.presentWrongCopyAlertAndExit]
+                    && planClean == [.setupStatusItem, .writeLaunchStatus, .startHotkeys, .requestScreenCapture]
+                    && statusIndex != nil && tccIndex != nil && warnIndex != nil
+                    && statusIndex! < tccIndex! && tccIndex! < warnIndex!
+                    && warnIndex == planDup.indices.last
+                    && planDev.isEmpty,
+                  "wrong \(planWrong) dup \(planDup) dev \(planDev)")
+
+            // Live discovery must not crash headless; from a bare binary the
+            // verdict is nil (no bundle to judge). Direct probing never
+            // reports a path that is not a Snippr bundle.
+            let bogus = BundleIntegrity.isSnipprBundle(at: URL(fileURLWithPath: "/System/Applications/Calculator.app"))
+            let missing = BundleIntegrity.isSnipprBundle(at: URL(fileURLWithPath: "/nonexistent/Snippr.app"))
+            check("integrity-discovery-filters-foreign-and-missing", !bogus && !missing, "bogus \(bogus) missing \(missing)")
+            // Positive discovery: a REAL temp .app with our bundle id at an
+            // injectable known location is found by the direct probe, a
+            // foreign-id .app is not, and the same path listed twice
+            // (LaunchServices + known location) is reported once.
+            var discoveryOK = false
+            var discoveryDetail = "not run"
+            do {
+                let root = URL(fileURLWithPath: NSTemporaryDirectory())
+                    .appendingPathComponent("snippr-integrity-\(getpid())")
+                try? FileManager.default.removeItem(at: root)
+                defer { try? FileManager.default.removeItem(at: root) }
+                func makeApp(_ name: String, id: String) throws -> URL {
+                    let app = root.appendingPathComponent(name)
+                    let contents = app.appendingPathComponent("Contents")
+                    try FileManager.default.createDirectory(
+                        at: contents.appendingPathComponent("MacOS"), withIntermediateDirectories: true)
+                    let plist: [String: Any] = [
+                        "CFBundleIdentifier": id, "CFBundleExecutable": "Snippr",
+                        "CFBundlePackageType": "APPL", "CFBundleName": "Snippr",
+                    ]
+                    try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
+                        .write(to: contents.appendingPathComponent("Info.plist"))
+                    return app
+                }
+                let stray = try makeApp("Applications/Snippr.app", id: BundleIntegrity.bundleIdentifier)
+                let foreign = try makeApp("Other/Snippr.app", id: "com.example.notsnippr")
+                let runningApp = try makeApp("Applications/Canonical.app", id: BundleIntegrity.bundleIdentifier)
+                let strayAlias = URL(fileURLWithPath: stray.path + "/") // same path, other spelling
+                let found = BundleIntegrity.discoveredBundles(
+                    running: runningApp, registered: [stray, foreign, strayAlias],
+                    knownLocations: [stray, foreign, URL(fileURLWithPath: root.path + "/Applications/Missing.app")])
+                let paths = found.map(BundleIntegrity.normalizedPath)
+                discoveryOK = paths.count == 2
+                    && paths[0] == BundleIntegrity.normalizedPath(runningApp)
+                    && paths[1] == BundleIntegrity.normalizedPath(stray)
+                    && BundleIntegrity.isSnipprBundle(at: stray)
+                    && !BundleIntegrity.isSnipprBundle(at: foreign)
+                discoveryDetail = "found \(found.map(\.path))"
+            } catch {
+                discoveryDetail = "error \(error)"
+            }
+            check("integrity-discovery-finds-real-duplicate", discoveryOK, discoveryDetail)
+
+            // Eviction executor against REAL children: one dies on the
+            // request (sleep), one ignores it (trap '' TERM) and needs
+            // force, one is "immortal" (isAlive lies) → stillAlive → the
+            // canonical must abort. Order and budgets are the invariant:
+            // request → wait → force → verify; never proceed with survivors.
+            var evictionOK = false
+            var evictionDetail = "not run"
+            do {
+                let polite = Process()
+                polite.executableURL = URL(fileURLWithPath: "/bin/sleep")
+                polite.arguments = ["30"]
+                try polite.run()
+                let stubborn = Process()
+                stubborn.executableURL = URL(fileURLWithPath: "/bin/sh")
+                stubborn.arguments = ["-c", "trap '' TERM; while :; do /bin/sleep 0.2; done"]
+                try stubborn.run()
+                Thread.sleep(forTimeInterval: 0.5) // let the trap install
+                defer { polite.terminate(); stubborn.terminate(); kill(stubborn.processIdentifier, SIGKILL) }
+                var events: [String] = []
+                let outcome = BundleIntegrity.evictInstances(
+                    [polite.processIdentifier, stubborn.processIdentifier],
+                    gracefulTimeout: 1.0, forceTimeout: 1.0,
+                    requestTerminate: { events.append("term \($0)"); kill($0, SIGTERM) },
+                    forceTerminate: { events.append("kill \($0)"); kill($0, SIGKILL) },
+                    isAlive: { kill($0, 0) == 0 },
+                    wait: { Thread.sleep(forTimeInterval: $0) })
+                let immortalOutcome = BundleIntegrity.evictInstances(
+                    [pid_t(99999)], gracefulTimeout: 0.3, forceTimeout: 0.3,
+                    requestTerminate: { _ in }, forceTerminate: { _ in },
+                    isAlive: { _ in true },
+                    wait: { Thread.sleep(forTimeInterval: $0) })
+                let politeDead = kill(polite.processIdentifier, 0) != 0
+                let stubbornDead = kill(stubborn.processIdentifier, 0) != 0
+                evictionOK = outcome == .evicted(forced: [stubborn.processIdentifier])
+                    && politeDead && stubbornDead
+                    && events.first?.hasPrefix("term") == true
+                    && events.contains("kill \(stubborn.processIdentifier)")
+                    && !events.contains("kill \(polite.processIdentifier)")
+                    && immortalOutcome == .stillAlive([99999])
+                    && BundleIntegrity.evictionGracefulTimeout >= 10
+                    && BundleIntegrity.evictionMaxDuration == 15
+                evictionDetail = "outcome \(outcome) events \(events) immortal \(immortalOutcome)"
+            } catch {
+                evictionDetail = "error \(error)"
+            }
+            check("integrity-eviction-request-wait-force-verify", evictionOK, evictionDetail)
+
+            let live = BundleIntegrity.discoveredBundles()
+            check("integrity-live-discovery-headless",
+                  Bundle.main.bundleURL.pathExtension == "app"
+                    || BundleIntegrity.currentVerdict() == nil,
+                  "live \(live.count) verdict \(String(describing: BundleIntegrity.currentVerdict()))")
+        }
+
         // 0. Updater detached-shell regression ----------------------------------
         let uppercaseHash = String(repeating: "AB", count: 32)
         let normalizedUppercase = UpdateChecker.normalizedSHA256(uppercaseHash)

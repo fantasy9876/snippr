@@ -66,6 +66,14 @@ enum UpdateChecker {
             }
             return
         }
+        if let verdict = BundleIntegrity.currentVerdict(), !updateAllowed(for: verdict) {
+            if manual {
+                ToastHUD.show(
+                    "Chỉ cập nhật được bản trong /Applications — hãy mở Snippr từ đó",
+                    symbol: "exclamationmark.triangle", duration: 5)
+            }
+            return
+        }
         guard let url = URL(string: manifestURL) else { return }
         do {
             var req = URLRequest(url: url)
@@ -90,6 +98,14 @@ enum UpdateChecker {
                 ToastHUD.show("Không kiểm tra được bản mới — thử lại sau", symbol: "wifi.exclamationmark")
             }
         }
+    }
+
+    /// The updater only runs for the canonical /Applications/Snippr.app: it
+    /// swaps that path and relaunches it, so running from any other copy would
+    /// leave the user in the wrong app (with the wrong TCC identity).
+    nonisolated static func updateAllowed(for verdict: BundleIntegrity.Verdict) -> Bool {
+        if case .canonical = verdict { return true }
+        return false
     }
 
     static func isNewer(_ a: String, than b: String) -> Bool {
