@@ -439,6 +439,15 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
 
     var canvasForTesting: EditorCanvasView { canvas }
 
+    /// Slice B seam: the real toolbar buttons, in `EditorTool.allCases` order,
+    /// so a gate can assert overflow/wrap and accessibility on the production
+    /// toolbar rather than on a re-created copy.
+    var toolButtonsForTesting: [(tool: EditorTool, button: NSButton)] {
+        EditorTool.allCases.compactMap { tool in
+            toolButtons[tool].map { (tool, $0) }
+        }
+    }
+
     func selectTool(_ tool: EditorTool) {
         canvas.currentTool = tool
         let cropping = tool == .crop
@@ -681,7 +690,13 @@ final class EditorCanvasView: NSView {
         CGPoint(x: viewPoint.x * pxScale, y: viewPoint.y * pxScale)
     }
 
+    /// Slice B seam: simulates a pixelation/render failure so the gates can
+    /// prove the editor fails CLOSED (no clean base on screen, no export, no
+    /// close) instead of quietly dropping the redaction.
+    nonisolated(unsafe) static var forcePixellateFailureForTesting = false
+
     private var pixellated: CGImage? {
+        if Self.forcePixellateFailureForTesting { return nil }
         if pixellatedCache == nil {
             pixellatedCache = AnnotationRenderer.pixellate(image.cgImage, scale: pxScale)
         }

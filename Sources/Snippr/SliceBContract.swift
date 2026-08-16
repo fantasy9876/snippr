@@ -90,9 +90,39 @@ enum SliceBPhase: Int, Comparable {
     }
 }
 
+enum SliceBOCR {
+    /// Word boxes for ONE region, returned in GLOBAL bottom-left image pixels.
+    /// Vision must run on the materialized region only (a 5K x 40K stitch must
+    /// never be handed to it whole), and the boxes must be mapped back out of
+    /// the region's own coordinate space.
+    static func wordRects(base: CGImage, region: CGRect) -> [CGRect] {
+        [] // RED
+    }
+
+    /// At most this many OCR jobs may be in flight; extra requests coalesce.
+    static let maxConcurrentJobs = 2
+}
+
 enum SliceBCompositor {
     static func phase(of annotation: Annotation) -> SliceBPhase {
         .foreground // RED
+    }
+
+    /// A magnifier patch must be rebuilt when a redaction starts (or stops)
+    /// overlapping its source, or the callout would keep showing pixels the
+    /// user has just covered.
+    static func needsRebuild(
+        source: CGRect, redactions: [BlurAnnotation]
+    ) -> Bool {
+        false // RED
+    }
+
+    /// Spotlight v1 is a singleton: adding a second one replaces the first so
+    /// darkness never stacks.
+    static func applySpotlight(
+        existing: [Annotation], new: SpotlightAnnotation
+    ) -> [Annotation] {
+        existing + [new] // RED
     }
 
     /// Stable sort of annotations into phase order.
@@ -130,6 +160,18 @@ enum SliceBExport {
 
 // MARK: - Backdrop
 
+// MARK: - Toolbar symbols
+
+enum SliceBSymbols {
+    /// Never force-unwrap `NSImage(systemSymbolName:)`: a symbol missing on the
+    /// deployment target would crash while building the toolbar. Falls back to
+    /// a secondary symbol and finally to a drawn placeholder, so a button is
+    /// always visible and always labelled.
+    static func image(named symbol: String, fallback: String) -> NSImage? {
+        nil // RED
+    }
+}
+
 enum BackdropPreset: String, CaseIterable {
     case none, ocean, sunset, mint, graphite
 }
@@ -142,6 +184,14 @@ enum SliceBBackdrop {
 
     static func padding(forLongEdge edge: CGFloat) -> CGFloat {
         0 // RED
+    }
+
+    /// Backdrop is an OUTER frame: a click at `padded` must resolve to the
+    /// same source pixel it did before the backdrop existed.
+    static func sourcePoint(
+        fromPadded point: CGPoint, padding: CGFloat
+    ) -> CGPoint {
+        .zero // RED
     }
 
     /// `.none` must be byte-identical to the input; anything over budget fails

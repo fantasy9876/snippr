@@ -8208,6 +8208,262 @@ enum SelfTest {
                   "spot \(spOK)/\(spScaled) mag \(mgMoved)/\(mgScaled)")
         }
 
+        // MARK: slice B RED2 — production paths, injected failures
+        //
+        // RED0 pinned the contract; these drive the REAL editor canvas, the
+        // real AnnotationSurface and the real toolbar/key routing through
+        // injected failures, so a green here cannot be faked by a helper.
+        do {
+            func probe2(_ image: CGImage, _ x: Int, _ yBL: Int) -> (Int, Int, Int) {
+                var bytes = [UInt8](
+                    repeating: 0, count: image.width * image.height * 4)
+                guard let c = CGContext(
+                    data: &bytes, width: image.width, height: image.height,
+                    bitsPerComponent: 8, bytesPerRow: image.width * 4,
+                    space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                    bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+                else { return (-1, -1, -1) }
+                c.interpolationQuality = .none
+                c.draw(image, in: CGRect(
+                    x: 0, y: 0, width: image.width, height: image.height))
+                let y = image.height - 1 - yBL
+                guard x >= 0, x < image.width, y >= 0, y < image.height
+                else { return (-1, -1, -1) }
+                let i = (y * image.width + x) * 4
+                return (Int(bytes[i]), Int(bytes[i + 1]), Int(bytes[i + 2]))
+            }
+            func viewSnapshot(_ view: NSView) -> CGImage? {
+                guard let rep = view.bitmapImageRepForCachingDisplay(
+                    in: view.bounds) else { return nil }
+                view.cacheDisplay(in: view.bounds, to: rep)
+                return rep.cgImage
+            }
+
+            // 1. Editor preview must not show clean pixels when pixelation fails
+            let leakBase = makeNoiseImage(width: 200, height: 120)
+            let leakWC = EditorWindowController.open(
+                with: CapturedImage(cgImage: leakBase, scale: 1),
+                forceFitForTesting: true)
+            let leakCanvas = leakWC.canvasForTesting
+            // Baseline: the same canvas with nothing on it. Comparing against
+            // this instead of against the source image keeps the gate immune
+            // to view resampling — the only difference we accept is the
+            // redaction itself.
+            leakCanvas.display()
+            let cleanShot = viewSnapshot(leakCanvas)
+            let leakBlur = BlurAnnotation(uiScale: 1)
+            leakBlur.rect = CGRect(x: 20, y: 20, width: 80, height: 60)
+            leakCanvas.annotations.append(leakBlur)
+            EditorCanvasView.forcePixellateFailureForTesting = true
+            leakCanvas.needsDisplay = true
+            leakCanvas.display()
+            let leakShot = viewSnapshot(leakCanvas)
+            var coveredSame = true
+            if let clean = cleanShot, let failed = leakShot {
+                coveredSame = (0..<6).allSatisfy { i in
+                    let x = 30 + i * 8
+                    return probe2(clean, x, 50) == probe2(failed, x, 50)
+                }
+            }
+            check("sliceB2-editor-preview-failclosed",
+                  cleanShot != nil && leakShot != nil && !coveredSame,
+                  "clean \(cleanShot != nil) shot \(leakShot != nil) leaked \(coveredSame)")
+
+            // 2. A failed render must not export and must not close the editor
+            let pb = NSPasteboard.general
+            pb.clearContents()
+            pb.setString("SENTINEL-B2-COPY", forType: .string)
+            leakWC.copyImage()
+            let clipboardIntact = pb.string(forType: .string) == "SENTINEL-B2-COPY"
+            leakWC.escPressed()
+            let stillOpen = leakWC.window?.isVisible == true
+            let stateIntact = leakCanvas.annotations.count == 1
+                && leakCanvas.image.cgImage.width == 200
+            check("sliceB2-editor-transactional",
+                  clipboardIntact && stillOpen && stateIntact,
+                  "clip \(clipboardIntact) open \(stillOpen) state \(stateIntact)")
+            EditorCanvasView.forcePixellateFailureForTesting = false
+            leakWC.window?.close()
+
+            // 3. Overlay/scroll surface preview must fail closed too
+            let surfBase = makeNoiseImage(width: 160, height: 100)
+            let (rendered, surfLeak) = MainActor.assumeIsolated {
+                () -> (Bool, Bool) in
+                let surface = AnnotationSurface(pixelScale: 1)
+                let surfBlur = BlurAnnotation(uiScale: 1)
+                surfBlur.rect = CGRect(x: 30, y: 30, width: 60, height: 40)
+                surface.addAnnotationForTesting(surfBlur)
+                surface.forceRegionalPixelateFailureForTesting = true
+                let surfCtx = ctx(160, 100)
+                surfCtx.draw(
+                    surfBase, in: CGRect(x: 0, y: 0, width: 160, height: 100))
+                let ok = surface.drawForPreview(in: surfCtx, base: surfBase)
+                let shot = surfCtx.makeImage()
+                let leak = shot.map {
+                    probe2($0, 60, 50) == probe2(surfBase, 60, 50)
+                } ?? true
+                surface.forceRegionalPixelateFailureForTesting = false
+                return (ok, leak)
+            }
+            check("sliceB2-surface-preview-failclosed",
+                  !rendered && !surfLeak,
+                  "renderedAll \(rendered) leaked \(surfLeak)")
+
+            // 4. Real OCR on a region that is NOT at the origin, so a
+            //    bottom-left / top-left mix-up cannot pass.
+            let ocrCtx = ctx(300, 200)
+            ocrCtx.setFillColor(NSColor.white.cgColor)
+            ocrCtx.fill(CGRect(x: 0, y: 0, width: 300, height: 200))
+            let ocrAttrs: [NSAttributedString.Key: Any] = [
+                .font: NSFont.boldSystemFont(ofSize: 26),
+                .foregroundColor: NSColor.black,
+            ]
+            let ocrNS = NSGraphicsContext(cgContext: ocrCtx, flipped: false)
+            NSGraphicsContext.saveGraphicsState()
+            NSGraphicsContext.current = ocrNS
+            ("Nguyen 0912345678" as NSString).draw(
+                at: CGPoint(x: 60, y: 130), withAttributes: ocrAttrs)
+            NSGraphicsContext.restoreGraphicsState()
+            let ocrImage = ocrCtx.makeImage()!
+            let ocrRegion = CGRect(x: 40, y: 110, width: 240, height: 60)
+            let words = SliceBOCR.wordRects(base: ocrImage, region: ocrRegion)
+            let inRegion = !words.isEmpty && words.allSatisfy {
+                ocrRegion.insetBy(dx: -6, dy: -6).contains($0)
+            }
+            let notFlipped = !words.isEmpty && words.allSatisfy { $0.midY > 100 }
+            check("sliceB2-ocr-regional",
+                  inRegion && notFlipped,
+                  "words \(words.count) inRegion \(inRegion) notFlipped \(notFlipped)")
+
+            // 5. Text redaction on a tall stitch must pixelate the WORDS, not
+            //    the whole rect, and must never materialize the whole image.
+            let tall = makeNoiseImage(width: 400, height: 4000)
+            let tallWord = CGRect(x: 60, y: 3810, width: 40, height: 14)
+            MainActor.assumeIsolated {
+                let tallSurface = AnnotationSurface(pixelScale: 1)
+                let tallBlur = BlurAnnotation(uiScale: 1)
+                tallBlur.rect = CGRect(x: 50, y: 3800, width: 160, height: 40)
+                tallBlur.redactionState = .words([tallWord])
+                tallSurface.addAnnotationForTesting(tallBlur)
+                AnnotationSurface.regionalPixelateAllocationsForTesting = 0
+                AnnotationSurface.lastRegionalPixelateRectForTesting = nil
+                let tallCtx = ctx(400, 4000)
+                tallCtx.draw(
+                    tall, in: CGRect(x: 0, y: 0, width: 400, height: 4000))
+                _ = tallSurface.drawForPreview(in: tallCtx, base: tall)
+            }
+            let lastRect = AnnotationSurface.lastRegionalPixelateRectForTesting
+            let regionArea = (lastRect?.width ?? 0) * (lastRect?.height ?? 0)
+            let wordArea = tallWord.width * tallWord.height
+            let stayedSmall = lastRect != nil && regionArea <= wordArea * 4
+            let baseUntouched = AnnotationSurface
+                .lastRegionalPixelateBaseSizeForTesting == CGSize(
+                    width: 400, height: 4000)
+            check("sliceB2-tall-regional",
+                  stayedSmall && baseUntouched,
+                  "region \(String(describing: lastRect)) area \(regionArea) word \(wordArea) base \(String(describing: AnnotationSurface.lastRegionalPixelateBaseSizeForTesting))")
+
+            // 6. Magnifier patch invalidation vs redactions
+            let magSource = CGRect(x: 10, y: 10, width: 20, height: 20)
+            let overlapping = BlurAnnotation(uiScale: 1)
+            overlapping.rect = CGRect(x: 15, y: 15, width: 30, height: 30)
+            let faraway = BlurAnnotation(uiScale: 1)
+            faraway.rect = CGRect(x: 200, y: 200, width: 10, height: 10)
+            check("sliceB2-magnifier-rebuild",
+                  SliceBCompositor.needsRebuild(
+                    source: magSource, redactions: [overlapping])
+                    && !SliceBCompositor.needsRebuild(
+                        source: magSource, redactions: [faraway]),
+                  "overlap \(SliceBCompositor.needsRebuild(source: magSource, redactions: [overlapping])) far \(SliceBCompositor.needsRebuild(source: magSource, redactions: [faraway]))")
+
+            // 7. Backdrop keeps inner coordinates and P3/alpha on `.none`
+            let mapped = SliceBBackdrop.sourcePoint(
+                fromPadded: CGPoint(x: 90, y: 70), padding: 40)
+            let p3Space = CGColorSpace(name: CGColorSpace.displayP3)!
+            let p3ctx = CGContext(
+                data: nil, width: 30, height: 20, bitsPerComponent: 8,
+                bytesPerRow: 0, space: p3Space,
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+            p3ctx.setFillColor(NSColor.systemPink.cgColor)
+            p3ctx.fill(CGRect(x: 0, y: 0, width: 30, height: 20))
+            let p3Image = p3ctx.makeImage()!
+            let p3None = SliceBBackdrop.compose(
+                image: p3Image, preset: .none,
+                budgetBytes: SliceBExport.defaultBudgetBytes)
+            let p3Kept = p3None?.colorSpace?.name == p3Space.name
+                && p3None.map { imagesEqualForTesting($0, p3Image) } == true
+            check("sliceB2-backdrop-mapping",
+                  mapped == CGPoint(x: 50, y: 30) && p3Kept,
+                  "mapped \(mapped) p3 \(p3Kept)")
+
+            // 8. Spotlight stays a singleton and is hit by its hole
+            let spot1 = SpotlightAnnotation(uiScale: 1)
+            spot1.rect = CGRect(x: 10, y: 10, width: 40, height: 40)
+            let spot2 = SpotlightAnnotation(uiScale: 1)
+            spot2.rect = CGRect(x: 60, y: 60, width: 20, height: 20)
+            let afterSecond = SliceBCompositor.applySpotlight(
+                existing: [spot1], new: spot2)
+            check("sliceB2-spotlight-singleton",
+                  afterSecond.count == 1 && afterSecond.first === spot2
+                    && spot2.hitTest(CGPoint(x: 70, y: 70))
+                    && !spot2.hitTest(CGPoint(x: 5, y: 5)),
+                  "count \(afterSecond.count) hitHole \(spot2.hitTest(CGPoint(x: 70, y: 70))) hitOutside \(spot2.hitTest(CGPoint(x: 5, y: 5)))")
+
+            // 9. Real key routing + real toolbar + symbol fallback
+            let uiWC = EditorWindowController.open(
+                with: CapturedImage(
+                    cgImage: makeSolidImage(
+                        width: 300, height: 200, color: NSColor.gray.cgColor),
+                    scale: 1),
+                forceFitForTesting: true)
+            uiWC.window?.setContentSize(NSSize(width: 560, height: 420))
+            let uiCanvas = uiWC.canvasForTesting
+            func sliceBKey(
+                _ chars: String, _ modifiers: NSEvent.ModifierFlags = []
+            ) -> NSEvent? {
+                NSEvent.keyEvent(
+                    with: .keyDown, location: .zero, modifierFlags: modifiers,
+                    timestamp: 0,
+                    windowNumber: uiWC.window?.windowNumber ?? 0, context: nil,
+                    characters: chars, charactersIgnoringModifiers: chars,
+                    isARepeat: false, keyCode: 0)
+            }
+            func toolAfter(
+                _ chars: String, _ modifiers: NSEvent.ModifierFlags = []
+            ) -> String {
+                guard let event = sliceBKey(chars, modifiers) else { return "" }
+                uiCanvas.keyDown(with: event)
+                return uiCanvas.currentTool.tooltip
+            }
+            let dTool = toolAfter("d")
+            let sTool = toolAfter("s")
+            let mTool = toolAfter("m")
+            let shiftBTool = toolAfter("b", .shift)
+            let bTool = toolAfter("b")
+            let keyRouting = dTool.hasPrefix("Backdrop")
+                && sTool.hasPrefix("Spotlight")
+                && mTool.hasPrefix("Magnifier")
+                && shiftBTool.hasPrefix("Pixelate text")
+                && bTool == "Pixelate (B)"
+            let buttons = uiWC.toolButtonsForTesting
+            let barWidth = uiWC.window?.contentView?.bounds.width ?? 0
+            let allVisible = buttons.count == 15 && buttons.allSatisfy {
+                let f = $0.button.convert($0.button.bounds, to: nil)
+                return f.width > 0 && f.maxX <= barWidth + 0.5 && f.minX >= -0.5
+            }
+            let labelled = buttons.allSatisfy {
+                !($0.button.toolTip ?? "").isEmpty
+                    && !($0.button.image?.accessibilityDescription ?? "").isEmpty
+            }
+            let fallbackImage = SliceBSymbols.image(
+                named: "snippr.definitely.missing.symbol",
+                fallback: "questionmark.square.dashed")
+            uiWC.window?.close()
+            check("sliceB2-ui-keys-toolbar",
+                  keyRouting && allVisible && labelled && fallbackImage != nil,
+                  "keys d=\(dTool) s=\(sTool) m=\(mTool) shiftB=\(shiftBTool) b=\(bTool) buttons \(buttons.count) visible \(allVisible) labelled \(labelled) fallback \(fallbackImage != nil)")
+        }
+
         print(failures == 0 ? "ALL TESTS PASSED" : "\(failures) TEST(S) FAILED")
         print("Artifacts: \(outputDir)")
         return failures == 0 ? 0 : 1

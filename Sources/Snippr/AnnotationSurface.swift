@@ -378,6 +378,13 @@ final class AnnotationSurface {
     /// Test hook: regional pixelation must fail closed during export.
     var forceRegionalPixelateFailureForTesting = false
 
+    /// Slice B seam: lets a gate seed any annotation model (a text-mode
+    /// redaction, a spotlight) through the real history path before the
+    /// toolbar routes the tool.
+    func addAnnotationForTesting(_ annotation: Annotation) {
+        appendNewAnnotation(annotation)
+    }
+
     /// Inserts the editor's existing BlurAnnotation model so the S2 RED gate
     /// can exercise rendering/allocation before the toolbar routes the tool.
     func addBlurForTesting(rect: CGRect) {

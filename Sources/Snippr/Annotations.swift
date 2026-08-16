@@ -347,6 +347,16 @@ final class CounterAnnotation: Annotation {
 final class BlurAnnotation: Annotation {
     var rect: CGRect = .zero
 
+    /// Slice B: rect pixelate today, text-only pixelate once the compositor
+    /// lands. `.rect` keeps the existing behaviour.
+    var redactionState: RedactionState = .rect
+
+    /// Bumped whenever the annotation is edited, so a late OCR result can tell
+    /// it is answering a question nobody is asking any more.
+    private(set) var redactionGeneration = 0
+
+    func bumpRedactionGeneration() { redactionGeneration += 1 }
+
     override var bounds: CGRect { rect }
 
     override func draw(in ctx: CGContext, pixellated: CGImage?) {
