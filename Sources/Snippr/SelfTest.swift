@@ -9794,6 +9794,18 @@ enum SelfTest {
             // every test above while silently clobbering any overlapping
             // scope, so the scoping is asserted directly — nested and across
             // threads, for both the budget and the toast recorder.
+            //
+            // Scope of the timeouts below: they guard against a worker that is
+            // merely SLOW, so a busy machine reports a failure instead of
+            // stalling. They do NOT turn a deadlock into a failure. If a
+            // worker were to hang while holding the budget or message lock,
+            // this thread would block on its next read, its next toast or its
+            // own scope unwind, and no in-process timeout can prevent that;
+            // proving hang-safety would need a probe in a subprocess that can
+            // be terminated. Both stacks lock only around a dictionary
+            // mutation and call nothing while holding the lock, so the
+            // deadlock this cannot catch is one the code cannot currently
+            // produce — but the gate should not be read as ruling it out.
             var scopeFailures: [String] = []
             let realBudget = SliceBExport.defaultBudgetBytes
             SliceBExport.withBudgetForTesting(5_000_000) {
@@ -9827,9 +9839,10 @@ enum SelfTest {
                     workerDepth = SliceBExport.budgetScopeDepthForTesting
                 }
                 if other.wait(timeout: .now() + 5) == .timedOut {
-                    // The worker may still be writing these, so they are not
-                    // read at all on this path — a timeout is a failure, not a
-                    // reason to race it for a second one.
+                    // A slow worker, as far as this can tell. The captured
+                    // variables are not read on this path: the worker may
+                    // still be writing them, and a timeout is a failure
+                    // already, not a reason to race for a second one.
                     scopeFailures.append("cross-timeout")
                 } else if seen != realBudget || seenInner != 2_000_000
                     || seenAfter != realBudget || workerDepth != 0 {
