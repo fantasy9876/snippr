@@ -8580,6 +8580,10 @@ enum SelfTest {
 
             // B. A late OCR result never narrows a mask after a real edit, and
             //    never leaves the annotation pending forever.
+            final class CountingRedactionHost: RedactionHost {
+                var repaints = 0
+                func redactionDidChange() { repaints += 1 }
+            }
             let word = CGRect(x: 25, y: 25, width: 20, height: 10)
             var raceFailures: [String] = []
             var redrawCounts: [String: Int] = [:]
@@ -8595,12 +8599,12 @@ enum SelfTest {
                 blur.rect = CGRect(x: 20, y: 20, width: 60, height: 40)
                 canvas.annotations = [blur]
                 return MainActor.assumeIsolated { () -> RedactionState in
-                    var redraws = 0
+                    let host = CountingRedactionHost()
                     let job = SliceBRedactionJob.pendingForTesting(
-                        blur: blur, redraw: { redraws += 1 })
+                        blur: blur, host: host)
                     mutate(wc, canvas, blur)
                     job.deliver([word])
-                    redrawCounts[label] = redraws
+                    redrawCounts[label] = host.repaints
                     let state = blur.redactionState
                     wc.window?.close()
                     return state
@@ -8663,7 +8667,7 @@ enum SelfTest {
                     let blur = BlurAnnotation(uiScale: 1)
                     blur.rect = CGRect(x: 5, y: 5, width: 40, height: 20)
                     _ = SliceBRedactionJob.start(
-                        blur: blur, base: queueBase, redraw: {})
+                        blur: blur, base: queueBase, host: nil)
                     states.append(blur.redactionState)
                 }
                 return states
@@ -8821,9 +8825,11 @@ enum SelfTest {
 
             // E3. Real blocking jobs: ownership, slot accounting and host
             //     lifetime, driven through the production `start` path.
-            final class RedrawHost {
+            // Host passed by value the way production will: no `[weak]` in the
+            // test, so the weakness has to come from the API itself.
+            final class RedrawHost: RedactionHost {
                 var count = 0
-                func touch() { count += 1 }
+                func redactionDidChange() { count += 1 }
             }
             let ownershipBase = makeSolidImage(
                 width: 120, height: 90, color: NSColor.white.cgColor)
@@ -8847,7 +8853,7 @@ enum SelfTest {
                     SliceBRedactionJob.ownerCountForTesting
                 }
             }
-            var hostRef: RedrawHost? = RedrawHost()
+            var hostRef: RedrawHost? = MainActor.assumeIsolated { RedrawHost() }
             weak var weakHost = hostRef
             let blurA = BlurAnnotation(uiScale: 1)
             blurA.rect = CGRect(x: 10, y: 10, width: 60, height: 40)
@@ -8857,11 +8863,9 @@ enum SelfTest {
                 // Two starts on the SAME annotation: the first loses ownership
                 // immediately but keeps its physical slot until it finishes.
                 let first = SliceBRedactionJob.start(
-                    blur: blurA, base: ownershipBase,
-                    redraw: { [weak hostRef] in hostRef?.touch() })
+                    blur: blurA, base: ownershipBase, host: hostRef)
                 let second = SliceBRedactionJob.start(
-                    blur: blurA, base: ownershipBase,
-                    redraw: { [weak hostRef] in hostRef?.touch() })
+                    blur: blurA, base: ownershipBase, host: hostRef)
                 if first == nil || second == nil {
                     ownershipFailures.append("start-refused")
                 }
@@ -8871,7 +8875,7 @@ enum SelfTest {
                 }
                 // Cap is now full: a third start must fail closed.
                 let third = SliceBRedactionJob.start(
-                    blur: blurB, base: ownershipBase, redraw: {})
+                    blur: blurB, base: ownershipBase, host: nil)
                 if third != nil { ownershipFailures.append("cap-not-enforced") }
                 if blurB.redactionState != .fallbackFull {
                     ownershipFailures.append("refused-not-masked")

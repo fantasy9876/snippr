@@ -116,7 +116,7 @@ enum OverlayAnnotationTool: String, CaseIterable {
 /// (QA invariant 24). Reuses the editor's `Annotation` model and renderer so
 /// the two surfaces cannot drift.
 @MainActor
-final class AnnotationSurface {
+final class AnnotationSurface: RedactionHost {
     /// Tests replace this before constructing a surface. Production callers
     /// leave it nil and therefore share the editor's Settings-backed store.
     static var strokeWidthStoreOverrideForTesting: OverlayStrokeWidthStore?
@@ -299,6 +299,14 @@ final class AnnotationSurface {
 
     /// Annotation-only two-stack history. The exact model object moves between
     /// stacks; no clone is needed because overlays do not edit old marks.
+    /// Hosts install this so a finished OCR job repaints the right surface.
+    var redactionDidChangeHandler: (() -> Void)?
+
+    func redactionDidChange() { redactionDidChangeHandler?() }
+
+    /// Gate visibility: a finished run must leave the registry empty.
+    var redactionJobCountForTesting: Int { redactionJobs.count }
+
     /// Jobs owned by this surface, keyed by the annotation they answer.
     private var redactionJobs: [ObjectIdentifier: SliceBRedactionJob] = [:]
 

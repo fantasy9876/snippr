@@ -52,9 +52,12 @@ enum SliceBRedaction {
             return [rect]
         case let .words(words):
             // Same rule as `resolvedWords`: one bad box and everything goes
-            // back to the full rect. Never mask "the valid subset".
+            // back to the full rect. Never mask "the valid subset". A box that
+            // is not entirely inside the annotation is bad too — clipping it
+            // would silently uncover whatever hangs outside.
             guard !words.isEmpty,
-                  words.allSatisfy({ $0.isValidMaskRect })
+                  words.allSatisfy({ $0.isValidMaskRect }),
+                  words.allSatisfy({ rect.insetBy(dx: -0.5, dy: -0.5).contains($0) })
             else { return [rect] }
             return words
         }
@@ -658,6 +661,14 @@ enum SliceBBackdrop {
 /// narrows once a live result lands. A result whose generation no longer
 /// matches the annotation (undo, redo, delete, move, crop, resize, save-lock,
 /// close) is dropped: it is answering a question nobody is asking any more.
+/// The surface (or window) that owns a redaction and repaints when its mask
+/// changes. Jobs hold this WEAKLY by construction: there is no way to hand a
+/// job a closure that captures the host strongly.
+@MainActor
+protocol RedactionHost: AnyObject {
+    func redactionDidChange()
+}
+
 @MainActor
 final class SliceBRedactionJob {
     private weak var blur: BlurAnnotation?  // cleared on cancel
@@ -665,9 +676,9 @@ final class SliceBRedactionJob {
     /// weak reference has gone nil, or a dead job would hold the slot forever.
     private let annotationID: ObjectIdentifier
     private let generation: Int
-    /// Cleared on every terminal path so a completed/cancelled job cannot keep
-    /// its host (and therefore the full capture) alive.
-    private var redraw: () -> Void
+    /// Weak by construction: a finished or cancelled job can never keep its
+    /// host (and therefore the whole capture) alive.
+    private weak var host: RedactionHost?
     private var delivered = false
     private var cancelled = false
     private var holdsSlot = false
@@ -688,12 +699,12 @@ final class SliceBRedactionJob {
     private(set) static var inFlight = 0
 
     private init(
-        blur: BlurAnnotation, generation: Int, redraw: @escaping () -> Void
+        blur: BlurAnnotation, generation: Int, host: RedactionHost?
     ) {
         self.blur = blur
         self.annotationID = ObjectIdentifier(blur)
         self.generation = generation
-        self.redraw = redraw
+        self.host = host
     }
 
     /// Give up the owner slot, but only if it is still ours. Safe to call when
@@ -713,8 +724,7 @@ final class SliceBRedactionJob {
 
     @discardableResult
     static func start(
-        blur: BlurAnnotation, base: CGImage,
-        redraw: @escaping () -> Void
+        blur: BlurAnnotation, base: CGImage, host: RedactionHost?
     ) -> SliceBRedactionJob? {
         // A new request for the same annotation invalidates the old one.
         owners.removeValue(forKey: ObjectIdentifier(blur))?.cancel()
@@ -724,13 +734,13 @@ final class SliceBRedactionJob {
               let patch = SliceBOCR.patch(base: base, region: blur.rect)
         else {
             blur.redactionState = .fallbackFull
-            redraw()
+            host?.redactionDidChange()
             return nil
         }
         blur.redactionState = .pendingFull
-        redraw()
+        host?.redactionDidChange()
         let job = SliceBRedactionJob(
-            blur: blur, generation: blur.redactionGeneration, redraw: redraw)
+            blur: blur, generation: blur.redactionGeneration, host: host)
         job.holdsSlot = true
         owners[ObjectIdentifier(blur)] = job
         inFlight += 1
@@ -757,10 +767,10 @@ final class SliceBRedactionJob {
         blur = nil
         let finish = onComplete
         onComplete = nil
-        let notify = redraw
-        redraw = {}  // drop the owner reference: no late redraw after cancel
+        let notify = host
+        host = nil   // drop the host: no late repaint after cancel
         finish?(self)
-        notify()
+        notify?.redactionDidChange()
     }
 
     /// Applies a result. Safe to call from a gate directly; production calls it
@@ -778,10 +788,10 @@ final class SliceBRedactionJob {
         let finish = onComplete
         onComplete = nil
         defer {
-            let notify = redraw
-            redraw = {}   // never keep the host alive past completion
+            let notify = host
+            host = nil    // never reference the host past completion
             finish?(self)
-            notify()
+            notify?.redactionDidChange()
         }
         guard !cancelled, wasOwner, let blur,
               blur.redactionState == .pendingFull
@@ -797,11 +807,11 @@ final class SliceBRedactionJob {
     /// Test seam: a job that has not been enqueued, so a gate can land a
     /// result at an exact moment relative to an edit.
     static func pendingForTesting(
-        blur: BlurAnnotation, redraw: @escaping () -> Void = {}
+        blur: BlurAnnotation, host: RedactionHost? = nil
     ) -> SliceBRedactionJob {
         blur.redactionState = .pendingFull
         let job = SliceBRedactionJob(
-            blur: blur, generation: blur.redactionGeneration, redraw: redraw)
+            blur: blur, generation: blur.redactionGeneration, host: host)
         // Same ownership rule as a real job: whoever started last owns the
         // annotation, and only the owner may apply a result.
         owners[ObjectIdentifier(blur)]?.cancel()
