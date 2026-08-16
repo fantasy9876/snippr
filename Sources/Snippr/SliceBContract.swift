@@ -477,13 +477,12 @@ enum SliceBCompositor {
         ctx.draw(crop, in: CGRect(x: 0, y: 0, width: w, height: h))
         // Draw the overlapping redactions in the patch's own space.
         ctx.translateBy(x: -region.minX, y: -region.minY)
+        RenderTrace.record(
+            kind: "destination", destination: "\(w)x\(h)", rect: region)
         guard draw(
             overlapping, in: ctx, base: base, visiblePixels: region)
         else { return nil }
-        guard let patch = ctx.makeImage() else { return nil }
-        RenderTrace.record(
-            kind: "destination", destination: "\(w)x\(h)", rect: region)
-        return patch
+        return ctx.makeImage()
     }
 
     /// A magnifier patch must be rebuilt when a redaction starts (or stops)
@@ -528,17 +527,18 @@ enum SliceBExport {
             space: base.colorSpace ?? CGColorSpace(name: CGColorSpace.sRGB)!,
             bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
         else { return nil }
+        // The destination buffer HAS been allocated at this point, even if the
+        // render later fails — the trace must say so.
+        RenderTrace.record(
+            kind: "destination", destination: "\(w)x\(h)",
+            rect: CGRect(x: 0, y: 0, width: w, height: h))
         ctx.draw(base, in: CGRect(x: 0, y: 0, width: w, height: h))
         guard SliceBCompositor.draw(
             annotations, in: ctx, base: base,
             visiblePixels: CGRect(x: 0, y: 0, width: w, height: h),
             pixelScale: pixelScale)
         else { return nil }
-        guard let out = ctx.makeImage() else { return nil }
-        RenderTrace.record(
-            kind: "destination", destination: "\(w)x\(h)",
-            rect: CGRect(x: 0, y: 0, width: w, height: h))
-        return out
+        return ctx.makeImage()
     }
 
     /// 256 MP * 4 bytes, matching slice A's resize cap.

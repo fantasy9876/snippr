@@ -7091,10 +7091,10 @@ enum SelfTest {
                     < CGFloat(pixelBase.width * pixelBase.height) / 10
                 && AnnotationSurface.flattenAllocationsForTesting
                     == pixelDestBefore + 1
-            pixelSurface.forceRegionalPixelateFailureForTesting = true
-            let regionalFailed = pixelSurface.flattened(
-                base: pixelBase, cropPixels: pixelCrop) == nil
-            pixelSurface.forceRegionalPixelateFailureForTesting = false
+            let regionalFailed = AnnotationRenderer.withForcedRegionalFailure {
+                pixelSurface.flattened(
+                    base: pixelBase, cropPixels: pixelCrop) == nil
+            }
             check("overlay9-pixelate-regional-s2",
                   previewPixelsOK && regionalPixelsOK
                     && regionalAllocOK && regionalFailed
@@ -8255,10 +8255,12 @@ enum SelfTest {
             let leakBlur = BlurAnnotation(uiScale: 1)
             leakBlur.rect = CGRect(x: 20, y: 20, width: 80, height: 60)
             leakCanvas.annotations.append(leakBlur)
-            EditorCanvasView.forcePixellateFailureForTesting = true
-            leakCanvas.needsDisplay = true
-            leakCanvas.display()
-            let leakShot = viewSnapshot(leakCanvas)
+            let leakShot = AnnotationRenderer.withForcedRegionalFailure {
+                () -> CGImage? in
+                leakCanvas.needsDisplay = true
+                leakCanvas.display()
+                return viewSnapshot(leakCanvas)
+            }
             var coveredSame = true
             if let clean = cleanShot, let failed = leakShot {
                 coveredSame = (0..<6).allSatisfy { i in
@@ -8274,16 +8276,19 @@ enum SelfTest {
             let pb = NSPasteboard.general
             pb.clearContents()
             pb.setString("SENTINEL-B2-COPY", forType: .string)
-            leakWC.copyImage()
+            AnnotationRenderer.withForcedRegionalFailure {
+                leakWC.copyImage()
+            }
             let clipboardIntact = pb.string(forType: .string) == "SENTINEL-B2-COPY"
-            leakWC.escPressed()
+            AnnotationRenderer.withForcedRegionalFailure {
+                leakWC.escPressed()
+            }
             let stillOpen = leakWC.window?.isVisible == true
             let stateIntact = leakCanvas.annotations.count == 1
                 && leakCanvas.image.cgImage.width == 200
             check("sliceB2-editor-transactional",
                   clipboardIntact && stillOpen && stateIntact,
                   "clip \(clipboardIntact) open \(stillOpen) state \(stateIntact)")
-            EditorCanvasView.forcePixellateFailureForTesting = false
             leakWC.window?.close()
 
             // 3. Overlay/scroll surface preview must fail closed too
@@ -8294,16 +8299,16 @@ enum SelfTest {
                 let surfBlur = BlurAnnotation(uiScale: 1)
                 surfBlur.rect = CGRect(x: 30, y: 30, width: 60, height: 40)
                 surface.addAnnotationForTesting(surfBlur)
-                surface.forceRegionalPixelateFailureForTesting = true
                 let surfCtx = ctx(160, 100)
                 surfCtx.draw(
                     surfBase, in: CGRect(x: 0, y: 0, width: 160, height: 100))
-                let ok = surface.drawForPreview(in: surfCtx, base: surfBase)
+                let ok = AnnotationRenderer.withForcedRegionalFailure {
+                    surface.drawForPreview(in: surfCtx, base: surfBase)
+                }
                 let shot = surfCtx.makeImage()
                 let leak = shot.map {
                     probe2($0, 60, 50) == probe2(surfBase, 60, 50)
                 } ?? true
-                surface.forceRegionalPixelateFailureForTesting = false
                 return (ok, leak)
             }
             check("sliceB2-surface-preview-failclosed",
@@ -8879,13 +8884,13 @@ enum SelfTest {
                 () -> (Bool, Bool) in
                 let surface = AnnotationSurface(pixelScale: 1)
                 surface.addAnnotationForTesting(glyphBlur)
-                surface.forceRegionalPixelateFailureForTesting = true
                 let white = makeSolidImage(
                     width: 200, height: 120, color: NSColor.white.cgColor)
                 let c = ctx(200, 120)
                 c.draw(white, in: CGRect(x: 0, y: 0, width: 200, height: 120))
-                _ = surface.drawForPreview(in: c, base: white)
-                surface.forceRegionalPixelateFailureForTesting = false
+                AnnotationRenderer.withForcedRegionalFailure {
+                    _ = surface.drawForPreview(in: c, base: white)
+                }
                 guard let shot = c.makeImage() else { return (false, true) }
                 func isCover(_ x: Int, _ y: Int) -> Bool {
                     let p = probe3(shot, x, y)
@@ -9159,14 +9164,17 @@ enum SelfTest {
                 let blur = BlurAnnotation(uiScale: 1)
                 blur.rect = gridMask
                 surface.addAnnotationForTesting(blur)
-                surface.forceRegionalPixelateFailureForTesting = true
                 let c = ctx(240, 160)
                 c.draw(gridBase, in: CGRect(x: 0, y: 0, width: 240, height: 160))
-                let ok = surface.drawForPreview(in: c, base: gridBase)
-                let exported = surface.flattened(
-                    base: gridBase,
-                    cropPixels: CGRect(x: 0, y: 0, width: 240, height: 160))
-                surface.forceRegionalPixelateFailureForTesting = false
+                let (ok, exported) = AnnotationRenderer.withForcedRegionalFailure {
+                    () -> (Bool, CGImage?) in
+                    let drew = surface.drawForPreview(in: c, base: gridBase)
+                    let out = surface.flattened(
+                        base: gridBase,
+                        cropPixels: CGRect(
+                            x: 0, y: 0, width: 240, height: 160))
+                    return (drew, out)
+                }
                 if ok { gridFailures.append("surface:claimed-ok") }
                 if exported != nil { gridFailures.append("surface:exported") }
                 guard let shot = c.makeImage() else {
@@ -9201,11 +9209,11 @@ enum SelfTest {
                 let blur = BlurAnnotation(uiScale: 1)
                 blur.rect = gridMask
                 canvas.annotations = [blur]
-                EditorCanvasView.forcePixellateFailureForTesting = true
-                canvas.display()
-                let shot = gridSnapshot(canvas)
-                let exported = canvas.flattened()
-                EditorCanvasView.forcePixellateFailureForTesting = false
+                let (shot, exported) = AnnotationRenderer
+                    .withForcedRegionalFailure { () -> (CGImage?, CapturedImage?) in
+                        canvas.display()
+                        return (gridSnapshot(canvas), canvas.flattened())
+                    }
                 if exported != nil { problems.append("editor:exported") }
                 if let shot {
                     for x in stride(from: Int(gridMask.minX) + 2,
@@ -9304,7 +9312,9 @@ enum SelfTest {
             }
             let hostFrozen = CapturedImage(
                 cgImage: makeNoiseImage(width: 240, height: 180), scale: 1)
-            let hostSelection = CGRect(x: 20, y: 20, width: 200, height: 140)
+            // Asymmetric in Y (20 + 110 != 180 - 20) so a top-left/bottom-left
+            // mix-up cannot survive the dimension and pixel checks.
+            let hostSelection = CGRect(x: 20, y: 30, width: 200, height: 110)
             let hostMask = CGRect(x: 60, y: 50, width: 80, height: 50)
 
             /// Rasterize once; comparing pixel by pixel through a helper that
@@ -9413,8 +9423,18 @@ enum SelfTest {
                 if failEvents.contains(where: { $0.kind == "regionalMaterialized" }) {
                     hostFailures.append("area:materialized-on-failure")
                 }
-                if failEvents.contains(where: { $0.kind == "destination" }) {
-                    hostFailures.append("area:destination-on-failure")
+                // The destination buffer really was allocated before the
+                // redaction failed, so it MUST appear exactly once.
+                if failEvents.filter({ $0.kind == "destination" }).count != 1 {
+                    hostFailures.append("area:fail-destinations")
+                }
+                if failEvents.count != 2 {
+                    hostFailures.append("area:fail-vector \(failEvents.count)")
+                }
+                if failEvents.contains(where: {
+                    $0.host != "area" || $0.path != "export"
+                }) {
+                    hostFailures.append("area:fail-attribution")
                 }
                 if let attempt = attempts.first,
                    !(hostMask.contains(attempt.rect)
@@ -9441,6 +9461,23 @@ enum SelfTest {
                 }
                 if okEvents.filter({ $0.kind == "destination" }).count != 1 {
                     hostFailures.append("area:destinations")
+                }
+                let okAttempts = okEvents.filter { $0.kind == "regionalAttempt" }
+                if okAttempts.count != 1
+                    || !(okAttempts.first.map { hostMask.contains($0.rect) } ?? false) {
+                    hostFailures.append("area:ok-attempt \(okAttempts.count)")
+                }
+                if okEvents.count != 3 {
+                    hostFailures.append("area:ok-vector \(okEvents.count)")
+                }
+                if okEvents.contains(where: {
+                    $0.host != "area" || $0.path != "export"
+                }) {
+                    hostFailures.append("area:ok-attribution")
+                }
+                if toasts < 1 { hostFailures.append("area:no-toast") }
+                if overlay.session.phase != .completed {
+                    hostFailures.append("area:not-completed \(overlay.session.phase)")
                 }
                 guard let shot = exported?.cgImage else {
                     hostFailures.append("area:no-export")

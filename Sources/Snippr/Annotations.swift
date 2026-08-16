@@ -660,16 +660,13 @@ enum AnnotationRenderer {
     /// The ONE seam a gate injects failure at. Both surfaces and the editor
     /// reach pixelation through here, so a forced failure exercises the real
     /// fail-closed path instead of a host-level shortcut that draws its own
-    /// cover.
-    nonisolated(unsafe) static var forceRegionalPixelateFailureForTesting = false
+    /// cover. There is no raw setter: scopes are token-owned.
+    static var forceRegionalPixelateFailureForTesting: Bool {
+        ForcedRegionalFailure.isActive
+    }
 
-    /// Scoped failure injection: a gate cannot forget to reset it, and one
-    /// gate can never leak the flag into the next.
     static func withForcedRegionalFailure<T>(_ body: () -> T) -> T {
-        let prior = forceRegionalPixelateFailureForTesting
-        forceRegionalPixelateFailureForTesting = true
-        defer { forceRegionalPixelateFailureForTesting = prior }
-        return body()
+        ForcedRegionalFailure.scoped(body)
     }
 
     static func pixellateRegion(
@@ -743,9 +740,11 @@ struct RenderTraceEvent: Equatable {
     let rect: CGRect
 }
 
-/// Token-owned scoped instrumentation. Frames are pushed and popped under a
-/// lock and identified by token, so nested or overlapping captures cannot
-/// clobber each other's state — the previous raw set/reset could.
+/// Token-owned scoped instrumentation, per thread.
+///
+/// A single process-global "innermost frame" mis-attributes events when two
+/// captures overlap on different threads, so each thread owns its own stack and
+/// an event is routed to that thread's current token.
 final class RenderTraceToken {
     fileprivate var events: [RenderTraceEvent] = []
     fileprivate let host: String
@@ -758,14 +757,18 @@ final class RenderTraceToken {
 }
 
 enum RenderTrace {
-    nonisolated(unsafe) private static var stack: [RenderTraceToken] = []
+    nonisolated(unsafe) private static var stacks:
+        [ObjectIdentifier: [RenderTraceToken]] = [:]
     private static let lock = NSLock()
 
-    /// Records into the innermost active frame. No frame -> no recording.
+    private static var threadKey: ObjectIdentifier {
+        ObjectIdentifier(Thread.current)
+    }
+
     static func record(kind: String, destination: String, rect: CGRect) {
         lock.lock()
         defer { lock.unlock() }
-        guard let frame = stack.last else { return }
+        guard let frame = stacks[threadKey]?.last else { return }
         frame.events.append(RenderTraceEvent(
             host: frame.host, path: frame.path, kind: kind,
             destination: destination, rect: rect))
@@ -775,13 +778,16 @@ enum RenderTrace {
         host: String, path: String, _ body: () -> T
     ) -> (result: T, events: [RenderTraceEvent]) {
         let token = RenderTraceToken(host: host, path: path)
+        let key = threadKey
         lock.lock()
-        stack.append(token)
+        stacks[key, default: []].append(token)
         lock.unlock()
         defer {
             lock.lock()
-            if let index = stack.lastIndex(where: { $0 === token }) {
+            if var stack = stacks[key],
+               let index = stack.lastIndex(where: { $0 === token }) {
                 stack.remove(at: index)
+                stacks[key] = stack.isEmpty ? nil : stack
             }
             lock.unlock()
         }
@@ -792,3 +798,34 @@ enum RenderTrace {
         return (value, captured)
     }
 }
+
+/// Forced-failure scope, owned by tokens rather than a raw Bool: overlapping
+/// scopes cannot switch each other off, and an early return cannot leak one.
+enum ForcedRegionalFailure {
+    nonisolated(unsafe) private static var tokens: Set<ObjectIdentifier> = []
+    private static let lock = NSLock()
+
+    static var isActive: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return !tokens.isEmpty
+    }
+
+    fileprivate final class Token {}
+
+    static func scoped<T>(_ body: () -> T) -> T {
+        let token = Token()
+        let id = ObjectIdentifier(token)
+        lock.lock()
+        tokens.insert(id)
+        lock.unlock()
+        defer {
+            lock.lock()
+            tokens.remove(id)
+            lock.unlock()
+            _ = token
+        }
+        return body()
+    }
+}
+

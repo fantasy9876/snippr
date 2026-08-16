@@ -431,9 +431,11 @@ final class AnnotationSurface: RedactionHost, RedactionJobObserver {
     /// Test hook kept for the S2 gates: it now drives the SHARED low-level
     /// seam, so preview and export take the same fail-closed path production
     /// would take if Core Image really failed.
+    /// Read-only view of the shared token-owned scope. There is deliberately
+    /// no setter: gates enter the scope with
+    /// `AnnotationRenderer.withForcedRegionalFailure { }`.
     var forceRegionalPixelateFailureForTesting: Bool {
-        get { AnnotationRenderer.forceRegionalPixelateFailureForTesting }
-        set { AnnotationRenderer.forceRegionalPixelateFailureForTesting = newValue }
+        AnnotationRenderer.forceRegionalPixelateFailureForTesting
     }
 
     /// Slice B seam: lets a gate seed any annotation model (a text-mode
@@ -489,12 +491,11 @@ final class AnnotationSurface: RedactionHost, RedactionJobObserver {
             x: crop.minX,
             y: CGFloat(base.height) - crop.maxY,
             width: crop.width, height: crop.height)
+        RenderTrace.record(
+            kind: "destination", destination: "\(width)x\(height)", rect: crop)
         guard drawAnnotations(
             in: ctx, base: base, visiblePixels: visibleBL)
         else { return nil }
-        guard let out = ctx.makeImage() else { return nil }
-        RenderTrace.record(
-            kind: "destination", destination: "\(width)x\(height)", rect: crop)
-        return out
+        return ctx.makeImage()
     }
 }

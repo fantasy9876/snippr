@@ -776,8 +776,7 @@ final class EditorCanvasView: NSView {
     /// editor takes production's fail-closed path (no clean base on screen, no
     /// export, no close) rather than a canvas-only shortcut.
     static var forcePixellateFailureForTesting: Bool {
-        get { AnnotationRenderer.forceRegionalPixelateFailureForTesting }
-        set { AnnotationRenderer.forceRegionalPixelateFailureForTesting = newValue }
+        AnnotationRenderer.forceRegionalPixelateFailureForTesting
     }
 
     private var pixellated: CGImage? {
