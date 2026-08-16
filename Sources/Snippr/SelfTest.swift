@@ -9427,6 +9427,235 @@ enum SelfTest {
             Settings.shared.escCopy = lockEscCopyBefore
             Settings.shared.escSave = lockEscSaveBefore
             Settings.shared.confirmationStyle = lockStyleBefore
+            // D. The padded PREVIEW: what the user reviews has to be the
+            //    thing that gets exported, at every scale.
+            var previewFailures: [String] = []
+            func previewCase(
+                _ label: String, width: Int, height: Int, scale: CGFloat,
+                preset: BackdropPreset
+            ) {
+                // A distinctive block near the source origin, so the export can
+                // be asked WHERE the document landed instead of only how big
+                // the result is.
+                let ctx = CGContext(
+                    data: nil, width: width, height: height,
+                    bitsPerComponent: 8, bytesPerRow: 0,
+                    space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                    bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+                ctx.setFillColor(NSColor.white.cgColor)
+                ctx.fill(CGRect(x: 0, y: 0, width: width, height: height))
+                ctx.setFillColor(NSColor.black.cgColor)
+                ctx.fill(CGRect(x: 0, y: 0, width: 4, height: 4))
+                let base = ctx.makeImage()!
+                let wc = EditorWindowController.open(
+                    with: CapturedImage(cgImage: base, scale: scale),
+                    forceFitForTesting: true)
+                let canvas = wc.canvasForTesting
+                if preset != .none, !canvas.applyBackdrop(preset) {
+                    previewFailures.append(label + ":apply")
+                }
+                let layout = canvas.backdropLayout
+                guard let wrapper = wc.documentWrapperForTesting else {
+                    previewFailures.append(label + ":no-wrapper")
+                    wc.window?.close()
+                    return
+                }
+                // Wrapper, canvas placement and the layout are one description.
+                if wrapper.frame.size != layout.outerPointSize
+                    || wrapper.layout != layout {
+                    previewFailures.append(
+                        label + ":wrapper \(wrapper.frame.size)")
+                }
+                if canvas.frame.origin != layout.innerPointRect.origin
+                    || canvas.frame.size != layout.innerPointSize {
+                    previewFailures.append(label + ":canvas \(canvas.frame)")
+                }
+                if preset == .none && !layout.isCollapsed {
+                    previewFailures.append(label + ":not-collapsed")
+                }
+                // The badge reports the exported size, in points.
+                let expectedBadge =
+                    "\(Int(layout.outerPointSize.width))×"
+                    + "\(Int(layout.outerPointSize.height))pt"
+                if wc.sizeBadgeTitleForTesting != expectedBadge {
+                    previewFailures.append(
+                        label + ":badge " + wc.sizeBadgeTitleForTesting)
+                }
+                // Fit has to bring the WHOLE frame inside the viewport.
+                wc.fitImageToWindow()
+                let viewport = wc.scrollViewportForTesting
+                let shown = CGSize(
+                    width: layout.outerPointSize.width
+                        * wc.scrollMagnificationForTesting,
+                    height: layout.outerPointSize.height
+                        * wc.scrollMagnificationForTesting)
+                if viewport.width > 2, viewport.height > 2,
+                   shown.width > viewport.width + 0.5
+                    || shown.height > viewport.height + 0.5 {
+                    previewFailures.append(
+                        label + ":fit \(shown) in \(viewport)")
+                }
+                // The frame is decoration: a click out in the padding belongs
+                // to nothing, and must not fall through to the canvas.
+                if !layout.isCollapsed {
+                    let inPadding = CGPoint(
+                        x: layout.padPoints / 2, y: layout.padPoints / 2)
+                    if wrapper.hitTest(inPadding) != nil {
+                        previewFailures.append(label + ":padding-hit")
+                    }
+                }
+                let insideWrapper = CGPoint(
+                    x: layout.padPoints + 3, y: layout.padPoints + 5)
+                if wrapper.hitTest(insideWrapper) !== canvas {
+                    previewFailures.append(label + ":inside-hit")
+                }
+                // ... and the point it maps to is the source point it covers,
+                // with no offset introduced by the frame.
+                let inCanvas = canvas.convert(insideWrapper, from: wrapper)
+                if abs(inCanvas.x - 3) > 0.01 || abs(inCanvas.y - 5) > 0.01 {
+                    previewFailures.append(label + ":map \(inCanvas)")
+                }
+                // Export: same outer size, and the document sits exactly at the
+                // padding offset the preview drew it at.
+                guard let flat = canvas.flattened() else {
+                    previewFailures.append(label + ":flatten")
+                    wc.window?.close()
+                    return
+                }
+                if CGFloat(flat.cgImage.width) != layout.outerPixelSize.width
+                    || CGFloat(flat.cgImage.height)
+                        != layout.outerPixelSize.height {
+                    previewFailures.append(
+                        label + ":export \(flat.cgImage.width)x"
+                        + "\(flat.cgImage.height)")
+                }
+                var bytes = [UInt8](
+                    repeating: 0,
+                    count: flat.cgImage.width * flat.cgImage.height * 4)
+                let read = CGContext(
+                    data: &bytes, width: flat.cgImage.width,
+                    height: flat.cgImage.height, bitsPerComponent: 8,
+                    bytesPerRow: flat.cgImage.width * 4,
+                    space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                    bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+                read?.interpolationQuality = .none
+                read?.draw(flat.cgImage, in: CGRect(
+                    x: 0, y: 0, width: flat.cgImage.width,
+                    height: flat.cgImage.height))
+                let pad = Int(layout.padPixels)
+                func lumaAt(_ x: Int, _ yBL: Int) -> Int {
+                    let y = flat.cgImage.height - 1 - yBL
+                    let i = (y * flat.cgImage.width + x) * 4
+                    guard i >= 0, i + 2 < bytes.count else { return -1 }
+                    return luma((Int(bytes[i]), Int(bytes[i + 1]),
+                                 Int(bytes[i + 2])))
+                }
+                // The black corner marker of the source, found at the padding
+                // offset; and white just inside the image beyond it.
+                if lumaAt(pad + 1, pad + 1) > 40
+                    || lumaAt(pad + 8, pad + 8) < 200 {
+                    previewFailures.append(
+                        label + ":offset \(lumaAt(pad + 1, pad + 1)) "
+                        + "\(lumaAt(pad + 8, pad + 8))")
+                }
+                wc.window?.close()
+            }
+            previewCase("none@1", width: 120, height: 80, scale: 1,
+                        preset: .none)
+            previewCase("ocean@1", width: 120, height: 80, scale: 1,
+                        preset: .ocean)
+            previewCase("ocean@2", width: 120, height: 80, scale: 2,
+                        preset: .ocean)
+            previewCase("tall@2", width: 60, height: 200, scale: 2,
+                        preset: .sunset)
+            // The frame follows every geometry change, and applying or
+            // removing it leaves the document itself alone: same bitmap, same
+            // marks, same coordinates. Nothing is translated and nothing baked.
+            var followFailures: [String] = []
+            do {
+                let source = makeSolidImage(
+                    width: 200, height: 160, color: NSColor.white.cgColor)
+                let wc = EditorWindowController.open(
+                    with: CapturedImage(cgImage: source, scale: 1),
+                    forceFitForTesting: true)
+                let canvas = wc.canvasForTesting
+                let mark = ShapeAnnotation(
+                    kind: .rect, start: CGPoint(x: 20, y: 20),
+                    end: CGPoint(x: 60, y: 50), uiScale: 1)
+                canvas.annotations = [mark]
+                let bitmapBefore = canvas.image.cgImage
+                let boundsBefore = mark.bounds
+                func expectLayout(_ label: String) {
+                    let layout = canvas.backdropLayout
+                    guard let wrapper = wc.documentWrapperForTesting else {
+                        followFailures.append(label + ":no-wrapper")
+                        return
+                    }
+                    if wrapper.layout != layout
+                        || wrapper.frame.size != layout.outerPointSize
+                        || canvas.frame.origin != layout.innerPointRect.origin
+                        || canvas.frame.size != layout.innerPointSize {
+                        followFailures.append(
+                            label + ":stale \(wrapper.frame.size) "
+                            + "\(canvas.frame)")
+                    }
+                }
+                _ = canvas.applyBackdrop(.ocean)
+                expectLayout("applied")
+                // Applying a frame is not an edit to the document.
+                if canvas.image.cgImage !== bitmapBefore
+                    || canvas.annotationRefsForTesting.first !== mark
+                    || mark.bounds != boundsBefore {
+                    followFailures.append("apply-touched-document")
+                }
+                canvas.cropForTesting(
+                    pixels: CGRect(x: 10, y: 10, width: 120, height: 100))
+                expectLayout("crop")
+                if canvas.backdropLayout.innerPixelSize
+                    != CGSize(width: 120, height: 100) {
+                    followFailures.append(
+                        "crop-size \(canvas.backdropLayout.innerPixelSize)")
+                }
+                canvas.undoManager?.undo()
+                expectLayout("crop-undo")
+                if canvas.backdropLayout.innerPixelSize
+                    != CGSize(width: 200, height: 160) {
+                    followFailures.append("crop-undo-size")
+                }
+                wc.applyResizeFactor(0.5)
+                expectLayout("resize")
+                if canvas.backdropLayout.innerPixelSize
+                    != CGSize(width: 100, height: 80) {
+                    followFailures.append(
+                        "resize-size \(canvas.backdropLayout.innerPixelSize)")
+                }
+                let framedLayout = canvas.backdropLayout
+                _ = canvas.applyBackdrop(.none)
+                expectLayout("removed")
+                if !canvas.backdropLayout.isCollapsed
+                    || canvas.frame.origin != .zero {
+                    followFailures.append("remove-not-collapsed")
+                }
+                canvas.undoManager?.undo()
+                expectLayout("preset-undo")
+                if canvas.backdropLayout != framedLayout {
+                    followFailures.append("preset-undo-layout")
+                }
+                canvas.undoManager?.redo()
+                expectLayout("preset-redo")
+                if !canvas.backdropLayout.isCollapsed {
+                    followFailures.append("preset-redo-layout")
+                }
+                wc.window?.close()
+            }
+            check("sliceB-backdrop-preview-follows-document",
+                  followFailures.isEmpty,
+                  followFailures.joined(separator: " | "))
+
+            check("sliceB-backdrop-preview-layout",
+                  previewFailures.isEmpty,
+                  previewFailures.joined(separator: " | "))
+
             check("sliceB-backdrop-save-lock-order",
                   lockFailures.isEmpty, lockFailures.joined(separator: " | "))
 

@@ -17,6 +17,7 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
     private var cropCancelButton: NSButton!
     private var cropActionBar: NSStackView!
     private var scrollView: NSScrollView!
+    private var documentWrapper: BackdropDocumentView!
     private var keepsImageFitted = true
     private let forceFitForTesting: Bool
 
@@ -86,8 +87,12 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
         window.delegate = self
 
         buildUI(toolbarHeight: toolbarHeight)
-        canvas.onStateChange = { [weak self] in self?.refreshLabels() }
+        canvas.onStateChange = { [weak self] in
+            self?.refreshBackdropLayout()
+            self?.refreshLabels()
+        }
         canvas.onImageChange = { [weak self] in
+            self?.refreshBackdropLayout()
             guard let self, self.keepsImageFitted else { return }
             // NSScrollView updates its document geometry on the next layout
             // pass after a crop/undo. Fit after that pass, not against stale bounds.
@@ -125,7 +130,9 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
         scrollView.backgroundColor = NSColor(white: 0.13, alpha: 1)
         // keeps the shot centered when it's smaller than the window
         scrollView.contentView = CenteringClipView()
-        scrollView.documentView = canvas
+        documentWrapper = BackdropDocumentView(
+            canvas: canvas, layout: canvas.backdropLayout)
+        scrollView.documentView = documentWrapper
         canvas.enclosingScroll = { [weak self] in self?.scrollView }
 
         // --- top bar
@@ -331,7 +338,10 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
         // changes with magnification. `contentSize` is the physical viewport,
         // so repeated fits after resize/crop stay stable instead of oscillating.
         let visible = scrollView.contentSize
-        let imageSize = canvas.image.pointSize
+        // The frame is part of what has to fit: fitting the image alone would
+        // push the padding out of view, which is exactly what the user opened
+        // the backdrop to look at.
+        let imageSize = canvas.backdropLayout.outerPointSize
         guard visible.width > 2, visible.height > 2,
               imageSize.width > 0, imageSize.height > 0 else { return }
         let fit = min(
@@ -412,12 +422,32 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
             && cropApplyButton.isEnabled == false
     }
 
+    /// The wrapper follows the document; both read the same layout, so the
+    /// preview cannot describe a different frame than the export produces.
+    func refreshBackdropLayout() {
+        let layout = canvas.backdropLayout
+        guard let documentWrapper, documentWrapper.layout != layout else { return }
+        documentWrapper.applyLayout(layout)
+        if let scrollView {
+            scrollView.reflectScrolledClipView(scrollView.contentView)
+        }
+    }
+
     func refreshLabels() {
-        let size = canvas.image.pointSize
-        let px = canvas.image.pixelSize
+        let layout = canvas.backdropLayout
+        // The badge reports what would be EXPORTED. Showing the inner size
+        // while a frame is on would understate the file the user is about to
+        // produce; the inner size stays visible in the tooltip.
+        let size = layout.outerPointSize
+        let px = layout.outerPixelSize
         sizeBadge.title = "\(Int(size.width))×\(Int(size.height))pt"
+        let innerPx = layout.innerPixelSize
+        let frameNote = layout.isCollapsed
+            ? ""
+            : " (image \(Int(innerPx.width))×\(Int(innerPx.height)) px"
+                + " + \(Int(layout.padPixels)) px backdrop)"
         sizeBadge.toolTip =
-            "\(Int(px.width))×\(Int(px.height)) px — click to scale. Does not change “Resize retina screenshots” on save."
+            "\(Int(px.width))×\(Int(px.height)) px\(frameNote) — click to scale. Does not change “Resize retina screenshots” on save."
         let pct = Int(round((scrollView?.magnification ?? 1) * 100))
         zoomLabel.stringValue = "\(pct)%"
     }
@@ -475,6 +505,15 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
     }
 
     var canvasForTesting: EditorCanvasView { canvas }
+
+    /// The REAL scroll document, so a gate reads what the user scrolls rather
+    /// than a wrapper built for the occasion.
+    var documentWrapperForTesting: BackdropDocumentView? {
+        scrollView?.documentView as? BackdropDocumentView
+    }
+
+    var scrollMagnificationForTesting: CGFloat { scrollView?.magnification ?? 0 }
+    var scrollViewportForTesting: CGSize { scrollView?.contentSize ?? .zero }
 
     /// Slice B seam: the real toolbar buttons, in `EditorTool.allCases` order,
     /// so a gate can assert overflow/wrap and accessibility on the production
@@ -753,6 +792,56 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
     }
 }
 
+/// Scroll document that wraps the canvas in its backdrop.
+///
+/// The canvas keeps its own size and its own coordinates and simply sits at an
+/// offset inside this view; nothing about the document is translated or baked.
+/// Because the padding belongs to THIS view and not to the canvas, a pointer
+/// out in the frame is outside the canvas entirely and can never resolve to a
+/// source pixel.
+final class BackdropDocumentView: NSView {
+    private let canvas: EditorCanvasView
+    private(set) var layout: BackdropLayout
+
+    init(canvas: EditorCanvasView, layout: BackdropLayout) {
+        self.canvas = canvas
+        self.layout = layout
+        super.init(frame: CGRect(origin: .zero, size: layout.outerPointSize))
+        addSubview(canvas)
+        applyLayout(layout)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override var isFlipped: Bool { false }
+
+    func applyLayout(_ layout: BackdropLayout) {
+        self.layout = layout
+        setFrameSize(layout.outerPointSize)
+        canvas.setFrameOrigin(layout.innerPointRect.origin)
+        canvas.setFrameSize(layout.innerPointSize)
+        needsDisplay = true
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard !layout.isCollapsed,
+              let ctx = NSGraphicsContext.current?.cgContext else { return }
+        // Drawn in POINTS here; the same routine works in pixels for the
+        // export because every metric it uses is scaled by the caller.
+        SliceBBackdrop.drawFrame(
+            in: ctx, size: layout.outerPointSize,
+            target: layout.innerPointRect, preset: layout.preset,
+            pixelScale: 1)
+    }
+
+    /// The frame is decoration: clicks in it belong to no tool, and must not
+    /// fall through to the canvas either.
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        let hit = super.hitTest(point)
+        return hit === self ? nil : hit
+    }
+}
+
 /// Clip view that centers the document view along any axis where the
 /// document is smaller than the visible area (instead of pinning it to a corner).
 final class CenteringClipView: NSClipView {
@@ -883,6 +972,17 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
     private(set) var backdropPreset: BackdropPreset = .none
 
     var backdropPresetForTesting: BackdropPreset { backdropPreset }
+
+    /// The single geometry description for this document. Preview, fit, the
+    /// size badge and the export all read it, so none of them can invent its
+    /// own idea of where the image sits inside the frame.
+    var backdropLayout: BackdropLayout {
+        BackdropLayout(
+            innerPixels: CGSize(
+                width: CGFloat(image.cgImage.width),
+                height: CGFloat(image.cgImage.height)),
+            pixelScale: pxScale, preset: backdropPreset)
+    }
 
     /// The integral pixel rect a flatten would render right now, or nil when
     /// no valid crop is pending. `flattened()` derives its base from this, so

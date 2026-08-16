@@ -745,6 +745,59 @@ enum BackdropPreset: String, CaseIterable {
     case none, ocean, sunset, mint, graphite
 }
 
+/// The ONE description of a framed document's geometry.
+///
+/// Preview, the scroll document, fit, the size badge and export all read their
+/// numbers from here. When each of them derived its own, they disagreed about
+/// where the image sat inside the frame — and a click landed on a different
+/// pixel than the one under the cursor.
+struct BackdropLayout: Equatable {
+    let preset: BackdropPreset
+    let pixelScale: CGFloat
+    /// Padding on every edge, in pixels and in points.
+    let padPixels: CGFloat
+    let padPoints: CGFloat
+    let innerPixelSize: CGSize
+    let outerPixelSize: CGSize
+    let innerPointSize: CGSize
+    let outerPointSize: CGSize
+
+    init(innerPixels: CGSize, pixelScale: CGFloat, preset: BackdropPreset) {
+        let scale = max(1, pixelScale)
+        let inner = CGSize(
+            width: max(0, innerPixels.width), height: max(0, innerPixels.height))
+        let pad: CGFloat = preset == .none
+            ? 0
+            : SliceBBackdrop.padding(
+                forLongEdge: max(inner.width, inner.height),
+                pixelScale: scale)
+        self.preset = preset
+        self.pixelScale = scale
+        self.padPixels = pad
+        self.padPoints = pad / scale
+        self.innerPixelSize = inner
+        self.outerPixelSize = CGSize(
+            width: inner.width + pad * 2, height: inner.height + pad * 2)
+        self.innerPointSize = CGSize(
+            width: inner.width / scale, height: inner.height / scale)
+        self.outerPointSize = CGSize(
+            width: (inner.width + pad * 2) / scale,
+            height: (inner.height + pad * 2) / scale)
+    }
+
+    /// Where the untouched document sits inside the frame, in points. The
+    /// canvas keeps its own coordinates: nothing is translated or baked, so a
+    /// mark, a crop, a guide and an OCR box all stay source-local.
+    var innerPointRect: CGRect {
+        CGRect(
+            origin: CGPoint(x: padPoints, y: padPoints),
+            size: innerPointSize)
+    }
+
+    /// `.none` collapses: the frame is not a thin border, it is absent.
+    var isCollapsed: Bool { preset == .none || padPixels == 0 }
+}
+
 enum SliceBBackdrop {
     static let paddingFraction: CGFloat = 0.06
     static let minPadding: CGFloat = 40
@@ -841,43 +894,24 @@ enum SliceBBackdrop {
     static let shadowOffsetPt: CGFloat = -8
     static let shadowBlurPt: CGFloat = 24
 
-    static func compose(
-        image: CGImage, preset: BackdropPreset, budgetBytes: Int,
-        pixelScale: CGFloat = 1
-    ) -> CGImage? {
-        guard preset != .none else { return image }
-        guard !ForcedOuterComposeFailure.isActive else { return nil }
-        let pad = padding(
-            forLongEdge: CGFloat(max(image.width, image.height)),
-            pixelScale: pixelScale)
-        guard let outer = outerDimensions(
-            innerWidth: image.width, innerHeight: image.height, preset: preset,
-            pixelScale: pixelScale),
-            let bytes = SliceBExport.byteCount(
-                width: outer.width, height: outer.height),
-            bytes <= budgetBytes
-        else { return nil }
-        let w = outer.width, h = outer.height
-        // Built ONCE and required. Building it per draw with `if let` and
-        // carrying on when it is nil returns a non-nil frame that is missing
-        // its background entirely — a malformed export that terminal callers
-        // would treat as success.
+    /// Draws the frame — gradient, shadow, rounded plate — into `ctx` for a
+    /// canvas of `size` PIXELS, leaving `target` for the document itself.
+    /// `compose` and the on-screen preview both call this, so what the user
+    /// reviews and what is exported cannot drift apart.
+    @discardableResult
+    static func drawFrame(
+        in ctx: CGContext, size: CGSize, target: CGRect,
+        preset: BackdropPreset, pixelScale: CGFloat
+    ) -> Bool {
+        guard preset != .none else { return true }
         guard let fill = CGGradient(
             colorsSpace: CGColorSpace(name: CGColorSpace.sRGB)!,
             colors: gradient(for: preset) as CFArray, locations: [0, 1])
-        else { return nil }
-        guard let ctx = CGContext(
-            data: nil, width: w, height: h, bitsPerComponent: 8,
-            bytesPerRow: 0,
-            space: image.colorSpace ?? CGColorSpace(name: CGColorSpace.sRGB)!,
-            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
-        else { return nil }
-        let axis = gradientAxis(width: w, height: h)
+        else { return false }
+        let axis = gradientAxis(
+            width: Int(size.width), height: Int(size.height))
         ctx.drawLinearGradient(
             fill, start: axis.start, end: axis.end, options: [])
-        let target = CGRect(
-            x: pad, y: pad,
-            width: CGFloat(image.width), height: CGFloat(image.height))
         let scale = max(1, pixelScale)
         ctx.setShadow(
             offset: CGSize(width: 0, height: shadowOffsetPt * scale),
@@ -900,6 +934,49 @@ enum SliceBBackdrop {
         ctx.clip()
         ctx.drawLinearGradient(
             fill, start: axis.start, end: axis.end, options: [])
+        ctx.restoreGState()
+        return true
+    }
+
+    static func compose(
+        image: CGImage, preset: BackdropPreset, budgetBytes: Int,
+        pixelScale: CGFloat = 1
+    ) -> CGImage? {
+        guard preset != .none else { return image }
+        guard !ForcedOuterComposeFailure.isActive else { return nil }
+        let pad = padding(
+            forLongEdge: CGFloat(max(image.width, image.height)),
+            pixelScale: pixelScale)
+        guard let outer = outerDimensions(
+            innerWidth: image.width, innerHeight: image.height, preset: preset,
+            pixelScale: pixelScale),
+            let bytes = SliceBExport.byteCount(
+                width: outer.width, height: outer.height),
+            bytes <= budgetBytes
+        else { return nil }
+        let w = outer.width, h = outer.height
+        guard let ctx = CGContext(
+            data: nil, width: w, height: h, bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: image.colorSpace ?? CGColorSpace(name: CGColorSpace.sRGB)!,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        else { return nil }
+        let target = CGRect(
+            x: pad, y: pad,
+            width: CGFloat(image.width), height: CGFloat(image.height))
+        // The SAME frame the preview draws. A gradient that cannot be built
+        // fails the whole compose: carrying on would return a non-nil frame
+        // with no background, which terminal callers would treat as success.
+        guard drawFrame(
+            in: ctx, size: CGSize(width: w, height: h), target: target,
+            preset: preset, pixelScale: pixelScale)
+        else { return nil }
+        ctx.saveGState()
+        let radius = cornerRadiusPt * max(1, pixelScale)
+        ctx.addPath(CGPath(
+            roundedRect: target, cornerWidth: radius, cornerHeight: radius,
+            transform: nil))
+        ctx.clip()
         ctx.draw(image, in: target)
         ctx.restoreGState()
         return ctx.makeImage()
