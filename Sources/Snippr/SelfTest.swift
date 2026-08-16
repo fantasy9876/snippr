@@ -9298,6 +9298,7 @@ enum SelfTest {
                     for _ in 0..<8 { release.signal() }
                 }
                 var signalled = false
+                var workerReturned = false
                 var workerContained = false
                 var workerEntered = false
                 let entryLock = NSLock()
@@ -9338,10 +9339,17 @@ enum SelfTest {
                     }
                     // Wait for OUR worker to return, then let the main queue
                     // deliver its result so the slot is actually given back.
-                    if workerFinished.wait(timeout: .now() + 10) == .timedOut {
-                        lockStageFailures.append("worker-never-returned")
-                        workerContained = false
-                        return false
+                    // Waited for ONCE. A retry that waited again would block
+                    // on a second signal nobody sends, add another ten seconds
+                    // and then report the worker as missing even though its
+                    // result had just landed.
+                    if !workerReturned {
+                        if workerFinished.wait(timeout: .now() + 10) == .timedOut {
+                            lockStageFailures.append("worker-never-returned")
+                            workerContained = false
+                            return false
+                        }
+                        workerReturned = true
                     }
                     // The slot is given back on the main queue AFTER the
                     // worker returns, so it is waited for separately — and the
@@ -9702,10 +9710,14 @@ enum SelfTest {
             if seamUnsafe {
                 // Fail-stop. Continuing would feed invented OCR results to
                 // every later gate and shift their slot baselines, turning one
-                // real failure into a cascade of false ones.
+                // real failure into a cascade of false ones. Exits the run the
+                // same way its normal end does, so the summary is still
+                // printed and the exit code is still meaningful.
                 check("sliceB-seam-isolation", false,
                       "OCR seam left installed; remaining gates skipped")
-                return
+                print("\(failures) TEST(S) FAILED")
+                print("Artifacts: \(outputDir)")
+                return 1
             }
 
             // J. Abandoning a drag restores the redo branch. Pen and the
