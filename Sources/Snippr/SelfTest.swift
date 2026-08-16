@@ -10986,7 +10986,63 @@ enum SelfTest {
                         }())
                 }
 
-                // --- area overlay
+                // --- initial crop creation, on its OWN session: a view with
+                // no selection shares nothing with the review fixture below,
+                // and reusing that owner would send this mouse-down straight
+                // into `finish(.cancelled)`.
+                final class WheelSpy: NSResponder {
+                    var forwarded = 0
+                    override func scrollWheel(with event: NSEvent) {
+                        forwarded += 1
+                    }
+                }
+                let creatingOverlay = SelectionOverlay(
+                    purpose: .areaReview,
+                    inputs: OverlaySessionInputs(
+                        afterShow: true, afterCopy: false, afterSave: false),
+                    completion: { _ in })
+                let creatingView = SelectionOverlayView(
+                    mode: .area, screen: screen,
+                    frozen: CapturedImage(
+                        cgImage: makeSolidImage(
+                            width: Int(screen.frame.width * 2),
+                            height: Int(screen.frame.height * 2),
+                            color: NSColor.white.cgColor),
+                        scale: 2),
+                    windowList: [], owner: creatingOverlay)
+                let spy = WheelSpy()
+                let previousResponder = creatingView.nextResponder
+                creatingView.nextResponder = spy
+                // With no surface the store cannot move either way, so the
+                // question is whether the event is CONSUMED: idle it must
+                // forward, mid-drag it must not.
+                if let event = wheel(creatingView, deltaY: 3, precise: false) {
+                    creatingView.scrollWheel(with: event)
+                }
+                if spy.forwarded != 1 {
+                    wheelFailures.append(
+                        "area:idle-not-forwarded \(spy.forwarded)")
+                }
+                let forwardedBeforeDrag = spy.forwarded
+                creatingView.annotationDragForTesting(
+                    from: CGPoint(x: 40, y: 40), to: CGPoint(x: 160, y: 140)
+                ) {
+                    for precise in [false, true] {
+                        if let event = wheel(
+                            creatingView, deltaY: 3, precise: precise) {
+                            creatingView.scrollWheel(with: event)
+                        }
+                    }
+                }
+                if spy.forwarded != forwardedBeforeDrag {
+                    wheelFailures.append(
+                        "area:creating-forwarded "
+                        + "\(spy.forwarded - forwardedBeforeDrag)")
+                }
+                creatingView.nextResponder = previousResponder
+                creatingOverlay.finish(.cancelled)
+
+                // --- area review drag, with a live surface
                 let overlay = SelectionOverlay(
                     purpose: .areaReview,
                     inputs: OverlaySessionInputs(
@@ -11007,37 +11063,15 @@ enum SelfTest {
                     wheelFailures.append("area:no-surface")
                     return
                 }
-                // The INITIAL crop drag, where there is no annotation surface
-                // yet — the case the ownership guard has to catch before it
-                // unwraps one.
-                // No selectForTesting here: with nothing selected, a real
-                // mouse-down starts a crop creation instead of an annotation,
-                // which is exactly the state being probed. The seam is the
-                // same real-event path either way.
-                let creatingView = SelectionOverlayView(
-                    mode: .area, screen: screen,
-                    frozen: CapturedImage(
-                        cgImage: makeSolidImage(
-                            width: Int(screen.frame.width * 2),
-                            height: Int(screen.frame.height * 2),
-                            color: NSColor.white.cgColor),
-                        scale: 2),
-                    windowList: [], owner: overlay)
-                var creatingWrites = 0
-                creatingView.annotationDragForTesting(
-                    from: CGPoint(x: 40, y: 40), to: CGPoint(x: 160, y: 140)
-                ) {
-                    if let event = wheel(creatingView, deltaY: 3, precise: false) {
-                        creatingView.scrollWheel(with: event)
-                    }
-                    creatingWrites = writes.count
-                }
-                if creatingWrites != 0 {
-                    wheelFailures.append(
-                        "area:creating-writes \(creatingWrites)")
-                }
-
                 surface.tool = .pen
+                // Prime the accumulator so the precise branch is not starting
+                // from zero: implementation RESETS it on the blocked path, so
+                // "unchanged" would be the wrong claim and a precise scroll
+                // from zero writes nothing even without the guard.
+                if let event = wheel(view, deltaY: 1, precise: true) {
+                    view.scrollWheel(with: event)
+                }
+                let primedWrites = writes.count
                 var midDragWrites = 0
                 view.annotationDragForTesting(
                     from: CGPoint(x: 100, y: 100),
@@ -11050,8 +11084,10 @@ enum SelfTest {
                     }
                     midDragWrites = writes.count
                 }
-                if midDragWrites != 0 {
-                    wheelFailures.append("area:mid-drag-writes \(midDragWrites)")
+                if midDragWrites != primedWrites {
+                    wheelFailures.append(
+                        "area:mid-drag-writes "
+                        + "\(midDragWrites - primedWrites)")
                 }
                 // The stroke still finished with the width it started with.
                 let drawnPen = surface.annotations
@@ -11062,11 +11098,22 @@ enum SelfTest {
                 }
                 // POSITIVE CONTROL: the same wheel, once the drag is over.
                 let beforeControl = writes.count
+                // Line first, then enough precise delta to cross the step
+                // threshold: both branches must work again after the drag.
                 if let event = wheel(view, deltaY: 3, precise: false) {
                     view.scrollWheel(with: event)
                 }
                 if writes.count == beforeControl {
                     wheelFailures.append("area:control")
+                }
+                let beforePreciseControl = writes.count
+                for _ in 0..<12 {
+                    if let event = wheel(view, deltaY: 3, precise: true) {
+                        view.scrollWheel(with: event)
+                    }
+                }
+                if writes.count == beforePreciseControl {
+                    wheelFailures.append("area:precise-control")
                 }
                 overlay.finish(.cancelled)
 
@@ -11094,6 +11141,7 @@ enum SelfTest {
                     return
                 }
                 var panelMidWrites = 0
+                let panelBeforeDrag = writes.count
                 panel.drawWithRealEventsForTesting(
                     fromView: CGPoint(x: 60, y: 60),
                     toView: CGPoint(x: 160, y: 140)
@@ -11105,11 +11153,10 @@ enum SelfTest {
                     }
                     panelMidWrites = writes.count
                 }
-                if panelMidWrites != writes.count
-                    || panelMidWrites != beforeControl + 1 {
+                if panelMidWrites != panelBeforeDrag {
                     wheelFailures.append(
                         "panel:mid-drag-writes "
-                        + "\(writes.count - panelMidWrites)")
+                        + "\(panelMidWrites - panelBeforeDrag)")
                 }
                 let panelPen = panelSurface.annotations
                     .compactMap { $0 as? PenAnnotation }.last
@@ -11123,7 +11170,7 @@ enum SelfTest {
                 if writes.count == beforePanelControl {
                     wheelFailures.append("panel:control")
                 }
-                if ScrollResultPanel.current === panel {
+                if panel.isVisible || ScrollResultPanel.current === panel {
                     panel.dismissForTesting()
                 }
             }
