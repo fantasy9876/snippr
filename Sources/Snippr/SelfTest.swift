@@ -7931,10 +7931,11 @@ enum SelfTest {
                     _ = viewPtr.performKeyEquivalent(with: tab)
                 }
                 let dragHex = pb.string(forType: .string)
-                if let exited = NSEvent.mouseEvent(
+                if let exited = NSEvent.enterExitEvent(
                     with: .mouseExited, location: CGPoint(x: 140, y: 40),
                     modifierFlags: [], timestamp: 0, windowNumber: 0,
-                    context: nil, eventNumber: 5, clickCount: 0, pressure: 0)
+                    context: nil, eventNumber: 5, trackingNumber: 0,
+                    userData: nil)
                 {
                     viewPtr.mouseExited(with: exited)
                 }
