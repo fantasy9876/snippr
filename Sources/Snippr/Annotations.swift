@@ -64,6 +64,11 @@ class Annotation {
     func draw(in ctx: CGContext, pixellated: CGImage?) {}
     func hitTest(_ p: CGPoint) -> Bool { bounds.insetBy(dx: -8 * uiScale, dy: -8 * uiScale).contains(p) }
     func move(by delta: CGPoint) {}
+
+    /// A DOCUMENT change (crop) moves everything the annotation owns, which is
+    /// not always what dragging it moves. Defaults to `move(by:)`.
+    func translateForDocumentChange(by delta: CGPoint) { move(by: delta) }
+
     func copyAnnotation() -> Annotation { self }
     /// Pixel-space scale used by the editor resize badge. Stroke/font sizes
     /// grow with the bitmap so marks keep the same relative weight.

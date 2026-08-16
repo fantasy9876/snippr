@@ -1050,6 +1050,10 @@ final class SelectionOverlayView: NSView {
             let p = convert(event.locationInWindow, from: nil)
             if annotationDragging {
                 annotationSurface?.endDrag()
+                if let frozen {
+                    annotationSurface?.startPendingTextRedaction(
+                        base: frozen.cgImage)
+                }
                 annotationDragging = false
                 needsDisplay = true
                 return
@@ -1101,6 +1105,13 @@ final class SelectionOverlayView: NSView {
             [.command, .shift, .control, .option])
         if owner?.session.phase == .reviewing,
            handleColorPickKey(event, flags: flags) {
+            return
+        }
+        // Shift-only + B selects text redaction; plain B stays Pixelate and
+        // plain S stays Spotlight.
+        if owner?.session.phase == .reviewing, flags == .shift,
+           event.charactersIgnoringModifiers?.lowercased() == "b" {
+            selectAnnotationTool(.pixelateText)
             return
         }
         if owner?.session.phase == .reviewing,

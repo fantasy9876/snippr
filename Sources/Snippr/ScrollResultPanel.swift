@@ -366,6 +366,13 @@ final class ScrollResultPanel: NSPanel {
         }
         let flags = event.modifierFlags.intersection(
             [.command, .shift, .control, .option])
+        // Shift-only + B selects text redaction; plain B stays Pixelate and
+        // plain S stays Spotlight.
+        if !saving, !terminalActionClaimed, flags == .shift,
+           event.charactersIgnoringModifiers?.lowercased() == "b" {
+            selectAnnotationTool(.pixelateText)
+            return
+        }
         if !saving, !terminalActionClaimed, flags.isEmpty,
            let key = event.charactersIgnoringModifiers,
            let tool = OverlayAnnotationTool.tool(forShortcutKey: key) {
@@ -581,6 +588,7 @@ final class AnnotationHostView: NSView {
     override func mouseUp(with event: NSEvent) {
         guard dragging else { return }
         surface.endDrag()
+        surface.startPendingTextRedaction(base: baseImage)
         dragging = false
         needsDisplay = true
     }

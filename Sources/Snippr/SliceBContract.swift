@@ -339,6 +339,16 @@ final class MagnifierAnnotation: Annotation {
         calloutRect.origin.y += delta.y
     }
 
+    /// A crop moves the whole document under the annotation, so the source
+    /// travels with the callout; moving only the callout would leave the
+    /// magnifier pointing at different pixels than the user picked.
+    override func translateForDocumentChange(by delta: CGPoint) {
+        sourceRect.origin.x += delta.x
+        sourceRect.origin.y += delta.y
+        calloutRect.origin.x += delta.x
+        calloutRect.origin.y += delta.y
+    }
+
     override func scaleCoordinates(by factor: CGFloat) {
         super.scaleCoordinates(by: factor)
         sourceRect = sourceRect.applying(

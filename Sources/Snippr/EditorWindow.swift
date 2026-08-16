@@ -856,7 +856,8 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
             let offset = EditableSelectionGeometry.annotationOffset(
                 forPixelCrop: px, imageHeight: CGFloat(base.height))
             for mark in marks {
-                mark.move(by: CGPoint(x: -offset.x, y: -offset.y))
+                mark.translateForDocumentChange(
+                    by: CGPoint(x: -offset.x, y: -offset.y))
             }
             base = owned
             croppedBase = owned
@@ -1314,6 +1315,19 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
         isMovingSelection = false
     }
 
+    /// After a crop or resize the sanitized patch a magnifier holds may no
+    /// longer match what is under it, so rebuild — and if the rebuild fails,
+    /// clear it rather than keep stale pixels.
+    func refreshMagnifierSnapshotsAfterDocumentChange() {
+        let redactions = annotations.compactMap { $0 as? BlurAnnotation }
+        for mag in annotations.compactMap({ $0 as? MagnifierAnnotation }) {
+            mag.snapshot = SliceBCompositor.magnifierSnapshot(
+                base: image.cgImage, sourceRect: mag.sourceRect,
+                redactions: redactions)
+        }
+        needsDisplay = true
+    }
+
     /// Save-lock: freeze the document by cancelling work in flight. Called
     /// only after a successful flatten.
     func cancelRedactionJobsForSaveLock() {
@@ -1373,8 +1387,9 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
             forPixelCrop: px, imageHeight: CGFloat(image.cgImage.height)
         )
         for a in annotations {
-            a.move(by: CGPoint(x: -offset.x, y: -offset.y))
+            a.translateForDocumentChange(by: CGPoint(x: -offset.x, y: -offset.y))
         }
+        refreshMagnifierSnapshotsAfterDocumentChange()
         setImage(CapturedImage(cgImage: owned, scale: pxScale))
     }
 

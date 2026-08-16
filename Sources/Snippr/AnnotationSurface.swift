@@ -53,6 +53,7 @@ enum OverlayAnnotationTool: String, CaseIterable {
         case "h": return .highlight
         case "n": return .counter
         case "b": return .blur
+        case "s": return .spotlight
         default: return nil
         }
     }
@@ -234,16 +235,23 @@ final class AnnotationSurface: RedactionHost, RedactionJobObserver {
         case .spotlight:
             let spot = SpotlightAnnotation(uiScale: pixelScale)
             spot.rect = CGRect(origin: p, size: .zero)
+            spot.baseBounds = redactionBaseBounds
             activeSpotlight = spot
             activeSpotlightAnchor = p
+            annotations.append(spot)
+            historyDidChange?()
             return true
         case .pixelateText:
             // Text mode starts as a FULL mask and only ever narrows once a
-            // live OCR result lands.
+            // live OCR result lands, so the preview covers from the first
+            // pixel of the drag.
             let blur = BlurAnnotation(uiScale: pixelScale)
+            blur.rect = CGRect(origin: p, size: .zero)
             blur.redactionState = .pendingFull
             activeBlur = blur
             activeBlurAnchor = p
+            annotations.append(blur)
+            historyDidChange?()
             return true
         case .pen:
             let pen = PenAnnotation(uiScale: pixelScale)
@@ -306,6 +314,10 @@ final class AnnotationSurface: RedactionHost, RedactionJobObserver {
             blur.rect = CGRect(
                 x: min(anchor.x, p.x), y: min(anchor.y, p.y),
                 width: abs(anchor.x - p.x), height: abs(anchor.y - p.y))
+        } else if let spot = activeSpotlight, let anchor = activeSpotlightAnchor {
+            spot.rect = CGRect(
+                x: min(anchor.x, p.x), y: min(anchor.y, p.y),
+                width: abs(anchor.x - p.x), height: abs(anchor.y - p.y))
         }
     }
 
@@ -315,10 +327,53 @@ final class AnnotationSurface: RedactionHost, RedactionJobObserver {
                 annotations.removeLast()
             } else {
                 redoAnnotations.removeAll()
+                // Exactly one enqueue per completed text redaction; the host
+                // starts it because only the host holds the base image.
+                if blur.redactionState == .pendingFull {
+                    pendingTextRedaction = blur
+                }
+            }
+            historyDidChange?()
+        }
+        if let spot = activeSpotlight, annotations.last === spot {
+            if spot.rect.width <= 1 || spot.rect.height <= 1 {
+                // A click is not a mutation: the previous spotlight stays.
+                annotations.removeLast()
+            } else {
+                // Singleton replacement is ONE transaction, so undo brings the
+                // previous spotlight back rather than leaving none.
+                annotations = SliceBCompositor.applySpotlight(
+                    existing: annotations.filter { $0 !== spot }, new: spot)
+                redoAnnotations.removeAll()
             }
             historyDidChange?()
         }
         clearActiveDraft()
+    }
+
+    /// Full SOURCE pixel bounds; hosts set this so a spotlight dims the whole
+    /// image, not just the selection or the view.
+    var redactionBaseBounds: CGRect = .zero
+
+    /// Set by `endDrag` when a text redaction finished; the host starts the
+    /// bounded OCR because only the host has the base image.
+    private(set) var pendingTextRedaction: BlurAnnotation?
+
+    @discardableResult
+    func startPendingTextRedaction(base: CGImage) -> Bool {
+        guard let blur = pendingTextRedaction else { return false }
+        pendingTextRedaction = nil
+        guard let job = SliceBRedactionJob.start(
+            blur: blur, base: base, host: self)
+        else {
+            // Refused (queue full or region unusable): stay fully masked and
+            // register nothing.
+            blur.redactionState = .fallbackFull
+            redactionDidChange()
+            return false
+        }
+        registerRedactionJob(job, for: blur)
+        return true
     }
 
     func addText(_ string: String, atPixel p: CGPoint) {
