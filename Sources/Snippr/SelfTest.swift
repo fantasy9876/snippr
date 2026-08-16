@@ -9406,6 +9406,15 @@ enum SelfTest {
                        panelToClean.isVisible
                         || ScrollResultPanel.current === panelToClean {
                         panelToClean.dismissForTesting()
+                        // Verified, not assumed: the early exits never reach
+                        // Stage 5's check, so a dismiss that failed here would
+                        // let the worker land on a live panel and the suite
+                        // carry on regardless.
+                        if panelToClean.isVisible
+                            || ScrollResultPanel.current === panelToClean {
+                            lockStageFailures.append("cleanup-leaked")
+                            seamUnsafe = true
+                        }
                     }
                     // Then release and drain OUR worker, and only then put the
                     // seam back. Ending the scope first makes the closure stop
@@ -9613,7 +9622,20 @@ enum SelfTest {
                 spy.saveDone = nil
                 // Cancel on its own, before anything else runs: an unwanted
                 // auto-retry, or a mutation at cancel time, would otherwise be
-                // hidden by the deliberate retry below.
+                // hidden by the deliberate retry below. The LIVE document is
+                // part of it: every check here reads a reference held aside,
+                // so a regression that moved the redaction onto the redo
+                // branch — and would then export an unredacted image — would
+                // satisfy all of them while `blur` stayed intact.
+                let liveIsRedacted = {
+                    surface.annotations.count == 1
+                        && surface.annotations.first === blur
+                }
+                if !liveIsRedacted() || surface.canRedo || !surface.canUndo {
+                    lockStageFailures.append(
+                        "cancel-document \(surface.annotations.count) "
+                        + "redo \(surface.canRedo) undo \(surface.canUndo)")
+                }
                 if spy.saveAsCalls != 1
                     || blur.redactionState != .fallbackFull
                     || blur.redactionGeneration != generationAfterLock
@@ -9660,10 +9682,12 @@ enum SelfTest {
                 if spy.saveAsCalls != 2 || spy.observations != 1
                     || spy.saveDone == nil
                     || ScrollResultPanel.current !== panel
-                    || !panel.isVisible {
+                    || !panel.isVisible
+                    || !liveIsRedacted() || surface.canRedo {
                     lockStageFailures.append(
                         "retry \(spy.saveAsCalls)/\(spy.observations) "
-                        + "done \(spy.saveDone != nil)")
+                        + "done \(spy.saveDone != nil) "
+                        + "live \(surface.annotations.count)")
                 }
                 if !spy.inCallback.isEmpty {
                     lockStageFailures.append(
@@ -9696,6 +9720,10 @@ enum SelfTest {
                 }
                 if panel.isVisible || ScrollResultPanel.current === panel {
                     lockStageFailures.append("panel-leaked")
+                }
+                if !liveIsRedacted() || surface.canRedo {
+                    lockStageFailures.append(
+                        "late-document \(surface.annotations.count)")
                 }
                 if blur.redactionState != .fallbackFull
                     || blur.redactionGeneration != generationAfterClose
