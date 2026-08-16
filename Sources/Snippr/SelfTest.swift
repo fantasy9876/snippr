@@ -9094,17 +9094,27 @@ enum SelfTest {
                     ("sizeBadge", wc.sizeBadgeForTesting),
                     ("zoom", wc.zoomLabelForTesting),
                 ]
+                // The constrained 30x28 icons: tools and the five terminal
+                // actions. The size badge is deliberately not in here.
+                let iconButtons: [NSView] =
+                    buttons.map { $0.button } + actions.map { $0.button }
 
                 // ONE verifier over the LIVE hierarchy, run at both sizes.
                 // Everything geometric is re-asked after the resize, because a
                 // control can be fine at one width and overflow, overlap or go
                 // dead at another.
+                // Positive comparison: `abs(a - b) > tol` is FALSE for NaN,
+                // so every tolerance check written that way fails open.
+                func near(_ a: CGFloat, _ b: CGFloat, _ tol: CGFloat = 0.5)
+                    -> Bool {
+                    a.isFinite && b.isFinite && abs(a - b) <= tol
+                }
                 func verifyLayout(_ phase: String) {
                     content.layoutSubtreeIfNeeded()
                     // Rows and bar.
-                    if abs(toolRow.frame.height - 35) > 0.5
-                        || abs(actionRow.frame.height - 35) > 0.5
-                        || abs(bar.frame.height - 70) > 0.5 {
+                    if !near(toolRow.frame.height, 35)
+                        || !near(actionRow.frame.height, 35)
+                        || !near(bar.frame.height, 70) {
                         toolbarFailures.append(
                             "\(phase):row-heights \(actionRow.frame.height)/"
                             + "\(toolRow.frame.height)/\(bar.frame.height)")
@@ -9161,18 +9171,26 @@ enum SelfTest {
                         // Not merely positive: an icon button squeezed to a
                         // point would satisfy that while denying the very
                         // reason there are two rows.
-                        if let control = view as? NSControl, !control.isEnabled {
+                        // The zoom label is display-only, so it is not asked
+                        // to be enabled; everything else here is actionable.
+                        if let control = view as? NSControl,
+                           view !== wc.zoomLabelForTesting,
+                           !control.isEnabled {
                             toolbarFailures.append("\(phase):\(name)-disabled")
                         }
-                        if view is NSButton {
-                            if abs(view.frame.width - 30) > 0.5
-                                || abs(view.frame.height - 28) > 0.5 {
+                        // Exact size for the icon buttons only. The size badge
+                        // is also an NSButton but carries no size constraint —
+                        // it is intrinsic, and demanding 30x28 of it would fail
+                        // a correct build.
+                        if iconButtons.contains(where: { $0 === view }) {
+                            if !near(view.frame.width, 30)
+                                || !near(view.frame.height, 28) {
                                 toolbarFailures.append(
                                     "\(phase):\(name)-size \(view.frame.size)")
                             }
                         } else if view === wc.colorWellForTesting {
-                            if abs(view.frame.width - 28) > 0.5
-                                || abs(view.frame.height - 24) > 0.5 {
+                            if !near(view.frame.width, 28)
+                                || !near(view.frame.height, 24) {
                                 toolbarFailures.append(
                                     "\(phase):\(name)-size \(view.frame.size)")
                             }
@@ -9219,24 +9237,41 @@ enum SelfTest {
                     // rect intersection needs BOTH axes, so asking for it
                     // across the rows catches a vertical collision the earlier
                     // wording waved away.
-                    if abs(bar.frame.width - content.bounds.width) > 0.5
-                        || abs(bar.frame.maxY - content.bounds.maxY) > 0.5 {
-                        toolbarFailures.append("\(phase):bar-frame")
+                    // Full rects, not just sizes: matching widths and heights
+                    // still allow a gap above one row and an overflow below
+                    // the other.
+                    if bar.superview !== content
+                        || !near(bar.frame.minX, content.bounds.minX)
+                        || !near(bar.frame.maxX, content.bounds.maxX)
+                        || !near(bar.frame.maxY, content.bounds.maxY) {
+                        toolbarFailures.append(
+                            "\(phase):bar-frame \(bar.frame)")
                     }
-                    if abs(stack.frame.width - bar.bounds.width) > 0.5
-                        || abs(stack.frame.height - bar.bounds.height) > 0.5 {
-                        toolbarFailures.append("\(phase):stack-frame")
+                    if !near(stack.frame.minX, bar.bounds.minX)
+                        || !near(stack.frame.maxX, bar.bounds.maxX)
+                        || !near(stack.frame.minY, bar.bounds.minY)
+                        || !near(stack.frame.maxY, bar.bounds.maxY) {
+                        toolbarFailures.append(
+                            "\(phase):stack-frame \(stack.frame)")
                     }
-                    if abs(toolRow.frame.width - stack.bounds.width) > 0.5
-                        || abs(actionRow.frame.width - stack.bounds.width) > 0.5 {
-                        toolbarFailures.append("\(phase):row-width")
+                    for (name, row) in [
+                        ("toolRow", toolRow), ("actionRow", actionRow),
+                    ] where !near(row.frame.minX, stack.bounds.minX)
+                        || !near(row.frame.maxX, stack.bounds.maxX) {
+                        toolbarFailures.append(
+                            "\(phase):\(name)-x \(row.frame)")
                     }
                     if toolRow.frame.intersects(actionRow.frame) {
                         toolbarFailures.append("\(phase):rows-collide")
                     }
-                    if abs(toolRow.frame.height + actionRow.frame.height
-                            - stack.bounds.height) > 0.5 {
-                        toolbarFailures.append("\(phase):rows-do-not-tile")
+                    let rowsUnion = toolRow.frame.union(actionRow.frame)
+                    if !near(rowsUnion.minY, stack.bounds.minY)
+                        || !near(rowsUnion.maxY, stack.bounds.maxY)
+                        || !near(toolRow.frame.height
+                                 + actionRow.frame.height,
+                                 stack.bounds.height) {
+                        toolbarFailures.append(
+                            "\(phase):rows-do-not-tile \(rowsUnion)")
                     }
                     // Disjoint WITHIN each row.
                     for row in [toolRow, actionRow] {
@@ -9259,7 +9294,7 @@ enum SelfTest {
                 window.setContentSize(NSSize(width: 200, height: 300))
                 content.layoutSubtreeIfNeeded()
                 let width = content.bounds.width
-                if abs(width - 560) > 0.5 {
+                if !near(width, 560) {
                     toolbarFailures.append("min-width \(width)")
                 }
                 verifyLayout("min")
@@ -9336,7 +9371,7 @@ enum SelfTest {
                 // just the first one.
                 window.setContentSize(NSSize(width: 900, height: 600))
                 content.layoutSubtreeIfNeeded()
-                if abs(content.bounds.width - 900) > 0.5 {
+                if !near(content.bounds.width, 900) {
                     toolbarFailures.append("no-expand \(content.bounds.width)")
                 }
                 verifyLayout("wide")

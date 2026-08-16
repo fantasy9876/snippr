@@ -284,6 +284,10 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
 
         let stack = NSStackView(views: [actionRow, toolRow])
         stack.orientation = .vertical
+        // A vertical stack centres its rows by default, so each row would be
+        // only as wide as its own content — the tool row's trailing spacer and
+        // the action row's right-hand chrome both assume the full bar width.
+        stack.alignment = .width
         stack.distribution = .fillEqually
         stack.spacing = 0
         stack.translatesAutoresizingMaskIntoConstraints = false
