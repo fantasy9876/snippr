@@ -3,158 +3,553 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Snippr — chụp màn hình cho Mac & Windows</title>
-<meta name="description" content="Snippr: app chụp màn hình miễn phí cho Mac (Apple Silicon & Intel) và Windows. Chụp vùng chọn, cửa sổ, cuộn trang, OCR tiếng Việt và chú thích ảnh; chỉ tính năng Dịch gửi văn bản khi bạn chủ động bấm.">
+<title>Snippr — Chụp màn hình cho Mac và Windows</title>
+<meta name="description" content="Snippr là ứng dụng chụp màn hình miễn phí cho Mac và Windows. Chụp vùng chọn, cửa sổ, cuộn trang, chú thích và OCR tiếng Việt. Ảnh ở lại máy bạn.">
+<meta name="theme-color" content="#000000">
+<meta property="og:title" content="Snippr — Chụp màn hình cho Mac và Windows">
+<meta property="og:description" content="Chụp, chú thích, OCR tiếng Việt. Miễn phí, mã nguồn mở, không tài khoản.">
+<meta property="og:image" content="https://snippr.pages.dev/icon.png">
+<meta property="og:url" content="https://snippr.pages.dev">
 <link rel="icon" href="icon.png">
+<link rel="apple-touch-icon" href="icon.png">
 <style>
   :root {
-    --bg: #0d0f14; --card: #161a22; --text: #e8eaf0; --muted: #9aa3b2;
-    --accent: #4c9aff; --accent2: #7c5cff; --border: #262c38;
+    --ink: #1d1d1f;
+    --muted: #6e6e73;
+    --faint: #86868b;
+    --line: rgba(0,0,0,.08);
+    --bg: #f5f5f7;
+    --card: #ffffff;
+    --blue: #0071e3;
+    --blue-hover: #0077ed;
+    --blue-press: #006edb;
+    --hero: #000;
+    --hero-ink: #f5f5f7;
+    --hero-muted: #a1a1a6;
+    --radius: 18px;
+    --shadow: 0 20px 60px rgba(0,0,0,.18);
+    --max: 1120px;
   }
-  * { margin: 0; padding: 0; box-sizing: border-box; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html { scroll-behavior: smooth; }
+  @media (prefers-reduced-motion: reduce) {
+    html { scroll-behavior: auto; }
+    * { transition: none !important; animation: none !important; }
+  }
   body {
-    background: var(--bg); color: var(--text);
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-    line-height: 1.6;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    font-size: 17px;
+    line-height: 1.47;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
   }
-  .wrap { max-width: 860px; margin: 0 auto; padding: 0 24px; }
-  header { text-align: center; padding: 72px 0 48px; }
-  header img { width: 128px; height: 128px; border-radius: 28px; box-shadow: 0 12px 40px rgba(76,154,255,.25); }
+  a { color: var(--blue); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  img { max-width: 100%; display: block; }
+  .wrap { width: min(var(--max), calc(100% - 48px)); margin: 0 auto; }
+
+  nav {
+    position: sticky; top: 0; z-index: 40;
+    backdrop-filter: saturate(180%) blur(20px);
+    -webkit-backdrop-filter: saturate(180%) blur(20px);
+    background: rgba(0,0,0,.72);
+    border-bottom: 1px solid rgba(255,255,255,.08);
+  }
+  .nav-inner {
+    width: min(var(--max), calc(100% - 40px));
+    margin: 0 auto;
+    height: 52px;
+    display: flex; align-items: center; justify-content: space-between; gap: 16px;
+  }
+  .brand {
+    display: flex; align-items: center; gap: 10px;
+    color: #fff; font-weight: 600; letter-spacing: -.02em;
+    text-decoration: none;
+  }
+  .brand:hover { text-decoration: none; opacity: .86; }
+  .brand img { width: 28px; height: 28px; border-radius: 7px; }
+  .nav-links { display: flex; align-items: center; gap: 22px; }
+  .nav-links a {
+    color: rgba(255,255,255,.82); font-size: 12px; font-weight: 400;
+    text-decoration: none;
+  }
+  .nav-links a:hover { color: #fff; text-decoration: none; }
+  .nav-cta {
+    background: var(--blue); color: #fff !important;
+    padding: 6px 14px; border-radius: 980px; font-weight: 500 !important;
+  }
+  .nav-cta:hover { background: var(--blue-hover); }
+
+  .hero {
+    background:
+      radial-gradient(900px 420px at 50% -10%, rgba(0,113,227,.28), transparent 60%),
+      var(--hero);
+    color: var(--hero-ink);
+    text-align: center;
+    padding: 88px 0 0;
+  }
+  .eyebrow {
+    color: var(--hero-muted);
+    font-size: 17px; font-weight: 600; letter-spacing: .01em;
+    margin-bottom: 14px;
+  }
   h1 {
-    font-size: 52px; margin: 20px 0 8px; letter-spacing: -1px;
-    background: linear-gradient(90deg, var(--accent), var(--accent2));
-    -webkit-background-clip: text; background-clip: text; color: transparent;
+    font-size: clamp(44px, 7vw, 80px);
+    line-height: 1.05;
+    letter-spacing: -.035em;
+    font-weight: 600;
   }
-  .tagline { font-size: 20px; color: var(--muted); max-width: 600px; margin: 0 auto; }
-  .cta { margin: 32px 0 10px; display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; }
+  .lede {
+    margin: 22px auto 0;
+    max-width: 640px;
+    color: var(--hero-muted);
+    font-size: clamp(19px, 2.4vw, 24px);
+    line-height: 1.4;
+    font-weight: 400;
+  }
+  .hero-cta {
+    display: flex; justify-content: center; flex-wrap: wrap; gap: 12px;
+    margin: 34px 0 14px;
+  }
   .btn {
-    display: inline-block; padding: 13px 26px; border-radius: 12px;
-    font-size: 16px; font-weight: 600; text-decoration: none;
-    background: linear-gradient(90deg, var(--accent), var(--accent2)); color: #fff;
-    box-shadow: 0 6px 24px rgba(76,154,255,.35); transition: transform .15s;
+    display: inline-flex; align-items: center; justify-content: center;
+    min-height: 48px; padding: 0 22px;
+    border-radius: 980px; font-size: 17px; font-weight: 500;
+    text-decoration: none; border: 0; cursor: pointer;
+    transition: background .15s ease, transform .15s ease;
   }
-  .btn:hover { transform: translateY(-2px); }
-  .btn small { display: block; font-weight: 400; font-size: 12px; opacity: .85; }
-  .btn.ghost {
-    background: transparent; border: 1px solid var(--border); color: var(--text);
-    box-shadow: none;
+  .btn:hover { text-decoration: none; transform: scale(1.02); }
+  .btn-primary { background: var(--blue); color: #fff; }
+  .btn-primary:hover { background: var(--blue-hover); }
+  .btn-ghost {
+    background: transparent; color: #fff;
+    box-shadow: inset 0 0 0 1px rgba(255,255,255,.28);
   }
-  .sub { color: var(--muted); font-size: 13px; margin-top: 12px; }
-  .sub a { color: var(--accent); }
-  section { padding: 36px 0; border-top: 1px solid var(--border); }
-  h2 { font-size: 26px; margin-bottom: 18px; }
-  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 14px; }
-  .card { background: var(--card); border: 1px solid var(--border); border-radius: 14px; padding: 18px; }
-  .card b { display: block; margin-bottom: 6px; font-size: 15px; }
-  .card span { color: var(--muted); font-size: 14px; }
-  ol { margin-left: 22px; }
-  ol li { margin-bottom: 12px; }
-  code, kbd {
-    background: #10141c; border: 1px solid var(--border); border-radius: 6px;
-    padding: 2px 7px; font-size: 13px; font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  .btn-ghost:hover { background: rgba(255,255,255,.08); }
+  .hero-meta { color: #6e6e73; font-size: 14px; padding: 0 8px; }
+  .hero-meta a { color: #2997ff; }
+
+  .hero-frame {
+    margin: 64px auto 0;
+    width: min(980px, calc(100% - 32px));
+    border-radius: 18px 18px 0 0;
+    overflow: hidden;
+    box-shadow: 0 40px 80px rgba(0,0,0,.45);
+    background: #111;
   }
-  kbd { background: #1d2430; }
-  .note {
-    background: rgba(76,154,255,.08); border: 1px solid rgba(76,154,255,.3);
-    border-radius: 12px; padding: 14px 18px; margin-top: 16px; font-size: 14.5px;
+  .hero-frame img { width: 100%; height: auto; }
+
+  section { padding: 96px 0; }
+  .band-dark { background: #000; color: #f5f5f7; }
+  .band-white { background: #fff; }
+  h1, h2, .copy h3 { overflow-wrap: anywhere; }
+  h2 {
+    font-size: clamp(32px, 5vw, 56px);
+    letter-spacing: -.03em; line-height: 1.07; font-weight: 600;
   }
-  table { width: 100%; border-collapse: collapse; font-size: 15px; }
-  td, th { padding: 9px 12px; border-bottom: 1px solid var(--border); text-align: left; }
-  th { color: var(--muted); font-weight: 600; font-size: 13px; }
-  footer { text-align: center; padding: 40px 0 56px; color: var(--muted); font-size: 14px; }
-  footer a { color: var(--accent); text-decoration: none; }
+  .center { text-align: center; }
+  .subhead {
+    margin: 16px auto 0; max-width: 680px;
+    color: var(--muted); font-size: 21px; line-height: 1.4;
+  }
+  .band-dark .subhead { color: var(--hero-muted); }
+
+  .split {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 64px;
+    align-items: center;
+  }
+  .split.reverse { direction: rtl; }
+  .split.reverse > * { direction: ltr; }
+  .kicker { color: var(--blue); font-size: 14px; font-weight: 600; margin-bottom: 10px; }
+  .copy h3 {
+    font-size: clamp(28px, 3.4vw, 40px);
+    letter-spacing: -.03em; line-height: 1.12; font-weight: 600;
+  }
+  .copy p { margin-top: 14px; color: var(--muted); font-size: 19px; }
+  .shot {
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    background: #111;
+    overflow: hidden;
+    width: 100%;
+  }
+  .shot.light { background: #fff; box-shadow: 0 16px 50px rgba(0,0,0,.1); }
+  .shot.crop-top {
+    height: min(420px, 58vw);
+    object-fit: cover;
+    object-position: top center;
+  }
+
+  .grid-3 {
+    display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px;
+    margin-top: 48px;
+  }
+  .tile {
+    background: var(--card);
+    border-radius: 22px;
+    padding: 28px 26px 26px;
+    box-shadow: 0 4px 24px rgba(0,0,0,.04);
+    border: 1px solid var(--line);
+  }
+  .tile h3 { font-size: 21px; letter-spacing: -.02em; margin-bottom: 8px; }
+  .tile p { color: var(--muted); font-size: 16px; }
+
+  .gallery { display: grid; grid-template-columns: 1.3fr .7fr; gap: 16px; margin-top: 48px; }
+  .gallery-side { display: grid; gap: 16px; }
+  figure figcaption {
+    margin-top: 10px; color: var(--muted); font-size: 13px; text-align: center;
+  }
+
+  .dl-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin-top: 40px; }
+  .dl-card {
+    background: var(--card);
+    border-radius: 22px;
+    padding: 28px 24px 24px;
+    display: flex; flex-direction: column; gap: 8px;
+    min-height: 240px;
+    box-shadow: 0 1px 0 var(--line);
+    transition: transform .15s ease, box-shadow .15s ease;
+  }
+  .dl-card.recommended { box-shadow: 0 0 0 2px var(--blue); }
+  .dl-card h3 { font-size: 24px; letter-spacing: -.02em; }
+  .dl-card .ver { color: var(--faint); font-size: 14px; }
+  .dl-card p { color: var(--muted); font-size: 15px; flex: 1; }
+  .dl-card .btn { width: 100%; margin-top: 12px; }
+  .ink-btn { background: var(--ink); color: #fff; }
+  .ink-btn:hover { background: #333; }
+  .note-mini { font-size: 13px; color: var(--faint); }
+
+  .install-box {
+    margin-top: 28px;
+    background: #1d1d1f;
+    color: #f5f5f7;
+    border-radius: 18px;
+    padding: 22px 22px 18px;
+  }
+  .install-box p { color: #a1a1a6; font-size: 15px; margin-bottom: 12px; }
+  .cmd {
+    display: flex; gap: 10px; align-items: stretch; flex-wrap: wrap;
+  }
+  .cmd code {
+    flex: 1; min-width: 240px;
+    background: #000; color: #d6f3ff;
+    border-radius: 12px; padding: 14px 16px;
+    font: 13.5px/1.4 ui-monospace, "SF Mono", Menlo, monospace;
+    overflow-x: auto; user-select: all;
+  }
+  .cmd button {
+    background: var(--blue); color: #fff; border: 0;
+    border-radius: 12px; padding: 0 16px; font-weight: 600; cursor: pointer;
+  }
+  .cmd button:hover { background: var(--blue-hover); }
+  details { margin-top: 18px; }
+  details summary {
+    cursor: pointer; color: var(--blue); font-weight: 500; list-style: none;
+  }
+  details summary::-webkit-details-marker { display: none; }
+  details summary::after { content: " ›"; }
+  details[open] summary::after { content: " ˄"; }
+  ol { margin: 14px 0 0 22px; color: var(--muted); }
+  ol li { margin: 10px 0; }
+  kbd, code.inline {
+    font: 13px/1 ui-monospace, "SF Mono", Menlo, monospace;
+    background: rgba(0,0,0,.05);
+    border: 1px solid var(--line);
+    border-radius: 6px; padding: 2px 6px;
+  }
+
+  table { width: 100%; border-collapse: collapse; margin-top: 28px; font-size: 16px; }
+  th, td { text-align: left; padding: 14px 12px; border-bottom: 1px solid var(--line); }
+  th { color: var(--faint); font-size: 13px; font-weight: 600; }
+  .faq { margin-top: 28px; display: grid; gap: 10px; }
+  .faq details {
+    margin: 0; background: #fff; border-radius: 16px; padding: 16px 20px;
+  }
+  .faq details summary { color: var(--ink); font-weight: 600; }
+  .faq details p { margin-top: 10px; color: var(--muted); }
+
+  footer {
+    background: #f5f5f7;
+    border-top: 1px solid var(--line);
+    padding: 40px 0 64px;
+    color: var(--faint); font-size: 13px;
+  }
+  footer .foot {
+    display: flex; justify-content: space-between; gap: 16px; flex-wrap: wrap;
+  }
+  footer a { color: var(--muted); }
+
+  @media (max-width: 860px) {
+    .nav-links a:not(.nav-cta) { display: none; }
+    .split, .split.reverse, .gallery, .grid-3, .dl-grid { grid-template-columns: 1fr; }
+    section { padding: 64px 0; }
+    .hero { padding-top: 56px; }
+    .wrap { width: min(var(--max), calc(100% - 36px)); }
+    .copy p { font-size: 17px; }
+    .subhead { font-size: 18px; }
+    h1 { font-size: 40px; }
+    h2 { font-size: 30px; }
+    .shot.crop-top { height: 260px; }
+  }
 </style>
 </head>
 <body>
-<div class="wrap">
-
-<header>
-  <img src="icon.png" alt="Snippr icon">
-  <h1>Snippr</h1>
-  <p class="tagline">Chụp màn hình nhanh, gọn cho <b>Mac</b> và <b>Windows</b>.<br>Chú thích · OCR tiếng Việt · Chụp cuộn trang — ảnh luôn ở lại máy bạn.</p>
-  <div class="cta">
-    <a class="btn" href="Snippr-1.2.5.dmg" download> Mac Apple Silicon<small>v1.2.5 · M1–M5 · DMG</small></a>
-    <a class="btn" href="Snippr-1.2.5-intel.dmg" download> Mac Intel<small>v1.2.5 · x86_64 · DMG</small></a>
-    <a class="btn" href="https://github.com/fantasy9876/snippr/releases/download/v1.2.8/SnipprSetup-1.2.8-win-x64.exe">🪟 Windows Installer<small>v1.2.8 · x64 · Setup.exe</small></a>
+<nav>
+  <div class="nav-inner">
+    <a class="brand" href="#top"><img src="icon.png" alt="">Snippr</a>
+    <div class="nav-links">
+      <a href="#features">Tính năng</a>
+      <a href="#preview">Xem trước</a>
+      <a href="#download">Tải về</a>
+      <a href="#help">Hỗ trợ</a>
+      <a href="https://github.com/fantasy9876/snippr">GitHub</a>
+      <a class="nav-cta" href="#download">Tải Snippr</a>
+    </div>
   </div>
-  <p class="sub">
-    macOS 14+ · Windows 10/11 64-bit · miễn phí, mã nguồn mở (MIT) ·
-    <a href="https://github.com/fantasy9876/snippr">GitHub</a> ·
-    <a href="https://github.com/fantasy9876/snippr/releases/download/v1.2.8/Snippr-portable-win-x64.zip">bản Windows portable (ZIP)</a>
-  </p>
+</nav>
+
+<header class="hero" id="top">
+  <div class="wrap">
+    <p class="eyebrow">Cho Mac và Windows</p>
+    <h1>Chụp màn hình.<br>Gọn như ý nghĩ.</h1>
+    <p class="lede">Vùng chọn, cửa sổ, cả trang dài. Chú thích ngay trên ảnh, đọc chữ tiếng Việt, rồi copy — không tài khoản, không đưa ảnh lên mây.</p>
+    <div class="hero-cta">
+      <a class="btn btn-primary" href="#download">Tải miễn phí</a>
+      <a class="btn btn-ghost" href="#features">Xem tính năng</a>
+    </div>
+    <p class="hero-meta">macOS 14+ · Windows 10/11 · MIT<br><a href="https://github.com/fantasy9876/snippr">Mã nguồn mở</a></p>
+  </div>
+  <div class="hero-frame">
+    <img src="shot-editor.png" alt="Thanh công cụ chú thích của Snippr trên một ảnh vừa chụp">
+  </div>
 </header>
 
-<section>
-  <h2>Tính năng</h2>
-  <div class="grid">
-    <div class="card"><b>📸 Chụp đủ kiểu</b><span>Toàn màn hình, kéo chọn vùng, cửa sổ đang mở, hẹn giờ 3s, lặp lại vùng cũ.</span></div>
-    <div class="card"><b>📜 Chụp cuộn trang</b><span>Chọn vùng, cuộn tự nhiên và xem ảnh ghép lớn dần ngay bên cạnh. Có trên cả Mac và Windows.</span></div>
-    <div class="card"><b>🔍 OCR & 🌐 Dịch</b><span>Quét chữ trong ảnh (offline) rồi dịch sang ngôn ngữ tùy chọn — Việt, Anh, Nhật, Hàn, Trung... Cả 2 nền tảng.</span></div>
-    <div class="card"><b>✏️ Editor thông minh</b><span>11 công cụ chú thích; lăn chuột đổi độ dày nét, Ctrl/⌘+lăn để zoom; tự nhớ nét vẽ và màu cho lần sau.</span></div>
-    <div class="card"><b>📌 Ghim & ⌨️ Hotkey</b><span>Ghim screenshot nổi luôn-trên-cùng; đổi phím tắt theo ý thích trên cả 2 hệ.</span></div>
-    <div class="card"><b>🔒 Riêng tư</b><span>Không tài khoản, không thu thập. Ảnh ở lại máy — chỉ phần Dịch gọi Google Translate khi bạn bấm.</span></div>
+<section id="features">
+  <div class="wrap">
+    <div class="center">
+      <h2>Xong việc.<br>Quên app đi.</h2>
+      <p class="subhead">Snippr sống trên menu bar hoặc khay hệ thống. Bấm phím tắt, chụp, đánh dấu, copy. Không wizard, không đăng nhập.</p>
+    </div>
+    <div class="grid-3" style="margin-top:56px">
+      <article class="tile">
+        <h3>Chụp đủ kiểu</h3>
+        <p>Toàn màn hình, kéo chọn vùng, cửa sổ đang mở, hẹn 3 giây, hoặc lặp lại đúng vùng vừa rồi.</p>
+      </article>
+      <article class="tile">
+        <h3>Cuộn một trang dài</h3>
+        <p>Chọn vùng, cuộn tự nhiên. Snippr ghép từng khung thành một tấm ảnh và hiện bản xem trước ngay bên cạnh.</p>
+      </article>
+      <article class="tile">
+        <h3>Chú thích tức thì</h3>
+        <p>Mũi tên, hình, bút, chữ, số thứ tự, làm mờ, cắt. Lăn chuột đổi nét, ⌘/Ctrl + lăn để zoom. App nhớ màu bạn vừa dùng.</p>
+      </article>
+      <article class="tile">
+        <h3>Đọc chữ, dịch khi cần</h3>
+        <p>OCR tiếng Việt và tiếng Anh chạy offline trên máy. Dịch chỉ gửi văn bản khi bạn bấm — không tự gửi ảnh.</p>
+      </article>
+      <article class="tile">
+        <h3>Ghim cho khỏi mất</h3>
+        <p>Ghim ảnh nổi trên mọi cửa sổ. Phím tắt đổi được trong Cài đặt, trên cả hai hệ.</p>
+      </article>
+      <article class="tile">
+        <h3>Ảnh ở lại máy bạn</h3>
+        <p>Không tài khoản, không phân tích, không đồng bộ đám mây. Chỉ phần Dịch gọi Google Translate khi bạn chủ động dùng.</p>
+      </article>
+    </div>
   </div>
 </section>
 
 <section>
-  <h2>Xem trước</h2>
-  <div class="grid" style="grid-template-columns: repeat(auto-fit, minmax(280px, 1fr))">
-    <figure><img class="shot" src="shot-editor.png" alt="Editor chú thích" style="width:100%;border-radius:12px;border:1px solid var(--border)"><figcaption style="color:var(--muted);font-size:13px;text-align:center;margin-top:6px">Editor — chú thích, OCR, dịch ngay trên toolbar</figcaption></figure>
-    <figure><img class="shot" src="shot-ocr.png" alt="OCR và dịch" style="width:100%;border-radius:12px;border:1px solid var(--border)"><figcaption style="color:var(--muted);font-size:13px;text-align:center;margin-top:6px">Quét chữ xong chọn ngôn ngữ để dịch</figcaption></figure>
-    <figure><img class="shot" src="shot-prefs.png" alt="Cài đặt" style="width:100%;border-radius:12px;border:1px solid var(--border)"><figcaption style="color:var(--muted);font-size:13px;text-align:center;margin-top:6px">Chọn kiểu nền window shot bằng thẻ preview trực quan</figcaption></figure>
+  <div class="wrap split">
+    <div class="copy">
+      <p class="kicker">Chụp cửa sổ</p>
+      <h3>Một cửa sổ, nền bạn chọn.</h3>
+      <p>Chụp cửa sổ đang mở với nền wallpaper, trong suốt, màu đặc, hoặc cắt bóng. Chọn kiểu ngay trên thẻ xem trước, không phải chỉnh sau.</p>
+    </div>
+    <img class="shot light crop-top" src="shot-prefs.png" alt="Bốn kiểu nền khi chụp cửa sổ">
   </div>
 </section>
 
-<section>
-  <h2>Cài đặt trên macOS</h2>
-  <div class="note" style="margin-top:0">
-    ⚡ <b>Cách nhanh nhất — không gặp cảnh báo "malware":</b> mở <b>Terminal</b> (⌘+Space, gõ Terminal), dán lệnh này rồi Enter:<br>
-    <code style="display:block;margin-top:8px;padding:10px 14px;font-size:14px;user-select:all">curl -fsSL https://snippr.pages.dev/install.sh | sh</code>
-    <span style="color:var(--muted);font-size:13px">Lệnh tự chọn đúng bản Apple Silicon/Intel, kiểm SHA-256 và chữ ký Snippr, cài có rollback vào Applications rồi mở app. Vì tải bằng curl nên macOS không gắn cờ kiểm dịch. Bạn có thể xem toàn bộ script tại <a href="install.sh" style="color:var(--accent)">install.sh</a>.</span>
+<section class="band-white">
+  <div class="wrap split reverse">
+    <div class="copy">
+      <p class="kicker">OCR &amp; dịch</p>
+      <h3>Chữ trên màn hình thành chữ trong clipboard.</h3>
+      <p>Quét vùng có chữ, copy ngay. Cần dịch thì chọn ngôn ngữ — Việt, Anh, Nhật, Hàn, Trung… Phần còn lại của ảnh không rời máy.</p>
+    </div>
+    <img class="shot" src="shot-ocr.png" alt="Vùng chữ vừa quét trong Snippr">
   </div>
-  <p style="margin:16px 0 8px;color:var(--muted)">Hoặc cài thủ công bằng DMG:</p>
-  <ol>
-    <li>Tải đúng bản cho máy (Apple Silicon cho M1–M5, Intel cho Mac cũ), mở DMG và kéo <b>Snippr</b> vào <b>Applications</b>.</li>
-    <li>Mở Snippr — macOS sẽ hiện cảnh báo <i>"Apple could not verify Snippr is free of malware"</i> (vì app chưa mua notarization của Apple, không phải virus). Bấm <b>Done</b> (đừng bấm Move to Trash!).</li>
-    <li>Vào <b>System Settings → Privacy &amp; Security</b>, kéo xuống phần Security sẽ thấy dòng về Snippr → bấm <b>Open Anyway</b> → xác nhận. Bước này chỉ cần làm 1 lần.</li>
-    <li>Cấp quyền <b>Screen Recording</b> (bắt buộc để chụp), rồi mở lại app. Snippr nằm trên menu bar (icon 📷).</li>
-  </ol>
-
-  <h2 style="margin-top:32px">Cài đặt trên Windows</h2>
-  <ol>
-    <li>Tải <b>Windows Installer</b>, chạy file <code>SnipprSetup-1.2.8-win-x64.exe</code>.</li>
-    <li>Bản Windows 1.2.8 chưa ký số; nếu SmartScreen cảnh báo, kiểm SHA-256 trên GitHub rồi bấm <b>More info → Run anyway</b>.</li>
-    <li>Installer cho <b>chọn thư mục cài đặt</b>, tạo shortcut Start Menu và mục gỡ trong "Add or remove programs". Xong bấm <b>Finish</b> là Snippr chạy luôn ở khay hệ thống.</li>
-  </ol>
-  <div class="note">💡 Không thích cài đặt? Dùng <a href="https://github.com/fantasy9876/snippr/releases/download/v1.2.8/Snippr-portable-win-x64.zip" style="color:var(--accent)">bản portable (ZIP)</a> — giải nén là chạy, xóa thư mục là gỡ xong.</div>
 </section>
 
-<section>
-  <h2>Phím tắt mặc định <span style="font-size:14px;color:var(--muted)">(đổi được trong Settings)</span></h2>
-  <table>
-    <tr><th>Chức năng</th><th>macOS</th><th>Windows</th></tr>
-    <tr><td>Chụp toàn màn hình</td><td><kbd>⇧⌘1</kbd></td><td><kbd>Ctrl+Shift+1</kbd></td></tr>
-    <tr><td>Chụp vùng chọn</td><td><kbd>⇧⌘2</kbd></td><td><kbd>Ctrl+Shift+2</kbd></td></tr>
-    <tr><td>Chụp cửa sổ đang mở</td><td>menu 📷 → more</td><td><kbd>Ctrl+Shift+4</kbd></td></tr>
-    <tr><td>Quét chữ / QR (OCR)</td><td><kbd>^⌥⌘O</kbd></td><td><i>sắp có</i></td></tr>
-  </table>
-  <div class="note">Trong Editor: lăn để chỉnh độ dày nét · <kbd>Ctrl/⌘+lăn</kbd> zoom · <kbd>Shift+lăn</kbd> kéo dọc · <kbd>Ctrl/⌘+C</kbd> copy rồi tự đóng · <kbd>Ctrl/⌘+S</kbd> chọn nơi lưu · <kbd>Ctrl/⌘+Z</kbd> undo · phím <kbd>A</kbd>/<kbd>R</kbd>/<kbd>T</kbd>/<kbd>B</kbd>… chuyển công cụ (arrow/rect/text/blur).</div>
+<section class="band-white" id="preview">
+  <div class="wrap">
+    <div class="center">
+      <h2>Nhìn gần hơn.</h2>
+      <p class="subhead">Editor, OCR và kiểu nền cửa sổ — đúng như khi bạn mở app.</p>
+    </div>
+    <div class="gallery">
+      <figure>
+        <img class="shot" src="shot-editor.png" alt="Editor chú thích">
+        <figcaption>Thanh công cụ trên ảnh vừa chụp — copy, lưu, ghim, OCR, dịch.</figcaption>
+      </figure>
+      <div class="gallery-side">
+        <figure>
+          <img class="shot" src="shot-ocr.png" alt="OCR">
+          <figcaption>Quét chữ xong, dịch khi bạn cần.</figcaption>
+        </figure>
+        <figure>
+          <img class="shot light crop-top" src="shot-prefs.png" alt="Nền cửa sổ">
+          <figcaption>Chọn kiểu nền cửa sổ bằng thẻ xem trước.</figcaption>
+        </figure>
+      </div>
+    </div>
+  </div>
 </section>
 
-<section>
-  <h2>Câu hỏi thường gặp</h2>
-  <p><b>Mac Intel dùng được không?</b> Được! Từ v1.0.2 có bản Intel (x86_64) riêng — tải nút "Mac Intel" ở trên.</p>
-  <p style="margin-top:10px"><b>Sao hệ điều hành cảnh báo app "không xác minh"?</b> Bản Mac dùng chữ ký Snippr ổn định để giữ quyền Screen Recording qua cập nhật, nhưng chưa được Apple notarize. Bản Windows 1.2.8 chưa ký Authenticode. Mã nguồn và SHA-256 đều công khai trên GitHub để bạn kiểm tra.</p>
-  <p style="margin-top:10px"><b>Đổi phím tắt kiểu gì?</b> Mac: menu 📷 → Settings → tab Hotkeys, bấm vào ô rồi gõ tổ hợp mới. Windows: chuột phải icon khay → Settings, bấm vào ô hotkey rồi gõ tổ hợp mới (Esc để tắt phím tắt đó).</p>
-  <p style="margin-top:10px"><b>Ảnh lưu ở đâu?</b> Mặc định ở Desktop, đổi được trong Settings. Định dạng Auto tự chọn PNG cho ảnh UI, JPEG cho ảnh nhiều màu.</p>
+<section id="download">
+  <div class="wrap">
+    <div class="center">
+      <h2>Tải Snippr.</h2>
+      <p class="subhead">Miễn phí. Chọn đúng máy của bạn. Không cần tạo tài khoản.</p>
+    </div>
+    <div class="dl-grid">
+      <article class="dl-card" data-os="mac-arm">
+        <h3>Mac</h3>
+        <p class="ver">Apple Silicon · v1.2.5</p>
+        <p>Cho máy M1 trở lên. Kéo vào Applications là xong.</p>
+        <a class="btn btn-primary" href="Snippr-1.2.5.dmg" download>Tải DMG</a>
+      </article>
+      <article class="dl-card" data-os="mac-intel">
+        <h3>Mac Intel</h3>
+        <p class="ver">x86_64 · v1.2.5</p>
+        <p>Cho Mac dùng chip Intel. Cùng tính năng với bản Apple Silicon.</p>
+        <a class="btn ink-btn" href="Snippr-1.2.5-intel.dmg" download>Tải DMG</a>
+      </article>
+      <article class="dl-card" data-os="win">
+        <h3>Windows</h3>
+        <p class="ver">64-bit · v1.2.8</p>
+        <p>Installer có Start Menu và mục gỡ. Hoặc dùng bản ZIP portable.</p>
+        <a class="btn ink-btn" href="https://github.com/fantasy9876/snippr/releases/download/v1.2.8/SnipprSetup-1.2.8-win-x64.exe">Tải Setup</a>
+        <p class="note-mini">Bản này chưa ký Authenticode. Nếu SmartScreen hỏi, đối chiếu SHA-256 trên GitHub rồi chọn More info → Run anyway. <a href="https://github.com/fantasy9876/snippr/releases/download/v1.2.8/Snippr-portable-win-x64.zip">ZIP portable</a></p>
+      </article>
+    </div>
+  </div>
+</section>
+
+<section class="band-white" id="help">
+  <div class="wrap">
+    <h2>Cài đặt.</h2>
+    <p class="subhead" style="margin-left:0;text-align:left">Trên Mac, một lệnh là đủ. Trên Windows, chạy installer.</p>
+
+    <div class="install-box">
+      <p><b style="color:#fff">Mac — cài nhanh</b>. Mở Terminal, dán lệnh, Enter. Script tự chọn bản Apple Silicon hoặc Intel, kiểm SHA-256 và chữ ký, rồi đặt app vào Applications.</p>
+      <div class="cmd">
+        <code id="install-cmd">curl -fsSL https://snippr.pages.dev/install.sh | sh</code>
+        <button type="button" id="copy-cmd">Sao chép</button>
+      </div>
+      <p style="margin:10px 0 0;font-size:13px">Bạn có thể đọc toàn bộ script tại <a href="install.sh">install.sh</a>.</p>
+    </div>
+
+    <details>
+      <summary>Cài Mac bằng DMG</summary>
+      <ol>
+        <li>Tải đúng bản máy, mở DMG, kéo <b>Snippr</b> vào <b>Applications</b>.</li>
+        <li>Mở app lần đầu. macOS có thể báo chưa xác minh — không phải virus, app chưa notarize. Bấm <b>Done</b>, đừng chuyển vào Thùng rác.</li>
+        <li>Vào <b>Cài đặt hệ thống → Quyền riêng tư &amp; bảo mật</b>, bấm <b>Mở anyway</b>. Chỉ cần một lần.</li>
+        <li>Cấp <b>Ghi màn hình</b>, mở lại app. Snippr nằm trên thanh menu.</li>
+      </ol>
+    </details>
+
+    <details>
+      <summary>Cài Windows</summary>
+      <ol>
+        <li>Tải <b>Setup</b>, chạy <code class="inline">SnipprSetup-1.2.8-win-x64.exe</code>.</li>
+        <li>Nếu SmartScreen cảnh báo, kiểm SHA-256 trên GitHub rồi <b>More info → Run anyway</b>.</li>
+        <li>Chọn thư mục, xong bấm Finish — Snippr chạy ở khay hệ thống.</li>
+      </ol>
+    </details>
+
+    <h2 style="margin-top:80px">Phím tắt.</h2>
+    <p class="subhead" style="margin-left:0;text-align:left">Đổi được trong Cài đặt.</p>
+    <table>
+      <thead>
+        <tr><th>Việc</th><th>Mac</th><th>Windows</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Toàn màn hình</td><td><kbd>⇧⌘1</kbd></td><td><kbd>Ctrl+Shift+1</kbd></td></tr>
+        <tr><td>Vùng chọn</td><td><kbd>⇧⌘2</kbd></td><td><kbd>Ctrl+Shift+2</kbd></td></tr>
+        <tr><td>Cửa sổ đang mở</td><td>menu bar → More</td><td><kbd>Ctrl+Shift+4</kbd></td></tr>
+        <tr><td>Quét chữ / QR</td><td><kbd>⌃⌥⌘O</kbd></td><td>Từ editor</td></tr>
+      </tbody>
+    </table>
+    <p style="margin-top:16px;color:var(--muted);font-size:15px">Trong editor: lăn đổi độ dày · <kbd>⌘/Ctrl + lăn</kbd> zoom · <kbd>⌘/Ctrl + C</kbd> copy và đóng · <kbd>⌘/Ctrl + S</kbd> lưu · <kbd>⌘/Ctrl + Z</kbd> hoàn tác · phím <kbd>A</kbd> <kbd>R</kbd> <kbd>T</kbd> <kbd>B</kbd> đổi công cụ.</p>
+
+    <h2 style="margin-top:80px">Câu hỏi thường gặp.</h2>
+    <div class="faq">
+      <details>
+        <summary>Mac Intel dùng được không?</summary>
+        <p>Được. Tải nút <b>Mac Intel</b>. Bản Apple Silicon dành cho M1 trở lên.</p>
+      </details>
+      <details>
+        <summary>Sao hệ điều hành cảnh báo app chưa xác minh?</summary>
+        <p>Bản Mac dùng chữ ký Snippr ổn định để giữ quyền Ghi màn hình khi cập nhật, nhưng chưa notarize với Apple. Bản Windows 1.2.8 chưa ký Authenticode. Mã nguồn và SHA-256 công khai trên GitHub để bạn tự kiểm.</p>
+      </details>
+      <details>
+        <summary>Đổi phím tắt thế nào?</summary>
+        <p>Mac: icon trên thanh menu → Cài đặt → Hotkeys, bấm ô rồi gõ tổ hợp mới. Windows: chuột phải icon khay → Settings, bấm ô hotkey rồi gõ tổ hợp (Esc để tắt phím đó).</p>
+      </details>
+      <details>
+        <summary>Ảnh lưu ở đâu?</summary>
+        <p>Mặc định trên Desktop, đổi được trong Cài đặt. Chế độ Auto chọn PNG cho giao diện, JPEG cho ảnh nhiều màu.</p>
+      </details>
+      <details>
+        <summary>Snippr có thu thập dữ liệu không?</summary>
+        <p>Không. Không tài khoản, không analytics. Ảnh không rời máy. Chỉ khi bạn bấm Dịch thì đoạn chữ đã quét mới được gửi đi để dịch.</p>
+      </details>
+    </div>
+  </div>
 </section>
 
 <footer>
-  <p>Snippr — mã nguồn mở theo giấy phép MIT · <a href="https://github.com/fantasy9876/snippr">github.com/fantasy9876/snippr</a></p>
-  <p style="margin-top:6px">Lấy cảm hứng từ Shottr · Made with <a href="https://claude.com/claude-code">Claude Code</a> 🤖</p>
-  <p style="margin-top:6px">Bản Windows 1.2.8 chưa ký số; hãy đối chiếu SHA-256 trên GitHub trước khi chạy.</p>
+  <div class="wrap foot">
+    <p>Snippr · MIT · <a href="https://github.com/fantasy9876/snippr">github.com/fantasy9876/snippr</a></p>
+    <p>macOS 1.2.5 · Windows 1.2.8 chưa ký số — hãy đối chiếu SHA-256 trước khi chạy.</p>
+  </div>
 </footer>
 
-</div>
+<script>
+  (function () {
+    var btn = document.getElementById("copy-cmd");
+    var cmd = document.getElementById("install-cmd");
+    if (btn && cmd) {
+      btn.addEventListener("click", function () {
+        var text = cmd.textContent;
+        function done() { btn.textContent = "Đã chép"; setTimeout(function () { btn.textContent = "Sao chép"; }, 1600); }
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(text).then(done).catch(function () {});
+        } else {
+          var range = document.createRange();
+          range.selectNodeContents(cmd);
+          var sel = window.getSelection();
+          sel.removeAllRanges();
+          sel.addRange(range);
+          done();
+        }
+      });
+    }
+
+    var ua = navigator.userAgent || "";
+    var isWin = /Windows/i.test(ua);
+    var isMac = /Mac OS X|Macintosh/i.test(ua);
+    // Chrome still reports "Intel" on Apple Silicon. Default Mac to the Silicon build.
+    var key = isWin ? "win" : isMac ? "mac-arm" : "";
+    if (key) {
+      var card = document.querySelector('[data-os="' + key + '"]');
+      if (card) card.classList.add("recommended");
+    }
+  })();
+</script>
 </body>
 </html>
