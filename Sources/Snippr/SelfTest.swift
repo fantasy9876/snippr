@@ -9492,13 +9492,16 @@ enum SelfTest {
                     "openEditor": 0, "setLastCapture": 0,
                     "setLastAreaRect": 0, "logEvent": 0,
                 ]
-                let overlay = SelectionOverlay(
+                // Built through the production factory: a hand-made overlay
+                // has no OverlayWindow, no contentView, no backing and never
+                // receives viewDidMoveToWindow, so calling it "the real host"
+                // was not true.
+                guard let overlay = SelectionOverlay.beginForTesting(
                     purpose: .areaReview,
                     inputs: OverlaySessionInputs(
                         afterShow: true, afterCopy: false, afterSave: false),
-                    completion: { _ in })
-                overlay.routerDependenciesOverride =
-                    CaptureActionRouter.Dependencies(
+                    frozen: hostFrozen, screen: hostScreen,
+                    dependencies: CaptureActionRouter.Dependencies(
                         copyToClipboard: { exported = $0; copyCount += 1 },
                         autoSave: { _, _ in deps["autoSave"]! += 1 },
                         saveAs: { _, _ in deps["saveAs"]! += 1 },
@@ -9508,10 +9511,31 @@ enum SelfTest {
                         toast: { _ in toasts += 1 },
                         setLastCapture: { _ in deps["setLastCapture"]! += 1 },
                         setLastAreaRect: { _ in deps["setLastAreaRect"]! += 1 },
-                        logEvent: { _ in deps["logEvent"]! += 1 })
-                let view = SelectionOverlayView(
-                    mode: .area, screen: hostScreen, frozen: hostFrozen,
-                    windowList: [], owner: overlay)
+                        logEvent: { _ in deps["logEvent"]! += 1 }),
+                    completion: { _ in }),
+                      let view = overlay.activeReviewViewForTesting else {
+                    hostFailures.append("area:no-overlay")
+                    return
+                }
+                defer { overlay.dismissForTesting() }
+                // Window ownership is real, and the assumptions the scan makes
+                // about geometry actually hold.
+                if view.window == nil { hostFailures.append("area:no-window") }
+                if view.window?.contentView !== view {
+                    hostFailures.append("area:not-content-view")
+                }
+                if abs(view.bounds.width - hostScreen.frame.width) > 0.5
+                    || abs(view.bounds.height - hostScreen.frame.height) > 0.5 {
+                    hostFailures.append("area:bounds \(view.bounds.size)")
+                }
+                if abs(hostFrozen.pointSize.width - view.bounds.width) > 0.5
+                    || abs(hostFrozen.pointSize.height - view.bounds.height) > 0.5 {
+                    hostFailures.append("area:frozen-size \(hostFrozen.pointSize)")
+                }
+                if !view.bounds.contains(hostSelection)
+                    || !hostSelection.contains(hostMask) {
+                    hostFailures.append("area:geometry")
+                }
                 view.selectForTesting(rect: hostSelection)
                 // Selecting already runs the initial capture, which legitimately
                 // records the capture and logs an event. Rebase every counter
@@ -9519,7 +9543,6 @@ enum SelfTest {
                 for key in deps.keys { deps[key] = 0 }
                 copyCount = 0
                 toasts = 0
-                defer { overlay.dismissForTesting() }
                 guard let surface = view.annotationSurface else {
                     hostFailures.append("area:no-surface")
                     return
