@@ -390,13 +390,23 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
     /// cancellation and the typed callback returns the session to review.
     fileprivate var isSaving: Bool { owner?.session.phase == .saving }
 
+    /// The session has already produced its result, or there is no session
+    /// left at all. Nothing may mutate the document or the overlay after that:
+    /// `finish` cancels the surfaces BEFORE its torn-down guard, so replaying
+    /// a cancel bumps every redaction's generation again, and a retained
+    /// button still carries a live target and action.
+    fileprivate var isFinished: Bool {
+        guard let owner else { return true }
+        return owner.session.phase == .completed
+    }
+
     fileprivate func handleEscape() {
-        if isSaving { return }
+        if isSaving || isFinished { return }
         owner?.finish(.cancelled)
     }
     func handleEscapeForTesting() { handleEscape() }
     func handleOutsideClickForTesting() {
-        if isSaving { return }
+        if isSaving || isFinished { return }
         owner?.finish(.cancelled)
     }
 
@@ -638,7 +648,7 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
     }
 
     @objc private func reviewToolbarButtonPressed(_ sender: NSButton) {
-        if isSaving { return }
+        if isSaving || isFinished { return }
         // The same rule the keyboard follows. A toolbar click, an
         // accessibility action or any programmatic route reaches this method
         // without passing a key handler, so the guard belongs here too.
@@ -974,7 +984,9 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
         updatePointer(from: event)
         let p = convert(event.locationInWindow, from: nil)
         guard mode == .area else { return }
-        if isSaving { return }
+        // Same rule as the drag: once the session has produced its result,
+        // a click can start nothing.
+        if isSaving || isFinished { return }
         if textEditingActive {
             // While the text field is first responder, a click on the canvas
             // must NOT move/resize the frame or cancel the session — the
@@ -1033,6 +1045,12 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
         updatePointer(from: event)
         guard mode == .area else { return }
         let p = convert(event.locationInWindow, from: nil)
+        // A live annotation drag is deliberately still served: it has to be
+        // able to abandon its draft. The selection routes below are not.
+        if isFinished, !annotationDragging {
+            areaDrag = nil
+            return
+        }
         if annotationDragging {
             annotationSurface?.continueDrag(toPixel: pixelPoint(fromView: p))
             needsDisplay = true
