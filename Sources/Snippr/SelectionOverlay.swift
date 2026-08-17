@@ -979,6 +979,19 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
             ctx.restoreGState()
         }
 
+        // The same hairline compose draws, at the same point in the order:
+        // after the document AND its marks, inside the plate's clip, and
+        // BEFORE any review chrome — the selection border and handles are
+        // overlay furniture the export never sees.
+        if let backdropClip, let sel = areaSelection {
+            ctx.saveGState()
+            ctx.addPath(backdropClip)
+            ctx.clip()
+            SliceBBackdrop.drawPlateHairline(
+                in: ctx, rect: sel, pixelScale: 1)
+            ctx.restoreGState()
+        }
+
         let accent = NSColor.controlAccentColor
 
         if let sel = areaSelection {
@@ -1044,7 +1057,10 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
             in: ctx, size: outer.size,
             target: CGRect(
                 origin: CGPoint(x: pad, y: pad), size: sel.size),
-            preset: backdropPreset, pixelScale: 1)
+            preset: backdropPreset, pixelScale: 1,
+            // Grain period is fixed in document pixels; this context is in
+            // points, so it has to be told the document's scale.
+            documentPixelsPerUserUnit: scale)
         ctx.restoreGState()
 
         // The frame just covered the crop as well; put the document back

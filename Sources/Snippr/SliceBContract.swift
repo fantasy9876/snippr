@@ -932,16 +932,14 @@ enum SliceBBackdrop {
     @discardableResult
     static func drawFrame(
         in ctx: CGContext, size: CGSize, target: CGRect,
-        preset: BackdropPreset, pixelScale: CGFloat
+        preset: BackdropPreset, pixelScale: CGFloat,
+        documentPixelsPerUserUnit: CGFloat = 1
     ) -> Bool {
         guard preset != .none else { return true }
-        guard let fill = CGGradient(
-            colorsSpace: CGColorSpace(name: CGColorSpace.sRGB)!,
-            colors: gradient(for: preset) as CFArray, locations: [0, 1])
+        guard drawFill(
+            in: ctx, size: size, preset: preset,
+            documentPixelsPerUserUnit: documentPixelsPerUserUnit)
         else { return false }
-        let axis = gradientAxis(width: size.width, height: size.height)
-        ctx.drawLinearGradient(
-            fill, start: axis.start, end: axis.end, options: [])
         let scale = max(1, pixelScale)
         ctx.setShadow(
             offset: CGSize(width: 0, height: shadowOffsetPt * scale),
@@ -954,7 +952,7 @@ enum SliceBBackdrop {
         // The opaque rounded fill exists only to cast the shadow. Leaving it
         // under the image would turn every transparent or translucent source
         // pixel black instead of letting the gradient show through, so the
-        // gradient is redrawn inside the shape before the image goes on top.
+        // fill is redrawn inside the shape before the image goes on top.
         ctx.addPath(rounded)
         ctx.setFillColor(NSColor.black.cgColor)
         ctx.fillPath()
@@ -962,10 +960,266 @@ enum SliceBBackdrop {
         ctx.saveGState()
         ctx.addPath(rounded)
         ctx.clip()
-        ctx.drawLinearGradient(
-            fill, start: axis.start, end: axis.end, options: [])
+        // The SAME fill, in the SAME canvas coordinates: re-running it inside
+        // the clip keeps the gradient, the wash and the grain phase continuous
+        // across the plate edge instead of restarting at the plate's origin.
+        guard drawFill(
+            in: ctx, size: size, preset: preset,
+            documentPixelsPerUserUnit: documentPixelsPerUserUnit) else {
+            ctx.restoreGState()
+            return false
+        }
         ctx.restoreGState()
         return true
+    }
+
+    /// The background, in one place: a four-stop linear ramp, a soft radial
+    /// wash from the upper left, and a deterministic grain that breaks up the
+    /// banding a smooth ramp shows on an 8-bit display.
+    ///
+    /// `documentPixelsPerUserUnit` is what keeps the grain the same SIZE in
+    /// both draw paths. Compose works in bitmap pixels (1), the preview works
+    /// in points (the document's scale), and the tile is specified in document
+    /// pixels — mixing the two makes a @2x preview show a grain twice the
+    /// period of the exported one.
+    @discardableResult
+    static func drawFill(
+        in ctx: CGContext, size: CGSize, preset: BackdropPreset,
+        documentPixelsPerUserUnit: CGFloat = 1
+    ) -> Bool {
+        guard preset != .none else { return true }
+        let stops = gradientStops(for: preset)
+        guard let fill = CGGradient(
+            colorsSpace: CGColorSpace(name: CGColorSpace.sRGB)!,
+            colors: stops.map(\.color) as CFArray,
+            locations: stops.map(\.location))
+        else { return false }
+        let axis = gradientAxis(width: size.width, height: size.height)
+        ctx.drawLinearGradient(
+            fill, start: axis.start, end: axis.end, options: [])
+
+        let wash = radialWash(for: preset)
+        guard let washGradient = CGGradient(
+            colorsSpace: CGColorSpace(name: CGColorSpace.sRGB)!,
+            colors: [wash.centre, wash.edge] as CFArray, locations: [0, 1])
+        else { return false }
+        ctx.drawRadialGradient(
+            washGradient,
+            startCenter: CGPoint(
+                x: 0.22 * size.width, y: 0.78 * size.height),
+            startRadius: 0,
+            endCenter: CGPoint(
+                x: 0.22 * size.width, y: 0.78 * size.height),
+            endRadius: hypot(size.width, size.height) * 0.85,
+            options: [])
+
+        guard let grain = grainTile(for: preset) else { return false }
+        // Tiled from the canvas ORIGIN every time, never from a dirty rect:
+        // panning or a partial redraw must not shift the pattern. CGPattern is
+        // deliberately not used — its phase follows the CTM.
+        let tileSide = CGFloat(Self.grainTileSide)
+            / max(0.0001, documentPixelsPerUserUnit)
+        ctx.saveGState()
+        ctx.setBlendMode(.overlay)
+        // Only the tiles the current clip can actually show. The second fill
+        // inside the plate would otherwise re-blit the whole canvas — on a 5K
+        // frame that is ~900 draws per pass, twice per event, while the user
+        // drags. The PHASE is unaffected: the first tile is snapped back to a
+        // multiple of the tile size from the canvas origin, so what is drawn
+        // is the same pattern either way, dirty rect or not.
+        let region = ctx.boundingBoxOfClipPath.intersection(
+            CGRect(origin: .zero, size: size))
+        var blits = 0
+        if !region.isNull, region.width > 0, region.height > 0 {
+            var y = (region.minY / tileSide).rounded(.down) * tileSide
+            while y < region.maxY {
+                var x = (region.minX / tileSide).rounded(.down) * tileSide
+                while x < region.maxX {
+                    ctx.draw(grain, in: CGRect(
+                        x: x, y: y, width: tileSide, height: tileSide))
+                    blits += 1
+                    x += tileSide
+                }
+                y += tileSide
+            }
+        }
+        countGrainTileBlits(blits)
+        ctx.restoreGState()
+        return true
+    }
+
+    /// The 1pt white line that softens the plate's clipped edge. Drawn AFTER
+    /// the image and inside the plate's clip, so it sits on top of the
+    /// screenshot rather than under it.
+    static func drawPlateHairline(
+        in ctx: CGContext, rect: CGRect, pixelScale: CGFloat
+    ) {
+        let scale = max(1, pixelScale)
+        let radius = cornerRadiusPt * scale
+        // Inset by half the line width so the whole stroke lands INSIDE the
+        // plate: a centred stroke would spill half of itself onto the frame.
+        let inset = rect.insetBy(dx: 0.5 * scale, dy: 0.5 * scale)
+        guard inset.width > 0, inset.height > 0 else { return }
+        ctx.saveGState()
+        defer { ctx.restoreGState() }
+        ctx.setLineWidth(1 * scale)
+        ctx.setStrokeColor(
+            NSColor(srgbRed: 1, green: 1, blue: 1, alpha: 0.16).cgColor)
+        ctx.addPath(CGPath(
+            roundedRect: inset,
+            cornerWidth: max(0, radius - 0.5 * scale),
+            cornerHeight: max(0, radius - 0.5 * scale), transform: nil))
+        ctx.strokePath()
+    }
+
+    /// Tile side in DOCUMENT pixels.
+    static let grainTileSide = 128
+
+    /// How many tiles the fills have blitted, so a gate can prove the clipped
+    /// pass does not scan the whole canvas. Compose can run off the main
+    /// thread, so this is locked rather than a bare global, and it ACCUMULATES
+    /// — a counter that reset itself per call would hide the second pass.
+    private nonisolated(unsafe) static var grainTileBlits = 0
+    private static let grainTileBlitsLock = NSLock()
+    static var grainTileBlitsForTesting: Int {
+        grainTileBlitsLock.lock()
+        defer { grainTileBlitsLock.unlock() }
+        return grainTileBlits
+    }
+    static func resetGrainTileBlitsForTesting() {
+        grainTileBlitsLock.lock()
+        grainTileBlits = 0
+        grainTileBlitsLock.unlock()
+    }
+    private static func countGrainTileBlits(_ n: Int) {
+        guard n > 0 else { return }
+        grainTileBlitsLock.lock()
+        grainTileBlits += n
+        grainTileBlitsLock.unlock()
+    }
+
+    static func grainSeed(for preset: BackdropPreset) -> UInt32 {
+        switch preset {
+        case .none: return 0
+        case .ocean: return 0x0CE4_0001
+        case .sunset: return 0x5E70_0002
+        case .mint: return 0xA117_0003
+        case .graphite: return 0x6A40_0004
+        }
+    }
+
+    /// Deterministic by construction: same preset, same bytes, every run and
+    /// every machine. No `arc4random`, no clock.
+    static func grainHash(x: Int, y: Int, seed: UInt32) -> UInt32 {
+        var h = seed
+        h &+= UInt32(bitPattern: Int32(truncatingIfNeeded: x))
+            &* 374_761_393
+        h &+= UInt32(bitPattern: Int32(truncatingIfNeeded: y))
+            &* 668_265_263
+        h ^= h >> 13
+        h &*= 1_274_126_177
+        h ^= h >> 16
+        return h
+    }
+
+    private nonisolated(unsafe) static var grainCache: [UInt32: CGImage] = [:]
+    private static let grainCacheLock = NSLock()
+
+    static func grainTile(for preset: BackdropPreset) -> CGImage? {
+        let seed = grainSeed(for: preset)
+        grainCacheLock.lock()
+        defer { grainCacheLock.unlock() }
+        if let cached = grainCache[seed] { return cached }
+        let side = grainTileSide
+        guard let ctx = CGContext(
+            data: nil, width: side, height: side, bitsPerComponent: 8,
+            bytesPerRow: side * 4,
+            space: CGColorSpace(name: CGColorSpace.sRGB)!,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue),
+            let data = ctx.data
+        else { return nil }
+        let bytes = data.assumingMemoryBound(to: UInt8.self)
+        for y in 0..<side {
+            for x in 0..<side {
+                // ±2/255 around mid grey: under `.overlay` that is a ±2 luma
+                // nudge, which is what dithers the ramp without being visible
+                // as texture.
+                let delta = Int(grainHash(x: x, y: y, seed: seed) % 5) - 2
+                let grey = UInt8(clamping: 128 + delta)
+                let i = (y * side + x) * 4
+                bytes[i] = grey
+                bytes[i + 1] = grey
+                bytes[i + 2] = grey
+                bytes[i + 3] = 255
+            }
+        }
+        guard let image = ctx.makeImage() else { return nil }
+        grainCache[seed] = image
+        return image
+    }
+
+    /// The wash laid over the linear ramp: a light source in the upper left,
+    /// falling to fully transparent at the edge.
+    static func radialWash(
+        for preset: BackdropPreset
+    ) -> (centre: CGColor, edge: CGColor) {
+        func srgb(
+            _ r: Int, _ g: Int, _ b: Int, _ a: CGFloat
+        ) -> CGColor {
+            NSColor(
+                srgbRed: CGFloat(r) / 255, green: CGFloat(g) / 255,
+                blue: CGFloat(b) / 255, alpha: a).cgColor
+        }
+        switch preset {
+        case .none: return (srgb(0, 0, 0, 0), srgb(0, 0, 0, 0))
+        case .ocean:
+            return (srgb(255, 255, 255, 0.20), srgb(255, 255, 255, 0))
+        case .sunset:
+            return (srgb(255, 232, 192, 0.18), srgb(255, 232, 192, 0))
+        case .mint:
+            return (srgb(232, 255, 246, 0.16), srgb(232, 255, 246, 0))
+        case .graphite:
+            return (srgb(139, 155, 184, 0.14), srgb(139, 155, 184, 0))
+        }
+    }
+
+    /// The preset's four stops, location and colour together. Exposed so a
+    /// reference render reads the SAME table production draws from and cannot
+    /// drift from it.
+    static func gradientStops(
+        for preset: BackdropPreset
+    ) -> [(location: CGFloat, color: CGColor)] {
+        func rgb(_ r: Int, _ g: Int, _ b: Int) -> CGColor {
+            NSColor(
+                srgbRed: CGFloat(r) / 255, green: CGFloat(g) / 255,
+                blue: CGFloat(b) / 255, alpha: 1).cgColor
+        }
+        switch preset {
+        case .none:
+            return [(0, rgb(0, 0, 0)), (1, rgb(0, 0, 0))]
+        case .ocean:
+            return [
+                (0.00, rgb(139, 180, 255)), (0.28, rgb(74, 124, 240)),
+                (0.62, rgb(46, 61, 184)), (1.00, rgb(26, 24, 104)),
+            ]
+        case .sunset:
+            return [
+                (0.00, rgb(255, 208, 138)), (0.28, rgb(255, 126, 74)),
+                (0.62, rgb(230, 61, 120)), (1.00, rgb(122, 34, 136)),
+            ]
+        case .mint:
+            return [
+                (0.00, rgb(154, 245, 212)), (0.28, rgb(61, 220, 176)),
+                (0.62, rgb(26, 154, 138)), (1.00, rgb(10, 69, 80)),
+            ]
+        case .graphite:
+            // Its own locations: the mid tones sit further apart, or the
+            // darkest stop swallows most of the frame.
+            return [
+                (0.00, rgb(90, 98, 112)), (0.32, rgb(52, 58, 70)),
+                (0.68, rgb(28, 32, 40)), (1.00, rgb(11, 13, 17)),
+            ]
+        }
     }
 
     static func compose(
@@ -988,7 +1242,13 @@ enum SliceBBackdrop {
         guard let ctx = CGContext(
             data: nil, width: w, height: h, bitsPerComponent: 8,
             bytesPerRow: 0,
-            space: image.colorSpace ?? CGColorSpace(name: CGColorSpace.sRGB)!,
+            // A FRAMED document is sRGB, deliberately. Every stop, wash and
+            // grain value in the spec is written in sRGB; compositing them
+            // into a P3 context would render the frame differently from the
+            // preview and leave the match ungateable. `.none` never reaches
+            // here, so a plain export still keeps its input space byte for
+            // byte.
+            space: CGColorSpace(name: CGColorSpace.sRGB)!,
             bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
         else { return nil }
         let target = CGRect(
@@ -999,7 +1259,10 @@ enum SliceBBackdrop {
         // with no background, which terminal callers would treat as success.
         guard drawFrame(
             in: ctx, size: CGSize(width: w, height: h), target: target,
-            preset: preset, pixelScale: pixelScale)
+            preset: preset, pixelScale: pixelScale,
+            // The context IS the document's pixel grid here, so a grain texel
+            // is a document pixel.
+            documentPixelsPerUserUnit: 1)
         else { return nil }
         ctx.saveGState()
         let radius = cornerRadiusPt * max(1, pixelScale)
@@ -1008,15 +1271,18 @@ enum SliceBBackdrop {
             transform: nil))
         ctx.clip()
         ctx.draw(image, in: target)
+        // Inside the same clip and ON TOP of the screenshot: it softens the
+        // clipped edge, which is the "jagged frame" the report was about.
+        drawPlateHairline(in: ctx, rect: target, pixelScale: pixelScale)
         ctx.restoreGState()
         return ctx.makeImage()
     }
 
-    /// The preset's two stops. Exposed so a caller can reproduce the exact
-    /// background — the gradient geometry is fixed by `compose`, so a reference
-    /// render cannot drift from the real one.
+    /// The preset's stop colours, in order. Reads the same table `drawFill`
+    /// draws from, so a caller cannot reproduce a background production no
+    /// longer paints.
     static func gradientColors(for preset: BackdropPreset) -> [CGColor] {
-        gradient(for: preset)
+        gradientStops(for: preset).map(\.color)
     }
 
     /// Gradient axis for a frame of this size, shared by `compose` and by
@@ -1030,20 +1296,6 @@ enum SliceBBackdrop {
         (CGPoint(x: 0, y: height), CGPoint(x: width, y: 0))
     }
 
-    private static func gradient(for preset: BackdropPreset) -> [CGColor] {
-        func rgb(_ r: Int, _ g: Int, _ b: Int) -> CGColor {
-            NSColor(
-                srgbRed: CGFloat(r) / 255, green: CGFloat(g) / 255,
-                blue: CGFloat(b) / 255, alpha: 1).cgColor
-        }
-        switch preset {
-        case .none: return [rgb(0, 0, 0), rgb(0, 0, 0)]
-        case .ocean: return [rgb(79, 125, 243), rgb(59, 47, 184)]
-        case .sunset: return [rgb(255, 138, 76), rgb(232, 68, 127)]
-        case .mint: return [rgb(47, 211, 165), rgb(30, 158, 143)]
-        case .graphite: return [rgb(58, 63, 70), rgb(28, 31, 36)]
-        }
-    }
 }
 
 // MARK: - Redaction lifecycle

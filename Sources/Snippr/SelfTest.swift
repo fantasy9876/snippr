@@ -9010,16 +9010,15 @@ enum SelfTest {
                     bitsPerComponent: 8, bytesPerRow: 0,
                     space: CGColorSpace(name: CGColorSpace.sRGB)!,
                     bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue),
-                    let g = CGGradient(
-                        colorsSpace: CGColorSpace(name: CGColorSpace.sRGB)!,
-                        colors: SliceBBackdrop.gradientColors(for: .ocean)
-                            as CFArray,
-                        locations: [0, 1])
+                    SliceBBackdrop.drawFill(
+                        in: c,
+                        size: CGSize(width: width, height: height),
+                        preset: .ocean, documentPixelsPerUserUnit: 1)
                 else { return nil }
-                let axis = SliceBBackdrop.gradientAxis(
-                    width: CGFloat(width), height: CGFloat(height))
-                c.drawLinearGradient(
-                    g, start: axis.start, end: axis.end, options: [])
+                // PRODUCTION's fill, not a hand-rolled gradient: the frame is
+                // a four-stop ramp plus a radial wash plus grain, and a
+                // two-stop reference would report a difference the export does
+                // not have.
                 return c.makeImage()
             }
             var shadowOK = false
@@ -9367,12 +9366,21 @@ enum SelfTest {
                 // how CoreGraphics blends between the stops.
                 let startPixel = pixel(0, h - 1)
                 let endPixel = pixel(w - 1, 0)
-                func near(_ a: (Int, Int, Int), _ b: (Int, Int, Int)) -> Bool {
-                    abs(a.0 - b.0) <= 2 && abs(a.1 - b.1) <= 2
-                        && abs(a.2 - b.2) <= 2
+                func near(
+                    _ a: (Int, Int, Int), _ b: (Int, Int, Int), _ tol: Int
+                ) -> Bool {
+                    abs(a.0 - b.0) <= tol && abs(a.1 - b.1) <= tol
+                        && abs(a.2 - b.2) <= tol
                 }
-                stopsOK = near(startPixel, (255, 138, 76))
-                    && near(endPixel, (232, 68, 127))
+                // The SPEC's first and last Sunset stops, written here as
+                // literals rather than read from production — a gate that
+                // asked `gradientStops` for its expectation would agree with
+                // any table at all. Tolerance covers the radial wash and the
+                // ±2/255 grain, both of which reach the corners: the wash is
+                // centred at (0.22w, 0.78h), so the top-left corner carries a
+                // real amount of it and the bottom-right almost none.
+                stopsOK = near(startPixel, (255, 208, 138), 26)
+                    && near(endPixel, (122, 34, 136), 6)
                 stopsDetail = "start \(startPixel) end \(endPixel)"
             }
 
@@ -9380,13 +9388,16 @@ enum SelfTest {
             var p3Detail = "framed nil"
             if let framed = p3Framed, let reference = p3Reference,
                framed.width == reference.width {
+                // sRGB, because a FRAMED export is sRGB. Reading it back
+                // through P3 would convert it a second time and leave every
+                // expectation in this block one conversion out of step.
                 func readBack(_ image: CGImage) -> [UInt8]? {
                     var bytes = [UInt8](
                         repeating: 0, count: image.width * image.height * 4)
                     guard let c = CGContext(
                         data: &bytes, width: image.width, height: image.height,
                         bitsPerComponent: 8, bytesPerRow: image.width * 4,
-                        space: p3Space,
+                        space: CGColorSpace(name: CGColorSpace.sRGB)!,
                         bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
                     else { return nil }
                     c.interpolationQuality = .none
@@ -9427,19 +9438,52 @@ enum SelfTest {
                     }
                     let transparentShowsBackdrop = close(
                         clearGot, (clearWant.0, clearWant.1, clearWant.2), 2)
-                    let opaqueShowsSource = close(solidGot, srcBytes, 3)
+                    // The framed context is sRGB, so a P3 source is converted
+                    // on the way in. Expect the CONVERTED colour, built by
+                    // drawing the same source into an sRGB context — that is
+                    // CoreGraphics' own conversion, not compose's.
+                    func convertedToSRGB(
+                        _ image: CGImage, atX x: Int
+                    ) -> (Int, Int, Int)? {
+                        let w = image.width, h = image.height
+                        var probe = [UInt8](repeating: 0, count: w * h * 4)
+                        guard let c = CGContext(
+                            data: &probe, width: w, height: h,
+                            bitsPerComponent: 8, bytesPerRow: w * 4,
+                            space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                            bitmapInfo: CGImageAlphaInfo
+                                .premultipliedLast.rawValue)
+                        else { return nil }
+                        c.interpolationQuality = .none
+                        c.draw(image, in: CGRect(
+                            x: 0, y: 0, width: CGFloat(w), height: CGFloat(h)))
+                        let i = ((h / 2) * w + x) * 4
+                        return (
+                            Int(probe[i]), Int(probe[i + 1]), Int(probe[i + 2]))
+                    }
+                    // The opaque band of the source sits at x 10..<20.
+                    let convertedSource = convertedToSRGB(p3Alpha, atX: 15)
+                        ?? srcBytes
+                    let opaqueShowsSource = close(solidGot, convertedSource, 3)
                     let quarterBlends = close(
                         mixGot,
-                        (Int(blend(mixDst.0, srcBytes.0, 0.25).rounded()),
-                         Int(blend(mixDst.1, srcBytes.1, 0.25).rounded()),
-                         Int(blend(mixDst.2, srcBytes.2, 0.25).rounded())),
+                        (Int(blend(
+                            mixDst.0, convertedSource.0, 0.25).rounded()),
+                         Int(blend(
+                            mixDst.1, convertedSource.1, 0.25).rounded()),
+                         Int(blend(
+                            mixDst.2, convertedSource.2, 0.25).rounded())),
                         4)
                     // A gradient-only result would satisfy the first check and
                     // fail these two, which is exactly the point.
                     let differsFromReference = !close(
                         solidGot, (px(want, solidX).0, px(want, solidX).1,
                                    px(want, solidX).2), 6)
-                    let spaceKept = framed.colorSpace?.name == p3Space.name
+                    // A FRAMED export is sRGB by design (the spec writes every
+                    // stop, wash and grain value in sRGB), while `.none` still
+                    // keeps its input space — the check just above.
+                    let spaceKept = framed.colorSpace?.name
+                        == CGColorSpace.sRGB
                     let opaqueOut = clearGot.3 == 255 && solidGot.3 == 255
                         && mixGot.3 == 255
                     p3FramedOK = spaceKept && opaqueOut
@@ -9449,7 +9493,8 @@ enum SelfTest {
                         + "clear \(transparentShowsBackdrop) "
                         + "solid \(opaqueShowsSource) mix \(quarterBlends) "
                         + "differs \(differsFromReference) "
-                        + "got \(solidGot) want \(srcBytes)"
+                        + "got \(solidGot) want \(convertedSource) "
+                        + "rawP3 \(srcBytes)"
                 }
             }
             check("sliceB2-backdrop-mapping",
@@ -15818,16 +15863,58 @@ enum SelfTest {
                 if let wrapper = wc.documentWrapperForTesting,
                    let field = canvas.textFieldForTesting {
                     wrapper.layoutSubtreeIfNeeded()
-                    // The mask is what clips SUBVIEWS. It is asserted as state
-                    // rather than as pixels on purpose: a layer mask is applied
-                    // by the compositor, and every in-process render of a view
-                    // hierarchy bypasses that, so no snapshot this gate can
-                    // take would show it. The draw-path clip is what the
-                    // raster gates above prove.
-                    let masked = canvas.layer?.masksToBounds == true
-                        && canvas.layer?.cornerRadius
-                            == SliceBBackdrop.cornerRadiusPt
-                    if !masked {
+                    // The clip that reaches SUBVIEWS now lives on the FIELD.
+                    // It is asserted as state rather than as pixels on purpose:
+                    // a layer mask is applied by the compositor, and every
+                    // in-process render of a view hierarchy bypasses it, so no
+                    // snapshot this gate can take would show it. The draw-path
+                    // clip is what the raster gates above prove.
+                    //
+                    // The canvas itself must stay UNMASKED: it is magnified by
+                    // the scroll view, and a masked layer would be rasterized
+                    // once at the backing scale and then scaled, which is the
+                    // stepped corner the 1.2.8 report was about.
+                    if canvas.layer?.masksToBounds == true
+                        || (canvas.layer?.cornerRadius ?? 0) != 0 {
+                        chromeFailures.append("canvas-rasterized-by-mask")
+                    }
+                    if let fieldMask = field.layer?.mask as? CAShapeLayer {
+                        if fieldMask.path?.contains(
+                            field.convert(CGPoint(x: 3, y: 3), from: canvas))
+                            == true {
+                            chromeFailures.append(
+                                "field-clip-lets-the-corner-through")
+                        }
+                        // Sharp under zoom: the mask is rendered for the
+                        // CURRENT magnification rather than scaled up from 1x.
+                        // The expected number is the backing scale times the
+                        // magnification the scroll view actually settled on —
+                        // this fixture fits at roughly 0.79, so demanding 2
+                        // would be red against correct code.
+                        @MainActor func expectedMaskScale() -> CGFloat {
+                            (wc.window?.backingScaleFactor ?? 2)
+                                * max(0.01, canvas.enclosingScrollView?
+                                    .magnification ?? 1)
+                        }
+                        if abs(fieldMask.contentsScale - expectedMaskScale())
+                            > 0.05 {
+                            chromeFailures.append(
+                                "field-clip-scale \(fieldMask.contentsScale) "
+                                    + "want \(expectedMaskScale())")
+                        }
+                        // And it FOLLOWS a zoom: a mask rendered once at the
+                        // opening magnification is the same rasterization bug
+                        // one level down.
+                        canvas.enclosingScrollView?.magnification = 2
+                        canvas.magnificationDidChange()
+                        if let rescaled = field.layer?.mask as? CAShapeLayer,
+                           abs(rescaled.contentsScale - expectedMaskScale())
+                            > 0.05 {
+                            chromeFailures.append(
+                                "field-clip-stale-after-zoom "
+                                    + "\(rescaled.contentsScale)")
+                        }
+                    } else {
                         chromeFailures.append("subview-unmasked")
                     }
                     // A point that is inside the FIELD and inside the canvas

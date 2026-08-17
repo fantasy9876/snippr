@@ -916,16 +916,21 @@ final class BackdropDocumentView: NSView {
         // draws. Without this the preview shows square corners over a rounded
         // plate and the user reviews something the export will not produce.
         //
-        // BOTH clips, because they cover different things. The draw-path clip
-        // shapes the canvas's own body and survives every render that calls
-        // draw directly; the layer mask is what actually clips SUBVIEWS, and
-        // the live text field being edited is one — without it a caption typed
-        // near a corner shows in the preview and is cut from the export.
+        // The draw-path clip shapes the canvas's own body and survives every
+        // render that calls draw directly.
+        //
+        // What is deliberately NOT here any more: `layer.cornerRadius` with
+        // `masksToBounds`. This canvas lives inside an NSScrollView with
+        // magnification, and a masked layer is rasterized once at the backing
+        // scale and then SCALED — which is precisely the stepped, pixelated
+        // frame edge the report was about, and it made the preview disagree
+        // with an export that antialiases correctly. The live text field, the
+        // one subview that needed the layer mask, carries its own clip now.
         let radius = layout.isCollapsed ? 0 : SliceBBackdrop.cornerRadiusPt
         canvas.documentCornerRadius = radius
-        canvas.wantsLayer = true
-        canvas.layer?.cornerRadius = radius
-        canvas.layer?.masksToBounds = radius > 0
+        canvas.layer?.cornerRadius = 0
+        canvas.layer?.masksToBounds = false
+        canvas.updateTextEntryClip()
         needsDisplay = true
     }
 
@@ -937,7 +942,12 @@ final class BackdropDocumentView: NSView {
         SliceBBackdrop.drawFrame(
             in: ctx, size: layout.outerPointSize,
             target: layout.innerPointRect, preset: layout.preset,
-            pixelScale: 1)
+            // Radius and shadow are POINT metrics and this context is in
+            // points, so their scale is 1. The grain is not: its period is
+            // fixed in DOCUMENT pixels, so at @2x a 128px tile has to be drawn
+            // 64pt wide or the preview shows a grain twice the exported one.
+            pixelScale: 1,
+            documentPixelsPerUserUnit: layout.pixelScale)
     }
 
     /// The frame is decoration: clicks in it belong to no tool, and must not
@@ -1380,7 +1390,19 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
                 x: 0, y: 0,
                 width: image.cgImage.width, height: image.cgImage.height),
             pixelScale: pxScale)
+        ctx.restoreGState()
 
+        // Straight after the document and its marks, and BEFORE any chrome:
+        // the same position compose gives it. Selection handles, crop shading
+        // and transients are editor furniture that the export never sees, so
+        // the line has to go under them, not over them.
+        if documentCornerRadius > 0 {
+            SliceBBackdrop.drawPlateHairline(
+                in: ctx, rect: bounds, pixelScale: 1)
+        }
+
+        ctx.saveGState()
+        ctx.scaleBy(x: 1 / pxScale, y: 1 / pxScale)
         if let sel = selected {
             drawSelectionChrome(around: sel.bounds, in: ctx)
         }
@@ -1984,6 +2006,7 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
         addSubview(field)
         window?.makeFirstResponder(field)
         textField = field
+        updateTextEntryClip()
 
         let ann = TextAnnotation(uiScale: pxScale)
         ann.color = currentColor
@@ -2655,9 +2678,42 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
     private var trackpadAccum: CGFloat = 0
 
     func magnificationDidChange() {
-        guard cropRect != nil else { return }
+        // The frame around the document is drawn by the superview, so a zoom
+        // has to repaint BOTH: repainting only the canvas left the plate edge
+        // rendered for the previous magnification.
+        superview?.needsDisplay = true
         needsDisplay = true
+        updateTextEntryClip()
+        guard cropRect != nil else { return }
         window?.invalidateCursorRects(for: self)
+    }
+
+    /// Clips the live text field to the document's rounded corners.
+    ///
+    /// The canvas itself is clipped in `draw`, which does not affect subviews;
+    /// the field is the only subview, and a caption typed into a corner would
+    /// otherwise show in the preview and be cut from the export. The mask goes
+    /// on the FIELD, not the canvas, so nothing that is magnified gets
+    /// rasterized — and its `contentsScale` follows the magnification so the
+    /// mask itself stays sharp.
+    func updateTextEntryClip() {
+        guard let field = textField else { return }
+        guard documentCornerRadius > 0 else {
+            field.layer?.mask = nil
+            return
+        }
+        field.wantsLayer = true
+        let magnification = enclosingScrollView?.magnification ?? 1
+        let scale = (window?.backingScaleFactor ?? 2) * max(0.01, magnification)
+        let rounded = CGPath(
+            roundedRect: convert(bounds, to: field),
+            cornerWidth: documentCornerRadius,
+            cornerHeight: documentCornerRadius, transform: nil)
+        let mask = (field.layer?.mask as? CAShapeLayer) ?? CAShapeLayer()
+        mask.frame = field.bounds
+        mask.path = rounded
+        mask.contentsScale = scale
+        field.layer?.mask = mask
     }
 
     static func isStrokeTool(_ tool: EditorTool) -> Bool {
