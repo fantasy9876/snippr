@@ -411,6 +411,9 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
     }
 
     var hasAreaSelectionForTesting: Bool { areaSelection != nil }
+    var areaSelectionForTesting: CGRect? { areaSelection }
+    var areaDragActiveForTesting: Bool { areaDrag != nil }
+    var isAnnotationDraggingForTesting: Bool { annotationDragging }
     var isReviewingForTesting: Bool { isReviewing }
     var reviewToolbarFrameForTesting: CGRect? {
         let frames = [reviewToolRail, reviewActionBar].compactMap { view in

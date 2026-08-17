@@ -9950,6 +9950,10 @@ enum SelfTest {
             // cannot speak for it.
             var areaLockFailures: [String] = []
             let runAreaSaveLock = {
+                guard !seamUnsafe else {
+                    areaLockFailures.append("prior-seam-unsafe")
+                    return
+                }
                 guard let screen = NSScreen.screens.first else {
                     areaLockFailures.append("no-screen")
                     return
@@ -9962,118 +9966,406 @@ enum SelfTest {
                         SliceBRedactionJob.ownerCountForTesting
                     }
                 }
-                if slots() != 0 || owners() != 0 {
+                if slots() != 0 || owners() != 0
+                    || SelectionOverlay.current != nil {
                     areaLockFailures.append(
-                        "dirty-baseline \(slots())/\(owners())")
+                        "dirty-baseline \(slots())/\(owners())/"
+                        + "\(SelectionOverlay.current != nil)")
                     seamUnsafe = true
                     return
                 }
+                let slotBase = slots()
+                let ownerBase = owners()
                 let release = DispatchSemaphore(value: 0)
                 let started = DispatchSemaphore(value: 0)
-                let finished = DispatchSemaphore(value: 0)
+                let workerFinished = DispatchSemaphore(value: 0)
                 let scopeLock = NSLock()
                 var scopeEnded = false
-                var entered = false
-                var returned = false
+                let entryLock = NSLock()
+                var workerEntered = false
+                var workerReturned = false
+                var releaseSignalled = false
+                var workerContained = false
                 let previousRecognizer = SliceBOCR.recognizerForTesting
-                SliceBOCR.recognizerForTesting = { _ in
+
+                func endScope() {
                     scopeLock.lock()
-                    entered = true
+                    scopeEnded = true
+                    scopeLock.unlock()
+                    for _ in 0..<8 { release.signal() }
+                }
+
+                @discardableResult
+                func releaseAndDrain() -> Bool {
+                    if workerContained { return true }
+                    entryLock.lock()
+                    let entered = workerEntered
+                    let returned = workerReturned
+                    entryLock.unlock()
+                    if !entered {
+                        // A queued job looks up the recognizer only when its
+                        // background block begins. Keep this ended fake seam
+                        // installed and pump until that queued slot returns.
+                        if slots() > slotBase {
+                            let deadline = Date().addingTimeInterval(10)
+                            while slots() > slotBase, Date() < deadline {
+                                RunLoop.current.run(
+                                    until: Date().addingTimeInterval(0.02))
+                            }
+                        }
+                    } else if !returned {
+                        if !releaseSignalled {
+                            releaseSignalled = true
+                            release.signal()
+                        }
+                        if workerFinished.wait(timeout: .now() + 10)
+                            == .timedOut {
+                            areaLockFailures.append("worker-never-returned")
+                            return false
+                        }
+                    }
+                    let deadline = Date().addingTimeInterval(5)
+                    while slots() > slotBase, Date() < deadline {
+                        RunLoop.current.run(
+                            until: Date().addingTimeInterval(0.02))
+                    }
+                    entryLock.lock()
+                    let returnedAfterDrain = !workerEntered || workerReturned
+                    entryLock.unlock()
+                    workerContained = returnedAfterDrain
+                        && slots() == slotBase && owners() == ownerBase
+                    if !workerContained {
+                        areaLockFailures.append(
+                            "drain \(slots())/\(owners())/"
+                            + "\(returnedAfterDrain)")
+                    }
+                    return workerContained
+                }
+
+                SliceBOCR.recognizerForTesting = { _ in
+                    entryLock.lock()
+                    workerEntered = true
+                    entryLock.unlock()
+                    started.signal()
+                    scopeLock.lock()
                     let ended = scopeEnded
                     scopeLock.unlock()
-                    started.signal()
                     if !ended { release.wait() }
-                    defer { finished.signal() }
-                    return .success([
+                    let result: Result<[RecognizedWord], Error> = .success([
                         RecognizedWord(
                             rect: CGRect(x: 6, y: 6, width: 20, height: 12),
                             confidence: 0.9),
                     ])
+                    entryLock.lock()
+                    workerReturned = true
+                    entryLock.unlock()
+                    workerFinished.signal()
+                    return result
                 }
                 final class AreaLockSpy {
                     var saveDone: (@MainActor (SaveAsOutcome) -> Void)?
                     var saveAsCalls = 0
                     var copies = 0
-                    var completions = 0
+                    var autoSaves = 0
+                    var pins = 0
+                    var ocrs = 0
+                    var editors = 0
+                    var toasts: [String] = []
+                    var lastCaptures = 0
+                    var areaRects: [CGRect] = []
+                    var logs: [String] = []
+                    var handled = 0
+                    var cancelled = 0
+                    var otherCompletions = 0
                     var observe: (() -> Void)?
                     var observations = 0
                     var inCallback: [String] = []
+                    var saveSizes: [CGSize] = []
+                    var lastCaptureSizes: [CGSize] = []
+                    var effectEvents: [String] = []
+                    var observeEffect: ((String) -> Void)?
+
+                    var effectSignature: String {
+                        "save=\(saveAsCalls),copy=\(copies),auto="
+                            + "\(autoSaves),pin=\(pins),ocr=\(ocrs),editor="
+                            + "\(editors),toasts=\(toasts),last="
+                            + "\(lastCaptures),rects=\(areaRects),logs="
+                            + "\(logs),completion=\(handled)/\(cancelled)/"
+                            + "\(otherCompletions),obs=\(observations),sizes="
+                            + "\(saveSizes)/\(lastCaptureSizes),events="
+                            + "\(effectEvents)"
+                    }
+
+                    func resetRoutes() {
+                        saveDone = nil
+                        saveAsCalls = 0
+                        copies = 0
+                        autoSaves = 0
+                        pins = 0
+                        ocrs = 0
+                        editors = 0
+                        toasts = []
+                        lastCaptures = 0
+                        areaRects = []
+                        logs = []
+                        observations = 0
+                        inCallback = []
+                        saveSizes = []
+                        lastCaptureSizes = []
+                        effectEvents = []
+                    }
                 }
                 let spy = AreaLockSpy()
-                let overlay = SelectionOverlay(
+                let frozen = CapturedImage(
+                    cgImage: makeNoiseImage(
+                        width: Int(screen.frame.width * 2),
+                        height: Int(screen.frame.height * 2)),
+                    scale: 2)
+                guard let overlay = SelectionOverlay.beginForTesting(
                     purpose: .areaReview,
                     inputs: OverlaySessionInputs(
                         afterShow: true, afterCopy: false, afterSave: false),
-                    completion: { _ in spy.completions += 1 })
-                overlay.routerDependenciesOverride =
-                    CaptureActionRouter.Dependencies(
+                    frozen: frozen, screen: screen,
+                    dependencies: CaptureActionRouter.Dependencies(
                         copyToClipboard: { _ in spy.copies += 1 },
-                        autoSave: { _, _ in },
-                        saveAs: { _, done in
+                        autoSave: { _, _ in spy.autoSaves += 1 },
+                        saveAs: { image, done in
                             spy.saveAsCalls += 1
+                            spy.saveSizes.append(CGSize(
+                                width: CGFloat(image.cgImage.width),
+                                height: CGFloat(image.cgImage.height)))
                             spy.saveDone = done
                             spy.observations += 1
+                            spy.effectEvents.append("saveAs")
+                            spy.observeEffect?("saveAs")
                             spy.observe?()
                         },
-                        pin: { _ in }, ocr: { _ in }, openEditor: { _ in },
-                        toast: { _ in }, setLastCapture: { _ in },
-                        setLastAreaRect: { _ in }, logEvent: { _ in })
-                let view = SelectionOverlayView(
-                    mode: .area, screen: screen,
-                    frozen: CapturedImage(
-                        cgImage: makeNoiseImage(
-                            width: Int(screen.frame.width * 2),
-                            height: Int(screen.frame.height * 2)),
-                        scale: 2),
-                    windowList: [], owner: overlay)
-                view.selectForTesting(
-                    rect: CGRect(x: 60, y: 60, width: 240, height: 180))
-                var cleaned = false
-                func cleanup() {
-                    guard !cleaned else { return }
-                    cleaned = true
-                    // Surface first, then the worker, then the seam — a late
-                    // result must never reach a live surface.
-                    view.annotationSurface?.cancelAllRedactionJobs()
-                    overlay.finish(.cancelled)
-                    scopeLock.lock()
-                    scopeEnded = true
-                    scopeLock.unlock()
-                    for _ in 0..<8 { release.signal() }
-                    if entered, !returned {
-                        if finished.wait(timeout: .now() + 10) == .timedOut {
-                            areaLockFailures.append("worker-never-returned")
-                            seamUnsafe = true
-                            return
+                        pin: { _ in spy.pins += 1 },
+                        ocr: { _ in spy.ocrs += 1 },
+                        openEditor: { _ in spy.editors += 1 },
+                        toast: {
+                            spy.toasts.append($0)
+                            let event = "toast:\($0)"
+                            spy.effectEvents.append(event)
+                            spy.observeEffect?(event)
+                        },
+                        setLastCapture: { image in
+                            spy.lastCaptures += 1
+                            spy.lastCaptureSizes.append(CGSize(
+                                width: CGFloat(image.cgImage.width),
+                                height: CGFloat(image.cgImage.height)))
+                            spy.effectEvents.append("lastCapture")
+                            spy.observeEffect?("lastCapture")
+                        },
+                        setLastAreaRect: {
+                            spy.areaRects.append($0)
+                            spy.effectEvents.append("areaRect")
+                            spy.observeEffect?("areaRect")
+                        },
+                        logEvent: { spy.logs.append($0) }),
+                    completion: { result in
+                        let event: String
+                        switch result {
+                        case .handled:
+                            spy.handled += 1
+                            event = "completion:handled"
+                        case .cancelled:
+                            spy.cancelled += 1
+                            event = "completion:cancelled"
+                        default:
+                            spy.otherCompletions += 1
+                            event = "completion:other"
                         }
-                        returned = true
-                    }
-                    let deadline = Date().addingTimeInterval(5)
-                    while slots() > 0, Date() < deadline {
-                        RunLoop.current.run(
-                            until: Date().addingTimeInterval(0.02))
-                    }
-                    if slots() != 0 || owners() != 0 {
-                        areaLockFailures.append("drain \(slots())/\(owners())")
+                        spy.effectEvents.append(event)
+                        spy.observeEffect?(event)
+                    }) else {
+                    areaLockFailures.append("no-overlay")
+                    endScope()
+                    if releaseAndDrain() || releaseAndDrain() {
+                        SliceBOCR.recognizerForTesting = previousRecognizer
+                    } else {
                         seamUnsafe = true
-                        return
                     }
-                    SliceBOCR.recognizerForTesting = previousRecognizer
+                    return
                 }
-                defer { cleanup() }
+                var retainedWindow: NSWindow?
+                var retainedSurface: AnnotationSurface?
+                defer {
+                    let foreignCurrent = SelectionOverlay.current != nil
+                        && SelectionOverlay.current !== overlay
+                    if foreignCurrent {
+                        areaLockFailures.append("cleanup-foreign-current")
+                        seamUnsafe = true
+                    }
+                    let terminalBeforeCleanup =
+                        overlay.session.phase == .completed
+                        && SelectionOverlay.current == nil
+                        && overlay.activeReviewViewForTesting == nil
+                        && retainedWindow?.isVisible == false
+                    if !terminalBeforeCleanup {
+                        overlay.dismissForTesting()
+                        if SelectionOverlay.current === overlay
+                            || overlay.activeReviewViewForTesting != nil
+                            || retainedWindow?.isVisible == true {
+                            areaLockFailures.append("cleanup-leaked")
+                            seamUnsafe = true
+                            retainedSurface?.cancelAllRedactionJobs()
+                            retainedWindow?.orderOut(nil)
+                        }
+                    }
+                    let completionOK = terminalBeforeCleanup
+                        ? (spy.handled == 1 && spy.cancelled == 0
+                            && spy.otherCompletions == 0)
+                        : (spy.handled == 0 && spy.cancelled == 1
+                            && spy.otherCompletions == 0)
+                    if overlay.session.phase != .completed
+                        || SelectionOverlay.current != nil
+                        || overlay.activeReviewViewForTesting != nil
+                        || retainedWindow?.isVisible == true
+                        || !completionOK {
+                        areaLockFailures.append(
+                            "cleanup-lifecycle phase="
+                            + "\(overlay.session.phase) completion="
+                            + "\(spy.handled)/\(spy.cancelled)/"
+                            + "\(spy.otherCompletions) current="
+                            + "\(SelectionOverlay.current === overlay) "
+                            + "visible=\(retainedWindow?.isVisible == true)")
+                    }
+                    // Break the test-only observer cycle only after any
+                    // synchronous cleanup completion has been inspected.
+                    spy.observeEffect = nil
+                    endScope()
+                    if (releaseAndDrain() || releaseAndDrain())
+                        && slots() == slotBase && owners() == ownerBase {
+                        SliceBOCR.recognizerForTesting = previousRecognizer
+                    } else {
+                        areaLockFailures.append("seam-held")
+                        seamUnsafe = true
+                    }
+                }
+
+                guard let view = overlay.activeReviewViewForTesting,
+                      let window = view.window else {
+                    areaLockFailures.append("no-real-view")
+                    return
+                }
+                retainedWindow = window
+                let selection = CGRect(
+                    x: 60, y: 60,
+                    width: min(240, max(120, view.bounds.width - 120)),
+                    height: min(180, max(100, view.bounds.height - 120)))
+                view.selectForTesting(rect: selection)
 
                 guard let surface = view.annotationSurface else {
                     areaLockFailures.append("no-surface")
                     return
                 }
+                retainedSurface = surface
+                let initialPixelRect = overlay.session.pixelRect
+                let expectedInitialLog =
+                    "capture source=areaReview px="
+                    + "\(Int(initialPixelRect.width))x"
+                    + "\(Int(initialPixelRect.height))"
+                let initialRoutesOK = spy.saveAsCalls == 0
+                    && spy.copies == 0 && spy.autoSaves == 0
+                    && spy.pins == 0 && spy.ocrs == 0 && spy.editors == 0
+                    && spy.toasts.isEmpty && spy.lastCaptures == 1
+                    && spy.lastCaptureSizes == [overlay.session.pixelRect.size]
+                    && spy.areaRects.isEmpty
+                    && spy.logs == [expectedInitialLog]
+                    && spy.handled == 0 && spy.cancelled == 0
+                    && spy.otherCompletions == 0
+                if !initialRoutesOK {
+                    areaLockFailures.append(
+                        "initial-routes \(spy.effectSignature)")
+                }
+                spy.resetRoutes()
+
+                @MainActor func buttons(in root: NSView) -> [NSButton] {
+                    root.subviews.flatMap { child -> [NSButton] in
+                        let own = (child as? NSButton).map { [$0] } ?? []
+                        return own + buttons(in: child)
+                    }
+                }
+                let expectedTags = OverlayAnnotationTool.allCases.map {
+                    $0.toolbarTag
+                } + [
+                    OverlayAnnotationTool.colorToolbarTag,
+                    OverlayAnnotationTool.undoToolbarTag,
+                    OverlayAnnotationTool.redoToolbarTag,
+                ] + Array(OverlayActionCatalog.items.indices) + [-1]
+                let buttonRefs = buttons(in: view)
+                let buttonParents = buttonRefs.map(\.superview)
+                let buttonTargets = buttonRefs.map(\.target)
+                let buttonActions = buttonRefs.map(\.action)
+                let catalogPairs = view.reviewToolbarButtonsForTesting
+                let actualTags = buttonRefs.map(\.tag)
+                let sharedButtonAction: Selector? = buttonRefs.first?.action
+                if buttonRefs.count != 22 || expectedTags.count != 22
+                    || Set(actualTags) != Set(expectedTags)
+                    || Set(actualTags).count != actualTags.count
+                    || catalogPairs.map(\.tag) != expectedTags
+                    || sharedButtonAction == nil
+                    || buttonRefs.contains(where: {
+                        $0.target !== view
+                            || $0.action != sharedButtonAction
+                    }) {
+                    areaLockFailures.append(
+                        "button-catalog \(buttonRefs.count) \(actualTags)")
+                }
+                func sameButtonRefs() -> Bool {
+                    let current = buttons(in: view)
+                    guard current.count == buttonRefs.count,
+                          buttonRefs.count == expectedTags.count,
+                          buttonParents.count == buttonRefs.count,
+                          buttonTargets.count == buttonRefs.count,
+                          buttonActions.count == buttonRefs.count else {
+                        return false
+                    }
+                    return zip(current.indices, current).allSatisfy {
+                        let index = $0.0
+                        let candidate = $0.1
+                        return candidate === buttonRefs[index]
+                            && candidate.tag == expectedTags[index]
+                            && candidate.superview === buttonParents[index]
+                            && candidate.target === buttonTargets[index]
+                            && candidate.action == buttonActions[index]
+                    }
+                }
+                func buttonsAreLocked(_ locked: Bool) -> Bool {
+                    guard sameButtonRefs(),
+                          view.reviewToolbarFrameForTesting != nil else {
+                        return false
+                    }
+                    if locked {
+                        return buttonRefs.allSatisfy { !$0.isEnabled }
+                    }
+                    return buttonRefs.allSatisfy { button in
+                        button.tag == OverlayAnnotationTool.redoToolbarTag
+                            ? !button.isEnabled : button.isEnabled
+                    }
+                }
+
+                var historyEvents = 0
+                let productionHistory = surface.historyDidChange
+                surface.historyDidChange = {
+                    historyEvents += 1
+                    productionHistory?()
+                }
                 let host = ForwardingRepaintDelegate(
                     wrapping: surface.redactionDelegate)
+                if surface.redactionDelegate == nil {
+                    areaLockFailures.append("no-production-repaint-delegate")
+                }
                 surface.redactionDelegate = host
                 view.clickReviewToolbarButtonForTesting(
                     tag: OverlayAnnotationTool.pixelateText.toolbarTag)
+                let dragFrom = CGPoint(
+                    x: selection.minX + 30, y: selection.minY + 30)
+                let dragTo = CGPoint(
+                    x: selection.maxX - 30, y: selection.maxY - 30)
                 view.annotationDragForTesting(
-                    from: CGPoint(x: 100, y: 100),
-                    to: CGPoint(x: 200, y: 170))
+                    from: dragFrom, to: dragTo)
                 guard let blur = surface.annotations
                     .compactMap({ $0 as? BlurAnnotation }).last else {
                     areaLockFailures.append("no-redaction")
@@ -10088,53 +10380,304 @@ enum SelfTest {
                     return
                 }
                 let generation = blur.redactionGeneration
-                let liveIsRedacted = {
-                    surface.annotations.contains { $0 === blur }
+                let repaints = host.repaints
+                let pixelRect = overlay.session.pixelRect
+                let expectedPixelSize = pixelRect.size
+                let blurRect = blur.rect
+                let color = surface.color
+                let expectedGlobalRect = CGRect(
+                    x: selection.minX + screen.frame.minX,
+                    y: selection.minY + screen.frame.minY,
+                    width: selection.width, height: selection.height)
+                let expectedFailureToast =
+                    "Không xuất được ảnh có nét vẽ — thử lại"
+                let failureEffect = "toast:\(expectedFailureToast)"
+                let savedEffect = "toast:Saved area-save-lock.png"
+                let failedTrace = [failureEffect]
+                let firstSaveTrace = failedTrace + ["saveAs"]
+                let retryTrace = firstSaveTrace + ["saveAs"]
+                let savedTrace = retryTrace + [
+                    "lastCapture", savedEffect, "areaRect",
+                    "completion:handled",
+                ]
+                spy.observeEffect = { event in
+                    let completionIsZero = spy.handled == 0
+                        && spy.cancelled == 0
+                        && spy.otherCompletions == 0
+                    switch event {
+                    case failureEffect:
+                        if overlay.session.phase != .reviewing
+                            || SelectionOverlay.current !== overlay
+                            || !window.isVisible || !completionIsZero {
+                            areaLockFailures.append(
+                                "failure-effect-order \(event)")
+                        }
+                    case "saveAs", "lastCapture", savedEffect, "areaRect":
+                        if overlay.session.phase != .saving
+                            || SelectionOverlay.current !== overlay
+                            || !window.isVisible || !completionIsZero {
+                            areaLockFailures.append(
+                                "save-effect-order \(event) phase="
+                                + "\(overlay.session.phase)")
+                        }
+                    case "completion:handled":
+                        if overlay.session.phase != .completed
+                            || SelectionOverlay.current != nil
+                            || overlay.activeReviewViewForTesting != nil
+                            || window.isVisible || spy.handled != 1
+                            || spy.cancelled != 0
+                            || spy.otherCompletions != 0
+                            || spy.effectEvents != savedTrace {
+                            areaLockFailures.append(
+                                "handled-effect-order phase="
+                                + "\(overlay.session.phase)")
+                        }
+                    case "completion:cancelled":
+                        // Failure-path cleanup is also synchronous: it must
+                        // finish and hide this real host before notifying.
+                        if overlay.session.phase != .completed
+                            || SelectionOverlay.current != nil
+                            || overlay.activeReviewViewForTesting != nil
+                            || window.isVisible || spy.cancelled != 1 {
+                            areaLockFailures.append(
+                                "cancel-effect-order phase="
+                                + "\(overlay.session.phase)")
+                        }
+                    default:
+                        break
+                    }
+                }
+                func liveIsRedacted() -> Bool {
+                    surface.annotations.count == 1
+                        && surface.annotations.first === blur
+                        && surface.canUndo && !surface.canRedo
+                }
+                func nonSaveRoutesAreZero() -> Bool {
+                    spy.copies == 0 && spy.autoSaves == 0
+                        && spy.pins == 0 && spy.ocrs == 0
+                        && spy.editors == 0 && spy.logs.isEmpty
+                }
+                func routesAre(
+                    saves: Int, toasts: [String], lastCaptures: Int,
+                    rects: [CGRect], completions: (Int, Int, Int),
+                    events: [String]
+                ) -> Bool {
+                    spy.saveAsCalls == saves
+                        && spy.observations == saves
+                        && nonSaveRoutesAreZero()
+                        && spy.toasts == toasts
+                        && spy.lastCaptures == lastCaptures
+                        && spy.saveSizes == Array(
+                            repeating: expectedPixelSize, count: saves)
+                        && spy.lastCaptureSizes == Array(
+                            repeating: expectedPixelSize,
+                            count: lastCaptures)
+                        && spy.areaRects == rects
+                        && spy.handled == completions.0
+                        && spy.cancelled == completions.1
+                        && spy.otherCompletions == completions.2
+                        && spy.effectEvents == events
+                }
+                func verifyLive(
+                    _ label: String, phase: OverlaySessionPhase,
+                    state: RedactionState, generation wantedGeneration: Int,
+                    repaints wantedRepaints: Int, registry: Int,
+                    ownerCount: Int, slotCount: Int, locked: Bool
+                ) {
+                    if overlay.session.phase != phase
+                        || SelectionOverlay.current !== overlay
+                        || overlay.activeReviewViewForTesting !== view
+                        || view.window !== window || !window.isVisible
+                        || overlay.session.pixelRect != pixelRect
+                        || view.areaSelectionForTesting != selection
+                        || view.areaDragActiveForTesting
+                        || view.isAnnotationDraggingForTesting
+                        || surface.isDragging
+                        || !liveIsRedacted()
+                        || blur.rect != blurRect
+                        || blur.redactionState != state
+                        || blur.redactionGeneration != wantedGeneration
+                        || host.repaints != wantedRepaints
+                        || surface.redactionJobCountForTesting != registry
+                        || owners() != ownerCount || slots() != slotCount
+                        || surface.tool != .pixelateText
+                        || surface.color != color
+                        || historyEvents != 2
+                        || !buttonsAreLocked(locked) {
+                        areaLockFailures.append(
+                            "\(label) phase=\(overlay.session.phase) state="
+                            + "\(blur.redactionState) gen="
+                            + "\(blur.redactionGeneration) repaint="
+                            + "\(host.repaints) reg="
+                            + "\(surface.redactionJobCountForTesting) "
+                            + "slot/owner=\(slots())/\(owners())")
+                    }
+                }
+
+                verifyLive(
+                    "start", phase: .reviewing, state: .pendingFull,
+                    generation: generation, repaints: repaints,
+                    registry: 1, ownerCount: ownerBase + 1,
+                    slotCount: slotBase + 1, locked: false)
+                if !routesAre(
+                    saves: 0, toasts: [], lastCaptures: 0, rects: [],
+                    completions: (0, 0, 0), events: []) {
+                    areaLockFailures.append(
+                        "start-routes \(spy.effectSignature)")
+                }
+                guard let saveTag = OverlayActionCatalog.items.firstIndex(
+                    where: { $0.intent == .save }),
+                      let saveButton = buttonRefs.first(
+                        where: { $0.tag == saveTag }) else {
+                    areaLockFailures.append("no-save-button")
+                    return
                 }
 
                 // Stage 1 — a failed render must leave the job alive.
-                let repaintsBeforeFail = host.repaints
                 AnnotationRenderer.withForcedRegionalFailure {
                     view.performReviewActionForTesting(.save)
                 }
-                if spy.saveAsCalls != 0
-                    || blur.redactionState != .pendingFull
-                    || blur.redactionGeneration != generation
-                    || host.repaints != repaintsBeforeFail
-                    || surface.redactionJobCountForTesting != 1
-                    || slots() != 1 || owners() != 1
-                    || overlay.session.phase != .reviewing
-                    || !liveIsRedacted() {
+                verifyLive(
+                    "failed-render", phase: .reviewing,
+                    state: .pendingFull, generation: generation,
+                    repaints: repaints, registry: 1,
+                    ownerCount: ownerBase + 1,
+                    slotCount: slotBase + 1, locked: false)
+                if !routesAre(
+                    saves: 0, toasts: [expectedFailureToast],
+                    lastCaptures: 0, rects: [],
+                    completions: (0, 0, 0), events: failedTrace) {
                     areaLockFailures.append(
-                        "failed-render \(spy.saveAsCalls) "
-                        + String(describing: blur.redactionState))
+                        "failed-render-routes \(spy.effectSignature)")
                 }
 
                 // Stage 2 — the successful handoff, inspected INSIDE saveAs.
-                let repaintsBeforeSave = host.repaints
-                spy.observe = {
-                    if blur.redactionState != .fallbackFull
-                        || blur.redactionGeneration != generation + 1
-                        || surface.redactionJobCountForTesting != 0
-                        || owners() != 0 || slots() != 1
-                        || host.repaints != repaintsBeforeSave + 1
-                        || overlay.session.phase != .saving
-                        || !liveIsRedacted() {
-                        spy.inCallback.append(
-                            "locked " + String(describing: blur.redactionState))
+                func lockedKey(
+                    _ chars: String, code: UInt16,
+                    modifiers: NSEvent.ModifierFlags = []
+                ) -> NSEvent? {
+                    guard let event = NSEvent.keyEvent(
+                        with: .keyDown, location: .zero,
+                        modifierFlags: modifiers, timestamp: 0,
+                        windowNumber: window.windowNumber, context: nil,
+                        characters: chars,
+                        charactersIgnoringModifiers: chars,
+                        isARepeat: false, keyCode: code)
+                    else {
+                        areaLockFailures.append("locked-key-no-event")
+                        return nil
                     }
-                    // A competing route inside the sheet does nothing.
-                    let copiesBefore = spy.copies
-                    view.performReviewActionForTesting(.copy)
-                    if spy.copies != copiesBefore {
-                        spy.inCallback.append("reentrant")
+                    return event
+                }
+                spy.observe = {
+                    let failuresBefore = areaLockFailures.count
+                    verifyLive(
+                        "locked", phase: .saving,
+                        state: .fallbackFull,
+                        generation: generation + 1,
+                        repaints: repaints + 1, registry: 0,
+                        ownerCount: ownerBase,
+                        slotCount: slotBase + 1, locked: true)
+                    if areaLockFailures.count != failuresBefore
+                        || spy.saveDone == nil
+                        || !routesAre(
+                            saves: 1, toasts: [expectedFailureToast],
+                            lastCaptures: 0, rects: [],
+                            completions: (0, 0, 0),
+                            events: firstSaveTrace) {
+                        spy.inCallback.append("locked-state")
+                    }
+
+                    func attempt(
+                        _ label: String, _ action: () -> Void
+                    ) {
+                        let effects = spy.effectSignature
+                        let failuresAtStart = areaLockFailures.count
+                        action()
+                        verifyLive(
+                            "reentrant-\(label)", phase: .saving,
+                            state: .fallbackFull,
+                            generation: generation + 1,
+                            repaints: repaints + 1, registry: 0,
+                            ownerCount: ownerBase,
+                            slotCount: slotBase + 1, locked: true)
+                        if spy.effectSignature != effects
+                            || areaLockFailures.count != failuresAtStart {
+                            spy.inCallback.append("reentrant-\(label)")
+                        }
+                    }
+                    let directIntents: [(String, CaptureIntent)] = [
+                        ("copy", .copy), ("save", .save),
+                        ("pin", .pin), ("ocr", .ocr),
+                        ("translate", .translate),
+                        ("editor", .openEditor),
+                    ]
+                    for (label, intent) in directIntents {
+                        attempt("intent-\(label)") {
+                            view.performReviewActionForTesting(intent)
+                        }
+                    }
+                    for (index, button) in buttonRefs.enumerated() {
+                        attempt("button-click-\(index)-\(button.tag)") {
+                            button.performClick(nil)
+                        }
+                        attempt("button-action-\(index)-\(button.tag)") {
+                            guard let action = button.action else {
+                                areaLockFailures.append(
+                                    "button-no-action-\(index)")
+                                return
+                            }
+                            if !NSApp.sendAction(
+                                action, to: button.target, from: button) {
+                                areaLockFailures.append(
+                                    "button-unhandled-\(index)")
+                            }
+                        }
+                    }
+                    attempt("escape") { view.handleEscapeForTesting() }
+                    attempt("outside") {
+                        view.handleOutsideClickForTesting()
+                    }
+                    let keyRoutes: [
+                        (String, String, UInt16, NSEvent.ModifierFlags, Bool)
+                    ] = [
+                        ("escape", "\u{1b}", 53, [], false),
+                        ("return", "\r", 36, [], false),
+                        ("tool", "o", 31, [], false),
+                        ("copy", "c", 8, [.command], true),
+                        ("undo", "z", 6, [.command], true),
+                    ]
+                    for route in keyRoutes {
+                        attempt("key-\(route.0)") {
+                            guard let event = lockedKey(
+                                route.1, code: route.2,
+                                modifiers: route.3) else { return }
+                            if route.4 {
+                                if !view.performKeyEquivalent(with: event) {
+                                    areaLockFailures.append(
+                                        "key-unhandled-\(route.0)")
+                                }
+                            } else {
+                                view.keyDown(with: event)
+                            }
+                        }
+                    }
+                    let center = CGPoint(
+                        x: selection.midX, y: selection.midY)
+                    attempt("mouse-drag") {
+                        view.annotationDragForTesting(
+                            from: center,
+                            to: CGPoint(x: center.x + 20,
+                                        y: center.y + 15))
                     }
                 }
-                view.performReviewActionForTesting(.save)
+                saveButton.performClick(nil)
                 spy.observe = nil
-                if spy.saveAsCalls != 1 || spy.observations != 1 {
+                if spy.saveAsCalls != 1 || spy.observations != 1
+                    || spy.saveDone == nil {
                     areaLockFailures.append(
-                        "handoff \(spy.saveAsCalls)/\(spy.observations)")
+                        "handoff \(spy.saveAsCalls)/\(spy.observations)/"
+                        + "\(spy.saveDone != nil)")
                 }
                 if !spy.inCallback.isEmpty {
                     areaLockFailures.append(
@@ -10142,45 +10685,132 @@ enum SelfTest {
                 }
 
                 // Stage 3 — cancel unlocks, and the same fixture saves again.
-                let generationAfterLock = blur.redactionGeneration
-                let repaintsAfterLock = host.repaints
                 MainActor.assumeIsolated { spy.saveDone?(.cancelled) }
                 spy.saveDone = nil
-                if spy.saveAsCalls != 1
-                    || blur.redactionGeneration != generationAfterLock
-                    || host.repaints != repaintsAfterLock
-                    || slots() != 1
-                    || surface.redactionJobCountForTesting != 0
-                    || overlay.session.phase != .reviewing
-                    || spy.completions != 0
-                    || !liveIsRedacted() {
+                verifyLive(
+                    "cancel", phase: .reviewing,
+                    state: .fallbackFull,
+                    generation: generation + 1,
+                    repaints: repaints + 1, registry: 0,
+                    ownerCount: ownerBase,
+                    slotCount: slotBase + 1, locked: false)
+                if !saveButton.isEnabled || !routesAre(
+                    saves: 1, toasts: [expectedFailureToast],
+                    lastCaptures: 0, rects: [],
+                    completions: (0, 0, 0), events: firstSaveTrace) {
                     areaLockFailures.append(
-                        "cancel \(spy.saveAsCalls) \(overlay.session.phase)")
+                        "cancel-routes \(spy.effectSignature) enabled="
+                        + "\(saveButton.isEnabled)")
                 }
-                view.performReviewActionForTesting(.save)
+
+                spy.inCallback = []
+                spy.observe = {
+                    let failuresBefore = areaLockFailures.count
+                    verifyLive(
+                        "retry-locked", phase: .saving,
+                        state: .fallbackFull,
+                        generation: generation + 2,
+                        repaints: repaints + 1, registry: 0,
+                        ownerCount: ownerBase,
+                        slotCount: slotBase + 1, locked: true)
+                    if areaLockFailures.count != failuresBefore
+                        || spy.saveDone == nil
+                        || !routesAre(
+                            saves: 2, toasts: [expectedFailureToast],
+                            lastCaptures: 0, rects: [],
+                            completions: (0, 0, 0),
+                            events: retryTrace) {
+                        spy.inCallback.append("retry-state")
+                    }
+                }
+                saveButton.performClick(nil)
+                spy.observe = nil
                 if spy.saveAsCalls != 2 || spy.saveDone == nil
-                    || overlay.session.phase != .saving {
-                    areaLockFailures.append("retry \(spy.saveAsCalls)")
+                    || spy.observations != 2 || !spy.inCallback.isEmpty {
+                    areaLockFailures.append(
+                        "retry \(spy.saveAsCalls)/\(spy.observations) "
+                        + "\(spy.inCallback)")
                 }
                 MainActor.assumeIsolated {
-                    spy.saveDone?(.saved(URL(fileURLWithPath: "/tmp/a.png")))
+                    spy.saveDone?(.saved(URL(
+                        fileURLWithPath: "/tmp/area-save-lock.png")))
                 }
                 spy.saveDone = nil
-                if spy.completions != 1 {
+                let savedRoutesOK = routesAre(
+                    saves: 2,
+                    toasts: [
+                        expectedFailureToast, "Saved area-save-lock.png",
+                    ],
+                    lastCaptures: 1, rects: [expectedGlobalRect],
+                    completions: (1, 0, 0), events: savedTrace)
+                if overlay.session.phase != .completed
+                    || SelectionOverlay.current != nil
+                    || overlay.activeReviewViewForTesting != nil
+                    || window.isVisible
+                    || overlay.session.pixelRect != pixelRect
+                    || view.areaSelectionForTesting != selection
+                    || view.areaDragActiveForTesting
+                    || view.isAnnotationDraggingForTesting
+                    || surface.isDragging
+                    || !liveIsRedacted()
+                    || blur.rect != blurRect
+                    || blur.redactionState != .fallbackFull
+                    || blur.redactionGeneration != generation + 3
+                    || host.repaints != repaints + 1
+                    || surface.redactionJobCountForTesting != 0
+                    || owners() != ownerBase
+                    || slots() != slotBase + 1
+                    || surface.tool != .pixelateText
+                    || surface.color != color
+                    || historyEvents != 2 || !buttonsAreLocked(true)
+                    || !savedRoutesOK {
                     areaLockFailures.append(
-                        "saved-completion \(spy.completions)")
+                        "saved state=\(blur.redactionState) gen="
+                        + "\(blur.redactionGeneration) repaint="
+                        + "\(host.repaints) routes=\(spy.effectSignature)")
                 }
 
                 // Stage 4 — releasing the worker returns only the slot.
                 let generationAfterClose = blur.redactionGeneration
                 let repaintsAfterClose = host.repaints
-                cleanup()
-                if blur.redactionState != .fallbackFull
+                let routesAfterClose = spy.effectSignature
+                // A first drain attempt may time out while the worker's
+                // main-queue slot delivery is merely late. The deferred
+                // containment retries and is the sole authority for whether
+                // restoring the global recognizer is unsafe.
+                _ = releaseAndDrain()
+                if slots() != slotBase || owners() != ownerBase
+                    || overlay.session.phase != .completed
+                    || SelectionOverlay.current != nil || window.isVisible
+                    || overlay.activeReviewViewForTesting != nil
+                    || overlay.session.pixelRect != pixelRect
+                    || view.areaSelectionForTesting != selection
+                    || view.areaDragActiveForTesting
+                    || view.isAnnotationDraggingForTesting
+                    || surface.isDragging
+                    || !liveIsRedacted()
+                    || blur.rect != blurRect
+                    || blur.redactionState != .fallbackFull
                     || blur.redactionGeneration != generationAfterClose
-                    || host.repaints != repaintsAfterClose {
+                    || host.repaints != repaintsAfterClose
+                    || surface.redactionJobCountForTesting != 0
+                    || surface.tool != .pixelateText
+                    || surface.color != color || historyEvents != 2
+                    || !buttonsAreLocked(true)
+                    || spy.effectSignature != routesAfterClose
+                    || !routesAre(
+                        saves: 2,
+                        toasts: [
+                            expectedFailureToast,
+                            "Saved area-save-lock.png",
+                        ],
+                        lastCaptures: 1, rects: [expectedGlobalRect],
+                        completions: (1, 0, 0), events: savedTrace) {
                     areaLockFailures.append(
-                        "late-result "
-                        + String(describing: blur.redactionState))
+                        "late-result state=\(blur.redactionState) gen="
+                        + "\(blur.redactionGeneration) slots="
+                        + "\(slots())/\(owners()) routes="
+                        + "\(spy.effectSignature)")
                 }
             }
             runAreaSaveLock()
