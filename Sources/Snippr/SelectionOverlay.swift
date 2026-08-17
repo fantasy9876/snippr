@@ -198,6 +198,9 @@ final class SelectionOverlay {
         for w in windows {
             if let view = w.contentView as? SelectionOverlayView {
                 view.releaseSamplerCache()
+                // Drops the tracking areas and anything scheduled: this window
+                // is about to be ordered out from under them.
+                view.hoverHint.detachAll()
             }
             w.orderOut(nil)
         }
@@ -423,8 +426,15 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
         for frame in frames.dropFirst() { result = result.union(frame) }
         return result
     }
+    /// The hint catalog — see the panel's seam: `toolTip` is deliberately nil
+    /// on every button the hint watches.
     var reviewToolbarButtonsForTesting: [(tag: Int, tooltip: String)] {
-        toolbarButtons.map { ($0.tag, $0.toolTip ?? "") }
+        toolbarButtons.map {
+            ($0.tag, hoverHint.textForTesting($0) ?? "")
+        }
+    }
+    var nativeTooltipsForTesting: [String?] {
+        toolbarButtons.map(\.toolTip)
     }
     var reviewToolbarButtonFramesForTesting: [CGRect] {
         toolbarButtons.map { $0.convert($0.bounds, to: self) }
@@ -638,6 +648,11 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
     }
 
     private func selectAnnotationTool(_ tool: OverlayAnnotationTool) {
+        // The authoritative selection point: keyboard, toolbar, accessibility
+        // and programmatic routes all land here, so dismissing the hint in the
+        // click handler alone would leave a hint describing the OLD tool on
+        // screen after a keyboard switch.
+        hoverHint.hide()
         annotationSurface?.tool = tool
         for button in toolbarButtons
             where OverlayAnnotationTool.tool(forToolbarTag: button.tag) != nil {
@@ -1228,7 +1243,8 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
         if owner?.session.phase == .reviewing,
            flags.isEmpty,
            let key = event.charactersIgnoringModifiers,
-           let tool = OverlayAnnotationTool.tool(forShortcutKey: key) {
+           let tool = OverlayAnnotationTool.tool(
+               forShortcutKey: key, in: OverlayAnnotationTool.areaReviewTools) {
             selectAnnotationTool(tool)
             return
         }
@@ -1449,6 +1465,10 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
                 surface.redactionBaseBounds = CGRect(
                     x: 0, y: 0,
                     width: frozen.cgImage.width, height: frozen.cgImage.height)
+                // Resampling a magnifier when the redaction set changes needs
+                // the base image at that moment, not at the moment the host
+                // happens to be running.
+                surface.redactionBaseImage = frozen.cgImage
                 annotationSurface = surface
                 owner.reviewDidBegin(in: self)
                 layoutReviewToolbar()

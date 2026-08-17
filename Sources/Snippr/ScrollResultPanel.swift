@@ -231,6 +231,7 @@ final class ScrollResultPanel: NSPanel {
         annotationSurface.redactionBaseBounds = CGRect(
             x: 0, y: 0,
             width: image.cgImage.width, height: image.cgImage.height)
+        annotationSurface.redactionBaseImage = image.cgImage
         host.strokeHUDContainer = content
         content.addSubview(host)
         annotationHost = host
@@ -258,8 +259,18 @@ final class ScrollResultPanel: NSPanel {
     var toolbarButtonFramesForTesting: [CGRect] {
         toolbarButtons.map { $0.frame }
     }
+    /// The hint CATALOG, not the native tooltip: `HoverHint.attach` switches
+    /// `toolTip` off on every button it watches, so reading it here would
+    /// report an empty sentence for buttons that describe themselves fine.
     var toolbarButtonsForTesting: [(tag: Int, tooltip: String)] {
-        toolbarButtons.map { ($0.tag, $0.toolTip ?? "") }
+        toolbarButtons.map {
+            ($0.tag, hoverHint.textForTesting($0) ?? "")
+        }
+    }
+    /// The native tooltip must be nil on every watched button — two tooltips
+    /// side by side is exactly the bug the hint replaced.
+    var nativeTooltipsForTesting: [String?] {
+        toolbarButtons.map(\.toolTip)
     }
 
     private func buildToolbar(
@@ -335,6 +346,9 @@ final class ScrollResultPanel: NSPanel {
     }
 
     private func selectAnnotationTool(_ tool: OverlayAnnotationTool) {
+        // Authoritative for every route, keyboard included — see the area
+        // host: a hint left up after a key switch describes the wrong tool.
+        hoverHint.hide()
         annotationSurface.tool = tool
         for button in toolbarButtons
             where OverlayAnnotationTool.tool(forToolbarTag: button.tag) != nil {
@@ -436,7 +450,8 @@ final class ScrollResultPanel: NSPanel {
         }
         if !saving, !terminalActionClaimed, flags.isEmpty,
            let key = event.charactersIgnoringModifiers,
-           let tool = OverlayAnnotationTool.tool(forShortcutKey: key) {
+           let tool = OverlayAnnotationTool.tool(
+               forShortcutKey: key, in: OverlayAnnotationTool.panelTools) {
             selectAnnotationTool(tool)
             return
         }
@@ -501,6 +516,7 @@ final class ScrollResultPanel: NSPanel {
     func dismissForTesting() { dismiss() }
 
     private func dismiss() {
+        hoverHint.detachAll()
         // Cancel BEFORE the view and `current` go away, or a late result would
         // land on a surface nobody can repaint.
         cancelRedactionJobs()

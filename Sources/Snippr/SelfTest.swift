@@ -5706,7 +5706,11 @@ enum SelfTest {
                 -> [(Int, String)] {
                 allButtons12(in: root)
                     .filter { $0.tag >= 0 && $0.tag < 100 }
-                    .map { ($0.tag, $0.toolTip ?? "") }
+                    // The accessibility label, not `toolTip`: HoverHint turns
+                    // the native tooltip OFF on every button it watches, so
+                    // this comparison would be "" == "" for both hosts and
+                    // could no longer tell their catalogs apart.
+                    .map { ($0.tag, $0.accessibilityLabel() ?? "") }
                     .sorted { $0.0 < $1.0 }
             }
 
@@ -5750,7 +5754,7 @@ enum SelfTest {
                 width: 240, height: 160)
             areaTranslateHost.selectForTesting(rect: areaTranslateSelection)
             let areaTranslateButtons = allButtons12(in: areaTranslateHost)
-                .filter { $0.toolTip == "OCR + Translate" }
+                .filter { $0.accessibilityLabel() == "OCR + Translate" }
             areaTranslateButtons.first?.performClick(nil)
 
             var panelTranslateCalls = 0
@@ -5784,7 +5788,7 @@ enum SelfTest {
             panelTranslateProbe = panelTranslate
             let panelRoot12 = panelTranslate.contentView ?? NSView()
             let panelTranslateButtons = allButtons12(in: panelRoot12)
-                .filter { $0.toolTip == "OCR + Translate" }
+                .filter { $0.accessibilityLabel() == "OCR + Translate" }
             let areaCatalog12 = actionCatalog12(in: areaTranslateHost)
             let panelCatalog12 = actionCatalog12(in: panelRoot12)
             panelTranslateButtons.first?.performClick(nil)
@@ -5851,7 +5855,10 @@ enum SelfTest {
                 let orderedButtons = editing + actions
                 let allFrames = editingFrames + actionFrames
                 var failures: [String] = []
-                if editing.count != OverlayAnnotationTool.panelTools.count + 3 {
+                // The AREA catalog: this inspects the area host, which now
+                // offers one tool the panel does not.
+                if editing.count
+                    != OverlayAnnotationTool.areaReviewTools.count + 3 {
                     failures.append("editing count \(editing.count)")
                 }
                 if actions.count != 7 { failures.append("action count \(actions.count)") }
@@ -5987,13 +5994,22 @@ enum SelfTest {
                     .map { buttonFrame12($0, in: cornerView) }
                 let cornerActionFrames = cornerButtons.filter { $0.tag < 100 }
                     .map { buttonFrame12($0, in: cornerView) }
-                for (name, frames) in [
-                    ("tools", cornerToolFrames),
-                    ("actions", cornerActionFrames),
+                // The companion placements in OverlayToolbarLayout.area put
+                // one group just beyond the other when a tiny corner selection
+                // cannot hold both; the allowance therefore has to include the
+                // group being cleared, or growing the tool rail by one button
+                // reads as a teleport. It still catches the real failure — a
+                // group jumping to the opposite screen edge.
+                for (name, frames, companion) in [
+                    ("tools", cornerToolFrames, cornerActionFrames),
+                    ("actions", cornerActionFrames, cornerToolFrames),
                 ] {
+                    let clearance = union12(companion).map {
+                        max($0.width, $0.height)
+                    } ?? 0
                     if let frame = union12(frames),
                        separation12(frame, selection)
-                        > max(frame.width, frame.height) * 2 + 20 {
+                        > max(frame.width, frame.height) * 2 + 20 + clearance {
                         layout12Failures.append(
                             "corner\(corner) \(name) teleported \(frame)")
                     }
@@ -8055,14 +8071,456 @@ enum SelfTest {
             let legacyFrozen = tools.count >= 10
                 && tools.prefix(10).map(\.tooltip) == legacyTips
                 && tools.prefix(10).map(\.toolbarTag) == Array(100..<110)
-            let appended = tools.count == 12
+            let appended = tools.count == 13
                 && tools.dropFirst(10).first?.tooltip.hasPrefix("Spotlight") == true
                 && tools.dropFirst(10).first?.toolbarTag == 110
-                && tools.last?.tooltip.hasPrefix("Pixelate text") == true
-                && tools.last?.toolbarTag == 111
+                && tools.dropFirst(11).first?.tooltip
+                    .hasPrefix("Pixelate text") == true
+                && tools.dropFirst(11).first?.toolbarTag == 111
+                && tools.last?.tooltip.hasPrefix("Magnifier") == true
+                && tools.last?.toolbarTag == 112
             check("sliceB-overlay-catalog-final",
                   legacyFrozen && appended,
                   "count \(tools.count) tips \(tools.map(\.tooltip))")
+
+            // 1b. A magnifier patch is sanitized ONCE, at creation. Everything
+            // that changes the redaction set afterwards has to resample it, or
+            // the callout keeps displaying pixels the user has since covered —
+            // a disclosure, not a stale pixel. The cross-check at the end is
+            // the load-bearing one: the REFRESH path must land on the same
+            // bytes the CREATION path produces for the same document, so this
+            // cannot pass by merely mutating the patch into something else.
+            do {
+                @MainActor func fieldWithBlock() -> CGImage? {
+                    guard let ctx = CGContext(
+                        data: nil, width: 400, height: 300,
+                        bitsPerComponent: 8, bytesPerRow: 0,
+                        space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+                    else { return nil }
+                    ctx.setFillColor(NSColor.white.cgColor)
+                    ctx.fill(CGRect(x: 0, y: 0, width: 400, height: 300))
+                    ctx.setFillColor(NSColor.red.cgColor)
+                    ctx.fill(CGRect(x: 90, y: 90, width: 60, height: 60))
+                    return ctx.makeImage()
+                }
+                @MainActor func patchBytes(_ surface: AnnotationSurface) -> [UInt8]? {
+                    guard let magnifier = surface.annotations
+                        .compactMap({ $0 as? MagnifierAnnotation }).last,
+                          let snapshot = magnifier.snapshot,
+                          let ctx = CGContext(
+                            data: nil, width: snapshot.width,
+                            height: snapshot.height, bitsPerComponent: 8,
+                            bytesPerRow: snapshot.width * 4,
+                            space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                            bitmapInfo: CGImageAlphaInfo
+                                .premultipliedLast.rawValue)
+                    else { return nil }
+                    ctx.draw(snapshot, in: CGRect(
+                        x: 0, y: 0, width: snapshot.width,
+                        height: snapshot.height))
+                    guard let data = ctx.data else { return nil }
+                    let count = snapshot.width * snapshot.height * 4
+                    return Array(UnsafeBufferPointer(
+                        start: data.assumingMemoryBound(to: UInt8.self),
+                        count: count))
+                }
+                @MainActor func newSurface(_ base: CGImage) -> AnnotationSurface {
+                    let surface = AnnotationSurface(pixelScale: 1)
+                    surface.redactionBaseBounds = CGRect(
+                        x: 0, y: 0, width: base.width, height: base.height)
+                    surface.redactionBaseImage = base
+                    return surface
+                }
+                @MainActor func addMagnifier(
+                    _ surface: AnnotationSurface, base: CGImage,
+                    at origin: CGPoint = CGPoint(x: 130, y: 130)
+                ) {
+                    surface.tool = .magnifier
+                    // STRADDLES the red block's edge at 150 on purpose:
+                    // pixelating a uniformly red region reproduces red, so a
+                    // source wholly inside it would leave the "patch changed"
+                    // assertions unable to fail.
+                    _ = surface.beginDrag(atPixel: origin)
+                    surface.continueDrag(toPixel: CGPoint(
+                        x: origin.x + 40, y: origin.y + 40))
+                    surface.endDrag()
+                    _ = surface.fillPendingMagnifier(base: base)
+                }
+                @MainActor func addPixelation(
+                    _ surface: AnnotationSurface,
+                    from start: CGPoint = CGPoint(x: 120, y: 120),
+                    to end: CGPoint = CGPoint(x: 190, y: 190)
+                ) {
+                    surface.tool = .blur
+                    _ = surface.beginDrag(atPixel: start)
+                    surface.continueDrag(toPixel: end)
+                    surface.endDrag()
+                }
+
+                var freshFailures: [String] = []
+                if let base = fieldWithBlock() {
+                    // M then Blur: the patch predates the pixelation.
+                    let mFirst = newSurface(base)
+                    addMagnifier(mFirst, base: base)
+                    let raw = patchBytes(mFirst)
+                    if raw == nil { freshFailures.append("no patch after create") }
+                    addPixelation(mFirst)
+                    let sanitized = patchBytes(mFirst)
+                    if sanitized == nil {
+                        freshFailures.append("patch lost after pixelate")
+                    } else if sanitized == raw {
+                        freshFailures.append(
+                            "patch unchanged by a pixelation over its source")
+                    }
+                    // Undo UNCOVERS: the patch must go back to the raw pixels,
+                    // exactly — a blurred patch over an unblurred document is
+                    // wrong in the other direction.
+                    _ = mFirst.undo()
+                    if patchBytes(mFirst) != raw {
+                        freshFailures.append("undo did not restore the patch")
+                    }
+                    // Redo covers again.
+                    _ = mFirst.redo()
+                    if patchBytes(mFirst) != sanitized {
+                        freshFailures.append("redo did not re-sanitize")
+                    }
+                    // An OCR job resolving off the main thread narrows the
+                    // mask; the funnel it calls must resample too.
+                    if let blur = mFirst.annotations
+                        .compactMap({ $0 as? BlurAnnotation }).last {
+                        // INSIDE the pixelation (a box that hangs outside it
+                        // fails closed to the full rect by design) and clear
+                        // of the magnifier's source, so the mask genuinely
+                        // narrows away from the sampled pixels.
+                        blur.redactionState = .words([
+                            CGRect(x: 175, y: 175, width: 10, height: 10),
+                        ])
+                        mFirst.redactionDidChange()
+                        if patchBytes(mFirst) == sanitized {
+                            freshFailures.append(
+                                "async word mask left the patch stale")
+                        }
+                    } else {
+                        freshFailures.append("no pixelation recorded")
+                    }
+
+                    // Blur then M: creation already samples the sanitized
+                    // document. Refreshing must reach the SAME bytes, which is
+                    // what makes the assertions above about a changed patch
+                    // mean "correctly sanitized" rather than merely "different".
+                    let blurFirst = newSurface(base)
+                    addPixelation(blurFirst)
+                    addMagnifier(blurFirst, base: base)
+                    let createdSanitized = patchBytes(blurFirst)
+                    let mThenBlur = newSurface(base)
+                    addMagnifier(mThenBlur, base: base)
+                    addPixelation(mThenBlur)
+                    if createdSanitized == nil {
+                        freshFailures.append("blur-first patch missing")
+                    } else if patchBytes(mThenBlur) != createdSanitized {
+                        freshFailures.append(
+                            "refresh path disagrees with creation path")
+                    }
+                    if createdSanitized == raw {
+                        freshFailures.append("sanitized equals raw — oracle blind")
+                    }
+                    // A redaction drag STARTS: until its rect is valid the
+                    // document is fully masked by both fail-closed paths, so
+                    // every callout — not only one under the press — must go
+                    // blank before the first dragged event, and come back
+                    // after the drag resolves.
+                    let twoPatches = newSurface(base)
+                    addMagnifier(twoPatches, base: base)
+                    addMagnifier(
+                        twoPatches, base: base, at: CGPoint(x: 230, y: 40))
+                    let patchesBefore = twoPatches.annotations
+                        .compactMap { $0 as? MagnifierAnnotation }
+                    if patchesBefore.count != 2
+                        || patchesBefore.contains(where: { $0.snapshot == nil }) {
+                        freshFailures.append("two-patch fixture not built")
+                    }
+                    twoPatches.tool = .blur
+                    // Far from both sources, and nothing dragged yet.
+                    _ = twoPatches.beginDrag(atPixel: CGPoint(x: 20, y: 280))
+                    if patchesBefore.contains(where: { $0.snapshot != nil }) {
+                        freshFailures.append(
+                            "callout kept raw pixels at redaction mouse-down")
+                    }
+                    twoPatches.abandonDrag()
+                    if patchesBefore.contains(where: { $0.snapshot == nil }) {
+                        freshFailures.append(
+                            "abandoned drag left a callout blank")
+                    }
+
+                    // No base image = no way to resample: clear rather than
+                    // keep showing pixels the document no longer shows.
+                    let orphan = newSurface(base)
+                    addMagnifier(orphan, base: base)
+                    orphan.redactionBaseImage = nil
+                    orphan.refreshMagnifierSnapshots()
+                    if orphan.annotations
+                        .compactMap({ $0 as? MagnifierAnnotation })
+                        .contains(where: { $0.snapshot != nil }) {
+                        freshFailures.append("orphan patch kept stale pixels")
+                    }
+                } else {
+                    freshFailures.append("no base image")
+                }
+                check("sliceB-magnifier-redaction-freshness",
+                      freshFailures.isEmpty,
+                      freshFailures.joined(separator: " | "))
+            }
+
+            // 1c. Keyboard is host-scoped. The panel deliberately shows no
+            // magnifier button, so routing M there would select a tool with no
+            // control and no way back. The letters the tooltips advertise must
+            // also actually work — a hint naming a key the host ignores is a
+            // promise the app breaks.
+            do {
+                var keyFailures: [String] = []
+                for key in ["v", "p", "a", "r", "t", "l", "o", "h", "n", "b", "s"] {
+                    if OverlayAnnotationTool.tool(
+                        forShortcutKey: key,
+                        in: OverlayAnnotationTool.areaReviewTools) == nil {
+                        keyFailures.append("area ignores \(key)")
+                    }
+                    if OverlayAnnotationTool.tool(
+                        forShortcutKey: key,
+                        in: OverlayAnnotationTool.panelTools) == nil {
+                        keyFailures.append("panel ignores \(key)")
+                    }
+                }
+                if OverlayAnnotationTool.tool(
+                    forShortcutKey: "m",
+                    in: OverlayAnnotationTool.areaReviewTools) != .magnifier {
+                    keyFailures.append("area lost M")
+                }
+                if OverlayAnnotationTool.tool(
+                    forShortcutKey: "m",
+                    in: OverlayAnnotationTool.panelTools) != nil {
+                    keyFailures.append("panel routed M to a hidden tool")
+                }
+                // Every advertised letter resolves to the tool whose tooltip
+                // advertises it, on the host that shows it.
+                for tool in OverlayAnnotationTool.areaReviewTools {
+                    guard let range = tool.tooltip.range(
+                        of: #"\(([A-Z])\)"#, options: .regularExpression)
+                    else { continue }
+                    let letter = tool.tooltip[range]
+                        .dropFirst().dropLast().lowercased()
+                    if OverlayAnnotationTool.tool(
+                        forShortcutKey: letter,
+                        in: OverlayAnnotationTool.areaReviewTools) != tool {
+                        keyFailures.append(
+                            "\(tool.rawValue) advertises \(letter), routes elsewhere")
+                    }
+                }
+                check("sliceB-host-scoped-shortcuts", keyFailures.isEmpty,
+                      keyFailures.joined(separator: " | "))
+            }
+
+            // 1d. The hover hint on all three hosts. The overlay and the panel
+            // never activate, so AppKit's own tooltip cannot serve them; the
+            // editor DOES activate, so leaving the native tooltip on would
+            // show two descriptions side by side. Both halves are pinned here,
+            // together with the geometry that the ~206pt panel breaks first.
+            do {
+                var hintFailures: [String] = []
+                @MainActor func hintButtons(in root: NSView) -> [NSButton] {
+                    root.subviews.flatMap { child -> [NSButton] in
+                        let own = (child as? NSButton).map { [$0] } ?? []
+                        return own + hintButtons(in: child)
+                    }
+                }
+                @MainActor func hintKey(_ characters: String) -> NSEvent? {
+                    NSEvent.keyEvent(
+                        with: .keyDown, location: .zero, modifierFlags: [],
+                        timestamp: 0, windowNumber: 0, context: nil,
+                        characters: characters,
+                        charactersIgnoringModifiers: characters,
+                        isARepeat: false, keyCode: 0)
+                }
+
+                if let hintScreen = NSScreen.main ?? NSScreen.screens.first {
+                    // --- Area review, inside a real window so the hint has a
+                    // content view to live in.
+                    let hintOverlay = SelectionOverlay(
+                        purpose: .areaReview,
+                        inputs: OverlaySessionInputs(
+                            afterShow: true, afterCopy: false, afterSave: false),
+                        completion: { _ in })
+                    hintOverlay.routerDependenciesOverride =
+                        CaptureActionRouter.Dependencies(
+                            copyToClipboard: { _ in }, autoSave: { _, _ in },
+                            saveAs: { _, _ in }, pin: { _ in }, ocr: { _ in },
+                            openEditor: { _ in }, toast: { _ in },
+                            setLastCapture: { _ in },
+                            setLastAreaRect: { _ in }, logEvent: { _ in })
+                    let hintFrozen = CapturedImage(
+                        cgImage: makeSolidImage(
+                            width: Int(hintScreen.frame.width),
+                            height: Int(hintScreen.frame.height),
+                            color: NSColor.darkGray.cgColor),
+                        scale: 1)
+                    let areaHintView = SelectionOverlayView(
+                        mode: .area, screen: hintScreen, frozen: hintFrozen,
+                        windowList: [], owner: hintOverlay)
+                    let areaHintWindow = NSWindow(
+                        contentRect: hintScreen.frame, styleMask: .borderless,
+                        backing: .buffered, defer: false)
+                    areaHintWindow.contentView = areaHintView
+                    areaHintView.selectForTesting(rect: CGRect(
+                        x: 200, y: 200, width: 300, height: 200))
+                    let areaCatalog = areaHintView.reviewToolbarButtonsForTesting
+                    if areaCatalog.contains(where: { $0.tooltip.isEmpty }) {
+                        hintFailures.append("area hint catalog has gaps")
+                    }
+                    if areaHintView.nativeTooltipsForTesting
+                        .contains(where: { $0 != nil }) {
+                        hintFailures.append("area kept a native tooltip")
+                    }
+                    let areaButtons = hintButtons(in: areaHintView)
+                    if let probe = areaButtons.first(where: {
+                        $0.tag == OverlayAnnotationTool.pixelateText.toolbarTag
+                    }) {
+                        areaHintView.hoverHint.showImmediatelyForTesting(probe)
+                        if areaHintView.hoverHint.visibleTextForTesting
+                            != OverlayAnnotationTool.pixelateText.tooltip {
+                            hintFailures.append("area hint text wrong")
+                        }
+                        if let frame = areaHintView.hoverHint.hintFrameForTesting {
+                            if !areaHintView.bounds.insetBy(dx: -1, dy: -1)
+                                .contains(frame) {
+                                hintFailures.append("area hint outside \(frame)")
+                            }
+                            // Decoration only: the click must reach the button.
+                            if let hit = areaHintView.hitTest(
+                                areaHintView.convert(
+                                    CGPoint(x: frame.midX, y: frame.midY),
+                                    to: areaHintView.superview)),
+                               String(describing: type(of: hit))
+                                .contains("HintView") {
+                                hintFailures.append("area hint swallowed a click")
+                            }
+                        } else {
+                            hintFailures.append("area hint did not show")
+                        }
+                        // A keyboard tool switch is an authoritative change of
+                        // what the pointer means: the hint goes with it.
+                        if let event = hintKey("l") {
+                            areaHintView.keyDown(with: event)
+                        }
+                        if areaHintView.hoverHint.visibleTextForTesting != nil {
+                            hintFailures.append("area hint survived a key switch")
+                        }
+                    } else {
+                        hintFailures.append("area probe button missing")
+                    }
+                    areaHintView.hoverHint.detachAll()
+                    if areaButtons.contains(where: { button in
+                        button.trackingAreas.contains {
+                            $0.userInfo?["snipprHoverHint"] != nil
+                        }
+                    }) {
+                        hintFailures.append("area tracking areas outlived detach")
+                    }
+                    if let probe = areaButtons.first,
+                       areaHintView.hoverHint.textForTesting(probe) != nil {
+                        hintFailures.append("area catalog outlived detach")
+                    }
+                    areaHintWindow.orderOut(nil)
+                    hintOverlay.dismissForTesting()
+
+                    // --- Scroll panel: the narrow one. Its content is about
+                    // 206pt wide, which the longest sentence exceeds outright.
+                    let hintPanel = ScrollResultPanel.show(
+                        image: CapturedImage(
+                            cgImage: makeStripePattern(
+                                width: 90, height: 900, seed: 0x1128_0817),
+                            scale: 1),
+                        inputs: OverlaySessionInputs(
+                            afterShow: true, afterCopy: false, afterSave: false),
+                        screen: hintScreen,
+                        dependencies: CaptureActionRouter.Dependencies(
+                            copyToClipboard: { _ in }, autoSave: { _, _ in },
+                            saveAs: { _, _ in }, pin: { _ in }, ocr: { _ in },
+                            openEditor: { _ in }, toast: { _ in },
+                            setLastCapture: { _ in },
+                            setLastAreaRect: { _ in }, logEvent: { _ in }))
+                    if hintPanel.toolbarButtonsForTesting
+                        .contains(where: { $0.tooltip.isEmpty }) {
+                        hintFailures.append("panel hint catalog has gaps")
+                    }
+                    if hintPanel.nativeTooltipsForTesting
+                        .contains(where: { $0 != nil }) {
+                        hintFailures.append("panel kept a native tooltip")
+                    }
+                    let panelContent = hintPanel.contentView ?? NSView()
+                    if let probe = hintButtons(in: panelContent).first(where: {
+                        $0.tag == OverlayAnnotationTool.pixelateText.toolbarTag
+                    }) {
+                        hintPanel.hoverHint.showImmediatelyForTesting(probe)
+                        if let frame = hintPanel.hoverHint.hintFrameForTesting {
+                            if frame.minX < panelContent.bounds.minX - 0.5
+                                || frame.maxX > panelContent.bounds.maxX + 0.5 {
+                                hintFailures.append(
+                                    "panel hint clamped outside \(frame) in \(panelContent.bounds)")
+                            }
+                            if frame.width > HoverHint.maxWidth + 0.5 {
+                                hintFailures.append(
+                                    "panel hint did not wrap \(frame.width)")
+                            }
+                            // Wrapping means taller, not clipped: a single
+                            // 22pt line cannot hold the pixelate sentence at
+                            // this width.
+                            if frame.height <= 22.5 {
+                                hintFailures.append(
+                                    "panel hint stayed one line \(frame.height)")
+                            }
+                        } else {
+                            hintFailures.append("panel hint did not show")
+                        }
+                        hintPanel.hoverHint.hide()
+                        if hintPanel.hoverHint.visibleTextForTesting != nil {
+                            hintFailures.append("panel hide left a hint up")
+                        }
+                    } else {
+                        hintFailures.append("panel probe button missing")
+                    }
+                    hintPanel.close()
+                }
+
+                // --- Editor: an activating window, so the native tooltip must
+                // be off and the hint must go down on an authoritative switch.
+                let hintWC = EditorWindowController.open(
+                    with: CapturedImage(
+                        cgImage: makeSolidImage(
+                            width: 240, height: 160,
+                            color: NSColor.gray.cgColor),
+                        scale: 1),
+                    forceFitForTesting: true)
+                let editorButtons = hintWC.toolButtonsForTesting
+                if let probe = editorButtons.first(where: {
+                    $0.tool == .pixelateText
+                })?.button {
+                    hintWC.hoverHint.showImmediatelyForTesting(probe)
+                    if hintWC.hoverHint.visibleTextForTesting
+                        != EditorTool.pixelateText.tooltip {
+                        hintFailures.append("editor hint text wrong")
+                    }
+                    hintWC.selectTool(.crop)
+                    if hintWC.hoverHint.visibleTextForTesting != nil {
+                        hintFailures.append("editor hint survived selectTool")
+                    }
+                } else {
+                    hintFailures.append("editor probe button missing")
+                }
+                hintWC.window?.close()
+
+                check("sliceB-hover-hint-three-hosts", hintFailures.isEmpty,
+                      hintFailures.joined(separator: " | "))
+            }
 
             // 2. Editor keys: old letters untouched, D/S/M/⇧B owned by B.
             let keys = SliceAHotkeys.editorToolKeys
@@ -10361,7 +10819,7 @@ enum SelfTest {
                         return own + buttons(in: child)
                     }
                 }
-                let expectedTags = OverlayAnnotationTool.allCases.map {
+                let expectedTags = OverlayAnnotationTool.areaReviewTools.map {
                     $0.toolbarTag
                 } + [
                     OverlayAnnotationTool.colorToolbarTag,
@@ -10375,7 +10833,8 @@ enum SelfTest {
                 let catalogPairs = view.reviewToolbarButtonsForTesting
                 let actualTags = buttonRefs.map(\.tag)
                 let sharedButtonAction: Selector? = buttonRefs.first?.action
-                if buttonRefs.count != 22 || expectedTags.count != 22
+                // 13 tools + Color/Undo/Redo + 6 actions + Close.
+                if buttonRefs.count != 23 || expectedTags.count != 23
                     || Set(actualTags) != Set(expectedTags)
                     || Set(actualTags).count != actualTags.count
                     || catalogPairs.map(\.tag) != expectedTags
@@ -13860,7 +14319,11 @@ enum SelfTest {
             // On the REAL buttons: every one carries a visible image and a
             // label, whichever branch of the fallback produced it.
             let labelled = buttons.allSatisfy {
-                !($0.button.toolTip ?? "").isEmpty
+                // Native tooltip OFF, hint catalog populated: both halves of
+                // the "exactly one description appears" contract.
+                $0.button.toolTip == nil
+                    && !(uiWC.hoverHint.textForTesting($0.button) ?? "").isEmpty
+                    && !($0.button.accessibilityLabel() ?? "").isEmpty
                     && $0.button.image != nil
                     && !($0.button.image?.accessibilityDescription ?? "").isEmpty
             }

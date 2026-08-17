@@ -514,8 +514,13 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
             ? ""
             : " (image \(Int(innerPx.width))×\(Int(innerPx.height)) px"
                 + " + \(Int(layout.padPixels)) px backdrop)"
-        sizeBadge.toolTip =
-            "\(Int(px.width))×\(Int(px.height)) px\(frameNote) — click to scale. Does not change “Resize retina screenshots” on save."
+        // Through the hint, never `toolTip`: writing the native tooltip back
+        // would give this button two descriptions, and the hint would keep
+        // quoting the size the image had before this layout.
+        hoverHint.setText(
+            "\(Int(px.width))×\(Int(px.height)) px\(frameNote) — click to scale. "
+                + "Does not change “Resize retina screenshots” on save.",
+            for: sizeBadge)
         let pct = Int(round((scrollView?.magnification ?? 1) * 100))
         zoomLabel.stringValue = "\(pct)%"
     }
@@ -593,6 +598,9 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
     }
 
     func selectTool(_ tool: EditorTool) {
+        // Authoritative for the toolbar, the keyboard and the menu alike: a
+        // hint left standing after a switch describes the previous tool.
+        hoverHint.hide()
         canvas.currentTool = tool
         let cropping = tool == .crop
         cropActionBar?.isHidden = !cropping
@@ -636,6 +644,9 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
     }
 
     @objc func showBackdropMenu(_ sender: NSButton) {
+        // popUp runs a nested event loop: a hint still on screen would sit
+        // under the menu until the loop exits.
+        hoverHint.hide()
         let menu = backdropMenu()
         backdropMenuForTesting = menu
         menu.popUp(
@@ -762,6 +773,7 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
     }
 
     @objc func copyImage() {
+        hoverHint.hide()
         guard let flat = flattenedOrWarn() else { return }
         terminalDependencies.copyToClipboard(flat)
         ToastHUD.show("Copied to clipboard")
@@ -772,6 +784,7 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
     /// SaveService.saveAs with the overlay action router so the panel/write
     /// behavior cannot drift between the two surfaces.
     @objc func saveImage() {
+        hoverHint.hide()
         guard let window else { return }
         // A failed render must change nothing, so the cancel happens only once
         // the flatten has actually succeeded — and before the panel opens, so
@@ -796,13 +809,20 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
     @objc func saveImageAs() { saveImage() }
 
     @objc func pinImage() {
+        hoverHint.hide()
         guard let flat = flattenedOrWarn() else { return }
         terminalDependencies.pin(flat)
         window?.close()
     }
 
-    @objc func runOCR() { recognizeText(autoTranslate: false) }
-    @objc func runTranslate() { recognizeText(autoTranslate: true) }
+    @objc func runOCR() {
+        hoverHint.hide()
+        recognizeText(autoTranslate: false)
+    }
+    @objc func runTranslate() {
+        hoverHint.hide()
+        recognizeText(autoTranslate: true)
+    }
 
     private func recognizeText(autoTranslate: Bool) {
         guard let flat = flattenedOrWarn() else { return }
@@ -849,6 +869,9 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
     }
 
     func windowWillClose(_ notification: Notification) {
+        // The hint holds tracking areas on buttons that are about to go away,
+        // and may have one scheduled to fire into this closing window.
+        hoverHint.detachAll()
         // Closing supersedes every OCR job in flight: a late result must not
         // touch annotations belonging to a window that is gone.
         for blur in canvas.annotations.compactMap({ $0 as? BlurAnnotation }) {

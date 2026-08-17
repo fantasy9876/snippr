@@ -53,10 +53,17 @@ enum OverlayAnnotationTool: String, CaseIterable {
     }
 
     /// S4 exposes the tools added by S1/S2 through the SAME mapping on both
-    /// live surfaces. Pre-existing V/P/A/R/T tooltip shortcuts remain outside
-    /// this slice; do not duplicate this switch in either host.
+    /// live surfaces; do not duplicate this switch in either host.
+    /// V/P/A/R/T are here because the toolbar has always ADVERTISED them in
+    /// its tooltips — a hint that names a key the host does not route is a
+    /// promise the app breaks the first time a user believes it.
     static func tool(forShortcutKey key: String) -> Self? {
         switch key.lowercased() {
+        case "v": return .select
+        case "p": return .pen
+        case "a": return .arrow
+        case "r": return .rect
+        case "t": return .text
         case "l": return .line
         case "o": return .oval
         case "h": return .highlight
@@ -66,6 +73,16 @@ enum OverlayAnnotationTool: String, CaseIterable {
         case "m": return .magnifier
         default: return nil
         }
+    }
+
+    /// The host-filtered lookup, which is the ONLY one a live surface may use.
+    /// The map above is catalog-wide, so the panel — which deliberately omits
+    /// the magnifier — would otherwise select a tool it shows no button for
+    /// and leave the toolbar highlighting nothing.
+    static func tool(forShortcutKey key: String, in catalog: [Self]) -> Self? {
+        guard let tool = tool(forShortcutKey: key), catalog.contains(tool)
+        else { return nil }
+        return tool
     }
 
     /// The editor's exact persisted raw value. Keep this explicit instead of
@@ -319,6 +336,7 @@ final class AnnotationSurface: RedactionHost, RedactionJobObserver {
             blur.redactionState = .pendingFull
             activeBlur = blur
             activeBlurAnchor = p
+            clearAllMagnifierSnapshots()
             annotations.append(blur)
             historyDidChange?()
             return true
@@ -368,6 +386,7 @@ final class AnnotationSurface: RedactionHost, RedactionJobObserver {
             blur.rect = CGRect(origin: p, size: .zero)
             activeBlur = blur
             activeBlurAnchor = p
+            clearAllMagnifierSnapshots()
             // Pixelate needs a live preview while dragging, but a click-only
             // zero-area draft is not a mutation and must preserve redo. Clear
             // the redo branch only when endDrag confirms a real region.
@@ -389,6 +408,7 @@ final class AnnotationSurface: RedactionHost, RedactionJobObserver {
             blur.rect = CGRect(
                 x: min(anchor.x, p.x), y: min(anchor.y, p.y),
                 width: abs(anchor.x - p.x), height: abs(anchor.y - p.y))
+            clearMagnifierSnapshots(overlapping: blur.rect)
         } else if let spot = activeSpotlight, let anchor = activeSpotlightAnchor {
             spot.rect = CGRect(
                 x: min(anchor.x, p.x), y: min(anchor.y, p.y),
@@ -413,6 +433,7 @@ final class AnnotationSurface: RedactionHost, RedactionJobObserver {
     /// document underneath a live drag: finalizing then would add a mark the
     /// export never saw.
     func abandonDrag() {
+        let touchedRedactions = activeBlur != nil
         if let shape = activeShape, annotations.last === shape {
             annotations.removeLast()
         }
@@ -441,6 +462,9 @@ final class AnnotationSurface: RedactionHost, RedactionJobObserver {
         activeMagnifier = nil
         activeMagnifierAnchor = nil
         replacedSpotlight = nil
+        // A pixelation dropped mid-drag may have blanked a magnifier patch on
+        // the way; rebuild against what is left so nothing stays empty.
+        if touchedRedactions { refreshMagnifierSnapshots() }
         // The document changed shape even though history did not, so the Undo
         // and Redo buttons have to be re-evaluated.
         historyDidChange?()
@@ -459,6 +483,9 @@ final class AnnotationSurface: RedactionHost, RedactionJobObserver {
     }
 
     func endDrag() {
+        // Whether this drag could have changed what the magnifiers see. Read
+        // BEFORE the branches, because `clearActiveDraft` erases the evidence.
+        let touchedRedactions = activeBlur != nil
         // A magnifier is finished like the other region tools: a drag that
         // never moved leaves nothing behind and keeps the redo branch. The
         // snapshot is left to the host, which owns the base image and can take
@@ -561,6 +588,10 @@ final class AnnotationSurface: RedactionHost, RedactionJobObserver {
             historyDidChange?()
         }
         clearActiveDraft()
+        // A pixelation that was committed — or one that was discarded after
+        // sweeping across a source mid-drag — both leave the patches needing a
+        // resample against the set that actually survived.
+        if touchedRedactions { redactionDidChange() }
     }
 
     /// Adjusting darkness is a REPLACEMENT, not an in-place mutation: it goes
@@ -626,6 +657,14 @@ final class AnnotationSurface: RedactionHost, RedactionJobObserver {
     /// image, not just the selection or the view.
     var redactionBaseBounds: CGRect = .zero
 
+    /// The image the surface samples from. Hosts set it beside
+    /// `redactionBaseBounds`: a magnifier patch is sanitized ONCE, when the
+    /// callout is made, so every later change to the redaction set has to
+    /// resample it — and only this reference makes that possible without the
+    /// host being present at the moment of the change (an OCR job resolving
+    /// asynchronously is exactly such a moment).
+    var redactionBaseImage: CGImage?
+
     /// Set by `endDrag` when a magnifier finished; the host fills its snapshot
     /// because only the host has the base image — and it must sample the
     /// document AFTER redactions so the callout cannot reveal what a
@@ -636,11 +675,80 @@ final class AnnotationSurface: RedactionHost, RedactionJobObserver {
     func fillPendingMagnifier(base: CGImage) -> Bool {
         guard let magnifier = pendingMagnifier else { return false }
         pendingMagnifier = nil
+        if redactionBaseImage == nil { redactionBaseImage = base }
         magnifier.snapshot = SliceBCompositor.magnifierSnapshot(
             base: base, sourceRect: magnifier.sourceRect,
-            redactions: annotations.compactMap { $0 as? BlurAnnotation })
+            redactions: liveRedactions)
         redactionDidChange()
         return true
+    }
+
+    /// Every redaction currently covering pixels, INCLUDING the one being
+    /// drawn right now: a rebuild that saw only committed marks would restore
+    /// raw pixels underneath an active pixelation.
+    private var liveRedactions: [BlurAnnotation] {
+        var result = annotations.compactMap { $0 as? BlurAnnotation }
+        if let draft = activeBlur, !result.contains(where: { $0 === draft }) {
+            result.append(draft)
+        }
+        return result
+    }
+
+    /// Resample every magnifier from the CURRENT redactions.
+    ///
+    /// The patch is sanitized once, at creation. Anything that changes the
+    /// redaction set afterwards — a pixelation drawn over the source, an undo
+    /// that removes one, a redo that brings one back, or a text-redaction job
+    /// resolving off the main thread — leaves the callout showing pixels the
+    /// document itself no longer shows. That is a privacy leak, not a stale
+    /// pixel: the user covered something and the magnifier still displays it.
+    /// With no base image to resample from, the patch is CLEARED — a blank
+    /// callout is a defect, a stale one is a disclosure.
+    @discardableResult
+    func refreshMagnifierSnapshots() -> Bool {
+        let magnifiers = annotations.compactMap { $0 as? MagnifierAnnotation }
+        guard !magnifiers.isEmpty else { return false }
+        let redactions = liveRedactions
+        for magnifier in magnifiers {
+            guard let base = redactionBaseImage else {
+                magnifier.snapshot = nil
+                continue
+            }
+            magnifier.snapshot = SliceBCompositor.magnifierSnapshot(
+                base: base, sourceRect: magnifier.sourceRect,
+                redactions: redactions)
+        }
+        return true
+    }
+
+    /// EVERY patch goes blank the moment a redaction drag starts, wherever it
+    /// started.
+    ///
+    /// Not just the one under the press: a zero-size draft is not a valid mask
+    /// rect, and both fail-closed paths react to that globally — the document
+    /// renderer covers the whole visible area rather than guess where to mask
+    /// (`SliceBCompositor.draw`), and `magnifierSnapshot` refuses to sample at
+    /// all while any redaction rect is undefined. So between mouse-down and
+    /// the first dragged event the document is fully masked while a callout
+    /// anywhere on it would still be painting its old pixels on top. Blank
+    /// them all; `endDrag`/`abandonDrag` rebuild.
+    private func clearAllMagnifierSnapshots() {
+        for magnifier in annotations.compactMap({ $0 as? MagnifierAnnotation }) {
+            magnifier.snapshot = nil
+        }
+    }
+
+    /// Mid-drag fail-closed: the instant a pixelation being drawn touches a
+    /// magnifier's source, drop that patch. Resampling on every mouse-moved
+    /// event would be far too expensive, and showing the old pixels WHILE the
+    /// user is covering them is precisely the leak this exists to prevent.
+    /// `endDrag`/`abandonDrag` rebuild, so the callout is never left blank.
+    private func clearMagnifierSnapshots(overlapping rect: CGRect) {
+        for magnifier in annotations.compactMap({ $0 as? MagnifierAnnotation })
+        where magnifier.snapshot != nil
+            && magnifier.sourceRect.intersects(rect) {
+            magnifier.snapshot = nil
+        }
     }
 
     /// Set by `endDrag` when a text redaction finished; the host starts the
@@ -675,7 +783,11 @@ final class AnnotationSurface: RedactionHost, RedactionJobObserver {
     /// no caller can accidentally retain the host through a repaint callback.
     weak var redactionDelegate: RedactionSurfaceDelegate?
 
+    /// The single funnel for "the redaction set is not what it was". Every
+    /// magnifier is resampled BEFORE the repaint, so no frame can ever be
+    /// drawn from a patch that predates the change.
     func redactionDidChange() {
+        refreshMagnifierSnapshots()
         redactionDelegate?.surfaceNeedsRedactionRepaint()
     }
 
@@ -748,6 +860,10 @@ final class AnnotationSurface: RedactionHost, RedactionJobObserver {
         }
         redoAnnotations.append(annotation)
         clearActiveDraft()
+        // Undoing a pixelation UNCOVERS pixels a magnifier sampled while they
+        // were covered, and undoing anything else can still change which
+        // redactions apply. Resample before the repaint either way.
+        refreshMagnifierSnapshots()
         historyDidChange?()
         return true
     }
@@ -763,6 +879,9 @@ final class AnnotationSurface: RedactionHost, RedactionJobObserver {
         }
         annotations.append(annotation)
         clearActiveDraft()
+        // Redo brings a pixelation BACK: a callout sampled while it was undone
+        // is showing exactly the pixels it now covers.
+        refreshMagnifierSnapshots()
         historyDidChange?()
         return true
     }

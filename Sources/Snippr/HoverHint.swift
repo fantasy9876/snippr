@@ -31,14 +31,21 @@ final class HoverHint: NSResponder {
             layer?.borderColor = NSColor(white: 1, alpha: 0.12).cgColor
             label.font = .systemFont(ofSize: 11, weight: .medium)
             label.textColor = .white
+            // Long hints WRAP instead of growing: the pixelate-text sentence
+            // is far wider than the scroll panel's window.
+            label.lineBreakMode = .byWordWrapping
+            label.maximumNumberOfLines = 3
             label.translatesAutoresizingMaskIntoConstraints = false
             addSubview(label)
             NSLayoutConstraint.activate([
                 label.leadingAnchor.constraint(
-                    equalTo: leadingAnchor, constant: 8),
+                    equalTo: leadingAnchor, constant: HoverHint.horizontalPadding),
                 label.trailingAnchor.constraint(
-                    equalTo: trailingAnchor, constant: -8),
-                label.centerYAnchor.constraint(equalTo: centerYAnchor),
+                    equalTo: trailingAnchor, constant: -HoverHint.horizontalPadding),
+                label.topAnchor.constraint(
+                    equalTo: topAnchor, constant: HoverHint.verticalPadding),
+                label.bottomAnchor.constraint(
+                    equalTo: bottomAnchor, constant: -HoverHint.verticalPadding),
             ])
         }
 
@@ -49,9 +56,63 @@ final class HoverHint: NSResponder {
         override func hitTest(_ point: NSPoint) -> NSView? { nil }
     }
 
+    /// A tracking area's `userInfo` is retained by the area, and the area is
+    /// retained by the button. Putting the button itself in there closes the
+    /// loop button → area → userInfo → button and leaks every toolbar the app
+    /// has ever built. The box breaks it.
+    private final class WeakButton: NSObject {
+        weak var button: NSButton?
+        init(_ button: NSButton) { self.button = button }
+    }
+
+    /// The widest a hint may be. Beyond this the sentence wraps rather than
+    /// growing: the scroll panel's window is only ~206pt, so a long hint would
+    /// otherwise be wider than the view it must sit inside and clamp to a
+    /// negative origin — visibly cut off at the left edge.
+    static let maxWidth: CGFloat = 240
+    fileprivate static let horizontalPadding: CGFloat = 8
+    fileprivate static let verticalPadding: CGFloat = 5
+
+    /// Measures the wrapped sentence. `intrinsicContentSize` reports a single
+    /// unwrapped line, which is what made a long hint wider than its host.
+    private static func size(
+        for label: NSTextField, text: String, maxWidth: CGFloat
+    ) -> CGSize {
+        let inner = max(20, maxWidth - horizontalPadding * 2)
+        label.preferredMaxLayoutWidth = inner
+        let bounding = (text as NSString).boundingRect(
+            with: CGSize(width: inner, height: .greatestFiniteMagnitude),
+            options: [.usesLineFragmentOrigin, .usesFontLeading],
+            attributes: [.font: label.font ?? NSFont.systemFont(ofSize: 11)])
+        return CGSize(
+            width: min(maxWidth, ceil(bounding.width) + horizontalPadding * 2),
+            height: max(22, ceil(bounding.height) + verticalPadding * 2))
+    }
+
     private let hint = HintView()
     private var pending: DispatchWorkItem?
     private weak var shownFor: NSButton?
+    private var attached: [WeakButton] = []
+    private var mouseMonitor: Any?
+
+    /// A press anywhere in the app takes the hint down and cancels anything
+    /// scheduled. A tracking area never reports mouse-down, and routing it
+    /// through each host would still miss the editor canvas, which does not
+    /// own the hint — so the press is observed once, here. The monitor only
+    /// OBSERVES: it returns the event untouched, so no host loses a click.
+    private func installMouseMonitor() {
+        guard mouseMonitor == nil else { return }
+        mouseMonitor = NSEvent.addLocalMonitorForEvents(
+            matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown]
+        ) { [weak self] event in
+            MainActor.assumeIsolated { self?.hide() }
+            return event
+        }
+    }
+
+    /// Explicit mouse-down route for hosts that already funnel their presses,
+    /// and for gates, which cannot post a real event into the monitor.
+    func mouseDidGoDown() { hide() }
     /// The hint text, held here rather than read back from `toolTip`, because
     /// the native tooltip is switched OFF on every attached button: in the
     /// editor — an ordinary, activating window — AppKit would otherwise show
@@ -61,6 +122,7 @@ final class HoverHint: NSResponder {
     /// Watches these buttons. The tracking areas are `.activeAlways`, because
     /// `.activeInKeyWindow` would never fire on an overlay that is not key.
     func attach(to buttons: [NSButton]) {
+        installMouseMonitor()
         for button in buttons {
             let text = button.toolTip ?? button.accessibilityLabel() ?? ""
             if !text.isEmpty {
@@ -82,12 +144,49 @@ final class HoverHint: NSResponder {
                     .enabledDuringMouseDrag,
                 ],
                 owner: self,
-                userInfo: ["snipprHoverHint": true, "button": button]))
+                userInfo: [
+                    "snipprHoverHint": true, "button": WeakButton(button),
+                ]))
+            attached.append(WeakButton(button))
         }
     }
 
+    /// Updates the sentence for a button that describes itself differently
+    /// over time — the editor's size badge restates the pixel dimensions on
+    /// every layout. Writing `toolTip` directly would switch AppKit's own
+    /// tooltip back on and leave the hint quoting the previous size.
+    func setText(_ text: String, for button: NSButton) {
+        texts[ObjectIdentifier(button)] = text
+        button.setAccessibilityLabel(text)
+        button.setAccessibilityHelp(text)
+        button.toolTip = nil
+        if shownFor === button { hint.label.stringValue = text }
+    }
+
+    /// Undoes `attach`: removes the tracking areas, drops the catalog and
+    /// takes any visible hint down. A host that is torn down while the pointer
+    /// sits on a button would otherwise leave a scheduled hint to fire into a
+    /// window that is already closing.
+    func detachAll() {
+        hide()
+        if let monitor = mouseMonitor {
+            NSEvent.removeMonitor(monitor)
+            mouseMonitor = nil
+        }
+        for box in attached {
+            guard let button = box.button else { continue }
+            for area in button.trackingAreas
+            where area.userInfo?["snipprHoverHint"] != nil {
+                button.removeTrackingArea(area)
+            }
+        }
+        attached.removeAll()
+        texts.removeAll()
+    }
+
     override func mouseEntered(with event: NSEvent) {
-        guard let button = event.trackingArea?.userInfo?["button"] as? NSButton
+        guard let box = event.trackingArea?.userInfo?["button"] as? WeakButton,
+              let button = box.button
         else { return }
         schedule(for: button)
     }
@@ -127,26 +226,43 @@ final class HoverHint: NSResponder {
     private func show(_ text: String, for button: NSButton) {
         guard let content = button.window?.contentView,
               button.window != nil else { return }
+        // Never while a mouse button is down. The hint is scheduled on enter,
+        // so pressing and HOLDING a toolbar button — or pressing and dragging
+        // onto the canvas — would otherwise let it appear mid-gesture, and the
+        // click handler that dismisses it does not run until mouse-up.
+        guard NSEvent.pressedMouseButtons == 0 else { return }
         hint.label.stringValue = text
-        hint.frame.size = CGSize(
-            width: ceil(hint.label.intrinsicContentSize.width) + 16,
-            height: 22)
+        // The rect the hint has to stay inside: the host's content view, and
+        // — for a window that extends past the usable screen — the visible
+        // frame as well, so a hint never lands under the menu bar or the Dock.
+        var allowed = content.bounds.insetBy(dx: 2, dy: 2)
+        if let window = button.window, let screen = window.screen {
+            let visible = content.convert(
+                window.convertFromScreen(screen.visibleFrame), from: nil)
+            let clipped = allowed.intersection(visible)
+            // Only when the intersection still leaves somewhere to draw: a
+            // headless or off-screen window must not shrink it to nothing.
+            if !clipped.isNull, clipped.width > 40, clipped.height > 30 {
+                allowed = clipped
+            }
+        }
+        hint.frame.size = Self.size(
+            for: hint.label, text: text, maxWidth: min(
+                Self.maxWidth, max(40, allowed.width)))
         content.addSubview(hint, positioned: .above, relativeTo: nil)
         let anchor = button.convert(button.bounds, to: content)
         var origin = CGPoint(
             x: anchor.midX - hint.frame.width / 2,
             y: anchor.minY - hint.frame.height - 6)
         // Below the button by default, above it when there is no room, and
-        // never outside the window it lives in.
-        if origin.y < content.bounds.minY + 2 {
+        // never outside the region computed above.
+        if origin.y < allowed.minY {
             origin.y = anchor.maxY + 6
         }
         origin.x = min(
-            max(content.bounds.minX + 2, origin.x),
-            content.bounds.maxX - hint.frame.width - 2)
+            max(allowed.minX, origin.x), allowed.maxX - hint.frame.width)
         origin.y = min(
-            max(content.bounds.minY + 2, origin.y),
-            content.bounds.maxY - hint.frame.height - 2)
+            max(allowed.minY, origin.y), allowed.maxY - hint.frame.height)
         hint.setFrameOrigin(origin)
         shownFor = button
     }
