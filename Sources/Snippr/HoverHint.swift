@@ -52,11 +52,25 @@ final class HoverHint: NSResponder {
     private let hint = HintView()
     private var pending: DispatchWorkItem?
     private weak var shownFor: NSButton?
+    /// The hint text, held here rather than read back from `toolTip`, because
+    /// the native tooltip is switched OFF on every attached button: in the
+    /// editor — an ordinary, activating window — AppKit would otherwise show
+    /// its own tooltip beside this one and the user would see two.
+    private var texts: [ObjectIdentifier: String] = [:]
 
     /// Watches these buttons. The tracking areas are `.activeAlways`, because
     /// `.activeInKeyWindow` would never fire on an overlay that is not key.
     func attach(to buttons: [NSButton]) {
         for button in buttons {
+            let text = button.toolTip ?? button.accessibilityLabel() ?? ""
+            if !text.isEmpty {
+                texts[ObjectIdentifier(button)] = text
+                // Accessibility keeps its own channels — the label is already
+                // set by the toolbars, and the help string carries the same
+                // sentence for anything that reads it.
+                button.setAccessibilityHelp(text)
+            }
+            button.toolTip = nil
             for area in button.trackingAreas
             where area.userInfo?["snipprHoverHint"] != nil {
                 button.removeTrackingArea(area)
@@ -86,8 +100,8 @@ final class HoverHint: NSResponder {
         cancelPending()
         // The text is the button's own label, so the hint cannot drift from
         // what the accessibility layer reports.
-        let text = button.toolTip ?? button.accessibilityLabel() ?? ""
-        guard !text.isEmpty else { return }
+        guard let text = texts[ObjectIdentifier(button)], !text.isEmpty
+        else { return }
         let work = DispatchWorkItem { [weak self, weak button] in
             guard let self, let button else { return }
             self.show(text, for: button)
@@ -139,6 +153,11 @@ final class HoverHint: NSResponder {
 
     // MARK: gate visibility
 
+    /// What the hint WOULD say — so a gate can prove the catalog survived the
+    /// native tooltip being switched off.
+    func textForTesting(_ button: NSButton) -> String? {
+        texts[ObjectIdentifier(button)]
+    }
     var visibleTextForTesting: String? {
         hint.superview == nil ? nil : hint.label.stringValue
     }
@@ -148,8 +167,8 @@ final class HoverHint: NSResponder {
     }
     func showImmediatelyForTesting(_ button: NSButton) {
         cancelPending()
-        let text = button.toolTip ?? button.accessibilityLabel() ?? ""
-        guard !text.isEmpty else { return }
+        guard let text = texts[ObjectIdentifier(button)], !text.isEmpty
+        else { return }
         show(text, for: button)
     }
 }

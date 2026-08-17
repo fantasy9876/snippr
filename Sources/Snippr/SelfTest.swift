@@ -9420,7 +9420,13 @@ enum SelfTest {
                     // of them — or merely that they are non-empty — would let
                     // two tools swap their descriptions unnoticed.
                     let label = button.accessibilityLabel() ?? ""
-                    if label != tool.tooltip || button.toolTip != tool.tooltip
+                    // The native tooltip is deliberately OFF — the editor is
+                    // an activating window, so AppKit would draw its own
+                    // beside the app's hint. The sentence lives in the hint
+                    // catalog and in accessibility instead.
+                    if label != tool.tooltip || button.toolTip != nil
+                        || wc.hoverHint.textForTesting(button) != tool.tooltip
+                        || button.accessibilityHelp() != tool.tooltip
                         || button.image == nil
                         || button.image?.accessibilityDescription
                             != tool.tooltip {
@@ -9442,7 +9448,9 @@ enum SelfTest {
                         toolbarFailures.append("\(name):action")
                     }
                     if button.accessibilityLabel() != tooltip
-                        || button.toolTip != tooltip
+                        || button.toolTip != nil
+                        || wc.hoverHint.textForTesting(button) != tooltip
+                        || button.accessibilityHelp() != tooltip
                         || button.image?.accessibilityDescription != tooltip {
                         toolbarFailures.append(
                             "\(name):label(\(button.accessibilityLabel() ?? "nil"))")
