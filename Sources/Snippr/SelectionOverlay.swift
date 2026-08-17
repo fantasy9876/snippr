@@ -485,6 +485,7 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
     private var toolToolbarButtons: [NSButton] = []
     private var actionToolbarButtons: [NSButton] = []
     private var toolbarButtons: [NSButton] = []
+    let hoverHint = HoverHint()
 
     private static let colorPresets: [NSColor] = [
         .systemRed, .systemOrange, .systemYellow, .systemGreen,
@@ -563,6 +564,9 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
         toolToolbarButtons = toolButtons
         actionToolbarButtons = actionButtons
         toolbarButtons = toolButtons + actionButtons
+        // AppKit's own tooltips never appear here: this window deliberately
+        // never activates, and NSToolTipManager only serves the active app.
+        hoverHint.attach(to: toolbarButtons)
         return (toolContainer, actionContainer)
     }
 
@@ -651,6 +655,7 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
     }
 
     @objc private func reviewToolbarButtonPressed(_ sender: NSButton) {
+        hoverHint.hide()
         if isSaving || isFinished { return }
         // The same rule the keyboard follows. A toolbar click, an
         // accessibility action or any programmatic route reaches this method
@@ -689,6 +694,7 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
     /// tear the overlay down BEFORE presenting; Save keeps the overlay in
     /// `.saving` and returns to review on cancel/failure.
     fileprivate func performReviewAction(_ intent: CaptureIntent) {
+        hoverHint.hide()
         guard !annotationDragging, areaDrag == nil else { return }
         guard let owner, owner.session.acceptsCommits,
               let selection = areaSelection?.intersection(bounds),
@@ -994,6 +1000,7 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
     }
 
     override func mouseDown(with event: NSEvent) {
+        hoverHint.hide()
         updatePointer(from: event)
         let p = convert(event.locationInWindow, from: nil)
         guard mode == .area else { return }

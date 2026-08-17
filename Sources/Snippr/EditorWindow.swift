@@ -14,6 +14,7 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
     /// accessor — a gate seam must never be the app's own router.
     private var backdropButton: NSButton?
     private var actionButtons: [(name: String, button: NSButton)] = []
+    let hoverHint = HoverHint()
 
     /// The five terminal buttons and the right-hand chrome, by identity.
     var actionButtonsForTesting: [(name: String, button: NSButton)] {
@@ -320,6 +321,12 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
         cropActions.isHidden = true
         cropActionBar = cropActions
 
+        // The editor is an ordinary window, but it uses the same hint so all
+        // three hosts read the same way — and so a shortcut is visible on
+        // hover rather than only in an accessibility inspector.
+        hoverHint.attach(
+            to: toolButtons.values.map { $0 }
+                + actionButtons.map { $0.button } + [sizeBadge])
         contentView.addSubview(scrollView)
         contentView.addSubview(bar)
         contentView.addSubview(cropActions)
@@ -647,6 +654,7 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
     private(set) var backdropMenuForTesting: NSMenu?
 
     @objc private func toolTapped(_ sender: NSButton) {
+        hoverHint.hide()
         guard let id = sender.identifier?.rawValue, let tool = EditorTool(rawValue: id) else { return }
         selectTool(tool)
     }

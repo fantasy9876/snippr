@@ -82,6 +82,7 @@ final class ScrollResultPanel: NSPanel {
     /// the panel has detached and started presenting its destination.
     private var terminalActionClaimed = false
     private var toolbarButtons: [NSButton] = []
+    let hoverHint = HoverHint()
     private var actionBar: NSView?
     /// Slice 4: shared annotation surface over the stitched image.
     let annotationSurface: AnnotationSurface
@@ -312,6 +313,9 @@ final class ScrollResultPanel: NSPanel {
             button.frame = frame
         }
         toolbarButtons = buttons
+        // Same reason as the area overlay: a nonactivating panel never gets
+        // AppKit's tooltips.
+        hoverHint.attach(to: buttons)
         return bar
     }
 
@@ -346,6 +350,7 @@ final class ScrollResultPanel: NSPanel {
     }
 
     @objc private func toolbarPressed(_ sender: NSButton) {
+        hoverHint.hide()
         if saving || terminalActionClaimed { return }
         // Clicks, accessibility actions and programmatic routes reach this
         // without passing a key handler, so the drag guard belongs here too.
@@ -527,6 +532,7 @@ final class ScrollResultPanel: NSPanel {
     /// commits use source `.scrollResult` with a nil rect, so the
     /// Repeat-Area memory is never touched.
     private func perform(intent: CaptureIntent) {
+        hoverHint.hide()
         guard !saving, !terminalActionClaimed else { return }
         guard annotationHost?.isAnnotationDragging != true else { return }
         // A terminal click must never race the in-flight text entry: commit
