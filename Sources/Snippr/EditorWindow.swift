@@ -65,6 +65,7 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
 
         // Two rows of controls; see buildUI.
         let toolbarHeight: CGFloat = 70
+        let minimumViewportHeight: CGFloat = 120
         let contentSize = image.pointSize
         let screen = NSScreen.main ?? NSScreen.screens[0]
         let maxSize = CGSize(
@@ -72,7 +73,13 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
             height: screen.visibleFrame.height * 0.9 - toolbarHeight
         )
         let winW = min(max(contentSize.width, 560), maxSize.width)
-        let winH = min(contentSize.height, maxSize.height) + toolbarHeight
+        // `contentMinSize` constrains user resizing, but AppKit may leave an
+        // already-created programmatic window below that floor. Construct the
+        // initial content rect with the same minimum so a tiny/Retina image
+        // still has a usable viewport on every architecture.
+        let winH = min(
+            max(contentSize.height, minimumViewportHeight), maxSize.height)
+            + toolbarHeight
 
         let window = NSWindow(
             contentRect: CGRect(x: 0, y: 0, width: winW, height: winH),
@@ -81,7 +88,8 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
         )
         // The tool row needs 560pt; without a floor the user could drag the
         // window narrower and push buttons out of reach.
-        window.contentMinSize = CGSize(width: 560, height: toolbarHeight + 120)
+        window.contentMinSize = CGSize(
+            width: 560, height: toolbarHeight + minimumViewportHeight)
         window.titlebarAppearsTransparent = true
         window.titleVisibility = .hidden
         window.appearance = NSAppearance(named: .darkAqua)

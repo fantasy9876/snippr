@@ -14578,6 +14578,11 @@ enum SelfTest {
                     with: CapturedImage(cgImage: base, scale: scale),
                     forceFitForTesting: true)
                 let canvas = wc.canvasForTesting
+                if wc.scrollViewportForTesting.height < 119 {
+                    previewFailures.append(
+                        label + ":viewport "
+                        + "\(wc.scrollViewportForTesting)")
+                }
                 if preset != .none, !canvas.applyBackdrop(preset) {
                     previewFailures.append(label + ":apply")
                 }
@@ -14615,8 +14620,21 @@ enum SelfTest {
                 // must do so BY ITSELF. Calling fitImageToWindow here would
                 // paper over a preset change that never refits, which is the
                 // regression this asks about; the refit is scheduled after the
-                // layout pass, so the run loop is given a turn instead.
-                RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+                // layout pass. Fence that production callback in FIFO order
+                // instead of assuming one fixed sleep drains the main queue
+                // under Rosetta and every supported AppKit runtime.
+                var refitDrained = false
+                DispatchQueue.main.async { refitDrained = true }
+                let refitDeadline = Date().addingTimeInterval(1)
+                while !refitDrained && Date() < refitDeadline {
+                    RunLoop.current.run(
+                        until: min(
+                            refitDeadline,
+                            Date().addingTimeInterval(0.01)))
+                }
+                if !refitDrained {
+                    previewFailures.append(label + ":refit-timeout")
+                }
                 if !wc.imageFitsViewportForTesting() {
                     previewFailures.append(
                         label + ":fit \(layout.outerPointSize) at "
@@ -15009,13 +15027,24 @@ enum SelfTest {
                     body()
                     canvas.undoManager?.endUndoGrouping()
                 }
-                func settle() {
-                    RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+                func settle(_ label: String) {
+                    var drained = false
+                    DispatchQueue.main.async { drained = true }
+                    let deadline = Date().addingTimeInterval(1)
+                    while !drained && Date() < deadline {
+                        RunLoop.current.run(
+                            until: min(
+                                deadline,
+                                Date().addingTimeInterval(0.01)))
+                    }
+                    if !drained {
+                        chromeFailures.append(label + ":refit-timeout")
+                    }
                 }
-                settle()
+                settle("initial")
                 let plainZoom = wc.scrollMagnificationForTesting
                 grouped { _ = canvas.applyBackdrop(.ocean) }
-                settle()
+                settle("framed")
                 let framedZoom = wc.scrollMagnificationForTesting
                 if !wc.imageFitsViewportForTesting() {
                     chromeFailures.append("framed-overflows")
@@ -15025,7 +15054,7 @@ enum SelfTest {
                         "framed-zoom \(framedZoom) vs \(plainZoom)")
                 }
                 grouped { _ = canvas.applyBackdrop(.none) }
-                settle()
+                settle("plain")
                 if !wc.imageFitsViewportForTesting() {
                     chromeFailures.append("plain-overflows")
                 }
@@ -15034,14 +15063,14 @@ enum SelfTest {
                         "removed-zoom \(wc.scrollMagnificationForTesting)")
                 }
                 canvas.undoManager?.undo()
-                settle()
+                settle("undo")
                 if abs(wc.scrollMagnificationForTesting - framedZoom) > 0.001
                     || !wc.imageFitsViewportForTesting() {
                     chromeFailures.append(
                         "undo-zoom \(wc.scrollMagnificationForTesting)")
                 }
                 canvas.undoManager?.redo()
-                settle()
+                settle("redo")
                 if abs(wc.scrollMagnificationForTesting - plainZoom) > 0.001 {
                     chromeFailures.append(
                         "redo-zoom \(wc.scrollMagnificationForTesting)")
@@ -15049,7 +15078,7 @@ enum SelfTest {
                 // A live text field in the corner cut-out must not show in the
                 // preview: the export clips it away.
                 grouped { _ = canvas.applyBackdrop(.ocean) }
-                settle()
+                settle("text-frame")
                 let layout = canvas.backdropLayout
                 canvas.beginTextEditingForTesting(at: CGPoint(x: 2, y: 2))
                 if let wrapper = wc.documentWrapperForTesting,
