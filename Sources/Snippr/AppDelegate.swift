@@ -42,6 +42,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             "--uitest", "--benchmark", "--test-firstopen", "--test-scrollpreview",
             "--test-scrollstitch", "--test-scrollreal", "--test-scrollapp",
             "--test-scrollreplay", "--test-scrollreplay-split",
+            "--test-panel-hid",
         ]
         let isDevTool = devToolFlags.contains { CommandLine.arguments.contains($0) }
         let captureDevToolFlags = [
@@ -125,6 +126,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         if let dir = Benchmark.scrollRealOutDir { Benchmark.runScrollRealTest(outDir: dir) }
         if Benchmark.scrollAppRequested { Benchmark.runScrollAppTest() }
+        if Benchmark.panelHIDTestRequested { Benchmark.runPanelHIDTest() }
         if !isDevTool {
             UpdateChecker.checkOnLaunch()
         }

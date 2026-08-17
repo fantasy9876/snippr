@@ -75,7 +75,8 @@ if arguments.contains("--check-permissions") {
 }
 
 let devToolFlags = [
-    "--uitest", "--benchmark", "--test-firstopen", "--test-scrollpreview",
+    "--uitest", "--benchmark", "--test-firstopen", "--test-panel-hid",
+    "--test-scrollpreview",
     "--test-scrollstitch", "--test-scrollreal", "--test-scrollapp",
     "--test-scrollreplay", "--test-scrollreplay-split",
 ]

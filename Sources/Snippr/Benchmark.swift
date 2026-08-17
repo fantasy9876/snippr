@@ -13,6 +13,471 @@ enum Benchmark {
         CommandLine.arguments.contains("--test-firstopen")
     }
 
+    /// `--test-panel-hid`: proves the WindowServer owns Select drags while the
+    /// panel's annotation host owns Pen drags. Unlike the headless responder
+    /// gate, this requires Accessibility because events are posted at the HID
+    /// tap; there is deliberately no direct-NSEvent fallback.
+    static var panelHIDTestRequested: Bool {
+        CommandLine.arguments.contains("--test-panel-hid")
+    }
+
+    static func runPanelHIDTest() {
+        Task { @MainActor in
+            func failBeforePanel(_ detail: String) -> Never {
+                print("PANEL-HID fixture FAIL (\(detail))")
+                print("PANEL-HID FAILED")
+                exit(1)
+            }
+            let mine = ProcessInfo.processInfo.processIdentifier
+            let bundleID = Bundle.main.bundleIdentifier
+                ?? "com.manhhoang.snippr"
+            func anotherSnipprIsRunning() -> Bool {
+                NSRunningApplication.runningApplications(
+                    withBundleIdentifier: bundleID
+                ).contains {
+                    $0.processIdentifier != mine && !$0.isTerminated
+                }
+            }
+            func leftButtonIsDown() -> Bool {
+                CGEventSource.buttonState(
+                    .combinedSessionState, button: .left)
+            }
+
+            // This dev tool deliberately bypasses main.swift's normal
+            // single-instance arbitration. Refuse to inject global input while
+            // another Snippr can own windows or react to the same session; the
+            // harness never terminates that process on the user's behalf.
+            guard !anotherSnipprIsRunning() else {
+                failBeforePanel("another Snippr is running; quit it first")
+            }
+            // Never synthesize an up over a physical drag the user already owns.
+            guard !leftButtonIsDown() else {
+                failBeforePanel("left mouse button is already down")
+            }
+            guard AXIsProcessTrusted() else {
+                print("PANEL-HID permission FAIL (Accessibility NOT granted)")
+                print("PANEL-HID FAILED")
+                exit(1)
+            }
+            guard let primary = NSScreen.screens.first else {
+                print("PANEL-HID fixture FAIL (no screen)")
+                print("PANEL-HID FAILED")
+                exit(1)
+            }
+            guard ScrollResultPanel.current == nil else {
+                print("PANEL-HID fixture FAIL (panel already active)")
+                print("PANEL-HID FAILED")
+                exit(1)
+            }
+
+            let primaryTop = primary.frame.maxY
+            func cgPoint(fromAppKit point: CGPoint) -> CGPoint {
+                // CGEvent global coordinates are top-left based. This is the
+                // inverse of WindowInfo.frameAppKit's repository-wide mapping.
+                CGPoint(x: point.x, y: primaryTop - point.y)
+            }
+            @MainActor func screenPoint(
+                _ local: CGPoint, host: NSView, panel: NSWindow
+            ) -> CGPoint {
+                panel.convertPoint(toScreen: host.convert(local, to: nil))
+            }
+            func distance(_ a: CGPoint, _ b: CGPoint) -> CGFloat {
+                hypot(a.x - b.x, a.y - b.y)
+            }
+            func sameSize(_ a: CGSize, _ b: CGSize,
+                          tolerance: CGFloat = 1) -> Bool {
+                abs(a.width - b.width) <= tolerance
+                    && abs(a.height - b.height) <= tolerance
+            }
+            func sameAnnotations(_ a: [Annotation], _ b: [Annotation]) -> Bool {
+                a.count == b.count
+                    && zip(a, b).allSatisfy { $0.0 === $0.1 }
+            }
+            @MainActor func panelOwnsFrontmostWindow(
+                atCG point: CGPoint, panel: NSWindow
+            ) -> Bool {
+                guard let list = CGWindowListCopyWindowInfo(
+                    [.optionOnScreenOnly, .excludeDesktopElements],
+                    kCGNullWindowID) as? [[String: Any]]
+                else { return false }
+                for entry in list {
+                    guard let bounds = entry[kCGWindowBounds as String]
+                            as? [String: CGFloat],
+                          let number = entry[kCGWindowNumber as String]
+                            as? CGWindowID
+                    else { continue }
+                    let frame = CGRect(
+                        x: bounds["X"] ?? 0, y: bounds["Y"] ?? 0,
+                        width: bounds["Width"] ?? 0,
+                        height: bounds["Height"] ?? 0)
+                    let alpha = entry[kCGWindowAlpha as String]
+                        as? CGFloat ?? 1
+                    guard alpha > 0.05, frame.contains(point) else { continue }
+                    // Window-server order is front-to-back. At this opaque
+                    // image point, the first containing window owns the HID.
+                    return number == CGWindowID(panel.windowNumber)
+                }
+                return false
+            }
+
+            let originalCursorAppKit = NSEvent.mouseLocation
+            let originalCursorCG = cgPoint(fromAppKit: originalCursorAppKit)
+            let image = CapturedImage(
+                cgImage: SelfTest.makeTestImage(width: 600, height: 400),
+                scale: 1)
+            let panel = ScrollResultPanel.show(
+                image: image,
+                inputs: OverlaySessionInputs(
+                    afterShow: true, afterCopy: false, afterSave: false),
+                screen: primary,
+                dependencies: CaptureActionRouter.Dependencies(
+                    copyToClipboard: { _ in }, autoSave: { _, _ in },
+                    saveAs: { _, done in done(.cancelled) },
+                    pin: { _ in }, ocr: { _ in }, openEditor: { _ in },
+                    toast: { _ in }, setLastCapture: { _ in },
+                    setLastAreaRect: { _ in }, logEvent: { _ in }))
+            AppActivation.activateNow()
+            panel.orderFrontRegardless()
+            panel.makeKey()
+
+            // `acceptsFirstMouse` is deliberately not part of the image-view
+            // fix: the production capture flow already owns activation. Make
+            // that premise explicit here so an inactive harness cannot turn a
+            // correct Select implementation red.
+            let activationDeadline = Date().addingTimeInterval(2)
+            while (!NSApp.isActive || !panel.isKeyWindow || !panel.isVisible),
+                  Date() < activationDeadline {
+                AppActivation.activateNow()
+                panel.orderFrontRegardless()
+                panel.makeKey()
+                try? await Task.sleep(nanoseconds: 50_000_000)
+            }
+
+            var penFailures: [String] = []
+            var selectFailures: [String] = []
+            var fixtureFailures: [String] = []
+            var cleanupFailures: [String] = []
+            var lastHIDPoint = originalCursorCG
+            var touchedHID = false
+            var penRan = false
+            var selectRan = false
+
+            // Every path after panel creation converges here. Before the first
+            // HID post it only dismisses the panel; afterwards it first forces
+            // left-up, restores the pointer, and verifies the source state.
+            @MainActor func finish() async -> Never {
+                if touchedHID {
+                    let cleanupHIDPoint = lastHIDPoint
+                    let cleanupPosted = await Task.detached(
+                        priority: .userInitiated
+                    ) {
+                        let released = releaseMouseHID(at: cleanupHIDPoint)
+                        usleep(120_000)
+                        let moved = moveMouseHID(to: originalCursorCG)
+                        return released && moved
+                    }.value
+                    try? await Task.sleep(nanoseconds: 180_000_000)
+                    if !cleanupPosted {
+                        cleanupFailures.append("event-construction")
+                    }
+                    if distance(NSEvent.mouseLocation, originalCursorAppKit) > 6 {
+                        cleanupFailures.append("cursor-not-restored")
+                    }
+                }
+                if leftButtonIsDown() {
+                    cleanupFailures.append("left-button-still-down")
+                }
+
+                panel.dismissForTesting()
+                try? await Task.sleep(nanoseconds: 100_000_000)
+                if panel.isVisible || ScrollResultPanel.current === panel {
+                    cleanupFailures.append("panel")
+                }
+
+                let penOK = penRan && penFailures.isEmpty
+                let selectOK = selectRan && selectFailures.isEmpty
+                let cleanupOK = cleanupFailures.isEmpty
+                print("PANEL-HID pen \(penOK ? "PASS" : "FAIL")")
+                print("PANEL-HID select \(selectOK ? "PASS" : "FAIL")")
+                print("PANEL-HID cleanup \(cleanupOK ? "PASS" : "FAIL")")
+                let details = fixtureFailures.map { "fixture:\($0)" }
+                    + penFailures.map { "pen:\($0)" }
+                    + selectFailures.map { "select:\($0)" }
+                    + cleanupFailures.map { "cleanup:\($0)" }
+                if !details.isEmpty {
+                    print("PANEL-HID detail "
+                          + details.joined(separator: " | "))
+                }
+                let ok = fixtureFailures.isEmpty
+                    && penOK && selectOK && cleanupOK
+                print(ok ? "PANEL-HID OK" : "PANEL-HID FAILED")
+                exit(ok ? 0 : 1)
+            }
+
+            guard let host = panel.annotationHostForTesting,
+                  let content = panel.contentView else {
+                fixtureFailures.append("no annotation host")
+                await finish()
+            }
+            guard NSApp.isActive, panel.isKeyWindow, panel.isVisible else {
+                fixtureFailures.append("panel did not become active/key/visible")
+                await finish()
+            }
+            guard !anotherSnipprIsRunning() else {
+                fixtureFailures.append("another Snippr started during fixture")
+                await finish()
+            }
+            guard !leftButtonIsDown() else {
+                fixtureFailures.append("left button changed before fixture")
+                await finish()
+            }
+
+            // Pen: a real HID drag must be dispatched into the host, finish a
+            // non-degenerate mark, and never turn the transparent canvas into
+            // a window-drag handle.
+            panel.clickToolbarButtonForTesting(
+                tag: OverlayAnnotationTool.pen.toolbarTag)
+            let penStart = CGPoint(
+                x: host.bounds.minX + host.bounds.width * 0.30,
+                y: host.bounds.minY + host.bounds.height * 0.42)
+            let penEnd = CGPoint(
+                x: host.bounds.minX + host.bounds.width * 0.68,
+                y: host.bounds.minY + host.bounds.height * 0.62)
+            let penHitPoint = host.convert(
+                penStart, to: content.superview ?? content)
+            guard panel.annotationSurface.tool == .pen else {
+                penFailures.append("premise-tool")
+                await finish()
+            }
+            guard content.hitTest(penHitPoint) === host else {
+                penFailures.append("premise-hit")
+                await finish()
+            }
+            guard !host.mouseDownCanMoveWindow else {
+                penFailures.append("premise-drag-handle")
+                await finish()
+            }
+            guard panel.annotationSurface.annotations.isEmpty,
+                  !host.isAnnotationDragging,
+                  !panel.annotationSurface.isDragging else {
+                penFailures.append("premise-document-or-drag")
+                await finish()
+            }
+            let penFrameBefore = panel.frame
+            let penAnnotationsBefore = panel.annotationSurface.annotations
+            let penStartScreen = screenPoint(penStart, host: host, panel: panel)
+            let penEndScreen = screenPoint(penEnd, host: host, panel: panel)
+            let penStartCG = cgPoint(fromAppKit: penStartScreen)
+            let penEndCG = cgPoint(fromAppKit: penEndScreen)
+            let ownershipDeadline = Date().addingTimeInterval(2)
+            while !panelOwnsFrontmostWindow(
+                    atCG: penStartCG, panel: panel),
+                  Date() < ownershipDeadline {
+                try? await Task.sleep(nanoseconds: 50_000_000)
+            }
+            guard !anotherSnipprIsRunning(), !leftButtonIsDown(),
+                  NSApp.isActive, panel.isKeyWindow, panel.isVisible,
+                  panelOwnsFrontmostWindow(
+                    atCG: penStartCG, panel: panel) else {
+                fixtureFailures.append("pen target is not frontmost/key")
+                await finish()
+            }
+            let penPrimed = await Task.detached(priority: .userInitiated) {
+                moveMouseHID(to: penStartCG)
+            }.value
+            if penPrimed {
+                touchedHID = true
+                lastHIDPoint = penStartCG
+            }
+            try? await Task.sleep(nanoseconds: 180_000_000)
+            guard penPrimed,
+                  distance(NSEvent.mouseLocation, penStartScreen) <= 6 else {
+                penFailures.append("cursor-prime")
+                await finish()
+            }
+            guard !leftButtonIsDown(), !anotherSnipprIsRunning(),
+                  NSApp.isActive, panel.isKeyWindow, panel.isVisible,
+                  panel.annotationSurface.tool == .pen,
+                  content.hitTest(penHitPoint) === host,
+                  !host.mouseDownCanMoveWindow,
+                  panelOwnsFrontmostWindow(
+                    atCG: penStartCG, panel: panel) else {
+                fixtureFailures.append("pen premise changed after cursor prime")
+                await finish()
+            }
+            lastHIDPoint = penEndCG
+            penRan = true
+            let penPosted = await Task.detached(priority: .userInitiated) {
+                dragMouseHID(from: penStartCG, to: penEndCG)
+            }.value
+            try? await Task.sleep(nanoseconds: 450_000_000)
+            guard penPosted else {
+                penFailures.append("event-construction")
+                await finish()
+            }
+            if !sameSize(panel.frame.size, penFrameBefore.size)
+                || distance(panel.frame.origin, penFrameBefore.origin) > 1 {
+                penFailures.append("window-moved")
+            }
+            let pen = panel.annotationSurface.annotations.last as? PenAnnotation
+            let penPoints = pen?.points ?? []
+            if panel.annotationSurface.annotations.count
+                    != penAnnotationsBefore.count + 1
+                || pen == nil || penPoints.count < 2
+                || penPoints.first == penPoints.last {
+                penFailures.append("no-finished-mark")
+            }
+            if host.isAnnotationDragging || panel.annotationSurface.isDragging {
+                penFailures.append("drag-still-live")
+            }
+            if leftButtonIsDown() {
+                penFailures.append("left-button-still-down")
+            }
+            guard penFailures.isEmpty, let pen else {
+                await finish()
+            }
+
+            // Select: the same real HID path must now miss the host, reach the
+            // actual draggable view underneath it and move the production
+            // panel by the requested screen-space delta without touching the
+            // annotation document.
+            panel.clickToolbarButtonForTesting(
+                tag: OverlayAnnotationTool.select.toolbarTag)
+            let selectStart = CGPoint(
+                x: host.bounds.minX + host.bounds.width * 0.45,
+                y: host.bounds.minY + host.bounds.height * 0.48)
+            let selectHitPoint = host.convert(
+                selectStart, to: content.superview ?? content)
+            let selectHit = content.hitTest(selectHitPoint)
+            guard panel.annotationSurface.tool == .select else {
+                selectFailures.append("premise-tool")
+                await finish()
+            }
+            guard selectHit !== host,
+                  selectHit?.mouseDownCanMoveWindow == true else {
+                selectFailures.append("premise-underlay-not-draggable")
+                await finish()
+            }
+            guard panel.isMovable, panel.isMovableByWindowBackground else {
+                selectFailures.append("premise-window-not-background-movable")
+                await finish()
+            }
+            let selectFrameBefore = panel.frame
+            let selectAnnotationsBefore = panel.annotationSurface.annotations
+            let selectPenPointsBefore = pen.points
+            let selectPenColorBefore = pen.color
+            let selectPenWidthBefore = pen.strokeWidthPt
+            let selectCanUndoBefore = panel.annotationSurface.canUndo
+            let selectCanRedoBefore = panel.annotationSurface.canRedo
+
+            // Leave an 8pt interior margin on the origin screen. A fixed
+            // positive delta is clamped on small displays and would test screen
+            // geometry rather than background dragging.
+            func safeAxisDelta(
+                positiveSpace: CGFloat, negativeSpace: CGFloat,
+                preferred: CGFloat
+            ) -> CGFloat {
+                let positive = max(0, positiveSpace - 8)
+                let negative = max(0, negativeSpace - 8)
+                if positive >= negative, positive > 0 {
+                    return min(preferred, positive)
+                }
+                if negative > 0 { return -min(preferred, negative) }
+                return 0
+            }
+            let visible = primary.visibleFrame
+            let requestedDelta = CGPoint(
+                x: safeAxisDelta(
+                    positiveSpace: visible.maxX - selectFrameBefore.maxX,
+                    negativeSpace: selectFrameBefore.minX - visible.minX,
+                    preferred: 80),
+                y: safeAxisDelta(
+                    positiveSpace: visible.maxY - selectFrameBefore.maxY,
+                    negativeSpace: selectFrameBefore.minY - visible.minY,
+                    preferred: 50))
+            guard distance(requestedDelta, .zero) >= 12 else {
+                fixtureFailures.append("insufficient visible movement room")
+                await finish()
+            }
+            // Recompute after Pen: HID coordinates must always follow the live
+            // window frame, never a stale fixture origin.
+            let selectStartScreen = screenPoint(
+                selectStart, host: host, panel: panel)
+            let selectEndScreen = CGPoint(
+                x: selectStartScreen.x + requestedDelta.x,
+                y: selectStartScreen.y + requestedDelta.y)
+            let selectStartCG = cgPoint(fromAppKit: selectStartScreen)
+            let selectEndCG = cgPoint(fromAppKit: selectEndScreen)
+            guard !anotherSnipprIsRunning(), !leftButtonIsDown(),
+                  NSApp.isActive, panel.isKeyWindow, panel.isVisible,
+                  panelOwnsFrontmostWindow(
+                    atCG: selectStartCG, panel: panel) else {
+                fixtureFailures.append("select target is not frontmost/key")
+                await finish()
+            }
+            let selectPrimed = await Task.detached(priority: .userInitiated) {
+                moveMouseHID(to: selectStartCG)
+            }.value
+            if selectPrimed {
+                touchedHID = true
+                lastHIDPoint = selectStartCG
+            }
+            try? await Task.sleep(nanoseconds: 180_000_000)
+            guard selectPrimed,
+                  distance(NSEvent.mouseLocation, selectStartScreen) <= 6 else {
+                selectFailures.append("cursor-prime")
+                await finish()
+            }
+            guard !leftButtonIsDown(), !anotherSnipprIsRunning(),
+                  NSApp.isActive, panel.isKeyWindow, panel.isVisible,
+                  panel.annotationSurface.tool == .select,
+                  content.hitTest(selectHitPoint) === selectHit,
+                  selectHit?.mouseDownCanMoveWindow == true,
+                  panel.isMovable, panel.isMovableByWindowBackground,
+                  panelOwnsFrontmostWindow(
+                    atCG: selectStartCG, panel: panel) else {
+                fixtureFailures.append("select premise changed after cursor prime")
+                await finish()
+            }
+            lastHIDPoint = selectEndCG
+            selectRan = true
+            let selectPosted = await Task.detached(priority: .userInitiated) {
+                dragMouseHID(from: selectStartCG, to: selectEndCG)
+            }.value
+            try? await Task.sleep(nanoseconds: 450_000_000)
+            if !selectPosted { selectFailures.append("event-construction") }
+            let actualDelta = CGPoint(
+                x: panel.frame.minX - selectFrameBefore.minX,
+                y: panel.frame.minY - selectFrameBefore.minY)
+            if distance(actualDelta, requestedDelta) > 4 {
+                selectFailures.append(
+                    "frame-delta-\(Int(actualDelta.x)),\(Int(actualDelta.y))")
+            }
+            if !sameSize(panel.frame.size, selectFrameBefore.size) {
+                selectFailures.append("window-resized")
+            }
+            if !sameAnnotations(
+                    panel.annotationSurface.annotations,
+                    selectAnnotationsBefore)
+                || panel.annotationSurface.annotations.last !== pen
+                || pen.points != selectPenPointsBefore
+                || !pen.color.isEqual(selectPenColorBefore)
+                || pen.strokeWidthPt != selectPenWidthBefore
+                || panel.annotationSurface.canUndo != selectCanUndoBefore
+                || panel.annotationSurface.canRedo != selectCanRedoBefore
+                || panel.annotationSurface.tool != .select {
+                selectFailures.append("document-mutated")
+            }
+            if host.isAnnotationDragging || panel.annotationSurface.isDragging {
+                selectFailures.append("drag-still-live")
+            }
+            if leftButtonIsDown() {
+                selectFailures.append("left-button-still-down")
+            }
+            await finish()
+        }
+    }
+
     static func runFirstOpenTest() {
         Task { @MainActor in
             try? await Task.sleep(nanoseconds: 2_000_000_000) // after prewarm fires
@@ -777,6 +1242,77 @@ enum Benchmark {
         }
         CGEvent(mouseEventSource: src, mouseType: .leftMouseUp,
                 mouseCursorPosition: to, mouseButton: .left)?.post(tap: .cghidEventTap)
+    }
+
+    /// CoreGraphics posting stays off the main actor for the panel HID gate:
+    /// background-window movement enters AppKit's mouse tracking loop on the
+    /// main thread, so that thread must remain free while dragged/up arrive.
+    nonisolated private static func dragMouseHID(
+        from: CGPoint, to: CGPoint
+    ) -> Bool {
+        let source = CGEventSource(stateID: .hidSystemState)
+        guard let firstMove = CGEvent(
+            mouseEventSource: source, mouseType: .mouseMoved,
+            mouseCursorPosition: from, mouseButton: .left),
+              let secondMove = CGEvent(
+                mouseEventSource: source, mouseType: .mouseMoved,
+                mouseCursorPosition: from, mouseButton: .left),
+              let down = CGEvent(
+                mouseEventSource: source, mouseType: .leftMouseDown,
+                mouseCursorPosition: from, mouseButton: .left)
+        else { return false }
+        firstMove.post(tap: .cghidEventTap)
+        usleep(180_000)
+        secondMove.post(tap: .cghidEventTap)
+        usleep(180_000)
+        down.post(tap: .cghidEventTap)
+        usleep(100_000)
+
+        var postedUp = false
+        defer {
+            if !postedUp {
+                _ = releaseMouseHID(at: to)
+            }
+        }
+        for i in 1...8 {
+            let t = CGFloat(i) / 8
+            let point = CGPoint(
+                x: from.x + (to.x - from.x) * t,
+                y: from.y + (to.y - from.y) * t)
+            guard let dragged = CGEvent(
+                mouseEventSource: source, mouseType: .leftMouseDragged,
+                mouseCursorPosition: point, mouseButton: .left)
+            else { return false }
+            dragged.post(tap: .cghidEventTap)
+            usleep(55_000)
+        }
+        guard let up = CGEvent(
+            mouseEventSource: source, mouseType: .leftMouseUp,
+            mouseCursorPosition: to, mouseButton: .left)
+        else { return false }
+        up.post(tap: .cghidEventTap)
+        postedUp = true
+        return true
+    }
+
+    nonisolated private static func moveMouseHID(to point: CGPoint) -> Bool {
+        guard let event = CGEvent(
+            mouseEventSource: CGEventSource(stateID: .hidSystemState),
+            mouseType: .mouseMoved, mouseCursorPosition: point,
+            mouseButton: .left)
+        else { return false }
+        event.post(tap: .cghidEventTap)
+        return true
+    }
+
+    nonisolated private static func releaseMouseHID(at point: CGPoint) -> Bool {
+        guard let event = CGEvent(
+            mouseEventSource: CGEventSource(stateID: .hidSystemState),
+            mouseType: .leftMouseUp, mouseCursorPosition: point,
+            mouseButton: .left)
+        else { return false }
+        event.post(tap: .cghidEventTap)
+        return true
     }
 
     private static func pressKey(_ keyCode: UInt16) {
