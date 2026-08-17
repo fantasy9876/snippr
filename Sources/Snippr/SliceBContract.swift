@@ -454,6 +454,24 @@ enum SliceBCompositor {
 
         for annotation in phaseOrder(annotations) {
             guard let blur = annotation as? BlurAnnotation else {
+                // A magnifier TRANSPORTS pixels: whatever its source covers is
+                // reproduced, enlarged, wherever the callout sits. So the crop
+                // is a privacy boundary for it, and the boundary is enforced
+                // HERE rather than at the drag — a source that was legitimate
+                // when the callout was made can be moved outside the crop
+                // afterwards by a crop move or resize, and this check catches
+                // that the instant it happens, with no resampling and without
+                // the snapshot losing its identity.
+                //
+                // CONTAINS, not intersects: a partially outside source still
+                // shows the part that is outside. The crop is rectangular, so
+                // the rounded frame plays no part in it — that is decoration,
+                // not a boundary.
+                if let magnifier = annotation as? MagnifierAnnotation,
+                   !visiblePixels.contains(
+                       magnifier.sourceRect.standardized.integral) {
+                    continue
+                }
                 annotation.draw(in: ctx, pixellated: nil)
                 continue
             }
@@ -618,10 +636,18 @@ enum SliceBExport {
     /// Editor export must not be fail-open. Returns nil when the destination
     /// cannot be built within `budgetBytes` or when any redaction failed to
     /// render; callers keep the session open and surface the failure.
+    /// `destinationSpace` overrides the base's own colour space.
+    ///
+    /// A framed export is composed in sRGB, so the INNER render has to land in
+    /// sRGB too. Rendering it in P3 and converting afterwards blends every
+    /// annotation's alpha against P3 primaries and only then maps the result —
+    /// which is a different colour from blending in sRGB, and it is the
+    /// preview the user compared against.
     static func checkedRender(
         base: CGImage, annotations: [Annotation],
         pixellated: CGImage?, budgetBytes: Int,
-        pixelScale: CGFloat = 1
+        pixelScale: CGFloat = 1,
+        destinationSpace: CGColorSpace? = nil
     ) -> CGImage? {
         let w = base.width, h = base.height
         // Same overflow discipline as the outer compose: a huge stitch must
@@ -631,7 +657,8 @@ enum SliceBExport {
         guard let ctx = CGContext(
             data: nil, width: w, height: h, bitsPerComponent: 8,
             bytesPerRow: 0,
-            space: base.colorSpace ?? CGColorSpace(name: CGColorSpace.sRGB)!,
+            space: destinationSpace
+                ?? base.colorSpace ?? CGColorSpace(name: CGColorSpace.sRGB)!,
             bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
         else { return nil }
         // The destination buffer HAS been allocated at this point, even if the
@@ -936,6 +963,15 @@ enum SliceBBackdrop {
         documentPixelsPerUserUnit: CGFloat = 1
     ) -> Bool {
         guard preset != .none else { return true }
+        // Nothing the frame draws may land outside the canvas it was asked
+        // for. The fill clips itself, but the plate's drop shadow reaches
+        // beyond the plate as well, and in a window context there is no buffer
+        // edge to stop it — a preview would darken the scroll view around the
+        // document. In a bitmap this changes nothing: the buffer clipped it
+        // already.
+        ctx.saveGState()
+        defer { ctx.restoreGState() }
+        ctx.clip(to: CGRect(origin: .zero, size: size))
         guard drawFill(
             in: ctx, size: size, preset: preset,
             documentPixelsPerUserUnit: documentPixelsPerUserUnit)
@@ -988,6 +1024,18 @@ enum SliceBBackdrop {
         documentPixelsPerUserUnit: CGFloat = 1
     ) -> Bool {
         guard preset != .none else { return true }
+        // The fill CLIPS ITSELF. Every primitive below covers the whole clip
+        // region rather than a rect: a gradient has no bounds, and `byTiling`
+        // replicates until the clip stops it. In a bitmap the edge of the
+        // buffer did that job, so nothing showed — but the editor's document
+        // view draws into the window's context, where (since macOS 14) a view
+        // does not clip to its bounds by default, and the backdrop painted
+        // straight across the scroll view. At fit zoom the window edge hid it;
+        // at 4% on a tall scroll capture it was the whole window. Clipping at
+        // the source makes every caller safe, present and future.
+        ctx.saveGState()
+        defer { ctx.restoreGState() }
+        ctx.clip(to: CGRect(origin: .zero, size: size))
         let stops = gradientStops(for: preset)
         guard let fill = CGGradient(
             colorsSpace: CGColorSpace(name: CGColorSpace.sRGB)!,

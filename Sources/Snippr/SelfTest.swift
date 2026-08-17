@@ -8762,6 +8762,872 @@ enum SelfTest {
                       specFailures.prefix(6).joined(separator: " | "))
             }
 
+            // 1b-2. The fill paints INSIDE the canvas and nowhere else.
+            //
+            // Every primitive the fill uses covers the current clip rather
+            // than a rect: a gradient is unbounded and `byTiling` replicates
+            // until something stops it. In a bitmap the buffer edge stopped
+            // them, so compose looked correct — but the editor draws into the
+            // window's context, where a view has not clipped to its bounds by
+            // default since macOS 14, and the backdrop ran across the whole
+            // scroll view. At fit zoom the window edge hid it; at 4% on a tall
+            // scrolling capture the owner saw a diagonal band over everything.
+            do {
+                var bleedFailures: [String] = []
+                let sentinel: UInt8 = 77
+                let canvasSize = CGSize(width: 120, height: 90)
+                /// Draws into a context THREE times the canvas, with the
+                /// canvas placed in the middle, and reports every pixel
+                /// outside the canvas that moved off the sentinel colour.
+                func bledOutside(
+                    _ label: String,
+                    _ body: (CGContext, CGSize) -> Void
+                ) {
+                    let w = Int(canvasSize.width) * 3
+                    let h = Int(canvasSize.height) * 3
+                    var bytes = [UInt8](repeating: 0, count: w * h * 4)
+                    guard let c = CGContext(
+                        data: &bytes, width: w, height: h,
+                        bitsPerComponent: 8, bytesPerRow: w * 4,
+                        space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+                    else {
+                        bleedFailures.append("\(label):no-context")
+                        return
+                    }
+                    c.setFillColor(CGColor(
+                        srgbRed: CGFloat(sentinel) / 255,
+                        green: CGFloat(sentinel) / 255,
+                        blue: CGFloat(sentinel) / 255, alpha: 1))
+                    c.fill(CGRect(x: 0, y: 0, width: w, height: h))
+                    c.saveGState()
+                    // The canvas origin is NOT the context origin: a fill that
+                    // clipped to its own bounds in device space rather than in
+                    // user space would pass a centred test and still bleed.
+                    c.translateBy(x: canvasSize.width, y: canvasSize.height)
+                    body(c, canvasSize)
+                    c.restoreGState()
+                    let inside = CGRect(
+                        origin: CGPoint(
+                            x: canvasSize.width, y: canvasSize.height),
+                        size: canvasSize)
+                    var strays = 0
+                    var firstStray = ""
+                    for y in 0..<h {
+                        for x in 0..<w
+                        where !inside.contains(
+                            CGPoint(x: CGFloat(x) + 0.5, y: CGFloat(y) + 0.5)) {
+                            let i = (y * w + x) * 4
+                            if bytes[i] != sentinel || bytes[i + 1] != sentinel
+                                || bytes[i + 2] != sentinel {
+                                strays += 1
+                                if firstStray.isEmpty {
+                                    firstStray = "@\(x),\(y)="
+                                        + "\(bytes[i]),\(bytes[i + 1]),"
+                                        + "\(bytes[i + 2])"
+                                }
+                            }
+                        }
+                    }
+                    if strays > 0 {
+                        bleedFailures.append(
+                            "\(label):\(strays)px \(firstStray)")
+                    }
+                    // Positive premise: the canvas itself HAS been painted, so
+                    // a fill that drew nothing at all cannot pass this gate.
+                    let centre = ((h / 2) * w + w / 2) * 4
+                    if bytes[centre] == sentinel
+                        && bytes[centre + 1] == sentinel
+                        && bytes[centre + 2] == sentinel {
+                        bleedFailures.append("\(label):painted-nothing")
+                    }
+                }
+                for preset in BackdropPreset.allCases where preset != .none {
+                    bledOutside("fill-\(preset.rawValue)") { c, size in
+                        SliceBBackdrop.drawFill(
+                            in: c, size: size, preset: preset)
+                    }
+                    bledOutside("frame-\(preset.rawValue)") { c, size in
+                        SliceBBackdrop.drawFrame(
+                            in: c, size: size,
+                            target: CGRect(
+                                x: 20, y: 20,
+                                width: size.width - 40,
+                                height: size.height - 40),
+                            preset: preset, pixelScale: 1)
+                    }
+                }
+                // The editor route the owner actually saw: a very tall
+                // scrolling capture at 4%, drawn through the production
+                // override into a context that does NOT bound it.
+                MainActor.assumeIsolated {
+                    let tall = makeStripePattern(
+                        width: 1433, height: 6469, seed: 0x1208_2026)
+                    let wc = EditorWindowController.open(
+                        with: CapturedImage(cgImage: tall, scale: 1),
+                        forceFitForTesting: true)
+                    let canvas = wc.canvasForTesting
+                    _ = canvas.applyBackdrop(.mint)
+                    canvas.enclosingScrollView?.magnification = 0.04
+                    guard let wrapper = wc.documentWrapperForTesting else {
+                        bleedFailures.append("editor:no-wrapper")
+                        wc.window?.close()
+                        return
+                    }
+                    if !wrapper.clipsToBounds {
+                        bleedFailures.append("editor:wrapper-unclipped")
+                    }
+                    let bounds = wrapper.bounds
+                    let margin: CGFloat = 40
+                    let w = Int(bounds.width + margin * 2)
+                    let h = Int(bounds.height + margin * 2)
+                    var bytes = [UInt8](repeating: 0, count: w * h * 4)
+                    guard w > 0, h > 0, let c = CGContext(
+                        data: &bytes, width: w, height: h,
+                        bitsPerComponent: 8, bytesPerRow: w * 4,
+                        space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+                    else {
+                        bleedFailures.append("editor:no-context")
+                        wc.window?.close()
+                        return
+                    }
+                    c.setFillColor(CGColor(
+                        srgbRed: CGFloat(sentinel) / 255,
+                        green: CGFloat(sentinel) / 255,
+                        blue: CGFloat(sentinel) / 255, alpha: 1))
+                    c.fill(CGRect(x: 0, y: 0, width: w, height: h))
+                    c.translateBy(x: margin, y: margin)
+                    let graphics = NSGraphicsContext(
+                        cgContext: c, flipped: false)
+                    NSGraphicsContext.saveGraphicsState()
+                    NSGraphicsContext.current = graphics
+                    wrapper.draw(bounds)
+                    NSGraphicsContext.restoreGraphicsState()
+                    var editorStrays = 0
+                    for y in 0..<h {
+                        for x in 0..<w
+                        where CGFloat(x) < margin || CGFloat(y) < margin
+                            || CGFloat(x) >= margin + bounds.width
+                            || CGFloat(y) >= margin + bounds.height {
+                            let i = (y * w + x) * 4
+                            if bytes[i] != sentinel { editorStrays += 1 }
+                        }
+                    }
+                    if editorStrays > 0 {
+                        bleedFailures.append("editor:\(editorStrays)px")
+                    }
+                    wc.window?.close()
+                }
+                check("sliceB-backdrop-fill-never-paints-outside-canvas",
+                      bleedFailures.isEmpty,
+                      bleedFailures.prefix(6).joined(separator: " | "))
+            }
+
+            // C1. What the user reviews and what the export writes describe
+            //     the same picture: the same colour space and the same crop.
+            //
+            //     Colour: a framed export is composed in sRGB, so the inner
+            //     render has to LAND in sRGB — not be rendered in the source's
+            //     P3 and converted afterwards, which blends every annotation
+            //     against different primaries. The band below is a saturated
+            //     NON-primary P3 colour on purpose: pure P3 green converts to
+            //     (0,255,0) and would make this oracle blind.
+            //
+            //     Crop: the payload crops by `session.pixelRect.integral`, so
+            //     everything on screen has to describe that same rect. A
+            //     selection dragged to a half point at scale 2 (the 127/128
+            //     seam below) used to leave the frame, its padding and the
+            //     reported rect a half point away from the exported ones.
+            MainActor.assumeIsolated {
+                var c1Failures: [String] = []
+                let p3 = CGColorSpace(name: CGColorSpace.displayP3)!
+                let sRGB = CGColorSpace(name: CGColorSpace.sRGB)!
+                let bandRect = CGRect(x: 220, y: 220, width: 60, height: 60)
+                @MainActor final class ImageSpy {
+                    var visual: [CGImage] = []
+                    var semantic: [CGImage] = []
+                    func dependencies() -> CaptureActionRouter.Dependencies {
+                        CaptureActionRouter.Dependencies(
+                            copyToClipboard: { [self] in
+                                visual.append($0.cgImage)
+                            },
+                            autoSave: { _, _ in }, saveAs: { _, _ in },
+                            pin: { _ in },
+                            ocrWithMode: { [self] image, _ in
+                                semantic.append(image.cgImage)
+                            },
+                            openEditor: { _ in }, toast: { _ in },
+                            setLastCapture: { _ in }, setLastAreaRect: { _ in },
+                            logEvent: { _ in })
+                    }
+                }
+                /// A P3 source: mid grey everywhere, with one saturated band
+                /// that sRGB cannot represent.
+                func p3Source(scale: CGFloat, size: CGSize) -> CGImage? {
+                    let w = Int(size.width * scale)
+                    let h = Int(size.height * scale)
+                    guard let c = CGContext(
+                        data: nil, width: w, height: h, bitsPerComponent: 8,
+                        bytesPerRow: 0, space: p3,
+                        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+                    else { return nil }
+                    c.setFillColor(CGColor(
+                        colorSpace: p3, components: [0.5, 0.5, 0.5, 1])!)
+                    c.fill(CGRect(x: 0, y: 0, width: w, height: h))
+                    c.setFillColor(CGColor(
+                        colorSpace: p3, components: [0.05, 0.92, 0.42, 1])!)
+                    c.fill(CGRect(
+                        x: bandRect.minX * scale, y: bandRect.minY * scale,
+                        width: bandRect.width * scale,
+                        height: bandRect.height * scale))
+                    return c.makeImage()
+                }
+                /// Reads one pixel of `image` through `space`, which is what
+                /// makes the difference between "the pixels were converted"
+                /// and "the pixels were relabelled" visible.
+                func read(
+                    _ image: CGImage, _ x: Int, _ yBL: Int, in space: CGColorSpace
+                ) -> (Int, Int, Int)? {
+                    let w = image.width, h = image.height
+                    guard x >= 0, x < w, yBL >= 0, yBL < h else { return nil }
+                    var bytes = [UInt8](repeating: 0, count: w * h * 4)
+                    guard let c = CGContext(
+                        data: &bytes, width: w, height: h, bitsPerComponent: 8,
+                        bytesPerRow: w * 4, space: space,
+                        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+                    else { return nil }
+                    c.interpolationQuality = .none
+                    c.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
+                    let i = ((h - 1 - yBL) * w + x) * 4
+                    return (Int(bytes[i]), Int(bytes[i + 1]), Int(bytes[i + 2]))
+                }
+                func near(
+                    _ a: (Int, Int, Int)?, _ b: (Int, Int, Int)?, _ tol: Int
+                ) -> Bool {
+                    guard let a, let b else { return false }
+                    return abs(a.0 - b.0) <= tol && abs(a.1 - b.1) <= tol
+                        && abs(a.2 - b.2) <= tol
+                }
+                guard let screen = NSScreen.main ?? NSScreen.screens.first
+                else {
+                    check("sliceB-backdrop-preview-matches-export",
+                          false, "no screen")
+                    return
+                }
+                @MainActor func review(
+                    _ spy: ImageSpy, scale: CGFloat, selection: CGRect
+                ) -> (SelectionOverlay, SelectionOverlayView)? {
+                    guard let base = p3Source(
+                        scale: scale, size: screen.frame.size) else { return nil }
+                    let overlay = SelectionOverlay(
+                        purpose: .areaReview,
+                        inputs: OverlaySessionInputs(
+                            afterShow: true, afterCopy: false, afterSave: false),
+                        completion: { _ in })
+                    overlay.routerDependenciesOverride = spy.dependencies()
+                    let view = SelectionOverlayView(
+                        mode: .area, screen: screen,
+                        frozen: CapturedImage(cgImage: base, scale: scale),
+                        windowList: [], owner: overlay)
+                    view.selectForTesting(rect: selection)
+                    return (overlay, view)
+                }
+                // The crop is chosen so the saturated band sits inside it.
+                let colourSelection = CGRect(
+                    x: 200, y: 200, width: 120, height: 100)
+                // Where the band is, relative to the crop, in points.
+                let bandInCrop = CGPoint(
+                    x: bandRect.midX - colourSelection.minX,
+                    y: bandRect.midY - colourSelection.minY)
+
+                /// One pixel of `color` painted into a context of `space` —
+                /// CoreGraphics' own conversion, computed independently of
+                /// anything under test.
+                func swatch(
+                    _ color: CGColor, in space: CGColorSpace
+                ) -> (Int, Int, Int)? {
+                    var bytes = [UInt8](repeating: 0, count: 4)
+                    guard let c = CGContext(
+                        data: &bytes, width: 1, height: 1, bitsPerComponent: 8,
+                        bytesPerRow: 4, space: space,
+                        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+                    else { return nil }
+                    c.setFillColor(color)
+                    c.fill(CGRect(x: 0, y: 0, width: 1, height: 1))
+                    return (Int(bytes[0]), Int(bytes[1]), Int(bytes[2]))
+                }
+                let bandColour = CGColor(
+                    colorSpace: p3, components: [0.05, 0.92, 0.42, 1])!
+
+                // -- framed: the semantic payload is sRGB and carries the
+                //    CONVERTED colour, computed here by CoreGraphics rather
+                //    than by the code under test.
+                let framedSpy = ImageSpy()
+                if let (overlay, view) = review(
+                    framedSpy, scale: 1, selection: colourSelection) {
+                    _ = view.applyBackdropPreset(.ocean)
+                    view.performReviewActionForTesting(.ocr)
+                    if let semantic = framedSpy.semantic.last {
+                        if semantic.colorSpace?.name != CGColorSpace.sRGB {
+                            c1Failures.append(
+                                "semantic space "
+                                    + "\(String(describing: semantic.colorSpace?.name))")
+                        }
+                        let got = read(
+                            semantic, Int(bandInCrop.x), Int(bandInCrop.y),
+                            in: sRGB)
+                        let want = swatch(bandColour, in: sRGB)
+                        // The raw P3 numbers, to prove the two readings are
+                        // actually different — a band that survived the
+                        // conversion unchanged would prove nothing at all.
+                        let raw = swatch(bandColour, in: p3)
+                        if !near(got, want, 3) {
+                            c1Failures.append(
+                                "band \(String(describing: got)) "
+                                    + "want \(String(describing: want))")
+                        }
+                        if near(want, raw, 3) {
+                            c1Failures.append(
+                                "band-blind \(String(describing: raw))")
+                        }
+                    } else {
+                        c1Failures.append("no semantic payload")
+                    }
+                    overlay.dismissForTesting()
+                }
+                // A terminal CLOSES the session, so the composed reading needs
+                // its own review — the same reason the dual-payload gate keeps
+                // one overlay per intent.
+                let composedSpy = ImageSpy()
+                if let (overlay, view) = review(
+                    composedSpy, scale: 1, selection: colourSelection) {
+                    _ = view.applyBackdropPreset(.ocean)
+                    view.performReviewActionForTesting(.copy)
+                    if let visual = composedSpy.visual.last {
+                        if visual.colorSpace?.name != CGColorSpace.sRGB {
+                            c1Failures.append("visual not sRGB")
+                        }
+                        // The frame was built AROUND the converted inner: the
+                        // band reads the same in the composed picture.
+                        let layout = BackdropLayout(
+                            innerPixels: colourSelection.size,
+                            pixelScale: 1, preset: .ocean)
+                        let inVisual = read(
+                            visual,
+                            Int(bandInCrop.x + layout.padPixels),
+                            Int(bandInCrop.y + layout.padPixels), in: sRGB)
+                        let inSemantic = framedSpy.semantic.last.flatMap {
+                            read(
+                                $0, Int(bandInCrop.x), Int(bandInCrop.y),
+                                in: sRGB)
+                        }
+                        if !near(inVisual, inSemantic, 2) {
+                            c1Failures.append(
+                                "composed inner \(String(describing: inVisual)) "
+                                    + "vs semantic \(String(describing: inSemantic))")
+                        }
+                    } else {
+                        c1Failures.append("no visual payload")
+                    }
+                    overlay.dismissForTesting()
+                }
+
+                // -- `.none`: not one byte converted. The document keeps its
+                //    own space, so a P3 capture stays P3.
+                let plainSpy = ImageSpy()
+                if let (overlay, view) = review(
+                    plainSpy, scale: 1, selection: colourSelection) {
+                    view.performReviewActionForTesting(.ocr)
+                    if let semantic = plainSpy.semantic.last {
+                        if semantic.colorSpace?.name != CGColorSpace.displayP3 {
+                            c1Failures.append(
+                                "none converted to "
+                                    + "\(String(describing: semantic.colorSpace?.name))")
+                        }
+                        let got = read(
+                            semantic, Int(bandInCrop.x), Int(bandInCrop.y),
+                            in: p3)
+                        let want = swatch(bandColour, in: p3)
+                        if !near(got, want, 0) {
+                            c1Failures.append(
+                                "none band moved \(String(describing: got)) "
+                                    + "want \(String(describing: want))")
+                        }
+                    } else {
+                        c1Failures.append("no plain payload")
+                    }
+                    overlay.dismissForTesting()
+                }
+
+                // -- Geometry, at scale 1 and scale 2, from a selection whose
+                //    edges land BETWEEN pixels. At scale 2 the left edge sits
+                //    on the 127/128 seam.
+                for scale in [CGFloat(1), CGFloat(2)] {
+                    for preset in [BackdropPreset.none, .ocean] {
+                        let fractional = CGRect(
+                            x: 63.75, y: 40.25, width: 32.4, height: 24.6)
+                        let spy = ImageSpy()
+                        guard let (overlay, view) = review(
+                            spy, scale: scale, selection: fractional)
+                        else {
+                            c1Failures.append("no overlay @\(scale)")
+                            continue
+                        }
+                        if preset != .none {
+                            _ = view.applyBackdropPreset(preset)
+                        }
+                        let px = overlay.session.pixelRect
+                        let canonical = view.areaSelectionForTesting
+                        if px != px.integral {
+                            c1Failures.append("pixelRect fractional \(px)")
+                        }
+                        // The seam premise: at scale 2 this selection must
+                        // actually straddle pixel 127/128, or the gate is
+                        // testing a rect that happened to be aligned.
+                        if scale == 2 && px.minX != 127 {
+                            c1Failures.append("seam moved \(px.minX)")
+                        }
+                        if let canonical {
+                            let backX = canonical.minX * scale
+                            let backW = canonical.width * scale
+                            if abs(backX - px.minX) > 0.001
+                                || abs(backW - px.width) > 0.001 {
+                                c1Failures.append(
+                                    "selection \(canonical) vs px \(px) "
+                                        + "@\(scale)")
+                            }
+                            if canonical == fractional {
+                                c1Failures.append("never quantized @\(scale)")
+                            }
+                        } else {
+                            c1Failures.append("no selection @\(scale)")
+                        }
+                        if preset != .none {
+                            let layout = BackdropLayout(
+                                innerPixels: px.size, pixelScale: scale,
+                                preset: preset)
+                            if let outer = view
+                                .backdropPreviewOuterRectForTesting {
+                                if abs(outer.width * scale
+                                        - layout.outerPixelSize.width) > 0.01
+                                    || abs(outer.height * scale
+                                        - layout.outerPixelSize.height) > 0.01 {
+                                    c1Failures.append(
+                                        "preview outer \(outer.size) "
+                                            + "vs export "
+                                            + "\(layout.outerPixelSize) @\(scale)")
+                                }
+                            } else {
+                                c1Failures.append("no preview rect @\(scale)")
+                            }
+                            view.performReviewActionForTesting(.copy)
+                            if let visual = spy.visual.last {
+                                if CGFloat(visual.width)
+                                    != layout.outerPixelSize.width
+                                    || CGFloat(visual.height)
+                                        != layout.outerPixelSize.height {
+                                    c1Failures.append(
+                                        "export \(visual.width)x\(visual.height)"
+                                            + " vs layout "
+                                            + "\(layout.outerPixelSize) @\(scale)")
+                                }
+                            } else {
+                                c1Failures.append("no export @\(scale)")
+                            }
+                        } else {
+                            view.performReviewActionForTesting(.copy)
+                            if let visual = spy.visual.last,
+                               CGFloat(visual.width) != px.width
+                                || CGFloat(visual.height) != px.height {
+                                c1Failures.append(
+                                    "plain export \(visual.width)x\(visual.height)"
+                                        + " vs \(px.size) @\(scale)")
+                            }
+                        }
+                        overlay.dismissForTesting()
+                    }
+                }
+                check("sliceB-backdrop-preview-matches-export",
+                      c1Failures.isEmpty,
+                      c1Failures.prefix(6).joined(separator: " | "))
+            }
+
+            // C2. The live caption is clipped by the crop the export makes —
+            //     in BOTH hosts, and while it is being typed.
+            //
+            //     A text field is a SUBVIEW: the draw-path clip that shapes
+            //     the document does not reach it, so a caption typed near a
+            //     rounded corner showed on screen and was missing from the
+            //     export. The clip therefore lives on the field, as a layer
+            //     mask, and the field editor — the NSTextView AppKit swaps in
+            //     while the field is first responder, which is what actually
+            //     draws the glyphs — must be inside it too.
+            MainActor.assumeIsolated {
+                var c2Failures: [String] = []
+                /// Drains the main queue so a production notification observer
+                /// has actually run before anything is asserted.
+                func settle() {
+                    var drained = false
+                    DispatchQueue.main.async { drained = true }
+                    let deadline = Date().addingTimeInterval(1)
+                    while !drained && Date() < deadline {
+                        RunLoop.current.run(
+                            until: min(
+                                deadline, Date().addingTimeInterval(0.01)))
+                    }
+                }
+                /// Asserts a mask exists, is not empty, and answers both ways:
+                /// a point outside the rounded document is OUT, a point well
+                /// inside is IN. A mask that clipped everything, or nothing,
+                /// fails one of the two.
+                func checkMask(
+                    _ label: String, _ mask: CAShapeLayer?,
+                    outside: CGPoint, inside: CGPoint
+                ) {
+                    guard let mask, let path = mask.path else {
+                        c2Failures.append("\(label):no-mask")
+                        return
+                    }
+                    if path.isEmpty {
+                        c2Failures.append("\(label):empty-path")
+                        return
+                    }
+                    if path.contains(outside) {
+                        c2Failures.append("\(label):corner-in \(outside)")
+                    }
+                    if !path.contains(inside) {
+                        c2Failures.append("\(label):interior-out \(inside)")
+                    }
+                }
+
+                // -- Editor: a real window, a real field editor, and a zoom
+                //    delivered by the production observer rather than by
+                //    calling the canvas' handler directly.
+                let base = makeStripePattern(
+                    width: 600, height: 400, seed: 0x0C02_2026)
+                let wc = EditorWindowController.open(
+                    with: CapturedImage(cgImage: base, scale: 1),
+                    forceFitForTesting: true)
+                let canvas = wc.canvasForTesting
+                _ = canvas.applyBackdrop(.ocean)
+                canvas.beginTextEditingForTesting(at: CGPoint(x: 2, y: 2))
+                wc.documentWrapperForTesting?.layoutSubtreeIfNeeded()
+                if let field = canvas.textFieldForTesting {
+                    let corner = field.convert(
+                        CGPoint(x: 2, y: 2), from: canvas)
+                    let interior = field.convert(
+                        CGPoint(x: canvas.bounds.midX, y: canvas.bounds.midY),
+                        from: canvas)
+                    checkMask(
+                        "editor-field", field.layer?.mask as? CAShapeLayer,
+                        outside: corner, inside: interior)
+                    // The premise the mask state alone cannot give: the field
+                    // is LIVE, so what draws the glyphs is the field editor,
+                    // and the mask has to cover it in ITS coordinates.
+                    if let editor = field.currentEditor() as? NSTextView {
+                        let editorCorner = editor.convert(
+                            CGPoint(x: 2, y: 2), from: canvas)
+                        let editorInterior = editor.convert(
+                            CGPoint(
+                                x: canvas.bounds.midX, y: canvas.bounds.midY),
+                            from: canvas)
+                        // The mask sits on the field, and the editor is inside
+                        // it, so the editor's points are converted back into
+                        // the masked layer's space before they are tested.
+                        let inField = (
+                            corner: field.convert(editorCorner, from: editor),
+                            interior: field.convert(
+                                editorInterior, from: editor))
+                        checkMask(
+                            "editor-currentEditor",
+                            field.layer?.mask as? CAShapeLayer,
+                            outside: inField.corner, inside: inField.interior)
+                    } else {
+                        c2Failures.append("editor:no-field-editor")
+                    }
+                    @MainActor func expectedScale() -> CGFloat {
+                        (wc.window?.backingScaleFactor ?? 2)
+                            * max(
+                                0.01,
+                                canvas.enclosingScrollView?.magnification ?? 1)
+                    }
+                    // Zoom through the PRODUCTION path: the scroll view's
+                    // bounds change posts the notification the controller
+                    // observes. Calling `magnificationDidChange()` by hand
+                    // would have proved the method works while the wiring
+                    // that calls it stayed broken.
+                    canvas.enclosingScrollView?.magnification = 2
+                    settle()
+                    if let mask = canvas.textFieldForTesting?
+                        .layer?.mask as? CAShapeLayer,
+                       abs(mask.contentsScale - expectedScale()) > 0.05 {
+                        c2Failures.append(
+                            "editor:zoom-stale \(mask.contentsScale) "
+                                + "want \(expectedScale())")
+                    }
+                    // A 1x <-> 2x display move changes the backing scale with
+                    // no zoom and no layout; AppKit's own callback is the only
+                    // thing that fires, so that is what is called here.
+                    canvas.viewDidChangeBackingProperties()
+                    if let mask = canvas.textFieldForTesting?
+                        .layer?.mask as? CAShapeLayer,
+                       abs(mask.contentsScale - expectedScale()) > 0.05 {
+                        c2Failures.append(
+                            "editor:backing-stale \(mask.contentsScale)")
+                    }
+                } else {
+                    c2Failures.append("editor:no-field")
+                }
+                wc.window?.close()
+
+                // -- Area review: the caption there had NO mask at all, so it
+                //    could be drawn over the rounded plate the export clips.
+                if let screen = NSScreen.main ?? NSScreen.screens.first {
+                    let overlay = SelectionOverlay(
+                        purpose: .areaReview,
+                        inputs: OverlaySessionInputs(
+                            afterShow: true, afterCopy: false, afterSave: false),
+                        completion: { _ in })
+                    let view = SelectionOverlayView(
+                        mode: .area, screen: screen,
+                        frozen: CapturedImage(
+                            cgImage: makeStripePattern(
+                                width: Int(screen.frame.width),
+                                height: Int(screen.frame.height),
+                                seed: 0x0C02_2027),
+                            scale: 1),
+                        windowList: [], owner: overlay)
+                    let selection = CGRect(
+                        x: 200, y: 200, width: 320, height: 240)
+                    view.selectForTesting(rect: selection)
+                    _ = view.applyBackdropPreset(.ocean)
+                    // Typed INSIDE the crop, near its corner — where the
+                    // rounded plate cuts and the square field does not.
+                    view.beginTextEntryForTesting(
+                        atView: CGPoint(
+                            x: selection.minX + 3, y: selection.minY + 3))
+                    if let field = view.textFieldForTesting {
+                        let canonical = view.areaSelectionForTesting ?? selection
+                        let corner = field.convert(
+                            CGPoint(x: canonical.minX + 1,
+                                    y: canonical.minY + 1),
+                            from: view)
+                        let interior = field.convert(
+                            CGPoint(x: canonical.midX, y: canonical.midY),
+                            from: view)
+                        checkMask(
+                            "area-field", field.layer?.mask as? CAShapeLayer,
+                            outside: corner, inside: interior)
+                        // The mask follows the crop: after a review resize the
+                        // old plate is gone, and a mask still describing it
+                        // would clip the caption in the wrong place.
+                        let moved = CGRect(
+                            x: selection.minX + 40, y: selection.minY + 30,
+                            width: 300, height: 220)
+                        view.adjustSelectionForTesting(rect: moved)
+                        let movedCanonical =
+                            view.areaSelectionForTesting ?? moved
+                        checkMask(
+                            "area-field-after-crop",
+                            field.layer?.mask as? CAShapeLayer,
+                            outside: field.convert(
+                                CGPoint(x: movedCanonical.minX + 1,
+                                        y: movedCanonical.minY + 1),
+                                from: view),
+                            inside: field.convert(
+                                CGPoint(x: movedCanonical.midX,
+                                        y: movedCanonical.midY),
+                                from: view))
+                        // `.none` still clips — to a SQUARE crop, so the same
+                        // corner point is now inside.
+                        _ = view.applyBackdropPreset(.none)
+                        if let mask = field.layer?.mask as? CAShapeLayer,
+                           let path = mask.path {
+                            let squareCorner = field.convert(
+                                CGPoint(x: movedCanonical.minX + 1,
+                                        y: movedCanonical.minY + 1),
+                                from: view)
+                            if !path.contains(squareCorner) {
+                                c2Failures.append("area-none:corner-clipped")
+                            }
+                            let outsideCrop = field.convert(
+                                CGPoint(x: movedCanonical.minX - 8,
+                                        y: movedCanonical.midY),
+                                from: view)
+                            if path.contains(outsideCrop) {
+                                c2Failures.append("area-none:outside-crop-in")
+                            }
+                        } else {
+                            c2Failures.append("area-none:no-mask")
+                        }
+                    } else {
+                        c2Failures.append("area:no-field")
+                    }
+                    overlay.dismissForTesting()
+                } else {
+                    c2Failures.append("area:no-screen")
+                }
+                check("sliceB-backdrop-live-caption-clipped",
+                      c2Failures.isEmpty,
+                      c2Failures.prefix(6).joined(separator: " | "))
+            }
+
+            // P0. The crop is a privacy boundary for the magnifier.
+            //
+            // A magnifier TRANSPORTS pixels: whatever its source covers is
+            // reproduced, enlarged, somewhere else. A source that was inside
+            // the crop when the callout was made can be put outside it
+            // afterwards by a crop move or resize — so the boundary is
+            // enforced in the compositor, where every route passes, rather
+            // than at the drag. CONTAINS, not intersects: a source that hangs
+            // half out still shows the half that is out.
+            MainActor.assumeIsolated {
+                var magFailures: [String] = []
+                let secret = CGRect(x: 220, y: 220, width: 40, height: 40)
+                let callout = CGRect(x: 400, y: 400, width: 80, height: 80)
+                func sourceImage(_ size: CGSize) -> CGImage? {
+                    guard let c = CGContext(
+                        data: nil, width: Int(size.width),
+                        height: Int(size.height), bitsPerComponent: 8,
+                        bytesPerRow: 0,
+                        space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+                    else { return nil }
+                    c.setFillColor(NSColor(white: 0.55, alpha: 1).cgColor)
+                    c.fill(CGRect(origin: .zero, size: size))
+                    // The pixels that must never travel outside the crop.
+                    c.setFillColor(
+                        NSColor(srgbRed: 1, green: 0, blue: 0, alpha: 1).cgColor)
+                    c.fill(secret)
+                    return c.makeImage()
+                }
+                func isRed(_ image: CGImage, _ x: Int, _ yBL: Int) -> Bool {
+                    let w = image.width, h = image.height
+                    guard x >= 0, x < w, yBL >= 0, yBL < h else { return false }
+                    var bytes = [UInt8](repeating: 0, count: w * h * 4)
+                    guard let c = CGContext(
+                        data: &bytes, width: w, height: h, bitsPerComponent: 8,
+                        bytesPerRow: w * 4,
+                        space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+                    else { return false }
+                    c.interpolationQuality = .none
+                    c.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
+                    let i = ((h - 1 - yBL) * w + x) * 4
+                    return Int(bytes[i]) > 150 && Int(bytes[i + 1]) < 110
+                        && Int(bytes[i + 2]) < 110
+                }
+                let size = CGSize(width: 640, height: 520)
+                if let base = sourceImage(size) {
+                    func compositorShot(visible: CGRect) -> CGImage? {
+                        let mag = MagnifierAnnotation(uiScale: 1)
+                        mag.sourceRect = secret
+                        mag.calloutRect = callout
+                        mag.snapshot = SliceBCompositor.magnifierSnapshot(
+                            base: base, sourceRect: secret, redactions: [])
+                        guard mag.snapshot != nil else { return nil }
+                        guard let c = CGContext(
+                            data: nil, width: Int(size.width),
+                            height: Int(size.height), bitsPerComponent: 8,
+                            bytesPerRow: 0,
+                            space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                            bitmapInfo: CGImageAlphaInfo
+                                .premultipliedLast.rawValue)
+                        else { return nil }
+                        c.draw(base, in: CGRect(origin: .zero, size: size))
+                        SliceBCompositor.draw(
+                            [mag], in: c, base: base, visiblePixels: visible)
+                        return c.makeImage()
+                    }
+                    let centreX = Int(callout.midX), centreY = Int(callout.midY)
+                    // Premise: with the source wholly inside the crop the
+                    // callout IS drawn, so the probes below mean something.
+                    if let inside = compositorShot(
+                        visible: CGRect(origin: .zero, size: size)) {
+                        if !isRed(inside, centreX, centreY) {
+                            magFailures.append("inside-crop:not-drawn")
+                        }
+                    } else {
+                        magFailures.append("inside-crop:no-shot")
+                    }
+                    // Source entirely outside the crop.
+                    if let outside = compositorShot(
+                        visible: CGRect(
+                            x: 300, y: 300, width: 340, height: 220)),
+                       isRed(outside, centreX, centreY) {
+                        magFailures.append("outside-crop:leaked")
+                    }
+                    // Source only PARTLY outside — still a leak of the part
+                    // that is out, so `contains` is the test, not `intersects`.
+                    if let partial = compositorShot(
+                        visible: CGRect(
+                            x: 240, y: 240, width: 400, height: 280)),
+                       isRed(partial, centreX, centreY) {
+                        magFailures.append("partial-crop:leaked")
+                    }
+                } else {
+                    magFailures.append("no-base")
+                }
+                // And the Area preview asks the same question the export does:
+                // before this, the preview passed the WHOLE image as visible,
+                // so a callout the export dropped stayed on screen.
+                if let screen = NSScreen.main ?? NSScreen.screens.first,
+                   let base = sourceImage(screen.frame.size) {
+                    let overlay = SelectionOverlay(
+                        purpose: .areaReview,
+                        inputs: OverlaySessionInputs(
+                            afterShow: true, afterCopy: false, afterSave: false),
+                        completion: { _ in })
+                    let view = SelectionOverlayView(
+                        mode: .area, screen: screen,
+                        frozen: CapturedImage(cgImage: base, scale: 1),
+                        windowList: [], owner: overlay)
+                    view.selectForTesting(
+                        rect: CGRect(x: 200, y: 200, width: 320, height: 300))
+                    if let surface = view.annotationSurface {
+                        let mag = MagnifierAnnotation(uiScale: 1)
+                        mag.sourceRect = secret
+                        mag.calloutRect = callout
+                        mag.snapshot = SliceBCompositor.magnifierSnapshot(
+                            base: base, sourceRect: secret, redactions: [])
+                        surface.addAnnotationForTesting(mag)
+                        view.needsDisplay = true
+                        if let shot = SelfTest.directDrawSnapshotForTesting(view),
+                           !isRed(
+                            shot,
+                            Int(callout.midX * CGFloat(shot.width)
+                                / view.bounds.width),
+                            Int(callout.midY * CGFloat(shot.height)
+                                / view.bounds.height)) {
+                            magFailures.append("preview:premise-not-drawn")
+                        }
+                        // The crop moves off the source; the callout stays
+                        // inside the crop, so anything red there came from
+                        // pixels the export will not contain.
+                        view.adjustSelectionForTesting(
+                            rect: CGRect(
+                                x: 300, y: 300, width: 320, height: 240))
+                        view.needsDisplay = true
+                        if let shot = SelfTest.directDrawSnapshotForTesting(view),
+                           isRed(
+                            shot,
+                            Int(callout.midX * CGFloat(shot.width)
+                                / view.bounds.width),
+                            Int(callout.midY * CGFloat(shot.height)
+                                / view.bounds.height)) {
+                            magFailures.append("preview:leaked-after-crop")
+                        }
+                    } else {
+                        magFailures.append("preview:no-surface")
+                    }
+                    overlay.dismissForTesting()
+                }
+                check("sliceB-magnifier-crop-privacy",
+                      magFailures.isEmpty,
+                      magFailures.prefix(6).joined(separator: " | "))
+            }
+
             // 1c. Keyboard is host-scoped. The panel deliberately shows no
             // magnifier button, so routing M there would select a tool with no
             // control and no way back. The letters the tooltips advertise must
@@ -17359,11 +18225,32 @@ enum SelfTest {
                     }
                 if exported != nil { problems.append("editor:exported") }
                 if let shot {
+                    // A cached-display snapshot is in BACKING pixels, and the
+                    // canvas sits in a magnified scroll view, so one view point
+                    // is `backingScale × magnification` pixels — 1.975 on this
+                    // fixture at 2x, not 1. Probing point coordinates directly
+                    // sampled a completely different part of the image (it only
+                    // agreed with the mask on a 1x display, which is the sole
+                    // reason this ever read green). The probe grid stays in
+                    // view points; the mapping to pixels is measured from the
+                    // snapshot itself.
+                    let sx = CGFloat(shot.width) / canvas.bounds.width
+                    let sy = CGFloat(shot.height) / canvas.bounds.height
+                    guard sx >= 0.99, sy >= 0.99 else {
+                        problems.append(
+                            "editor:shot-\(shot.width)x\(shot.height)")
+                        wc.window?.close()
+                        return problems
+                    }
+                    func pixel(_ v: Int, _ scale: CGFloat) -> Int {
+                        Int((CGFloat(v) + 0.5) * scale)
+                    }
                     for x in stride(from: Int(gridMask.minX) + 2,
                                     to: Int(gridMask.maxX) - 2, by: 9) {
                         for y in stride(from: Int(gridMask.minY) + 2,
                                         to: Int(gridMask.maxY) - 2, by: 9)
-                        where !coverProbe(shot, x, y) {
+                        where !coverProbe(
+                            shot, pixel(x, sx), pixel(y, sy)) {
                             problems.append("editor:hole@\(x),\(y)")
                         }
                     }

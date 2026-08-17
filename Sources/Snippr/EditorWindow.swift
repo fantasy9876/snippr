@@ -899,6 +899,11 @@ final class BackdropDocumentView: NSView {
         self.canvas = canvas
         self.layout = layout
         super.init(frame: CGRect(origin: .zero, size: layout.outerPointSize))
+        // Since macOS 14 a view does NOT clip to its bounds by default, and a
+        // frame drawn past this one's edge lands on the scroll view. The fill
+        // clips itself now; this is the second line of defence, and it also
+        // bounds the shadow.
+        clipsToBounds = true
         addSubview(canvas)
         applyLayout(layout)
     }
@@ -909,6 +914,12 @@ final class BackdropDocumentView: NSView {
 
     func applyLayout(_ layout: BackdropLayout) {
         self.layout = layout
+        // A framed document is composed in sRGB, so the window it is reviewed
+        // in has to be sRGB as well: on a P3 display the preview would
+        // otherwise show source colours the export has already clipped, and
+        // the two could never be compared. `.none` hands the window back to
+        // the system, keeping a P3 document's colours on screen.
+        window?.colorSpace = layout.isCollapsed ? nil : .sRGB
         setFrameSize(layout.outerPointSize)
         canvas.setFrameOrigin(layout.innerPointRect.origin)
         canvas.setFrameSize(layout.innerPointSize)
@@ -1319,7 +1330,12 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
         else { return nil }
         guard let inner = SliceBExport.checkedRender(
             base: base, annotations: marks, pixellated: nil,
-            budgetBytes: innerBudget, pixelScale: pxScale)
+            budgetBytes: innerBudget, pixelScale: pxScale,
+            // Framed output is composed in sRGB, so the inner render has to
+            // blend there too — see checkedRender. `.none` keeps the
+            // document's own space.
+            destinationSpace: backdropPreset == .none
+                ? nil : CGColorSpace(name: CGColorSpace.sRGB))
         else { return nil }
         guard let cg = SliceBBackdrop.compose(
             image: inner, preset: backdropPreset,
@@ -2676,6 +2692,14 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
     }
 
     private var trackpadAccum: CGFloat = 0
+
+    override func viewDidChangeBackingProperties() {
+        super.viewDidChangeBackingProperties()
+        // A 1x <-> 2x display change moves the backing scale without touching
+        // the magnification, so nothing else would refresh the field's mask.
+        updateTextEntryClip()
+        needsDisplay = true
+    }
 
     func magnificationDidChange() {
         // The frame around the document is drawn by the superview, so a zoom

@@ -914,10 +914,16 @@ final class AnnotationSurface: RedactionHost, RedactionJobObserver {
     /// Draws the annotations for on-screen preview into a context whose
     /// transform already maps image pixels to the destination.
     @discardableResult
-    func drawForPreview(in ctx: CGContext, base: CGImage) -> Bool {
+    /// `visiblePixels` is what the export will actually contain. The host
+    /// passes its live crop so the preview answers the same question the
+    /// export does — most importantly for the magnifier, whose source must be
+    /// wholly inside the crop to be drawn at all.
+    func drawForPreview(
+        in ctx: CGContext, base: CGImage, visiblePixels: CGRect? = nil
+    ) -> Bool {
         drawAnnotations(
             in: ctx, base: base,
-            visiblePixels: CGRect(
+            visiblePixels: visiblePixels ?? CGRect(
                 x: 0, y: 0, width: base.width, height: base.height))
     }
 
@@ -980,22 +986,58 @@ final class AnnotationSurface: RedactionHost, RedactionJobObserver {
     /// FAIL-CLOSED: with annotations present, an allocation/render failure
     /// returns nil. Callers must keep their surface open and tell the user —
     /// silently exporting the un-annotated image would lose their drawings.
+    /// One crop, materialized straight into the destination space — the same
+    /// single allocation the plain path makes, not an extra pass.
+    ///
+    /// It allocates a destination and can fail, so it books itself exactly
+    /// like `flattened` does: counted before the attempt, honouring the forced
+    /// failure, recorded in the trace. Otherwise a route that produces a real
+    /// buffer would be invisible to the allocation budget and immune to the
+    /// fail-closed gates — the accounting would say "no destination" while a
+    /// full-size one was being built.
+    private func convertedCrop(
+        base: CGImage, crop: CGRect, space: CGColorSpace
+    ) -> CGImage? {
+        let width = Int(crop.width), height = Int(crop.height)
+        Self.flattenAllocationsForTesting += 1
+        guard !forceRenderFailureForTesting,
+              let sourceCrop = base.cropping(to: crop),
+              let ctx = CGContext(
+                data: nil, width: width, height: height,
+                bitsPerComponent: 8, bytesPerRow: 0, space: space,
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        else { return nil }
+        ctx.draw(sourceCrop, in: CGRect(
+            x: 0, y: 0, width: width, height: height))
+        RenderTrace.record(
+            kind: "destination", destination: "\(width)x\(height)", rect: crop)
+        return ctx.makeImage()
+    }
+
     /// `extra` renders as if it were appended to the document WITHOUT being
     /// appended: a terminal action flattens the text still being typed before
     /// deciding whether the export succeeded, so a failure leaves the field
     /// exactly as the user left it.
     func flattened(
-        base: CGImage, cropPixels: CGRect, extra: [Annotation] = []
+        base: CGImage, cropPixels: CGRect, extra: [Annotation] = [],
+        destinationSpace: CGColorSpace? = nil
     ) -> CGImage? {
         let crop = cropPixels.integral
         guard crop.width >= 1, crop.height >= 1 else { return nil }
         guard !annotations.isEmpty || !extra.isEmpty else {
-            // no drawings: a plain (shared-storage) crop materialized once
-            return base.cropping(to: crop)?.materialized()
+            // No drawings. Normally a plain (shared-storage) crop materialized
+            // once — but when a destination space is demanded the pixels have
+            // to be converted INTO it here, or the frame would be composed in
+            // sRGB around an inner image that never left P3.
+            guard let space = destinationSpace else {
+                return base.cropping(to: crop)?.materialized()
+            }
+            return convertedCrop(base: base, crop: crop, space: space)
         }
         let width = Int(crop.width)
         let height = Int(crop.height)
-        let space = base.colorSpace ?? CGColorSpace(name: CGColorSpace.sRGB)!
+        let space = destinationSpace
+            ?? base.colorSpace ?? CGColorSpace(name: CGColorSpace.sRGB)!
         Self.flattenAllocationsForTesting += 1
         guard !forceRenderFailureForTesting,
               let sourceCrop = base.cropping(to: crop), // descriptor, no copy

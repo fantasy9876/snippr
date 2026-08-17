@@ -738,6 +738,7 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
         }
         guard surface.applyBackdrop(preset) else { return false }
         refreshBackdropButton()
+        updateTextEntryClip()
         needsDisplay = true
         return true
     }
@@ -760,11 +761,50 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
         return innerBytes <= innerBudget
     }
 
+    /// Clips the live caption to the crop the export will produce — rounded
+    /// when a frame is on, square when it is not.
+    ///
+    /// The overlay draws its own content clipped, but a text field is a
+    /// SUBVIEW and ignores that entirely: without this a caption typed near a
+    /// corner shows on screen and is missing from the export, the same
+    /// mismatch the editor had. The mask lives on the field, so nothing that
+    /// is drawn or magnified gets rasterized.
+    fileprivate func updateTextEntryClip() {
+        guard let field = textField else { return }
+        let plate = backdropPreviewGeometry()?.0 ?? areaSelection
+        guard let plate else {
+            field.layer?.mask = nil
+            return
+        }
+        field.wantsLayer = true
+        let radius = backdropPreset == .none
+            ? 0 : SliceBBackdrop.cornerRadiusPt
+        let mask = (field.layer?.mask as? CAShapeLayer) ?? CAShapeLayer()
+        mask.frame = field.bounds
+        mask.path = CGPath(
+            roundedRect: convert(plate, to: field),
+            cornerWidth: radius, cornerHeight: radius, transform: nil)
+        mask.contentsScale = window?.backingScaleFactor ?? 2
+        field.layer?.mask = mask
+    }
+
+    override func viewDidChangeBackingProperties() {
+        super.viewDidChangeBackingProperties()
+        // Moving between a 1x and a 2x display changes the backing scale
+        // without changing anything else, and a mask rendered for the old
+        // scale stays stepped until something else happens to touch it.
+        updateTextEntryClip()
+    }
+
     private func refreshBackdropButton() {
         for button in toolbarButtons
         where button.tag == OverlayAnnotationTool.backdropToolbarTag {
             button.contentTintColor = backdropTint
         }
+        // Same reason as the editor's document view: what is reviewed has to
+        // live in the space the export is composed in, or a P3 display shows
+        // colours the framed export has already clipped.
+        window?.colorSpace = backdropPreset == .none ? nil : .sRGB
     }
 
     private func performHistoryAction(redo: Bool) {
@@ -774,6 +814,7 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
         if changed {
             // Undo/redo can move the preset — it lives in the same timeline.
             refreshBackdropButton()
+            updateTextEntryClip()
             needsDisplay = true
         }
     }
@@ -836,7 +877,9 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
         // exactly as the user left it — committing first would add the text
         // and fork the redo branch for an action that never ran.
         let prospectiveText = prospectiveTextAnnotation()
-        syncSessionPixelRect()
+        // The rect AFTER quantization: what the router is told the capture
+        // covers has to be the crop that was actually exported.
+        let canonical = syncSessionPixelRect() ?? selection
         guard let payload = reviewPayload(prospectiveText: prospectiveText)
         else {
             // fail-closed like the panel: keep review + drawings, tell the
@@ -864,7 +907,7 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
         // OCR/Translate consume the crop but the app still remembers the
         // framed picture, so Repeat/pin/editor pick up what the user saw.
         let lastCaptureOverride = decorated ? nil : payload.visual
-        let global = globalRect(for: selection)
+        let global = globalRect(for: canonical)
         let inputs = owner.session.inputs
 
         let baseDependencies = owner.routerDependenciesOverride
@@ -975,7 +1018,17 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
                 ctx.clip(to: sel)
             }
             ctx.scaleBy(x: 1 / scale, y: 1 / scale)
-            surface.drawForPreview(in: ctx, base: frozen.cgImage)
+            // The crop the export will make, in bottom-left image pixels: the
+            // session's rect is top-left because it indexes the frozen image.
+            let px = owner?.session.pixelRect ?? .zero
+            let visibleBL = px.width >= 1 && px.height >= 1
+                ? CGRect(
+                    x: px.minX,
+                    y: CGFloat(frozen.cgImage.height) - px.maxY,
+                    width: px.width, height: px.height)
+                : nil
+            surface.drawForPreview(
+                in: ctx, base: frozen.cgImage, visiblePixels: visibleBL)
             ctx.restoreGState()
         }
 
@@ -983,12 +1036,12 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
         // after the document AND its marks, inside the plate's clip, and
         // BEFORE any review chrome — the selection border and handles are
         // overlay furniture the export never sees.
-        if let backdropClip, let sel = areaSelection {
+        if let backdropClip, let (plate, _) = backdropPreviewGeometry() {
             ctx.saveGState()
             ctx.addPath(backdropClip)
             ctx.clip()
             SliceBBackdrop.drawPlateHairline(
-                in: ctx, rect: sel, pixelScale: 1)
+                in: ctx, rect: plate, pixelScale: 1)
             ctx.restoreGState()
         }
 
@@ -1032,13 +1085,9 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
     @discardableResult
     private func drawBackdropPreview(in ctx: CGContext) -> CGPath? {
         guard isReviewing, backdropPreset != .none,
-              let sel = areaSelection, let frozen else { return nil }
+              let (sel, layout) = backdropPreviewGeometry() else { return nil }
+        guard let frozen else { return nil }
         let scale = frozen.scale
-        let layout = BackdropLayout(
-            innerPixels: CGSize(
-                width: sel.width * scale, height: sel.height * scale),
-            pixelScale: scale, preset: backdropPreset)
-        guard !layout.isCollapsed else { return nil }
         let pad = layout.padPoints
         let outer = sel.insetBy(dx: -pad, dy: -pad)
         let radius = SliceBBackdrop.cornerRadiusPt
@@ -1077,17 +1126,39 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
         return rounded
     }
 
+    /// The rect the preview frames, and its layout — both derived from the
+    /// SAME pixel authority the export crops by.
+    ///
+    /// `areaSelection` is fractional and moves with the pointer; the payload
+    /// crops by `session.pixelRect`, which is that selection quantized ONCE.
+    /// Deriving the preview from the fractional rect put the frame's padding,
+    /// its grain phase and its hairline half a point away from the exported
+    /// ones at scale 2 — a preview that disagrees with the export is the exact
+    /// failure this whole slice is meant to close.
+    private func backdropPreviewGeometry() -> (CGRect, BackdropLayout)? {
+        guard let owner, let frozen else { return nil }
+        let px = owner.session.pixelRect
+        guard px.width >= 1, px.height >= 1 else { return nil }
+        let scale = frozen.scale
+        let layout = BackdropLayout(
+            innerPixels: px.size, pixelScale: scale,
+            preset: backdropPreset)
+        guard !layout.isCollapsed else { return nil }
+        // Pixel rect -> view points. The pixel rect is TOP-left origin (it
+        // indexes the frozen image); the view is bottom-left.
+        let imageHeightPoints = CGFloat(frozen.cgImage.height) / scale
+        let rect = CGRect(
+            x: px.minX / scale,
+            y: imageHeightPoints - px.maxY / scale,
+            width: px.width / scale, height: px.height / scale)
+        return (rect, layout)
+    }
+
     /// Gate visibility: the exact outer rect the preview draws, in view
     /// points, so a gate can prove preview and export agree on geometry.
     var backdropPreviewOuterRectForTesting: CGRect? {
-        guard backdropPreset != .none, let sel = areaSelection, let frozen
-        else { return nil }
-        let layout = BackdropLayout(
-            innerPixels: CGSize(
-                width: sel.width * frozen.scale,
-                height: sel.height * frozen.scale),
-            pixelScale: frozen.scale, preset: backdropPreset)
-        guard !layout.isCollapsed else { return nil }
+        guard backdropPreset != .none,
+              let (sel, layout) = backdropPreviewGeometry() else { return nil }
         return sel.insetBy(dx: -layout.padPoints, dy: -layout.padPoints)
     }
 
@@ -1345,6 +1416,7 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
             // Keep the visible toolbar and the session's pixel authority on
             // the same crop during the drag.  Waiting for mouseUp leaves the
             // toolbar behind and creates a visible jump on release.
+            // Syncing also moves the caption's clip with the crop.
             syncSessionPixelRect()
             layoutReviewToolbar()
         }
@@ -1589,6 +1661,7 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
         field.delegate = textFieldDelegate
         addSubview(field)
         textField = field
+        updateTextEntryClip()
         textFieldPixelOrigin = pixelPoint(fromView: CGPoint(x: p.x, y: p.y - 12))
         window?.makeFirstResponder(field)
     }
@@ -1691,7 +1764,12 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
             break
         case .areaReview:
             guard owner.session.commitInitialCapture() else { return }
-            syncSessionPixelRect()
+            // Same authority for the reported rect as for the pixels: the
+            // clamped, quantized selection, not the one the pointer left
+            // behind. Sync reads the stored rect, so the clamp lands there
+            // first or the two readings would diverge at the screen edge.
+            areaSelection = selection
+            let canonical = syncSessionPixelRect() ?? selection
             guard let snapshot = snapshotFromSessionPixelRect() else {
                 owner.finish(.cancelled)
                 return
@@ -1699,7 +1777,7 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
             CaptureActionRouter.commit(
                 snapshot, source: .areaReview, intent: .initialCapture,
                 inputs: owner.session.inputs,
-                finalGlobalRect: globalRect(for: selection),
+                finalGlobalRect: globalRect(for: canonical),
                 dependencies: owner.routerDependenciesOverride)
             if owner.session.phase == .reviewing {
                 let surface = AnnotationSurface(pixelScale: frozen.scale)
@@ -1826,12 +1904,24 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
             return nil
         }
 
+        // A framed export is composed in sRGB, so the inner render lands in
+        // sRGB as well — including the semantic payload, so OCR reads exactly
+        // the pixels the frame was built around. With no frame the document
+        // keeps its own space, byte for byte.
+        let destinationSpace: CGColorSpace? = preset == .none
+            ? nil : CGColorSpace(name: CGColorSpace.sRGB)
         let extra: [Annotation] = prospectiveText.map { [$0] } ?? []
         let inner: CGImage
+        // The LIVE surface, even with nothing drawn on it: a conversion into
+        // the destination space allocates a real buffer and can fail, so it
+        // has to run through the surface the gates hold — its forced-failure
+        // flag is per instance, and a throwaway surface would make this route
+        // both unfailable and invisible to the allocation trace.
         if let surface = annotationSurface,
-           !surface.isEmpty || !extra.isEmpty {
+           !surface.isEmpty || !extra.isEmpty || destinationSpace != nil {
             guard let flat = surface.flattened(
-                base: frozen.cgImage, cropPixels: px, extra: extra)
+                base: frozen.cgImage, cropPixels: px, extra: extra,
+                destinationSpace: destinationSpace)
             else { return nil }
             inner = flat
         } else {
@@ -1865,16 +1955,42 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
     /// Pixel contract: the session always holds the image-local INTEGRAL
     /// pixel rect for the current selection (same quantization rule as
     /// CapturedImage.cropping(toViewRect:)).
-    private func syncSessionPixelRect() {
-        guard let owner, let frozen, let selection = areaSelection else { return }
+    ///
+    /// The integral rect is the ONE authority, so the selection is mapped back
+    /// OUT of it and stored: the border, the dim hole, the annotation clip,
+    /// the caption mask, the toolbar and the frame then all describe the crop
+    /// the export actually makes. While the fractional rect stayed live, a
+    /// selection created or dragged by half a point at scale 2 drew a boundary
+    /// the exported image did not have — with no backdrop just as much as with
+    /// one. Every drag recomputes from its own anchor/original rect, so
+    /// quantizing here cannot accumulate.
+    @discardableResult
+    private func syncSessionPixelRect() -> CGRect? {
+        guard let owner, let frozen, let selection = areaSelection
+        else { return nil }
         let scale = frozen.scale
+        let imageHeightPoints = CGFloat(frozen.cgImage.height) / scale
         let px = CGRect(
             x: selection.minX * scale,
-            y: (CGFloat(frozen.cgImage.height) / scale - selection.maxY) * scale,
+            y: (imageHeightPoints - selection.maxY) * scale,
             width: selection.width * scale,
             height: selection.height * scale
         ).integral
         owner.session.pixelRect = px
+        // Inverse of the map above: top-left image pixels back to view points.
+        let canonical = CGRect(
+            x: px.minX / scale,
+            y: imageHeightPoints - px.maxY / scale,
+            width: px.width / scale,
+            height: px.height / scale)
+        areaSelection = canonical
+        // The caption is clipped to the crop, so the two move together. Doing
+        // it here rather than at each call site is what keeps them coherent:
+        // the live drag refreshed the mask on every move, but the mouse-up
+        // that quantizes the rect one last time did not, and neither did the
+        // review-resize path a gate drives.
+        updateTextEntryClip()
+        return canonical
     }
 }
 
