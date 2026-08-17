@@ -61,7 +61,9 @@ if let idx = arguments.firstIndex(of: "--selftest") {
     let outDir = arguments.count > idx + 1
         ? arguments[idx + 1]
         : NSTemporaryDirectory() + "snippr-selftest"
-    exit(SelfTest.run(outputDir: outDir))
+    exit(MainActor.assumeIsolated {
+        SelfTest.run(outputDir: outDir)
+    })
 }
 
 if arguments.contains("--check-permissions") {

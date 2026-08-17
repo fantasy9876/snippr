@@ -19,6 +19,48 @@ extension AnnotationSurface: S4RedoProbe {}
 /// Headless feature tests: `Snippr --selftest [outdir]`.
 /// Exercises everything that doesn't need Screen Recording permission.
 enum SelfTest {
+    private static func luma(_ pixel: (Int, Int, Int)) -> Int {
+        (pixel.0 * 299 + pixel.1 * 587 + pixel.2 * 114) / 1000
+    }
+
+    private final class LockedStringBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value = ""
+
+        func set(_ newValue: String) {
+            lock.lock()
+            value = newValue
+            lock.unlock()
+        }
+
+        func get() -> String {
+            lock.lock()
+            defer { lock.unlock() }
+            return value
+        }
+    }
+
+    /// Counts the real repaint path without replacing the production delegate.
+    /// Kept at type scope because save-lock gates use it before the later
+    /// backdrop fixtures that originally declared their own local copy.
+    @MainActor
+    private final class ForwardingRepaintDelegate:
+        RedactionSurfaceDelegate
+    {
+        var repaints = 0
+        private let wrapped: RedactionSurfaceDelegate?
+
+        init(wrapping wrapped: RedactionSurfaceDelegate?) {
+            self.wrapped = wrapped
+        }
+
+        func surfaceNeedsRedactionRepaint() {
+            repaints += 1
+            wrapped?.surfaceNeedsRedactionRepaint()
+        }
+    }
+
+    @MainActor
     static func run(outputDir: String) -> Int32 {
         // Headless tests may run from the installed bundle and therefore share
         // its preferences domain. Never mutate real user settings here.
@@ -4559,14 +4601,17 @@ enum SelfTest {
         let textImage = makeTextImage(text: "SNIPPR TEST 123", width: 900, height: 240)
         writePNG(textImage, to: "\(outputDir)/ocr-input.png")
         let sem = DispatchSemaphore(value: 0)
-        var ocrText = ""
-        Task {
+        let ocrText = LockedStringBox()
+        Task.detached {
             let result = await OCRService.shared.recognize(textImage)
-            ocrText = result.text
+            ocrText.set(result.text)
             sem.signal()
         }
         _ = sem.wait(timeout: .now() + 30)
-        check("ocr-text", ocrText.uppercased().contains("SNIPPR"), "got '\(ocrText)'")
+        let recognizedText = ocrText.get()
+        check(
+            "ocr-text", recognizedText.uppercased().contains("SNIPPR"),
+            "got '\(recognizedText)'")
 
         // 6. Window shot composition ---------------------------------------------------
         let windowShot = CapturedImage(cgImage: makeSolidImage(width: 400, height: 300, color: NSColor.darkGray.cgColor), scale: 2)
@@ -7895,6 +7940,7 @@ enum SelfTest {
                 {
                     viewPtr.mouseDown(with: down)
                 }
+                let downInside = viewPtr.pointerInsideForTesting
                 pb.clearContents()
                 pb.setString("SENTINEL-OV-DOWN", forType: .string)
                 if let tab = sliceAKey(48, characters: "\t") {
@@ -7958,12 +8004,16 @@ enum SelfTest {
                 host.orderOut(nil)
                 check("sliceA-overlay-pointer-events",
                       overlayPtr.session.phase == .reviewing
-                        && downHex == "#FF0000"
+                        // A live crop drag owns every route, including Tab.
+                        // Pointer ownership is still updated by mouseDown;
+                        // the post-mouseUp blue sample proves the coordinate.
+                        && downInside
+                        && downHex == "SENTINEL-OV-DOWN"
                         && dragHex == "#0000FF"
                         && exitHex == "SENTINEL-OV-EXIT"
                         && !afterScreenInside
                         && screenHex == "SENTINEL-OV-SCREEN",
-                      "down \(downHex ?? "nil") drag \(dragHex ?? "nil") exit \(exitHex ?? "nil") screenInside \(afterScreenInside) screen \(screenHex ?? "nil")")
+                      "down \(downHex ?? "nil") inside \(downInside) drag \(dragHex ?? "nil") exit \(exitHex ?? "nil") screenInside \(afterScreenInside) screen \(screenHex ?? "nil")")
             }
         }
 
@@ -7995,10 +8045,6 @@ enum SelfTest {
                 let i = (y * image.width + x) * 4
                 return (Int(bytes[i]), Int(bytes[i + 1]), Int(bytes[i + 2]))
             }
-            func luma(_ p: (Int, Int, Int)) -> Int {
-                (p.0 * 299 + p.1 * 587 + p.2 * 114) / 1000
-            }
-
             // 1. Overlay catalog: legacy tags frozen, two tools appended.
             let tools = OverlayAnnotationTool.allCases
             let legacyTips = [
@@ -9109,7 +9155,7 @@ enum SelfTest {
                     -> Bool {
                     a.isFinite && b.isFinite && abs(a - b) <= tol
                 }
-                func verifyLayout(_ phase: String) {
+                @MainActor func verifyLayout(_ phase: String) {
                     content.layoutSubtreeIfNeeded()
                     // Rows and bar.
                     // 0.01: production constrains these to exactly 35, 35
@@ -9197,30 +9243,39 @@ enum SelfTest {
                         // is also an NSButton but carries no size constraint —
                         // it is intrinsic, and demanding 30x28 of it would fail
                         // a correct build.
+                        // Auto Layout constrains alignment rectangles. An
+                        // SF-symbol button's frame includes symbol-specific
+                        // alignment insets on current AppKit, so frame height
+                        // is neither 28 nor uniform even when the required
+                        // 30x28 constraints are satisfied exactly.
+                        let alignment = view.alignmentRect(forFrame: view.frame)
                         if iconButtons.contains(where: { $0 === view }) {
-                            if !near(view.frame.width, 30)
-                                || !near(view.frame.height, 28) {
+                            if !near(alignment.width, 30)
+                                || !near(alignment.height, 28) {
                                 toolbarFailures.append(
-                                    "\(phase):\(name)-size \(view.frame.size)")
+                                    "\(phase):\(name)-size \(alignment.size)")
                             }
                         } else if view === wc.colorWellForTesting {
-                            if !near(view.frame.width, 28)
-                                || !near(view.frame.height, 24) {
+                            if !near(alignment.width, 28)
+                                || !near(alignment.height, 24) {
                                 toolbarFailures.append(
-                                    "\(phase):\(name)-size \(view.frame.size)")
+                                    "\(phase):\(name)-size \(alignment.size)")
                             }
                         }
                         if view.hasAmbiguousLayout {
                             toolbarFailures.append("\(phase):\(name)-ambiguous")
                         }
-                        let inRow = view.convert(view.bounds, to: row)
+                        // `alignment` is already in the direct superview's
+                        // coordinates; every member is required above to be a
+                        // direct arranged child of `row`.
+                        let inRow = alignment
                         if inRow.minX < -0.5
                             || inRow.maxX > row.bounds.width + 0.5
                             || inRow.minY < -0.5
                             || inRow.maxY > row.bounds.height + 0.5 {
                             toolbarFailures.append("\(phase):\(name)-row")
                         }
-                        let inBar = view.convert(view.bounds, to: bar)
+                        let inBar = row.convert(alignment, to: bar)
                         if inBar.minX < -0.5
                             || inBar.maxX > bar.bounds.width + 0.5
                             || inBar.minY < -0.5
@@ -9316,7 +9371,9 @@ enum SelfTest {
                     for row in [toolRow, actionRow] {
                         let frames = members
                             .filter { $0.2 === row && !$0.1.isHidden }
-                            .map { ($0.0, $0.1.convert($0.1.bounds, to: row)) }
+                            .map {
+                                ($0.0, $0.1.alignmentRect(forFrame: $0.1.frame))
+                            }
                         for i in frames.indices {
                             for j in frames.indices where j > i
                                 && frames[i].1.intersects(frames[j].1) {
@@ -9328,9 +9385,16 @@ enum SelfTest {
                     }
                 }
 
-                // setContentSize, not setFrame: a frame is applied verbatim
-                // and would sail past the minimum this is asking about.
-                window.setContentSize(NSSize(width: 200, height: 300))
+                // Programmatic `setContentSize` is allowed to bypass
+                // `contentMinSize`; AppKit then stops at the stack's fitting
+                // width instead. Pin the declared user-resize floor itself,
+                // and exercise the live hierarchy at that exact floor.
+                if !near(window.contentMinSize.width, 560)
+                    || !near(window.contentMinSize.height, 190) {
+                    toolbarFailures.append(
+                        "content-min \(window.contentMinSize)")
+                }
+                window.setContentSize(NSSize(width: 560, height: 300))
                 content.layoutSubtreeIfNeeded()
                 let width = content.bounds.width
                 if !near(width, 560) {
@@ -9659,7 +9723,7 @@ enum SelfTest {
                     var inCallback: [String] = []
                     /// Runs INSIDE saveAs. Checking after the action returns
                     /// would say nothing about the order at the boundary.
-                    var observe: (() -> Void)?
+                    var observe: (@MainActor () -> Void)?
                     var observations = 0
                     var copyCalls = 0
                 }
@@ -10083,7 +10147,7 @@ enum SelfTest {
                     var saveSizes: [CGSize] = []
                     var lastCaptureSizes: [CGSize] = []
                     var effectEvents: [String] = []
-                    var observeEffect: ((String) -> Void)?
+                    var observeEffect: (@MainActor (String) -> Void)?
 
                     var effectSignature: String {
                         "save=\(saveAsCalls),copy=\(copies),auto="
@@ -10313,7 +10377,7 @@ enum SelfTest {
                     areaLockFailures.append(
                         "button-catalog \(buttonRefs.count) \(actualTags)")
                 }
-                func sameButtonRefs() -> Bool {
+                @MainActor func sameButtonRefs() -> Bool {
                     let current = buttons(in: view)
                     guard current.count == buttonRefs.count,
                           buttonRefs.count == expectedTags.count,
@@ -10332,7 +10396,7 @@ enum SelfTest {
                             && candidate.action == buttonActions[index]
                     }
                 }
-                func buttonsAreLocked(_ locked: Bool) -> Bool {
+                @MainActor func buttonsAreLocked(_ locked: Bool) -> Bool {
                     guard sameButtonRefs(),
                           view.reviewToolbarFrameForTesting != nil else {
                         return false
@@ -10447,7 +10511,7 @@ enum SelfTest {
                         break
                     }
                 }
-                func liveIsRedacted() -> Bool {
+                @MainActor func liveIsRedacted() -> Bool {
                     surface.annotations.count == 1
                         && surface.annotations.first === blur
                         && surface.canUndo && !surface.canRedo
@@ -10478,7 +10542,7 @@ enum SelfTest {
                         && spy.otherCompletions == completions.2
                         && spy.effectEvents == events
                 }
-                func verifyLive(
+                @MainActor func verifyLive(
                     _ label: String, phase: OverlaySessionPhase,
                     state: RedactionState, generation wantedGeneration: Int,
                     repaints wantedRepaints: Int, registry: Int,
@@ -10552,7 +10616,7 @@ enum SelfTest {
                 }
 
                 // Stage 2 — the successful handoff, inspected INSIDE saveAs.
-                func lockedKey(
+                @MainActor func lockedKey(
                     _ chars: String, code: UInt16,
                     modifiers: NSEvent.ModifierFlags = []
                 ) -> NSEvent? {
@@ -10588,8 +10652,8 @@ enum SelfTest {
                         spy.inCallback.append("locked-state")
                     }
 
-                    func attempt(
-                        _ label: String, _ action: () -> Void
+                    @MainActor func attempt(
+                        _ label: String, _ action: @MainActor () -> Void
                     ) {
                         let effects = spy.effectSignature
                         let failuresAtStart = areaLockFailures.count
@@ -11133,11 +11197,11 @@ enum SelfTest {
                     historyEvents += 1
                     productionHistory?()
                 }
-                func clickUndo() {
+                @MainActor func clickUndo() {
                     panel.clickToolbarButtonForTesting(
                         tag: OverlayAnnotationTool.undoToolbarTag)
                 }
-                func clickRedo() {
+                @MainActor func clickRedo() {
                     panel.clickToolbarButtonForTesting(
                         tag: OverlayAnnotationTool.redoToolbarTag)
                 }
@@ -12136,9 +12200,11 @@ enum SelfTest {
                 if selectHit === host {
                     dispatchFailures.append("select:still-host")
                 } else if selectHit?.mouseDownCanMoveWindow != true {
+                    let hitType = selectHit.map {
+                        String(describing: type(of: $0))
+                    } ?? "nil"
                     dispatchFailures.append(
-                        "select:not-draggable "
-                        + "\(String(describing: type(of: selectHit)))")
+                        "select:not-draggable " + hitType)
                 }
             }
             runWindowDispatch()
@@ -12349,7 +12415,7 @@ enum SelfTest {
             //    real field editor; calling the host's keyDown directly only
             //    proves a guard and says nothing about responder dispatch.
             var textKeyFailures: [String] = []
-            let runTextKeys = {
+            let runTextKeys: @MainActor () -> Void = {
                 guard let screen = NSScreen.screens.first else {
                     textKeyFailures.append("no-screen")
                     return
@@ -12411,7 +12477,7 @@ enum SelfTest {
                 }
 
                 @discardableResult
-                func sendKey(
+                @MainActor func sendKey(
                     _ characters: String, keyCode: UInt16,
                     through window: NSWindow, label: String
                 ) -> Bool {
@@ -12445,7 +12511,7 @@ enum SelfTest {
                         && zip(lhs, rhs).allSatisfy { $0.0 === $0.1 }
                 }
 
-                func strictEditor(
+                @MainActor func strictEditor(
                     field: NSTextField, editor: NSTextView,
                     window: NSWindow
                 ) -> Bool {
@@ -12457,7 +12523,7 @@ enum SelfTest {
                         && window.fieldEditor(false, for: field) === editor
                 }
 
-                func runArea() {
+                @MainActor func runArea() {
                     guard SelectionOverlay.current == nil else {
                         textKeyFailures.append("area:dirty-current")
                         return
@@ -12583,7 +12649,9 @@ enum SelfTest {
                         textKeyFailures.append("area:editor-identity")
                     }
 
-                    func liveState(_ label: String, text: String) {
+                    @MainActor func liveState(
+                        _ label: String, text: String
+                    ) {
                         let annotations = surface.annotations
                         if view.textFieldForTesting !== field
                             || field.currentEditor() !== editor
@@ -12689,7 +12757,7 @@ enum SelfTest {
                     }
                 }
 
-                func runPanel() {
+                @MainActor func runPanel() {
                     guard ScrollResultPanel.current == nil,
                           SelectionOverlay.current == nil else {
                         textKeyFailures.append(
@@ -12781,7 +12849,9 @@ enum SelfTest {
                         textKeyFailures.append("panel:editor-identity")
                     }
 
-                    func liveState(_ label: String, text: String) {
+                    @MainActor func liveState(
+                        _ label: String, text: String
+                    ) {
                         let annotations = surface.annotations
                         if panel.annotationHostForTesting !== host
                             || host.textFieldForTesting !== field
@@ -12901,7 +12971,7 @@ enum SelfTest {
             //    this: a replayed Close/Esc may leave those values unchanged
             //    while still bumping every Blur generation.
             var areaTerminalFailures: [String] = []
-            let runAreaPostTerminal = {
+            let runAreaPostTerminal: @MainActor () -> Void = {
                 guard let screen = NSScreen.screens.first else {
                     areaTerminalFailures.append("no-screen")
                     return
@@ -13324,7 +13394,7 @@ enum SelfTest {
                     default: return false
                     }
                 }
-                func exactButtons() -> Bool {
+                @MainActor func exactButtons() -> Bool {
                     let current = allButtons(view)
                     guard current.count == buttonRefs.count,
                           buttonRefs.count == expectedTags.count else {
@@ -13348,7 +13418,7 @@ enum SelfTest {
                     }
                     return true
                 }
-                func exactAnnotations() -> Bool {
+                @MainActor func exactAnnotations() -> Bool {
                     let live = surface.annotations
                     let liveRedo = surface.redoAnnotationsForTesting
                     return live.count == annotationsBefore.count
@@ -13374,7 +13444,7 @@ enum SelfTest {
                         && redoPen.color.isEqual(redoColor)
                         && redoPen.strokeWidthPt == redoWidth
                 }
-                func verifyFrozen(_ label: String) {
+                @MainActor func verifyFrozen(_ label: String) {
                     if overlay.session.phase != .completed
                         || SelectionOverlay.current != nil
                         || overlay.activeReviewViewForTesting != nil
@@ -13405,7 +13475,9 @@ enum SelfTest {
                 }
                 verifyFrozen("terminal-baseline")
 
-                func attempt(_ label: String, _ body: () -> Void) {
+                @MainActor func attempt(
+                    _ label: String, _ body: @MainActor () -> Void
+                ) {
                     body()
                     verifyFrozen(label)
                 }
@@ -13447,7 +13519,7 @@ enum SelfTest {
                         rect: selection.offsetBy(dx: 12, dy: 8))
                 }
 
-                func key(
+                @MainActor func key(
                     _ chars: String, code: UInt16,
                     modifiers: NSEvent.ModifierFlags = []
                 ) -> NSEvent? {
@@ -13487,7 +13559,7 @@ enum SelfTest {
                     }
                 }
 
-                func mouseEvent(
+                @MainActor func mouseEvent(
                     _ type: NSEvent.EventType, point: CGPoint,
                     clicks: Int = 1
                 ) -> NSEvent? {
@@ -13497,7 +13569,7 @@ enum SelfTest {
                         windowNumber: window.windowNumber, context: nil,
                         eventNumber: 0, clickCount: clicks, pressure: 1)
                 }
-                func mouseRoute(
+                @MainActor func mouseRoute(
                     _ label: String, from: CGPoint, to: CGPoint,
                     clicks: Int = 1
                 ) {
@@ -13550,7 +13622,7 @@ enum SelfTest {
             // it cannot exercise the late field-editor callback. Isolate the
             // phase guard with a second real host whose session is completed
             // while a second caption is still live.
-            let runLateAreaText = {
+            let runLateAreaText: @MainActor () -> Void = {
                 guard let screen = NSScreen.screens.first,
                       SelectionOverlay.current == nil else {
                     areaTerminalFailures.append("late-text-dirty")
@@ -14479,7 +14551,15 @@ enum SelfTest {
                 // the export clips the document to that rounded rect, so a
                 // marker in the very corner would be legitimately replaced by
                 // gradient and asking for it there fails correct code.
-                let inset = Int((24 * scale).rounded())
+                // Keep the sentinel large enough to survive the editor's Fit
+                // magnification. The old 4 px width became less than one
+                // preview pixel on Retina fixtures, so an otherwise correct
+                // antialiased preview could never satisfy a near-black
+                // single-pixel probe.
+                let inset = Int((20 * scale).rounded())
+                let markerWidth = Int((8 * scale).rounded())
+                let markerHeight = Int((16 * scale).rounded())
+                let whiteGap = Int((2 * scale).rounded())
                 let ctx = CGContext(
                     data: nil, width: width, height: height,
                     bitsPerComponent: 8, bytesPerRow: 0,
@@ -14491,7 +14571,8 @@ enum SelfTest {
                 // Taller than it is wide, and offset from both axes, so a
                 // transposed or mirrored placement cannot look correct.
                 ctx.fill(CGRect(
-                    x: inset, y: inset, width: 4, height: 10))
+                    x: inset, y: inset,
+                    width: markerWidth, height: markerHeight))
                 let base = ctx.makeImage()!
                 let wc = EditorWindowController.open(
                     with: CapturedImage(cgImage: base, scale: scale),
@@ -14630,12 +14711,15 @@ enum SelfTest {
                 }
                 let pad = Int(layout.padPixels)
                 // The sentinel appears at exactly the padding offset...
-                if exportLuma(pad + inset + 1, pad + inset + 1) > 40
-                    || exportLuma(pad + inset + 1, pad + inset + 12) < 200 {
+                let markerProbeX = pad + inset + markerWidth / 2
+                let markerProbeY = pad + inset + markerHeight / 2
+                let whiteProbeY = pad + inset + markerHeight + whiteGap
+                if exportLuma(markerProbeX, markerProbeY) > 40
+                    || exportLuma(markerProbeX, whiteProbeY) < 200 {
                     previewFailures.append(
                         label + ":offset "
-                        + "\(exportLuma(pad + inset + 1, pad + inset + 1)) "
-                        + "\(exportLuma(pad + inset + 1, pad + inset + 12))")
+                        + "\(exportLuma(markerProbeX, markerProbeY)) "
+                        + "\(exportLuma(markerProbeX, whiteProbeY))")
                 }
                 // ...and the very corner is NOT the document: it is clipped
                 // away by the rounded plate, which is what the preview must
@@ -14652,7 +14736,13 @@ enum SelfTest {
                 // displayIgnoringOpacity, so the CANVAS subview is rendered
                 // too: drawing only the wrapper's own body would show the
                 // frame with no document inside it and prove nothing.
-                let previewImage = SelfTest.snapshotViewForTesting(wrapper)
+                // A layer-backed canvas is not included by
+                // `displayIgnoringOpacity` on its non-layer-backed wrapper on
+                // current AppKit. Compose the two REAL draw overrides with the
+                // production subview offset instead of accepting a snapshot
+                // containing only the backdrop frame.
+                let previewImage = SelfTest.backdropPreviewSnapshotForTesting(
+                    wrapper: wrapper, canvas: canvas)
                 if let previewImage, let previewPx = rasterOf(previewImage) {
                     let pw = previewImage.width, ph = previewImage.height
                     func previewLuma(_ x: Int, _ yBL: Int) -> Int {
@@ -14665,23 +14755,30 @@ enum SelfTest {
                     }
                     // Same questions asked of the preview, in ITS units, so a
                     // square-cornered preview over a rounded export fails.
-                    let ratio = CGFloat(pw) / layout.outerPointSize.width
+                    let ratioX = CGFloat(pw) / layout.outerPointSize.width
+                    let ratioY = CGFloat(ph) / layout.outerPointSize.height
                     func atPoint(_ px: CGFloat, _ py: CGFloat) -> Int {
                         previewLuma(
-                            Int((px * ratio).rounded(.down)),
-                            Int((py * ratio).rounded(.down)))
+                            Int((px * ratioX).rounded(.down)),
+                            Int((py * ratioY).rounded(.down)))
                     }
-                    let insetPt = CGFloat(inset) / max(1, scale)
-                    let markX = layout.padPoints + insetPt + 1
-                    let markY = layout.padPoints + insetPt + 1
+                    // Define both probes in source pixels, then convert once.
+                    // Probe the centers, never an antialiased edge.
+                    let markX = layout.padPoints
+                        + CGFloat(inset + markerWidth / 2) / max(1, scale)
+                    let markY = layout.padPoints
+                        + CGFloat(inset + markerHeight / 2) / max(1, scale)
+                    let whiteY = layout.padPoints
+                        + CGFloat(inset + markerHeight + whiteGap)
+                            / max(1, scale)
                     if atPoint(markX, markY) > 60 {
                         previewFailures.append(
                             label + ":preview-mark \(atPoint(markX, markY))")
                     }
-                    if atPoint(markX, markY + 8) < 180 {
+                    if atPoint(markX, whiteY) < 180 {
                         previewFailures.append(
                             label + ":preview-inside "
-                            + "\(atPoint(markX, markY + 8))")
+                            + "\(atPoint(markX, whiteY))")
                     }
                     if !layout.isCollapsed {
                         // Backdrop visible out in the padding...
@@ -15014,23 +15111,6 @@ enum SelfTest {
             final class CountingRedactionHost: RedactionHost {
                 var repaints = 0
                 func redactionDidChange() { repaints += 1 }
-            }
-
-            /// Sits where the canvas's own delegate sits and forwards to it, so
-            /// the count comes from the REAL path
-            /// (`canvas.redactionDidChange` -> delegate) instead of replacing
-            /// it. Counting on a synthetic host would have missed a repaint
-            /// regression in production entirely.
-            final class ForwardingRepaintDelegate: RedactionSurfaceDelegate {
-                var repaints = 0
-                private let wrapped: RedactionSurfaceDelegate?
-                init(wrapping wrapped: RedactionSurfaceDelegate?) {
-                    self.wrapped = wrapped
-                }
-                func surfaceNeedsRedactionRepaint() {
-                    repaints += 1
-                    wrapped?.surfaceNeedsRedactionRepaint()
-                }
             }
 
             // C. Backdrop as document state: what the real menu does, what the
@@ -15588,6 +15668,16 @@ enum SelfTest {
             }
             SliceBExport.withBudgetForTesting(10_000_000) {
                 let (wc, canvas) = seedStabilityEditor(width: 900, height: 900)
+                // These are separate user events. Group them separately so
+                // one undo reverts the crop without also reverting the
+                // backdrop chosen in the preceding event.
+                let previousGrouping = canvas.undoManager?.groupsByEvent ?? true
+                canvas.undoManager?.groupsByEvent = false
+                @MainActor func grouped(_ body: @MainActor () -> Void) {
+                    canvas.undoManager?.beginUndoGrouping()
+                    body()
+                    canvas.undoManager?.endUndoGrouping()
+                }
                 // The reported outer size follows the PROSPECTIVE export at
                 // every stage, which is a different question from validity.
                 if outerField(canvas) != "outer=none" {
@@ -15596,7 +15686,9 @@ enum SelfTest {
                 canvas.currentTool = .crop
                 canvas.setCropSelectionForTesting(
                     CGRect(x: 10, y: 10, width: 80, height: 60))
-                if !canvas.applyBackdrop(.graphite) {
+                var appliedBackdrop = false
+                grouped { appliedBackdrop = canvas.applyBackdrop(.graphite) }
+                if !appliedBackdrop {
                     stabilityFailures.append("apply-refused")
                 }
                 // Hard-coded, not derived: an expectation that calls the same
@@ -15617,8 +15709,11 @@ enum SelfTest {
                     stabilityFailures.append("cancel-crop " + outerField(canvas))
                 }
                 // Committing a crop only shrinks the peak, so it stays valid.
-                canvas.cropForTesting(
-                    pixels: CGRect(x: 5, y: 5, width: 600, height: 400))
+                grouped {
+                    canvas.cropForTesting(
+                        pixels: CGRect(
+                            x: 5, y: 5, width: 600, height: 400))
+                }
                 // 600x400 pads by the 40 px floor to 680x480.
                 if canvas.backdropPresetForTesting != .graphite
                     || canvas.image.cgImage.width != 600
@@ -15629,6 +15724,11 @@ enum SelfTest {
                         + "\(canvas.image.cgImage.height) " + outerField(canvas))
                 }
                 canvas.undoManager?.undo()
+                // The remaining resize probes are independent production
+                // actions and register their own undo snapshots. Restore
+                // event grouping before them; leaving it disabled without an
+                // explicit group makes NSUndoManager reject registration.
+                canvas.undoManager?.groupsByEvent = previousGrouping
                 if canvas.backdropPresetForTesting != .graphite
                     || canvas.image.cgImage.width != 900
                     || outerField(canvas) != "outer=1008x1008" {
@@ -15852,7 +15952,7 @@ enum SelfTest {
                     _ = surface.drawForPreview(in: c, base: white)
                 }
                 guard let shot = c.makeImage() else { return (false, true) }
-                func isCover(_ x: Int, _ y: Int) -> Bool {
+                @MainActor func isCover(_ x: Int, _ y: Int) -> Bool {
                     let p = probe3(shot, x, y)
                     return p.0 >= 0 && p.0 < 60 && p.1 < 60 && p.2 < 60
                 }
@@ -18309,6 +18409,46 @@ enum SelfTest {
         defer { NSGraphicsContext.restoreGraphicsState() }
         NSGraphicsContext.current = graphics
         view.draw(bounds)
+        return ctx.makeImage()
+    }
+
+    /// Renders the live backdrop document without trusting AppKit to include
+    /// a layer-backed canvas when a non-layer-backed wrapper is asked to
+    /// `displayIgnoringOpacity`. Each production draw override gets an
+    /// isolated context, then the two resulting bitmaps are composited using
+    /// the canvas's real subview frame. This avoids inheriting AppKit view
+    /// focus/CTM state from one manual draw into the other.
+    @MainActor
+    static func backdropPreviewSnapshotForTesting(
+        wrapper: BackdropDocumentView, canvas: EditorCanvasView
+    ) -> CGImage? {
+        wrapper.layoutSubtreeIfNeeded()
+        canvas.layoutSubtreeIfNeeded()
+        let bounds = wrapper.bounds
+        guard bounds.width >= 1, bounds.height >= 1,
+              let wrapperShot = directDrawSnapshotForTesting(wrapper),
+              let canvasShot = directDrawSnapshotForTesting(canvas)
+        else { return nil }
+        let pixelWidth = wrapperShot.width
+        let pixelHeight = wrapperShot.height
+        guard let ctx = CGContext(
+            data: nil, width: pixelWidth, height: pixelHeight,
+            bitsPerComponent: 8, bytesPerRow: 0,
+            space: CGColorSpace(name: CGColorSpace.sRGB)!,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        else { return nil }
+        ctx.clear(CGRect(x: 0, y: 0, width: pixelWidth, height: pixelHeight))
+        ctx.interpolationQuality = .high
+        ctx.draw(wrapperShot, in: CGRect(
+            x: 0, y: 0, width: pixelWidth, height: pixelHeight))
+        let sx = CGFloat(pixelWidth) / bounds.width
+        let sy = CGFloat(pixelHeight) / bounds.height
+        let target = CGRect(
+            x: (canvas.frame.minX - bounds.minX) * sx,
+            y: (canvas.frame.minY - bounds.minY) * sy,
+            width: canvas.frame.width * sx,
+            height: canvas.frame.height * sy)
+        ctx.draw(canvasShot, in: target)
         return ctx.makeImage()
     }
 

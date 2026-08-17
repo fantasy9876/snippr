@@ -1,5 +1,14 @@
 import AppKit
 
+/// The image is the background hit target while Select is active. AppKit's
+/// `NSImageView` opts out of background window dragging, so relying on the
+/// generic nonopaque-NSView default makes Select unable to move the panel on
+/// current macOS releases.
+@MainActor
+private final class DraggablePanelImageView: NSImageView {
+    override var mouseDownCanMoveWindow: Bool { true }
+}
+
 /// Routes a finished scrolling capture: the auto actions run exactly once
 /// through the router (`.scrollFinished`, source `.scrollResult` — never a
 /// Repeat-Area rect), then — only when the snapshotted `afterShow` says so —
@@ -183,7 +192,7 @@ final class ScrollResultPanel: NSPanel {
             NSColor.windowBackgroundColor.withAlphaComponent(0.97).cgColor
         content.layer?.cornerRadius = 10
 
-        let imageView = NSImageView(frame: CGRect(
+        let imageView = DraggablePanelImageView(frame: CGRect(
             x: (contentSize.width - imageSize.width) / 2, y: toolbarHeight,
             width: imageSize.width, height: imageSize.height))
         imageView.image = image.nsImage
