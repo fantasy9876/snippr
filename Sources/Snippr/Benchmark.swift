@@ -93,6 +93,31 @@ enum Benchmark {
                 a.count == b.count
                     && zip(a, b).allSatisfy { $0.0 === $0.1 }
             }
+            // The Dock keeps one invisible, mouse-transparent window at the
+            // dock level covering exactly the primary display. It sits in
+            // front of a floating panel in window-server order without ever
+            // owning a click, so it must not count as the HID owner. Only
+            // that exact window is exempt: the Dock's own process, the dock
+            // window level, and the primary display bounds in CG coordinates.
+            // Every other window in front still blocks. Pen running first is
+            // the positive control that the exemption really passes through.
+            let dockPIDs = Set(
+                NSRunningApplication.runningApplications(
+                    withBundleIdentifier: "com.apple.dock"
+                ).map { $0.processIdentifier })
+            let dockLevel = Int(CGWindowLevelForKey(.dockWindow))
+            let primaryDisplayCG = CGDisplayBounds(CGMainDisplayID())
+            func isDockDesktopOverlay(_ entry: [String: Any], frame: CGRect)
+                -> Bool
+            {
+                guard let ownerPID = entry[kCGWindowOwnerPID as String]
+                        as? pid_t,
+                      dockPIDs.contains(ownerPID),
+                      let layer = entry[kCGWindowLayer as String] as? Int,
+                      layer == dockLevel
+                else { return false }
+                return frame.equalTo(primaryDisplayCG)
+            }
             @MainActor func panelOwnsFrontmostWindow(
                 atCG point: CGPoint, panel: NSWindow
             ) -> Bool {
@@ -113,6 +138,7 @@ enum Benchmark {
                     let alpha = entry[kCGWindowAlpha as String]
                         as? CGFloat ?? 1
                     guard alpha > 0.05, frame.contains(point) else { continue }
+                    if isDockDesktopOverlay(entry, frame: frame) { continue }
                     // Window-server order is front-to-back. At this opaque
                     // image point, the first containing window owns the HID.
                     return number == CGWindowID(panel.windowNumber)

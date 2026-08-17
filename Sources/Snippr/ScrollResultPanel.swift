@@ -4,9 +4,21 @@ import AppKit
 /// `NSImageView` opts out of background window dragging, so relying on the
 /// generic nonopaque-NSView default makes Select unable to move the panel on
 /// current macOS releases.
+///
+/// `mouseDownCanMoveWindow` alone is not enough for real input either: the
+/// window server moves a background-draggable window from a region AppKit
+/// precomputes from the view tree, and the annotation surface (which opts
+/// out) covers this image. Its `hitTest` hands Select clicks to this view
+/// only on the AppKit side, so a physical drag reaches `mouseDown` here and
+/// nothing moves. Start the window-server drag explicitly from that event.
 @MainActor
 private final class DraggablePanelImageView: NSImageView {
     override var mouseDownCanMoveWindow: Bool { true }
+
+    override func mouseDown(with event: NSEvent) {
+        guard let window else { return }
+        window.performDrag(with: event)
+    }
 }
 
 /// Routes a finished scrolling capture: the auto actions run exactly once
