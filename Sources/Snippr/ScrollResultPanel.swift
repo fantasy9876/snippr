@@ -116,7 +116,7 @@ final class ScrollResultPanel: NSPanel {
         let maxSize = CGSize(
             width: visible.width * 0.9, height: visible.height * 0.9)
         let pointSize = image.pointSize
-        let toolbarButtonCount = OverlayAnnotationTool.allCases.count + 3
+        let toolbarButtonCount = OverlayAnnotationTool.panelTools.count + 3
             + OverlayActionCatalog.items.count + 1 // Color/Undo/Redo + Close
         // A narrow stitch gets only enough chrome width for the 190pt
         // stroke HUD plus margins; controls wrap instead of widening the
@@ -285,7 +285,9 @@ final class ScrollResultPanel: NSPanel {
             buttons.append(button)
             return button
         }
-        for tool in OverlayAnnotationTool.allCases {
+        // The panel keeps exactly the tools it had: the magnifier was added
+        // for Area Review only.
+        for tool in OverlayAnnotationTool.panelTools {
             _ = makeButton(
                 symbol: tool.symbol, tooltip: tool.tooltip,
                 tag: tool.toolbarTag,

@@ -5851,7 +5851,7 @@ enum SelfTest {
                 let orderedButtons = editing + actions
                 let allFrames = editingFrames + actionFrames
                 var failures: [String] = []
-                if editing.count != OverlayAnnotationTool.allCases.count + 3 {
+                if editing.count != OverlayAnnotationTool.panelTools.count + 3 {
                     failures.append("editing count \(editing.count)")
                 }
                 if actions.count != 7 { failures.append("action count \(actions.count)") }
@@ -8099,11 +8099,13 @@ enum SelfTest {
             check("sliceB-symbols-resolve",
                   symbolContract
                     && EditorTool.allCases.count == 15
-                    && OverlayAnnotationTool.allCases.count == 12,
+                    && OverlayAnnotationTool.areaReviewTools.count == 13
+                    && OverlayAnnotationTool.panelTools.count == 12,
                   "primary \(resolvedPrimary != nil) fallback \(usesFallback != nil) "
                     + "placeholder \(bothMissing != nil) "
                     + "editor \(EditorTool.allCases.count) "
-                    + "overlay \(OverlayAnnotationTool.allCases.count)")
+                    + "overlay \(OverlayAnnotationTool.areaReviewTools.count)"
+                    + "/\(OverlayAnnotationTool.panelTools.count)")
 
             // 4. A redaction never renders "nothing".
             let redactRect = CGRect(x: 10, y: 20, width: 100, height: 40)

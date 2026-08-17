@@ -27,6 +27,15 @@ enum OverlayAnnotationTool: String, CaseIterable {
     // Appended at the END so the legacy tags 100-109 keep their meaning.
     case spotlight
     case pixelateText
+    // Appended after pixelateText so tags 100-111 keep their meaning; this
+    // one is 112.
+    case magnifier
+
+    /// The tools each host offers. Area Review gained the magnifier; the
+    /// scroll panel keeps exactly what it had, so a catalog per host is what
+    /// decides the toolbar rather than `allCases`.
+    static let areaReviewTools: [Self] = allCases
+    static let panelTools: [Self] = allCases.filter { $0 != .magnifier }
 
     static let toolbarTagBase = 100
     static let colorToolbarTag = 200
@@ -54,6 +63,7 @@ enum OverlayAnnotationTool: String, CaseIterable {
         case "n": return .counter
         case "b": return .blur
         case "s": return .spotlight
+        case "m": return .magnifier
         default: return nil
         }
     }
@@ -96,6 +106,7 @@ enum OverlayAnnotationTool: String, CaseIterable {
         case .blur: return "drop.halffull"
         case .spotlight: return "rectangle.center.inset.filled"
         case .pixelateText: return "text.redaction"
+        case .magnifier: return "plus.magnifyingglass"
         }
     }
 
@@ -114,6 +125,7 @@ enum OverlayAnnotationTool: String, CaseIterable {
         case .spotlight: return "Spotlight (S)"
         case .pixelateText:
             return "Pixelate text (⇧B) — best-effort, review before sharing"
+        case .magnifier: return "Magnifier (M)"
         }
     }
 }
@@ -150,13 +162,15 @@ final class AnnotationSurface: RedactionHost, RedactionJobObserver {
     private var activeBlurAnchor: CGPoint?
     private var activeSpotlight: SpotlightAnnotation?
     private var activeSpotlightAnchor: CGPoint?
+    private var activeMagnifier: MagnifierAnnotation?
+    private var activeMagnifierAnchor: CGPoint?
     /// True between `beginDrag` and `endDrag`. A draft is already IN the
     /// document at this point and the transaction that will finalize it is
     /// half-built, so every route that mutates history, tools or the document
     /// has to stand aside until the drag resolves.
     var isDragging: Bool {
         activeShape != nil || activePen != nil || activeBlur != nil
-            || activeSpotlight != nil
+            || activeSpotlight != nil || activeMagnifier != nil
     }
 
     /// The spotlight a drag is about to replace, held so a click can put it
@@ -238,6 +252,8 @@ final class AnnotationSurface: RedactionHost, RedactionJobObserver {
         activeBlurAnchor = nil
         activeSpotlight = nil
         activeSpotlightAnchor = nil
+        activeMagnifier = nil
+        activeMagnifierAnchor = nil
     }
 
     /// A real new annotation forks history. Redo itself deliberately does
@@ -279,6 +295,19 @@ final class AnnotationSurface: RedactionHost, RedactionJobObserver {
                 annotations.remove(at: index)
             }
             annotations.append(spot)
+            historyDidChange?()
+            return true
+        case .magnifier:
+            // The callout is placed by the same drag that picks the source, so
+            // the draft carries both from the first pixel. The snapshot is
+            // taken at the release, once the source rect is final — and it is
+            // taken from the REDACTED document, never the raw base.
+            let magnifier = MagnifierAnnotation(uiScale: pixelScale)
+            magnifier.sourceRect = CGRect(origin: p, size: .zero)
+            magnifier.calloutRect = CGRect(origin: p, size: .zero)
+            activeMagnifier = magnifier
+            activeMagnifierAnchor = p
+            annotations.append(magnifier)
             historyDidChange?()
             return true
         case .pixelateText:
@@ -364,6 +393,18 @@ final class AnnotationSurface: RedactionHost, RedactionJobObserver {
             spot.rect = CGRect(
                 x: min(anchor.x, p.x), y: min(anchor.y, p.y),
                 width: abs(anchor.x - p.x), height: abs(anchor.y - p.y))
+        } else if let magnifier = activeMagnifier,
+                  let anchor = activeMagnifierAnchor {
+            let source = CGRect(
+                x: min(anchor.x, p.x), y: min(anchor.y, p.y),
+                width: abs(anchor.x - p.x), height: abs(anchor.y - p.y))
+            magnifier.sourceRect = source
+            // The callout sits beside the source at the editor's default
+            // magnification, so a drag produces something visible without a
+            // second gesture.
+            magnifier.calloutRect = CGRect(
+                x: source.maxX + 16, y: source.minY,
+                width: source.width * 2, height: source.height * 2)
         }
     }
 
@@ -381,6 +422,9 @@ final class AnnotationSurface: RedactionHost, RedactionJobObserver {
         if let blur = activeBlur, annotations.last === blur {
             annotations.removeLast()
         }
+        if let magnifier = activeMagnifier, annotations.last === magnifier {
+            annotations.removeLast()
+        }
         if let spot = activeSpotlight, annotations.last === spot {
             annotations.removeLast()
             if let previous = replacedSpotlight {
@@ -394,6 +438,8 @@ final class AnnotationSurface: RedactionHost, RedactionJobObserver {
         activeBlurAnchor = nil
         activeSpotlight = nil
         activeSpotlightAnchor = nil
+        activeMagnifier = nil
+        activeMagnifierAnchor = nil
         replacedSpotlight = nil
         // The document changed shape even though history did not, so the Undo
         // and Redo buttons have to be re-evaluated.
@@ -413,6 +459,22 @@ final class AnnotationSurface: RedactionHost, RedactionJobObserver {
     }
 
     func endDrag() {
+        // A magnifier is finished like the other region tools: a drag that
+        // never moved leaves nothing behind and keeps the redo branch. The
+        // snapshot is left to the host, which owns the base image and can take
+        // it from the REDACTED document — the surface must never hand back raw
+        // pixels a redaction was meant to cover.
+        if let magnifier = activeMagnifier, annotations.last === magnifier {
+            if magnifier.sourceRect.width <= 1
+                || magnifier.sourceRect.height <= 1 {
+                annotations.removeLast()
+            } else {
+                redoAnnotations.removeAll()
+                pruneSpotlightReplacements()
+                pendingMagnifier = magnifier
+            }
+            historyDidChange?()
+        }
         // A completed pen stroke or shape forks history HERE, not at
         // mouseDown — and only if it is a real mark. A press-and-release with
         // no movement leaves a single-point stroke or a zero-size shape that
@@ -563,6 +625,23 @@ final class AnnotationSurface: RedactionHost, RedactionJobObserver {
     /// Full SOURCE pixel bounds; hosts set this so a spotlight dims the whole
     /// image, not just the selection or the view.
     var redactionBaseBounds: CGRect = .zero
+
+    /// Set by `endDrag` when a magnifier finished; the host fills its snapshot
+    /// because only the host has the base image — and it must sample the
+    /// document AFTER redactions so the callout cannot reveal what a
+    /// pixelation covers.
+    private(set) var pendingMagnifier: MagnifierAnnotation?
+
+    @discardableResult
+    func fillPendingMagnifier(base: CGImage) -> Bool {
+        guard let magnifier = pendingMagnifier else { return false }
+        pendingMagnifier = nil
+        magnifier.snapshot = SliceBCompositor.magnifierSnapshot(
+            base: base, sourceRect: magnifier.sourceRect,
+            redactions: annotations.compactMap { $0 as? BlurAnnotation })
+        redactionDidChange()
+        return true
+    }
 
     /// Set by `endDrag` when a text redaction finished; the host starts the
     /// bounded OCR because only the host has the base image.

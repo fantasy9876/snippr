@@ -523,7 +523,7 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
         let toolContainer = makeReviewToolbarContainer()
         let actionContainer = makeReviewToolbarContainer()
         var toolButtons: [NSButton] = []
-        for tool in OverlayAnnotationTool.allCases {
+        for tool in OverlayAnnotationTool.areaReviewTools {
             let button = makeReviewToolbarButton(
                 symbol: tool.symbol, tooltip: tool.tooltip,
                 tag: tool.toolbarTag,
@@ -1131,6 +1131,10 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
                     annotationSurface?.endDrag()
                     if let frozen {
                         annotationSurface?.startPendingTextRedaction(
+                            base: frozen.cgImage)
+                        // Sampled from the document, so an existing pixelation
+                        // is already covering the pixels the callout enlarges.
+                        annotationSurface?.fillPendingMagnifier(
                             base: frozen.cgImage)
                     }
                 }
