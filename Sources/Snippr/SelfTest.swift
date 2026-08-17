@@ -8531,6 +8531,237 @@ enum SelfTest {
                       bdFailures.joined(separator: " | "))
             }
 
+            @MainActor func rasterizeSpec(
+                _ image: CGImage
+            ) -> ((Int, Int) -> Int)? {
+                let w = image.width, h = image.height
+                var bytes = [UInt8](repeating: 0, count: w * h * 4)
+                guard let c = CGContext(
+                    data: &bytes, width: w, height: h, bitsPerComponent: 8,
+                    bytesPerRow: w * 4,
+                    space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                    bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+                else { return nil }
+                c.interpolationQuality = .none
+                c.draw(image, in: CGRect(
+                    x: 0, y: 0, width: CGFloat(w), height: CGFloat(h)))
+                let snapshot = bytes
+                // x, y bottom-left -> red channel.
+                return { x, y in Int(snapshot[((h - 1 - y) * w + x) * 4]) }
+            }
+
+            // C3: the spec's numbers, written out HERE as literals. A gate
+            // that asked production for its expectations would agree with any
+            // table at all, including one that drifted.
+            do {
+                var specFailures: [String] = []
+                func rgbBytes(_ color: CGColor) -> (Int, Int, Int, CGFloat)? {
+                    guard let converted = color.converted(
+                        to: CGColorSpace(name: CGColorSpace.sRGB)!,
+                        intent: .defaultIntent, options: nil),
+                        let c = converted.components, c.count >= 4
+                    else { return nil }
+                    return (
+                        Int((c[0] * 255).rounded()),
+                        Int((c[1] * 255).rounded()),
+                        Int((c[2] * 255).rounded()),
+                        c[3])
+                }
+                let expectedStops:
+                    [BackdropPreset: [(CGFloat, (Int, Int, Int))]] = [
+                    .ocean: [
+                        (0.00, (139, 180, 255)), (0.28, (74, 124, 240)),
+                        (0.62, (46, 61, 184)), (1.00, (26, 24, 104)),
+                    ],
+                    .sunset: [
+                        (0.00, (255, 208, 138)), (0.28, (255, 126, 74)),
+                        (0.62, (230, 61, 120)), (1.00, (122, 34, 136)),
+                    ],
+                    .mint: [
+                        (0.00, (154, 245, 212)), (0.28, (61, 220, 176)),
+                        (0.62, (26, 154, 138)), (1.00, (10, 69, 80)),
+                    ],
+                    .graphite: [
+                        (0.00, (90, 98, 112)), (0.32, (52, 58, 70)),
+                        (0.68, (28, 32, 40)), (1.00, (11, 13, 17)),
+                    ],
+                ]
+                let expectedWash:
+                    [BackdropPreset: ((Int, Int, Int), CGFloat)] = [
+                    .ocean: ((255, 255, 255), 0.20),
+                    .sunset: ((255, 232, 192), 0.18),
+                    .mint: ((232, 255, 246), 0.16),
+                    .graphite: ((139, 155, 184), 0.14),
+                ]
+                let expectedSeeds: [BackdropPreset: UInt32] = [
+                    .ocean: 0x0CE4_0001, .sunset: 0x5E70_0002,
+                    .mint: 0xA117_0003, .graphite: 0x6A40_0004,
+                ]
+                for preset in BackdropPreset.allCases where preset != .none {
+                    let stops = SliceBBackdrop.gradientStops(for: preset)
+                    guard let want = expectedStops[preset],
+                          stops.count == want.count else {
+                        specFailures.append("\(preset.rawValue) stop count")
+                        continue
+                    }
+                    for (index, pair) in zip(stops, want).enumerated() {
+                        if abs(pair.0.location - pair.1.0) > 0.001 {
+                            specFailures.append(
+                                "\(preset.rawValue) loc\(index) "
+                                    + "\(pair.0.location)")
+                        }
+                        guard let got = rgbBytes(pair.0.color) else {
+                            specFailures.append(
+                                "\(preset.rawValue) colour\(index)")
+                            continue
+                        }
+                        if (got.0, got.1, got.2) != pair.1.1 {
+                            specFailures.append(
+                                "\(preset.rawValue) stop\(index) "
+                                    + "\((got.0, got.1, got.2)) "
+                                    + "want \(pair.1.1)")
+                        }
+                    }
+                    let wash = SliceBBackdrop.radialWash(for: preset)
+                    if let wantWash = expectedWash[preset],
+                       let centre = rgbBytes(wash.centre),
+                       let edge = rgbBytes(wash.edge) {
+                        if (centre.0, centre.1, centre.2) != wantWash.0
+                            || abs(centre.3 - wantWash.1) > 0.001 {
+                            specFailures.append(
+                                "\(preset.rawValue) wash centre "
+                                    + "\((centre.0, centre.1, centre.2)) "
+                                    + "α\(centre.3)")
+                        }
+                        // The wash must vanish at the rim, or it would tint
+                        // the whole frame rather than light one corner.
+                        if edge.3 != 0 {
+                            specFailures.append(
+                                "\(preset.rawValue) wash edge α\(edge.3)")
+                        }
+                    } else {
+                        specFailures.append("\(preset.rawValue) wash missing")
+                    }
+                    if SliceBBackdrop.grainSeed(for: preset)
+                        != expectedSeeds[preset] {
+                        specFailures.append("\(preset.rawValue) seed")
+                    }
+                }
+                // The hash, recomputed here from the spec's own formula. If
+                // production's mixing constants drift, the tiles change and
+                // this catches it without a stored image.
+                func referenceHash(_ x: Int, _ y: Int, _ seed: UInt32) -> UInt32 {
+                    var h = seed
+                    h &+= UInt32(bitPattern: Int32(truncatingIfNeeded: x))
+                        &* 374_761_393
+                    h &+= UInt32(bitPattern: Int32(truncatingIfNeeded: y))
+                        &* 668_265_263
+                    h ^= h >> 13
+                    h &*= 1_274_126_177
+                    h ^= h >> 16
+                    return h
+                }
+                let seed = SliceBBackdrop.grainSeed(for: .ocean)
+                for (x, y) in [(0, 0), (1, 0), (0, 1), (63, 91), (127, 127)] {
+                    if SliceBBackdrop.grainHash(x: x, y: y, seed: seed)
+                        != referenceHash(x, y, seed) {
+                        specFailures.append("hash(\(x),\(y))")
+                    }
+                }
+                // And the tile really carries those values: ±2 around mid
+                // grey, opaque, 128 texels square.
+                if let tile = SliceBBackdrop.grainTile(for: .ocean) {
+                    if tile.width != 128 || tile.height != 128 {
+                        specFailures.append(
+                            "tile \(tile.width)x\(tile.height)")
+                    }
+                    var bytes = [UInt8](repeating: 0, count: 128 * 128 * 4)
+                    if let c = CGContext(
+                        data: &bytes, width: 128, height: 128,
+                        bitsPerComponent: 8, bytesPerRow: 128 * 4,
+                        space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                        bitmapInfo: CGImageAlphaInfo
+                            .premultipliedLast.rawValue) {
+                        c.interpolationQuality = .none
+                        c.draw(tile, in: CGRect(
+                            x: 0, y: 0, width: 128, height: 128))
+                        var sawLow = false, sawHigh = false
+                        for y in 0..<128 {
+                            for x in 0..<128 {
+                                // Row-major from the TOP, which is how a
+                                // CGContext's buffer is laid out and how the
+                                // tile was authored. Orientation is immaterial
+                                // to a repeating dither, but the gate has to
+                                // read it the way it was written.
+                                let i = (y * 128 + x) * 4
+                                let want = 128
+                                    + Int(referenceHash(x, y, seed) % 5) - 2
+                                if Int(bytes[i]) != want
+                                    || Int(bytes[i + 1]) != want
+                                    || Int(bytes[i + 2]) != want
+                                    || bytes[i + 3] != 255 {
+                                    specFailures.append(
+                                        "tile(\(x),\(y)) \(bytes[i]) "
+                                            + "want \(want)")
+                                }
+                                if want < 128 { sawLow = true }
+                                if want > 128 { sawHigh = true }
+                            }
+                        }
+                        if !(sawLow && sawHigh) {
+                            specFailures.append("tile is flat — oracle blind")
+                        }
+                    }
+                    // Deterministic across calls, and the cache hands back the
+                    // same object rather than rebuilding a different one.
+                    if SliceBBackdrop.grainTile(for: .ocean) !== tile {
+                        specFailures.append("tile not cached")
+                    }
+                    if SliceBBackdrop.grainTile(for: .sunset) === tile {
+                        specFailures.append("seeds share a tile")
+                    }
+                } else {
+                    specFailures.append("no grain tile")
+                }
+                // Hairline: 1pt at α0.16 white, inside the plate.
+                if let c = CGContext(
+                    data: nil, width: 60, height: 60, bitsPerComponent: 8,
+                    bytesPerRow: 0,
+                    space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                    bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) {
+                    c.setFillColor(NSColor.black.cgColor)
+                    c.fill(CGRect(x: 0, y: 0, width: 60, height: 60))
+                    SliceBBackdrop.drawPlateHairline(
+                        in: c, rect: CGRect(x: 0, y: 0, width: 60, height: 60),
+                        pixelScale: 1)
+                    if let out = c.makeImage(), let px = rasterizeSpec(out) {
+                        // Mid-edge, where the stroke is straight: black lifted
+                        // by 0.16 of white is ~41.
+                        let edge = px(0, 30)
+                        let middle = px(30, 30)
+                        if abs(edge - 41) > 3 {
+                            specFailures.append("hairline edge \(edge)")
+                        }
+                        if middle != 0 {
+                            specFailures.append("hairline bled inward \(middle)")
+                        }
+                    }
+                }
+                // Geometry the spec freezes.
+                if SliceBBackdrop.cornerRadiusPt != 12
+                    || SliceBBackdrop.shadowOffsetPt != -8
+                    || SliceBBackdrop.shadowBlurPt != 24
+                    || SliceBBackdrop.paddingFraction != 0.06
+                    || SliceBBackdrop.minPadding != 40
+                    || SliceBBackdrop.maxPadding != 320
+                    || SliceBBackdrop.shadowSafetyFactor != 1.25 {
+                    specFailures.append("geometry moved")
+                }
+                check("sliceB-backdrop-presets-match-spec",
+                      specFailures.isEmpty,
+                      specFailures.prefix(6).joined(separator: " | "))
+            }
+
             // 1c. Keyboard is host-scoped. The panel deliberately shows no
             // magnifier button, so routing M there would select a tool with no
             // control and no way back. The letters the tooltips advertise must

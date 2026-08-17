@@ -1021,29 +1021,18 @@ enum SliceBBackdrop {
             / max(0.0001, documentPixelsPerUserUnit)
         ctx.saveGState()
         ctx.setBlendMode(.overlay)
-        // Only the tiles the current clip can actually show. The second fill
-        // inside the plate would otherwise re-blit the whole canvas — on a 5K
-        // frame that is ~900 draws per pass, twice per event, while the user
-        // drags. The PHASE is unaffected: the first tile is snapped back to a
-        // multiple of the tile size from the canvas origin, so what is drawn
-        // is the same pattern either way, dirty rect or not.
-        let region = ctx.boundingBoxOfClipPath.intersection(
-            CGRect(origin: .zero, size: size))
-        var blits = 0
-        if !region.isNull, region.width > 0, region.height > 0 {
-            var y = (region.minY / tileSide).rounded(.down) * tileSide
-            while y < region.maxY {
-                var x = (region.minX / tileSide).rounded(.down) * tileSide
-                while x < region.maxX {
-                    ctx.draw(grain, in: CGRect(
-                        x: x, y: y, width: tileSide, height: tileSide))
-                    blits += 1
-                    x += tileSide
-                }
-                y += tileSide
-            }
-        }
-        countGrainTileBlits(blits)
+        // ONE call. `byTiling` replicates the image across the current clip in
+        // user space, anchored to the rect's origin — which is the canvas
+        // origin here, so the phase is exactly the one the spec fixes and a
+        // partial redraw lands on the same pattern as a full one. Tiling by
+        // hand cost ~900 blits per pass on a 5K frame, twice per event while
+        // the user drags, and clipping the loop only trimmed about an eighth
+        // of that. This is not CGPattern: no CTM-dependent phase.
+        ctx.draw(
+            grain,
+            in: CGRect(x: 0, y: 0, width: tileSide, height: tileSide),
+            byTiling: true)
+        countGrainTileBlits(1)
         ctx.restoreGState()
         return true
     }
@@ -1075,10 +1064,11 @@ enum SliceBBackdrop {
     /// Tile side in DOCUMENT pixels.
     static let grainTileSide = 128
 
-    /// How many tiles the fills have blitted, so a gate can prove the clipped
-    /// pass does not scan the whole canvas. Compose can run off the main
-    /// thread, so this is locked rather than a bare global, and it ACCUMULATES
-    /// — a counter that reset itself per call would hide the second pass.
+    /// How many tiling DRAWS the fills have issued — one per fill pass, so a
+    /// backdrop frame costs two, not one per tile. Compose can run off the
+    /// main thread, so this is locked rather than a bare global, and it
+    /// ACCUMULATES: a counter that reset itself per call would hide the second
+    /// pass entirely.
     private nonisolated(unsafe) static var grainTileBlits = 0
     private static let grainTileBlitsLock = NSLock()
     static var grainTileBlitsForTesting: Int {
