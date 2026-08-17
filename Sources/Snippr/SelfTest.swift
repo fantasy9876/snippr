@@ -11714,149 +11714,551 @@ enum SelfTest {
                 }
             }
             // O. While a text field owns the keyboard, the shortcuts must
-            //    not fire: typing "5" into a caption is text, not a darkness
-            //    change. Both hosts route keys themselves.
+            //    not fire: typing "5l" into a caption is text, not a
+            //    darkness/tool change. This gate drives the WINDOW and its
+            //    real field editor; calling the host's keyDown directly only
+            //    proves a guard and says nothing about responder dispatch.
             var textKeyFailures: [String] = []
             let runTextKeys = {
                 guard let screen = NSScreen.screens.first else {
                     textKeyFailures.append("no-screen")
                     return
                 }
-                func digit(_ chars: String) -> NSEvent? {
-                    NSEvent.keyEvent(
-                        with: .keyDown, location: .zero, modifierFlags: [],
-                        timestamp: 0, windowNumber: 0, context: nil,
-                        characters: chars, charactersIgnoringModifiers: chars,
-                        isARepeat: false, keyCode: 0)
-                }
-                let inertDependencies = CaptureActionRouter.Dependencies(
-                    copyToClipboard: { _ in }, autoSave: { _, _ in },
-                    saveAs: { _, _ in }, pin: { _ in }, ocr: { _ in },
-                    openEditor: { _ in }, toast: { _ in },
-                    setLastCapture: { _ in }, setLastAreaRect: { _ in },
-                    logEvent: { _ in })
 
-                // --- area
-                let overlay = SelectionOverlay(
-                    purpose: .areaReview,
-                    inputs: OverlaySessionInputs(
-                        afterShow: true, afterCopy: false, afterSave: false),
-                    completion: { _ in })
-                overlay.routerDependenciesOverride = inertDependencies
-                let view = SelectionOverlayView(
-                    mode: .area, screen: screen,
-                    frozen: CapturedImage(
-                        cgImage: makeSolidImage(
-                            width: Int(screen.frame.width * 2),
-                            height: Int(screen.frame.height * 2),
-                            color: NSColor.white.cgColor),
-                        scale: 2),
-                    windowList: [], owner: overlay)
-                view.selectForTesting(
-                    rect: CGRect(x: 60, y: 60, width: 240, height: 180))
-                defer { overlay.finish(.cancelled) }
-                guard let surface = view.annotationSurface else {
-                    textKeyFailures.append("area:no-surface")
-                    return
-                }
-                view.clickReviewToolbarButtonForTesting(
-                    tag: OverlayAnnotationTool.spotlight.toolbarTag)
-                view.annotationDragForTesting(
-                    from: CGPoint(x: 100, y: 100), to: CGPoint(x: 200, y: 170))
-                guard let spot = surface.annotations
-                    .compactMap({ $0 as? SpotlightAnnotation }).last else {
-                    textKeyFailures.append("area:no-spotlight")
-                    return
-                }
-                var areaEvents = 0
-                let areaProduction = surface.historyDidChange
-                surface.historyDidChange = {
-                    areaEvents += 1
-                    areaProduction?()
-                }
-                view.beginTextEntryForTesting(
-                    atView: CGPoint(x: 120, y: 120))
-                let dimBefore = spot.dimFraction
-                let toolBefore = surface.tool
-                let eventsBefore = areaEvents
-                if let event = digit("5") { view.keyDown(with: event) }
-                if let event = digit("l") { view.keyDown(with: event) }
-                if spot.dimFraction != dimBefore
-                    || surface.tool != toolBefore
-                    || areaEvents != eventsBefore
-                    || surface.annotations
-                        .compactMap({ $0 as? SpotlightAnnotation }).count != 1 {
-                    textKeyFailures.append(
-                        "area:keys-leaked \(spot.dimFraction) \(surface.tool)")
-                }
-                // Once the field is gone the same key works again, so the
-                // block above means "the field had it", not "digits are dead".
-                view.commitTextEntryForTesting(text: "caption")
-                if let event = digit("5") { view.keyDown(with: event) }
-                let areaAfter = surface.annotations
-                    .compactMap { $0 as? SpotlightAnnotation }.last
-                if abs((areaAfter?.dimFraction ?? 0) - 0.5) > 0.0001 {
-                    textKeyFailures.append(
-                        "area:control \(areaAfter?.dimFraction ?? -1)")
-                }
+                final class TextRouteSpy {
+                    var copies = 0
+                    var autoSaves = 0
+                    var saveAsCalls = 0
+                    var pins = 0
+                    var ocrs = 0
+                    var editors = 0
+                    var toasts = 0
+                    var lastCaptures = 0
+                    var areaRects = 0
+                    var logs = 0
 
-                // --- panel
-                let panel = ScrollResultPanel.show(
-                    image: CapturedImage(
-                        cgImage: makeSolidImage(
-                            width: 600, height: 400,
-                            color: NSColor.white.cgColor),
-                        scale: 1),
-                    inputs: OverlaySessionInputs(
-                        afterShow: true, afterCopy: false, afterSave: false),
-                    screen: screen, dependencies: inertDependencies)
-                defer {
-                    if panel.isVisible || ScrollResultPanel.current === panel {
-                        panel.dismissForTesting()
+                    var total: Int {
+                        copies + autoSaves + saveAsCalls + pins + ocrs
+                            + editors + toasts + lastCaptures + areaRects
+                            + logs
+                    }
+
+                    var detail: String {
+                        "copy=\(copies),auto=\(autoSaves),saveAs="
+                            + "\(saveAsCalls),pin=\(pins),ocr=\(ocrs),editor="
+                            + "\(editors),toast=\(toasts),capture="
+                            + "\(lastCaptures),rect=\(areaRects),log=\(logs)"
+                    }
+
+                    func reset() {
+                        copies = 0
+                        autoSaves = 0
+                        saveAsCalls = 0
+                        pins = 0
+                        ocrs = 0
+                        editors = 0
+                        toasts = 0
+                        lastCaptures = 0
+                        areaRects = 0
+                        logs = 0
                     }
                 }
-                let panelSurface = panel.annotationSurface
-                panel.clickToolbarButtonForTesting(
-                    tag: OverlayAnnotationTool.spotlight.toolbarTag)
-                panel.drawWithRealEventsForTesting(
-                    fromView: CGPoint(x: 60, y: 60),
-                    toView: CGPoint(x: 200, y: 160))
-                guard let panelSpot = panelSurface.annotations
-                    .compactMap({ $0 as? SpotlightAnnotation }).last,
-                      let host = panel.annotationHostForTesting else {
-                    textKeyFailures.append("panel:no-spotlight")
-                    return
+
+                func dependencies(
+                    _ spy: TextRouteSpy
+                ) -> CaptureActionRouter.Dependencies {
+                    CaptureActionRouter.Dependencies(
+                        copyToClipboard: { _ in spy.copies += 1 },
+                        autoSave: { _, _ in spy.autoSaves += 1 },
+                        saveAs: { _, _ in spy.saveAsCalls += 1 },
+                        pin: { _ in spy.pins += 1 },
+                        ocr: { _ in spy.ocrs += 1 },
+                        openEditor: { _ in spy.editors += 1 },
+                        toast: { _ in spy.toasts += 1 },
+                        setLastCapture: { _ in spy.lastCaptures += 1 },
+                        setLastAreaRect: { _ in spy.areaRects += 1 },
+                        logEvent: { _ in spy.logs += 1 })
                 }
-                // Text entry the way a user starts it: the tool, then a click.
-                panel.clickToolbarButtonForTesting(
-                    tag: OverlayAnnotationTool.text.toolbarTag)
-                panel.drawWithRealEventsForTesting(
-                    fromView: CGPoint(x: 120, y: 120),
-                    toView: CGPoint(x: 120, y: 120))
-                if !host.textEditingActive {
-                    textKeyFailures.append("panel:no-field")
+
+                @discardableResult
+                func sendKey(
+                    _ characters: String, keyCode: UInt16,
+                    through window: NSWindow, label: String
+                ) -> Bool {
+                    guard let event = NSEvent.keyEvent(
+                        with: .keyDown, location: .zero,
+                        modifierFlags: [], timestamp: 0,
+                        windowNumber: window.windowNumber, context: nil,
+                        characters: characters,
+                        charactersIgnoringModifiers: characters,
+                        isARepeat: false, keyCode: keyCode)
+                    else {
+                        textKeyFailures.append("\(label):event-nil")
+                        return false
+                    }
+                    guard event.windowNumber == window.windowNumber,
+                          event.keyCode == keyCode,
+                          event.characters == characters,
+                          event.charactersIgnoringModifiers == characters
+                    else {
+                        textKeyFailures.append("\(label):event-malformed")
+                        return false
+                    }
+                    window.sendEvent(event)
+                    return true
                 }
-                let panelDimBefore = panelSpot.dimFraction
-                let panelToolBefore = panelSurface.tool
-                if let event = digit("5") { panel.keyDown(with: event) }
-                if let event = digit("l") { panel.keyDown(with: event) }
-                if panelSpot.dimFraction != panelDimBefore
-                    || panelSurface.tool != panelToolBefore
-                    || panelSurface.annotations
-                        .compactMap({ $0 as? SpotlightAnnotation }).count != 1 {
-                    textKeyFailures.append(
-                        "panel:keys-leaked \(panelSpot.dimFraction)")
+
+                func sameAnnotations(
+                    _ lhs: [Annotation], _ rhs: [Annotation]
+                ) -> Bool {
+                    lhs.count == rhs.count
+                        && zip(lhs, rhs).allSatisfy { $0.0 === $0.1 }
                 }
-                host.commitActiveTextEntry()
-                panel.clickToolbarButtonForTesting(
-                    tag: OverlayAnnotationTool.spotlight.toolbarTag)
-                if let event = digit("5") { panel.keyDown(with: event) }
-                let panelAfter = panelSurface.annotations
-                    .compactMap { $0 as? SpotlightAnnotation }.last
-                if abs((panelAfter?.dimFraction ?? 0) - 0.5) > 0.0001 {
-                    textKeyFailures.append(
-                        "panel:control \(panelAfter?.dimFraction ?? -1)")
+
+                func strictEditor(
+                    field: NSTextField, editor: NSTextView,
+                    window: NSWindow
+                ) -> Bool {
+                    field.window === window
+                        && editor.isFieldEditor
+                        && window.firstResponder === editor
+                        && editor.delegate === field
+                        && field.currentEditor() === editor
+                        && window.fieldEditor(false, for: field) === editor
                 }
+
+                func runArea() {
+                    guard SelectionOverlay.current == nil else {
+                        textKeyFailures.append("area:dirty-current")
+                        return
+                    }
+                    let spy = TextRouteSpy()
+                    var completions = 0
+                    var cancelledCompletions = 0
+                    var retainedWindow: NSWindow?
+                    let frozen = CapturedImage(
+                        cgImage: makeSolidImage(
+                            width: max(
+                                8, Int(screen.frame.width.rounded(.up))),
+                            height: max(
+                                8, Int(screen.frame.height.rounded(.up))),
+                            color: NSColor.white.cgColor),
+                        scale: 1)
+                    guard let overlay = SelectionOverlay.beginForTesting(
+                        purpose: .areaReview,
+                        inputs: OverlaySessionInputs(
+                            afterShow: true, afterCopy: false,
+                            afterSave: false),
+                        frozen: frozen, screen: screen,
+                        dependencies: dependencies(spy),
+                        completion: { result in
+                            completions += 1
+                            if case .cancelled = result {
+                                cancelledCompletions += 1
+                            }
+                        })
+                    else {
+                        textKeyFailures.append("area:no-overlay")
+                        return
+                    }
+                    defer {
+                        overlay.dismissForTesting()
+                        let windowHidden = retainedWindow.map {
+                            !$0.isVisible
+                        } ?? false
+                        if completions != 1 || cancelledCompletions != 1
+                            || overlay.session.phase != .completed
+                            || SelectionOverlay.current != nil
+                            || !windowHidden {
+                            textKeyFailures.append(
+                                "area:cleanup completion=\(completions)/"
+                                + "\(cancelledCompletions) phase="
+                                + "\(overlay.session.phase) current="
+                                + "\(SelectionOverlay.current != nil) hidden="
+                                + "\(windowHidden)")
+                        }
+                    }
+                    guard let view = overlay.activeReviewViewForTesting,
+                          let window = view.window else {
+                        textKeyFailures.append("area:no-real-view")
+                        return
+                    }
+                    retainedWindow = window
+                    let selection = CGRect(
+                        x: 40, y: 40,
+                        width: min(320, max(120, view.bounds.width - 80)),
+                        height: min(240, max(100, view.bounds.height - 80)))
+                    view.selectForTesting(rect: selection)
+                    // Initial selection legitimately records initialCapture.
+                    // Everything below is measured from the reviewing state.
+                    spy.reset()
+                    guard overlay.activeReviewViewForTesting === view,
+                          overlay.session.phase == .reviewing,
+                          SelectionOverlay.current === overlay,
+                          window.contentView === view,
+                          window.isVisible,
+                          let surface = view.annotationSurface else {
+                        textKeyFailures.append("area:not-reviewing")
+                        return
+                    }
+                    var history = 0
+                    let productionHistory = surface.historyDidChange
+                    surface.historyDidChange = {
+                        history += 1
+                        productionHistory?()
+                    }
+
+                    // Seed through the real toolbar and real mouse handlers.
+                    view.clickReviewToolbarButtonForTesting(
+                        tag: OverlayAnnotationTool.spotlight.toolbarTag)
+                    let spotFrom = CGPoint(
+                        x: selection.minX + 30, y: selection.minY + 30)
+                    let spotTo = CGPoint(
+                        x: selection.maxX - 30, y: selection.maxY - 30)
+                    view.annotationDragForTesting(from: spotFrom, to: spotTo)
+                    guard surface.annotations.count == 1,
+                          let spot = surface.annotations.first
+                            as? SpotlightAnnotation else {
+                        textKeyFailures.append("area:no-spotlight")
+                        return
+                    }
+                    let spotDim = spot.dimFraction
+                    let spotRect = spot.rect
+                    let spotBase = spot.baseBounds
+                    let baselineAnnotations = surface.annotations
+                    let baselineHistory = history
+                    let baselineUndo = surface.canUndo
+                    let baselineRedo = surface.canRedo
+                    if baselineHistory != 2 || !baselineUndo || baselineRedo {
+                        textKeyFailures.append(
+                            "area:spot-premise history=\(baselineHistory) "
+                            + "undo=\(baselineUndo) redo=\(baselineRedo)")
+                    }
+
+                    view.clickReviewToolbarButtonForTesting(
+                        tag: OverlayAnnotationTool.text.toolbarTag)
+                    let textPoint = CGPoint(
+                        x: selection.midX, y: selection.midY)
+                    view.annotationDragForTesting(
+                        from: textPoint, to: textPoint)
+                    guard surface.tool == .text,
+                          let field = view.textFieldForTesting,
+                          let editor = field.currentEditor() as? NSTextView
+                    else {
+                        textKeyFailures.append("area:no-field-editor")
+                        return
+                    }
+                    if !strictEditor(
+                        field: field, editor: editor, window: window) {
+                        textKeyFailures.append("area:editor-identity")
+                    }
+
+                    func liveState(_ label: String, text: String) {
+                        let annotations = surface.annotations
+                        if view.textFieldForTesting !== field
+                            || field.currentEditor() !== editor
+                            || !strictEditor(
+                                field: field, editor: editor, window: window)
+                            || editor.string != text
+                            || !sameAnnotations(
+                                annotations, baselineAnnotations)
+                            || annotations.first !== spot
+                            || spot.dimFraction != spotDim
+                            || spot.rect != spotRect
+                            || spot.baseBounds != spotBase
+                            || surface.tool != .text
+                            || surface.canUndo != baselineUndo
+                            || surface.canRedo != baselineRedo
+                            || history != baselineHistory
+                            || spy.total != 0
+                            || overlay.session.phase != .reviewing
+                            || SelectionOverlay.current !== overlay
+                            || view.window !== window || !window.isVisible
+                            || completions != 0 {
+                            textKeyFailures.append(
+                                "area:\(label) text=\(editor.string) "
+                                + "history=\(history) deps=\(spy.detail)")
+                        }
+                    }
+
+                    liveState("field-premise", text: "")
+                    _ = sendKey(
+                        "5", keyCode: 23, through: window,
+                        label: "area:5")
+                    liveState("after-5", text: "5")
+                    _ = sendKey(
+                        "l", keyCode: 37, through: window,
+                        label: "area:l")
+                    liveState("after-l", text: "5l")
+
+                    _ = sendKey(
+                        "\r", keyCode: 36, through: window,
+                        label: "area:return")
+                    let afterReturn = surface.annotations
+                    let areaTexts = afterReturn.compactMap {
+                        $0 as? TextAnnotation
+                    }
+                    guard afterReturn.count == 2,
+                          afterReturn[0] === spot,
+                          areaTexts.count == 1,
+                          let text = areaTexts.first else {
+                        textKeyFailures.append(
+                            "area:return-document \(afterReturn.count)")
+                        return
+                    }
+                    if text.text != "5l"
+                        || afterReturn[1] !== text
+                        || view.textFieldForTesting != nil
+                        || field.currentEditor() != nil
+                        || window.firstResponder === editor
+                        || spot.dimFraction != spotDim
+                        || spot.rect != spotRect
+                        || spot.baseBounds != spotBase
+                        || surface.tool != .text
+                        || history != baselineHistory + 1
+                        || !surface.canUndo
+                        || surface.canRedo
+                        || spy.total != 0
+                        || overlay.session.phase != .reviewing
+                        || SelectionOverlay.current !== overlay
+                        || view.window !== window || !window.isVisible
+                        || completions != 0 {
+                        textKeyFailures.append(
+                            "area:return text=\(text.text) history="
+                            + "\(history) deps=\(spy.detail)")
+                    }
+
+                    let committed = surface.annotations
+                    let historyAfterReturn = history
+                    let undoAfterReturn = surface.canUndo
+                    let redoAfterReturn = surface.canRedo
+                    _ = sendKey(
+                        "o", keyCode: 31, through: window,
+                        label: "area:o")
+                    if surface.tool != .oval
+                        || !sameAnnotations(surface.annotations, committed)
+                        || surface.annotations[0] !== spot
+                        || surface.annotations[1] !== text
+                        || text.text != "5l"
+                        || spot.dimFraction != spotDim
+                        || spot.rect != spotRect
+                        || spot.baseBounds != spotBase
+                        || history != historyAfterReturn
+                        || surface.canUndo != undoAfterReturn
+                        || surface.canRedo != redoAfterReturn
+                        || spy.total != 0
+                        || view.textFieldForTesting != nil
+                        || window.firstResponder === editor
+                        || overlay.session.phase != .reviewing
+                        || SelectionOverlay.current !== overlay
+                        || view.window !== window || !window.isVisible
+                        || completions != 0 {
+                        textKeyFailures.append(
+                            "area:o tool=\(surface.tool) history=\(history) "
+                            + "deps=\(spy.detail)")
+                    }
+                }
+
+                func runPanel() {
+                    guard ScrollResultPanel.current == nil,
+                          SelectionOverlay.current == nil else {
+                        textKeyFailures.append(
+                            "panel:dirty-current panel="
+                            + "\(ScrollResultPanel.current != nil) overlay="
+                            + "\(SelectionOverlay.current != nil)")
+                        return
+                    }
+                    let spy = TextRouteSpy()
+                    let panel = ScrollResultPanel.show(
+                        image: CapturedImage(
+                            cgImage: makeSolidImage(
+                                width: 600, height: 400,
+                                color: NSColor.white.cgColor),
+                            scale: 1),
+                        inputs: OverlaySessionInputs(
+                            afterShow: true, afterCopy: false,
+                            afterSave: false),
+                        screen: screen, dependencies: dependencies(spy))
+                    defer {
+                        panel.dismissForTesting()
+                        if panel.isVisible
+                            || ScrollResultPanel.current != nil {
+                            textKeyFailures.append(
+                                "panel:cleanup current="
+                                + "\(ScrollResultPanel.current != nil) "
+                                + "visible=\(panel.isVisible)")
+                        }
+                    }
+                    guard let host = panel.annotationHostForTesting else {
+                        textKeyFailures.append("panel:no-host")
+                        return
+                    }
+                    spy.reset()
+                    let surface = panel.annotationSurface
+                    var history = 0
+                    let productionHistory = surface.historyDidChange
+                    surface.historyDidChange = {
+                        history += 1
+                        productionHistory?()
+                    }
+
+                    // Seed through the real toolbar and real mouse handlers.
+                    panel.clickToolbarButtonForTesting(
+                        tag: OverlayAnnotationTool.spotlight.toolbarTag)
+                    let spotFrom = CGPoint(
+                        x: host.bounds.midX - host.bounds.width * 0.2,
+                        y: host.bounds.midY - host.bounds.height * 0.2)
+                    let spotTo = CGPoint(
+                        x: host.bounds.midX + host.bounds.width * 0.2,
+                        y: host.bounds.midY + host.bounds.height * 0.2)
+                    panel.drawWithRealEventsForTesting(
+                        fromView: spotFrom, toView: spotTo)
+                    guard surface.annotations.count == 1,
+                          let spot = surface.annotations.first
+                            as? SpotlightAnnotation else {
+                        textKeyFailures.append("panel:no-spotlight")
+                        return
+                    }
+                    let spotDim = spot.dimFraction
+                    let spotRect = spot.rect
+                    let spotBase = spot.baseBounds
+                    let baselineAnnotations = surface.annotations
+                    let baselineHistory = history
+                    let baselineUndo = surface.canUndo
+                    let baselineRedo = surface.canRedo
+                    if baselineHistory != 2 || !baselineUndo || baselineRedo {
+                        textKeyFailures.append(
+                            "panel:spot-premise history=\(baselineHistory) "
+                            + "undo=\(baselineUndo) redo=\(baselineRedo)")
+                    }
+
+                    panel.clickToolbarButtonForTesting(
+                        tag: OverlayAnnotationTool.text.toolbarTag)
+                    let textPoint = CGPoint(
+                        x: host.bounds.midX, y: host.bounds.midY)
+                    panel.drawWithRealEventsForTesting(
+                        fromView: textPoint, toView: textPoint)
+                    guard surface.tool == .text,
+                          host.textEditingActive,
+                          let field = host.textFieldForTesting,
+                          let editor = field.currentEditor() as? NSTextView
+                    else {
+                        textKeyFailures.append("panel:no-field-editor")
+                        return
+                    }
+                    if !strictEditor(
+                        field: field, editor: editor, window: panel) {
+                        textKeyFailures.append("panel:editor-identity")
+                    }
+
+                    func liveState(_ label: String, text: String) {
+                        let annotations = surface.annotations
+                        if panel.annotationHostForTesting !== host
+                            || host.textFieldForTesting !== field
+                            || field.currentEditor() !== editor
+                            || !host.textEditingActive
+                            || !strictEditor(
+                                field: field, editor: editor, window: panel)
+                            || editor.string != text
+                            || !sameAnnotations(
+                                annotations, baselineAnnotations)
+                            || annotations.first !== spot
+                            || spot.dimFraction != spotDim
+                            || spot.rect != spotRect
+                            || spot.baseBounds != spotBase
+                            || surface.tool != .text
+                            || surface.canUndo != baselineUndo
+                            || surface.canRedo != baselineRedo
+                            || history != baselineHistory
+                            || spy.total != 0
+                            || ScrollResultPanel.current !== panel
+                            || !panel.isVisible || host.window !== panel
+                            || host.isLocked() {
+                            textKeyFailures.append(
+                                "panel:\(label) text=\(editor.string) "
+                                + "history=\(history) deps=\(spy.detail)")
+                        }
+                    }
+
+                    liveState("field-premise", text: "")
+                    _ = sendKey(
+                        "5", keyCode: 23, through: panel,
+                        label: "panel:5")
+                    liveState("after-5", text: "5")
+                    _ = sendKey(
+                        "l", keyCode: 37, through: panel,
+                        label: "panel:l")
+                    liveState("after-l", text: "5l")
+
+                    _ = sendKey(
+                        "\r", keyCode: 36, through: panel,
+                        label: "panel:return")
+                    let afterReturn = surface.annotations
+                    let panelTexts = afterReturn.compactMap {
+                        $0 as? TextAnnotation
+                    }
+                    guard afterReturn.count == 2,
+                          afterReturn[0] === spot,
+                          panelTexts.count == 1,
+                          let text = panelTexts.first else {
+                        textKeyFailures.append(
+                            "panel:return-document \(afterReturn.count)")
+                        return
+                    }
+                    if text.text != "5l"
+                        || afterReturn[1] !== text
+                        || host.textFieldForTesting != nil
+                        || host.textEditingActive
+                        || field.currentEditor() != nil
+                        || panel.firstResponder === editor
+                        || spot.dimFraction != spotDim
+                        || spot.rect != spotRect
+                        || spot.baseBounds != spotBase
+                        || surface.tool != .text
+                        || history != baselineHistory + 1
+                        || !surface.canUndo
+                        || surface.canRedo
+                        || spy.total != 0
+                        || ScrollResultPanel.current !== panel
+                        || !panel.isVisible || host.window !== panel
+                        || host.isLocked() {
+                        textKeyFailures.append(
+                            "panel:return text=\(text.text) history="
+                            + "\(history) deps=\(spy.detail)")
+                    }
+
+                    let committed = surface.annotations
+                    let historyAfterReturn = history
+                    let undoAfterReturn = surface.canUndo
+                    let redoAfterReturn = surface.canRedo
+                    _ = sendKey(
+                        "o", keyCode: 31, through: panel,
+                        label: "panel:o")
+                    if surface.tool != .oval
+                        || !sameAnnotations(surface.annotations, committed)
+                        || surface.annotations[0] !== spot
+                        || surface.annotations[1] !== text
+                        || text.text != "5l"
+                        || spot.dimFraction != spotDim
+                        || spot.rect != spotRect
+                        || spot.baseBounds != spotBase
+                        || history != historyAfterReturn
+                        || surface.canUndo != undoAfterReturn
+                        || surface.canRedo != redoAfterReturn
+                        || spy.total != 0
+                        || host.textFieldForTesting != nil
+                        || panel.firstResponder === editor
+                        || ScrollResultPanel.current !== panel
+                        || !panel.isVisible || host.window !== panel
+                        || host.isLocked() {
+                        textKeyFailures.append(
+                            "panel:o tool=\(surface.tool) history=\(history) "
+                            + "deps=\(spy.detail)")
+                    }
+                }
+
+                runArea()
+                runPanel()
             }
             runTextKeys()
             check("sliceB-text-field-owns-keys",
