@@ -304,6 +304,37 @@ final class SpotlightAnnotation: Annotation {
     }
 }
 
+/// The document's backdrop preset, carried as an annotation.
+///
+/// The frame is not a mark — it draws nothing here and covers no pixels — but
+/// choosing one IS an edit, and the overlay's history is a single array of
+/// annotations. Modelling the preset as an entry in that array is what makes
+/// mark → preset → mark undo in exactly that order: a parallel stack could
+/// record the presets but not where they sat between the marks. The editor
+/// keeps its own snapshot-based undo and does not use this.
+final class BackdropAnnotation: Annotation {
+    let preset: BackdropPreset
+
+    init(preset: BackdropPreset, uiScale: CGFloat) {
+        self.preset = preset
+        super.init(uiScale: uiScale)
+    }
+
+    /// Nothing to hit and nothing to move: Select must never pick this up, and
+    /// a crop must not translate it.
+    override var bounds: CGRect { .null }
+    override func hitTest(_ p: CGPoint) -> Bool { false }
+    override func move(by delta: CGPoint) {}
+    override func translateForDocumentChange(by delta: CGPoint) {}
+    override func scaleCoordinates(by factor: CGFloat) {}
+    /// The frame is composed around the finished raster, not drawn into it.
+    override func draw(in ctx: CGContext, pixellated: CGImage?) {}
+
+    override func copyAnnotation() -> Annotation {
+        BackdropAnnotation(preset: preset, uiScale: uiScale)
+    }
+}
+
 /// Callout that magnifies a cluster of pixels. The snapshot is taken from the
 /// SANITIZED layer (after redactions) and materialized, so dragging the
 /// callout can never re-expose pixels a redaction covered.

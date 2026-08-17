@@ -541,6 +541,15 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
             toolContainer.addSubview(button)
             toolButtons.append(button)
         }
+        // A document style, so it opens the preset menu instead of entering a
+        // drawing mode — the same shape the editor's Backdrop button has. It
+        // sits with the tools, next to the magnifier, not with the pickers.
+        let backdropButton = makeReviewToolbarButton(
+            symbol: "photo.artframe", tooltip: "Backdrop (D)",
+            tag: OverlayAnnotationTool.backdropToolbarTag,
+            tint: backdropTint)
+        toolContainer.addSubview(backdropButton)
+        toolButtons.append(backdropButton)
         let colorButton = makeReviewToolbarButton(
             symbol: "circle.fill", tooltip: "Color",
             tag: OverlayAnnotationTool.colorToolbarTag,
@@ -662,11 +671,111 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
         if tool != .text { endTextEntry(commit: true) }
     }
 
+    // MARK: Backdrop
+
+    private var backdropPreset: BackdropPreset {
+        annotationSurface?.backdropPreset ?? .none
+    }
+    private var backdropTint: NSColor {
+        backdropPreset == .none ? .white : .controlAccentColor
+    }
+
+    /// Built separately from being shown: `popUp` runs a nested event loop, so
+    /// a headless gate can exercise the real items, targets and actions only
+    /// if construction stands on its own. Mirrors the editor's chooser.
+    func backdropMenu() -> NSMenu {
+        let menu = NSMenu(title: "Backdrop")
+        for (index, preset) in BackdropPreset.allCases.enumerated() {
+            let item = NSMenuItem(
+                title: preset == .none ? "None" : preset.rawValue.capitalized,
+                action: #selector(backdropPresetChosen(_:)), keyEquivalent: "")
+            item.target = self
+            item.tag = index
+            item.state = preset == backdropPreset ? .on : .off
+            menu.addItem(item)
+        }
+        return menu
+    }
+
+    private(set) var backdropMenuForTesting: NSMenu?
+
+    private func showBackdropMenu(from sender: NSButton) {
+        // popUp runs a nested event loop: a hint still up would sit under the
+        // menu until that loop exits. Opening changes nothing else; only
+        // choosing an item applies a preset.
+        hoverHint.hide()
+        let menu = backdropMenu()
+        backdropMenuForTesting = menu
+        menu.popUp(
+            positioning: nil,
+            at: NSPoint(x: 0, y: sender.bounds.height), in: sender)
+    }
+
+    /// Sender is an NSMenuItem, so the preset travels as an Int tag: a Swift
+    /// enum is not representable in Objective-C.
+    @objc private func backdropPresetChosen(_ sender: NSMenuItem) {
+        let presets = BackdropPreset.allCases
+        guard presets.indices.contains(sender.tag) else { return }
+        applyBackdropPreset(presets[sender.tag])
+    }
+
+    @discardableResult
+    func applyBackdropPreset(_ preset: BackdropPreset) -> Bool {
+        guard owner?.session.phase == .reviewing, let surface = annotationSurface
+        else { return false }
+        // The same rule every other mutating route follows.
+        guard !annotationDragging, areaDrag == nil else { return false }
+        // Judge the PEAK — inner and outer alive at once — on the FULL frozen
+        // image, not the current crop: the user can enlarge the selection
+        // afterwards, and a preset that becomes unaffordable when they do
+        // would fail at the terminal action instead of here.
+        guard preset == .none || backdropPeakFits(preset) else {
+            ToastHUD.show(
+                "Vùng chọn quá lớn cho Backdrop",
+                symbol: "exclamationmark.triangle.fill",
+                on: window?.screen ?? screen, above: window?.level)
+            return false
+        }
+        guard surface.applyBackdrop(preset) else { return false }
+        refreshBackdropButton()
+        needsDisplay = true
+        return true
+    }
+
+    /// Mirrors the editor's peak arithmetic exactly: reserve what the outer
+    /// frame will need, then ask whether the inner render still fits in what
+    /// is left. Both buffers are alive during a compose.
+    private func backdropPeakFits(_ preset: BackdropPreset) -> Bool {
+        guard let frozen else { return false }
+        let width = frozen.cgImage.width
+        let height = frozen.cgImage.height
+        let reserve = SliceBBackdrop.reservedBytes(
+            forInnerWidth: width, height: height, preset: preset,
+            pixelScale: frozen.scale)
+        guard let innerBudget = SliceBExport.budget(
+            SliceBExport.defaultBudgetBytes, minus: reserve),
+            let innerBytes = SliceBExport.byteCount(
+                width: width, height: height)
+        else { return false }
+        return innerBytes <= innerBudget
+    }
+
+    private func refreshBackdropButton() {
+        for button in toolbarButtons
+        where button.tag == OverlayAnnotationTool.backdropToolbarTag {
+            button.contentTintColor = backdropTint
+        }
+    }
+
     private func performHistoryAction(redo: Bool) {
         guard owner?.session.phase == .reviewing,
               let surface = annotationSurface else { return }
         let changed = redo ? surface.redo() : surface.undo()
-        if changed { needsDisplay = true }
+        if changed {
+            // Undo/redo can move the preset — it lives in the same timeline.
+            refreshBackdropButton()
+            needsDisplay = true
+        }
     }
 
     @objc private func reviewToolbarButtonPressed(_ sender: NSButton) {
@@ -699,6 +808,10 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
             performHistoryAction(redo: true)
             return
         }
+        if sender.tag == OverlayAnnotationTool.backdropToolbarTag {
+            showBackdropMenu(from: sender)
+            return
+        }
         guard sender.tag >= 0,
               sender.tag < OverlayActionCatalog.items.count else { return }
         performReviewAction(OverlayActionCatalog.items[sender.tag].intent)
@@ -716,25 +829,41 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
               selection.width >= 4, selection.height >= 4,
               frozen != nil
         else { return }
-        // A terminal click must never race the in-flight text entry: commit
-        // the active field BEFORE the snapshot/phase change, or the typed
-        // text silently misses the export (no Return required first).
-        endTextEntry(commit: true)
+        // A terminal click must never race the in-flight text entry: the typed
+        // text has to reach the export without the user pressing Return first.
+        // It is rendered as a PROSPECTIVE annotation rather than committed
+        // here, because a compose that fails afterwards must leave the field
+        // exactly as the user left it — committing first would add the text
+        // and fork the redo branch for an action that never ran.
+        let prospectiveText = prospectiveTextAnnotation()
         syncSessionPixelRect()
-        guard let snapshot = snapshotFromSessionPixelRect() else {
+        guard let payload = reviewPayload(prospectiveText: prospectiveText)
+        else {
             // fail-closed like the panel: keep review + drawings, tell the
-            // user, run NO action
+            // user, run NO action. Nothing above this line mutated anything.
+            let message = lastPayloadFailure == .backdrop
+                ? "Không dựng được nền Backdrop — thử preset khác"
+                : "Không xuất được ảnh có nét vẽ — thử lại"
             if let toast = owner.routerDependenciesOverride?.toast {
-                toast("Không xuất được ảnh có nét vẽ — thử lại")
+                toast(message)
             } else {
                 // the overlay is live at .screenSaver on THIS screen — a
                 // default .statusBar toast would be invisible behind it
                 ToastHUD.show(
-                    "Không xuất được ảnh có nét vẽ — thử lại",
-                    on: window?.screen ?? screen, above: window?.level)
+                    message, on: window?.screen ?? screen, above: window?.level)
             }
             return
         }
+        // BOTH payloads exist: only now does the document change.
+        endTextEntry(commit: true)
+        // OCR and Translate read the DOCUMENT: a decorative frame adds no text
+        // and would shift every recognized box off the source. Everything that
+        // produces a picture gets the composed one.
+        let decorated = Self.usesDecoration(intent)
+        let snapshot = decorated ? payload.visual : payload.semantic
+        // OCR/Translate consume the crop but the app still remembers the
+        // framed picture, so Repeat/pin/editor pick up what the user saw.
+        let lastCaptureOverride = decorated ? nil : payload.visual
         let global = globalRect(for: selection)
         let inputs = owner.session.inputs
 
@@ -783,7 +912,8 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
             CaptureActionRouter.commit(
                 snapshot, source: .areaReview, intent: intent,
                 inputs: inputs, finalGlobalRect: global,
-                dependencies: baseDependencies)
+                dependencies: baseDependencies,
+                lastCaptureOverride: lastCaptureOverride)
         case .initialCapture, .scrollFinished:
             break
         }
@@ -827,11 +957,23 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
             ctx.fill(bounds)
         }
 
+        // The frame goes down BEFORE the marks and BEFORE anything reads the
+        // frozen background: it paints over the raw screen inside the crop as
+        // well as around it, and the crop is then redrawn through the rounded
+        // clip. Drawing only the surround would leave the four corner cutouts
+        // showing raw pixels the export has replaced with gradient.
+        let backdropClip = drawBackdropPreview(in: ctx)
+
         if let surface = annotationSurface, !surface.isEmpty,
            let sel = areaSelection, let frozen {
             let scale = frozen.scale
             ctx.saveGState()
-            ctx.clip(to: sel)
+            if let backdropClip {
+                ctx.addPath(backdropClip)
+                ctx.clip()
+            } else {
+                ctx.clip(to: sel)
+            }
             ctx.scaleBy(x: 1 / scale, y: 1 / scale)
             surface.drawForPreview(in: ctx, base: frozen.cgImage)
             ctx.restoreGState()
@@ -865,6 +1007,72 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
                 drawBubble(text: title, at: CGPoint(x: hover.midX, y: hover.maxY - 28), centered: true)
             }
         }
+    }
+
+    /// Draws the framed document the export will produce, in view points,
+    /// and returns the rounded path the crop's own content must be clipped to.
+    /// Returns nil when there is no frame, so callers keep their square clip.
+    ///
+    /// Geometry comes from `BackdropLayout` — the same type the editor,
+    /// the fit, the size badge and the export read — so what the user reviews
+    /// here cannot drift from what compose emits.
+    @discardableResult
+    private func drawBackdropPreview(in ctx: CGContext) -> CGPath? {
+        guard isReviewing, backdropPreset != .none,
+              let sel = areaSelection, let frozen else { return nil }
+        let scale = frozen.scale
+        let layout = BackdropLayout(
+            innerPixels: CGSize(
+                width: sel.width * scale, height: sel.height * scale),
+            pixelScale: scale, preset: backdropPreset)
+        guard !layout.isCollapsed else { return nil }
+        let pad = layout.padPoints
+        let outer = sel.insetBy(dx: -pad, dy: -pad)
+        let radius = SliceBBackdrop.cornerRadiusPt
+        let rounded = CGPath(
+            roundedRect: sel, cornerWidth: radius, cornerHeight: radius,
+            transform: nil)
+
+        ctx.saveGState()
+        // Confined to the frame's own rect: drawFrame fills the whole context
+        // it is handed, which here is the entire screen.
+        ctx.clip(to: outer)
+        ctx.translateBy(x: outer.minX, y: outer.minY)
+        // POINTS, so pixelScale is 1: the radius and shadow are point metrics
+        // and compose applies the document scale to the same numbers.
+        SliceBBackdrop.drawFrame(
+            in: ctx, size: outer.size,
+            target: CGRect(
+                origin: CGPoint(x: pad, y: pad), size: sel.size),
+            preset: backdropPreset, pixelScale: 1)
+        ctx.restoreGState()
+
+        // The frame just covered the crop as well; put the document back
+        // through the same rounded clip the composed image uses.
+        ctx.saveGState()
+        ctx.addPath(rounded)
+        ctx.clip()
+        ctx.draw(
+            frozen.cgImage,
+            in: CGRect(origin: .zero, size: CGSize(
+                width: CGFloat(frozen.cgImage.width) / scale,
+                height: CGFloat(frozen.cgImage.height) / scale)))
+        ctx.restoreGState()
+        return rounded
+    }
+
+    /// Gate visibility: the exact outer rect the preview draws, in view
+    /// points, so a gate can prove preview and export agree on geometry.
+    var backdropPreviewOuterRectForTesting: CGRect? {
+        guard backdropPreset != .none, let sel = areaSelection, let frozen
+        else { return nil }
+        let layout = BackdropLayout(
+            innerPixels: CGSize(
+                width: sel.width * frozen.scale,
+                height: sel.height * frozen.scale),
+            pixelScale: frozen.scale, preset: backdropPreset)
+        guard !layout.isCollapsed else { return nil }
+        return sel.insetBy(dx: -layout.padPoints, dy: -layout.padPoints)
     }
 
     private func drawSelectionHandles(for rect: CGRect, in ctx: CGContext) {
@@ -1240,6 +1448,16 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
             annotationSurface?.setSpotlightDim(CGFloat(digit) / 10)
             return
         }
+        // D opens the preset chooser, exactly as the button does — the hint
+        // advertises the key, so it has to work.
+        if owner?.session.phase == .reviewing, flags.isEmpty,
+           event.charactersIgnoringModifiers?.lowercased() == "d",
+           let button = toolbarButtons.first(where: {
+               $0.tag == OverlayAnnotationTool.backdropToolbarTag
+           }) {
+            showBackdropMenu(from: button)
+            return
+        }
         if owner?.session.phase == .reviewing,
            flags.isEmpty,
            let key = event.charactersIgnoringModifiers,
@@ -1399,6 +1617,19 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
         }
         endTextEntry(commit: true)
     }
+    /// Types into the LIVE field without ending the entry, so a gate can run
+    /// a terminal action while the text is still uncommitted — which is the
+    /// state the prospective-render path exists for.
+    func typeTextForTesting(_ text: String) {
+        if let editor = textField?.currentEditor() as? NSTextView {
+            editor.insertText(
+                text,
+                replacementRange: NSRange(
+                    location: 0, length: (editor.string as NSString).length))
+        } else {
+            textField?.stringValue = text
+        }
+    }
     var textFieldForTesting: NSTextField? { textField }
 
     private lazy var textFieldDelegate = OverlayTextFieldDelegate(
@@ -1506,22 +1737,113 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
         return window?.firstResponder === field
     }
 
+    /// What a terminal action needs: the SAME freeze in both readings.
+    ///
+    /// `semantic` is the crop the user selected, undecorated — what OCR and
+    /// Translate must read and what `lastAreaRect` describes. `visual` is that
+    /// crop inside its frame — what Copy, Save, Pin, the editor and
+    /// `lastCapture` receive. With no backdrop the two are the same image, so
+    /// nothing is composed and nothing extra is allocated.
+    struct ReviewPayload {
+        let visual: CapturedImage
+        let semantic: CapturedImage
+    }
+
+    /// Which reading an intent takes. Anything that produces a picture is
+    /// decorated; the two text intents are not.
+    static func usesDecoration(_ intent: CaptureIntent) -> Bool {
+        switch intent {
+        case .ocr, .translate: return false
+        default: return true
+        }
+    }
+
+    enum PayloadFailure {
+        case render
+        case backdrop
+    }
+    /// Why the last payload attempt failed, so the toast can name the frame
+    /// rather than blame the drawings.
+    private(set) var lastPayloadFailure: PayloadFailure = .render
+
+    /// The text still being typed, rendered as if it had been committed. Must
+    /// mirror `AnnotationSurface.addText` exactly, or the export would differ
+    /// from the mark the commit afterwards actually adds.
+    private func prospectiveTextAnnotation() -> TextAnnotation? {
+        guard let field = textField, let surface = annotationSurface,
+              owner?.session.phase == .reviewing else { return nil }
+        let value = field.stringValue
+        guard !value.isEmpty else { return nil }
+        let annotation = TextAnnotation(uiScale: surface.pixelScale)
+        annotation.text = value
+        annotation.origin = textFieldPixelOrigin
+        annotation.color = surface.color
+        return annotation
+    }
+
     /// THE single pixel-crop authority: every snapshot (initial, manual
     /// action, and slice-4 annotation flatten) crops the frozen image by the
     /// session's integral pixelRect — the view rect is quantized exactly
     /// once, in syncSessionPixelRect.
-    fileprivate func snapshotFromSessionPixelRect() -> CapturedImage? {
+    fileprivate func reviewPayload(
+        prospectiveText: TextAnnotation? = nil
+    ) -> ReviewPayload? {
+        lastPayloadFailure = .render
         guard let owner, let frozen else { return nil }
         let px = owner.session.pixelRect
         guard px.width >= 1, px.height >= 1 else { return nil }
-        if let surface = annotationSurface, !surface.isEmpty {
-            guard let flat = surface.flattened(
-                base: frozen.cgImage, cropPixels: px) else { return nil }
-            return CapturedImage(cgImage: flat, scale: frozen.scale)
+        let preset = backdropPreset
+        // Reserve what the FRAME will need before rendering the crop, and
+        // render the crop inside what is left: both buffers are alive during
+        // the compose, so the peak is inner + outer, not whichever is larger.
+        // Same arithmetic as the editor's flatten.
+        let reserve = SliceBBackdrop.reservedBytes(
+            forInnerWidth: Int(px.width), height: Int(px.height),
+            preset: preset, pixelScale: frozen.scale)
+        guard let innerBudget = SliceBExport.budget(
+            SliceBExport.defaultBudgetBytes, minus: reserve),
+            let innerBytes = SliceBExport.byteCount(
+                width: Int(px.width), height: Int(px.height)),
+            innerBytes <= innerBudget
+        else {
+            lastPayloadFailure = .backdrop
+            return nil
         }
-        guard let cropped = frozen.cgImage.cropping(to: px)?.materialized()
-        else { return nil }
-        return CapturedImage(cgImage: cropped, scale: frozen.scale)
+
+        let extra: [Annotation] = prospectiveText.map { [$0] } ?? []
+        let inner: CGImage
+        if let surface = annotationSurface,
+           !surface.isEmpty || !extra.isEmpty {
+            guard let flat = surface.flattened(
+                base: frozen.cgImage, cropPixels: px, extra: extra)
+            else { return nil }
+            inner = flat
+        } else {
+            guard let cropped = frozen.cgImage.cropping(to: px)?.materialized()
+            else { return nil }
+            inner = cropped
+        }
+        let semantic = CapturedImage(cgImage: inner, scale: frozen.scale)
+        guard preset != .none else {
+            return ReviewPayload(visual: semantic, semantic: semantic)
+        }
+        guard let composed = SliceBBackdrop.compose(
+            image: inner, preset: preset,
+            budgetBytes: SliceBExport.defaultBudgetBytes,
+            pixelScale: frozen.scale)
+        else {
+            lastPayloadFailure = .backdrop
+            return nil
+        }
+        return ReviewPayload(
+            visual: CapturedImage(cgImage: composed, scale: frozen.scale),
+            semantic: semantic)
+    }
+
+    /// The undecorated crop, for the routes that predate the frame (the
+    /// initial capture runs before review begins, so no preset can exist yet).
+    fileprivate func snapshotFromSessionPixelRect() -> CapturedImage? {
+        reviewPayload()?.semantic
     }
 
     /// Pixel contract: the session always holds the image-local INTEGRAL

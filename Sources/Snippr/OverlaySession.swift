@@ -313,10 +313,16 @@ struct CaptureActionRouter {
         inputs: OverlaySessionInputs,
         finalGlobalRect: CGRect?,
         dependencies: Dependencies? = nil,
+        lastCaptureOverride: CapturedImage? = nil,
         resolution: (@MainActor (CaptureCommitOutcome) -> Void)? = nil
     ) -> CaptureCommitOutcome {
         let deps = dependencies ?? .live
         let areaRect: CGRect? = source == .areaReview ? finalGlobalRect : nil
+        // What the app REMEMBERS can differ from what the effect consumes:
+        // OCR and Translate must read the undecorated crop, but the last
+        // capture is the picture the user saw, frame and all. Everything else
+        // passes one image and remembers exactly it.
+        let remembered = lastCaptureOverride ?? snapshot
 
         func recordAreaRect() {
             if let areaRect { deps.setLastAreaRect(areaRect) }
@@ -324,7 +330,7 @@ struct CaptureActionRouter {
 
         func runInitialAutoActions(recordRectOnComplete: Bool) -> CaptureCommitOutcome {
             let reviewing = presentsReview(source: source, inputs: inputs)
-            deps.setLastCapture(snapshot)
+            deps.setLastCapture(remembered)
             deps.logEvent(
                 "capture source=\(source) px=\(snapshot.cgImage.width)x\(snapshot.cgImage.height)")
             let copied = inputs.afterCopy
@@ -370,7 +376,7 @@ struct CaptureActionRouter {
             return runInitialAutoActions(recordRectOnComplete: false)
 
         case .copy:
-            deps.setLastCapture(snapshot)
+            deps.setLastCapture(remembered)
             deps.copyToClipboard(snapshot)
             deps.toast("Screenshot copied")
             recordAreaRect()
@@ -388,7 +394,7 @@ struct CaptureActionRouter {
                 resolved = true
                 switch outcome {
                 case let .saved(url):
-                    deps.setLastCapture(snapshot)
+                    deps.setLastCapture(remembered)
                     deps.toast("Saved \(url.lastPathComponent)")
                     recordAreaRect()
                     resolution?(.completed)
@@ -404,19 +410,19 @@ struct CaptureActionRouter {
             return .saving
 
         case .pin:
-            deps.setLastCapture(snapshot)
+            deps.setLastCapture(remembered)
             deps.pin(snapshot)
             recordAreaRect()
             return .completed
 
         case .ocr, .translate:
-            deps.setLastCapture(snapshot)
+            deps.setLastCapture(remembered)
             deps.ocr(snapshot, intent == .translate)
             recordAreaRect()
             return .completed
 
         case .openEditor:
-            deps.setLastCapture(snapshot)
+            deps.setLastCapture(remembered)
             deps.openEditor(snapshot)
             recordAreaRect()
             return .completed

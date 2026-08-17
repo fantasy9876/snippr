@@ -73,10 +73,18 @@ final class HoverHint: NSResponder {
     fileprivate static let horizontalPadding: CGFloat = 8
     fileprivate static let verticalPadding: CGFloat = 5
 
+    /// The smallest region a hint can legibly occupy. Below this the host is
+    /// so far off-screen that showing one is worse than staying quiet.
+    static let minimumWidth: CGFloat = 60
+    static let minimumHeight: CGFloat = 24
+
     /// Measures the wrapped sentence. `intrinsicContentSize` reports a single
     /// unwrapped line, which is what made a long hint wider than its host.
+    /// Bounded on BOTH axes: a region 31pt tall cannot hold a three-line hint,
+    /// and clamping such a hint would push its origin back outside the region.
     private static func size(
-        for label: NSTextField, text: String, maxWidth: CGFloat
+        for label: NSTextField, text: String, maxWidth: CGFloat,
+        maxHeight: CGFloat
     ) -> CGSize {
         let inner = max(20, maxWidth - horizontalPadding * 2)
         label.preferredMaxLayoutWidth = inner
@@ -86,7 +94,9 @@ final class HoverHint: NSResponder {
             attributes: [.font: label.font ?? NSFont.systemFont(ofSize: 11)])
         return CGSize(
             width: min(maxWidth, ceil(bounding.width) + horizontalPadding * 2),
-            height: max(22, ceil(bounding.height) + verticalPadding * 2))
+            height: min(
+                maxHeight,
+                max(22, ceil(bounding.height) + verticalPadding * 2)))
     }
 
     private let hint = HintView()
@@ -240,15 +250,24 @@ final class HoverHint: NSResponder {
             let visible = content.convert(
                 window.convertFromScreen(screen.visibleFrame), from: nil)
             let clipped = allowed.intersection(visible)
-            // Only when the intersection still leaves somewhere to draw: a
-            // headless or off-screen window must not shrink it to nothing.
-            if !clipped.isNull, clipped.width > 40, clipped.height > 30 {
-                allowed = clipped
-            }
+            // A window dragged mostly off-screen leaves too little room for a
+            // legible hint. Show NOTHING then: falling back to the full
+            // content view would place the hint where the user cannot see it,
+            // which is worse than no hint at all.
+            guard !clipped.isNull,
+                  clipped.width >= Self.minimumWidth,
+                  clipped.height >= Self.minimumHeight
+            else { return }
+            allowed = clipped
         }
         hint.frame.size = Self.size(
-            for: hint.label, text: text, maxWidth: min(
-                Self.maxWidth, max(40, allowed.width)))
+            for: hint.label, text: text,
+            maxWidth: min(Self.maxWidth, allowed.width),
+            maxHeight: allowed.height)
+        // Capped by both axes above, so this only rejects a region that was
+        // never usable — never a hint that could have fitted.
+        guard hint.frame.width <= allowed.width,
+              hint.frame.height <= allowed.height else { return }
         content.addSubview(hint, positioned: .above, relativeTo: nil)
         let anchor = button.convert(button.bounds, to: content)
         var origin = CGPoint(

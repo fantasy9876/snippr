@@ -41,6 +41,10 @@ enum OverlayAnnotationTool: String, CaseIterable {
     static let colorToolbarTag = 200
     static let undoToolbarTag = 201
     static let redoToolbarTag = 202
+    /// Backdrop is a document STYLE, not a drawing tool: it gets a toolbar tag
+    /// but deliberately no case in this enum, so choosing it never displaces
+    /// the active tool and never becomes a drag.
+    static let backdropToolbarTag = 203
 
     var toolbarTag: Int {
         Self.toolbarTagBase + Self.allCases.firstIndex(of: self)!
@@ -657,6 +661,25 @@ final class AnnotationSurface: RedactionHost, RedactionJobObserver {
     /// image, not just the selection or the view.
     var redactionBaseBounds: CGRect = .zero
 
+    /// The frame the document currently wears: the LAST preset chosen, read
+    /// straight out of history so undo and redo need no separate bookkeeping.
+    var backdropPreset: BackdropPreset {
+        annotations.compactMap { ($0 as? BackdropAnnotation)?.preset }.last
+            ?? .none
+    }
+
+    /// Choosing a preset is an edit and joins the same timeline as the marks.
+    /// Choosing the one already on is not an edit and must not touch history.
+    /// Returns false when nothing changed.
+    @discardableResult
+    func applyBackdrop(_ preset: BackdropPreset) -> Bool {
+        guard !isDragging else { return false }
+        guard preset != backdropPreset else { return false }
+        appendNewAnnotation(BackdropAnnotation(
+            preset: preset, uiScale: pixelScale))
+        return true
+    }
+
     /// The image the surface samples from. Hosts set it beside
     /// `redactionBaseBounds`: a magnifier patch is sanitized ONCE, when the
     /// callout is made, so every later change to the redaction set has to
@@ -901,13 +924,14 @@ final class AnnotationSurface: RedactionHost, RedactionJobObserver {
     /// Shared preview/export renderer. Pixelation asks Core Image only for
     /// the intersecting region; it never materializes a second full stitch.
     private func drawAnnotations(
-        in ctx: CGContext, base: CGImage, visiblePixels: CGRect
+        in ctx: CGContext, base: CGImage, visiblePixels: CGRect,
+        extra: [Annotation] = []
     ) -> Bool {
         // One renderer for every surface: phases, regional pixelation and the
         // opaque fail-closed cover all live in SliceBCompositor.
         return SliceBCompositor.draw(
-            annotations, in: ctx, base: base, visiblePixels: visiblePixels,
-            pixelScale: pixelScale)
+            annotations + extra, in: ctx, base: base,
+            visiblePixels: visiblePixels, pixelScale: pixelScale)
     }
 
     /// Allocation spy for the export path: exactly ONE full-size destination
@@ -956,10 +980,16 @@ final class AnnotationSurface: RedactionHost, RedactionJobObserver {
     /// FAIL-CLOSED: with annotations present, an allocation/render failure
     /// returns nil. Callers must keep their surface open and tell the user —
     /// silently exporting the un-annotated image would lose their drawings.
-    func flattened(base: CGImage, cropPixels: CGRect) -> CGImage? {
+    /// `extra` renders as if it were appended to the document WITHOUT being
+    /// appended: a terminal action flattens the text still being typed before
+    /// deciding whether the export succeeded, so a failure leaves the field
+    /// exactly as the user left it.
+    func flattened(
+        base: CGImage, cropPixels: CGRect, extra: [Annotation] = []
+    ) -> CGImage? {
         let crop = cropPixels.integral
         guard crop.width >= 1, crop.height >= 1 else { return nil }
-        guard !annotations.isEmpty else {
+        guard !annotations.isEmpty || !extra.isEmpty else {
             // no drawings: a plain (shared-storage) crop materialized once
             return base.cropping(to: crop)?.materialized()
         }
@@ -989,7 +1019,7 @@ final class AnnotationSurface: RedactionHost, RedactionJobObserver {
         RenderTrace.record(
             kind: "destination", destination: "\(width)x\(height)", rect: crop)
         guard drawAnnotations(
-            in: ctx, base: base, visiblePixels: visibleBL)
+            in: ctx, base: base, visiblePixels: visibleBL, extra: extra)
         else { return nil }
         return ctx.makeImage()
     }

@@ -5856,9 +5856,10 @@ enum SelfTest {
                 let allFrames = editingFrames + actionFrames
                 var failures: [String] = []
                 // The AREA catalog: this inspects the area host, which now
-                // offers one tool the panel does not.
+                // offers one tool the panel does not, plus Color/Undo/Redo and
+                // the Backdrop chooser.
                 if editing.count
-                    != OverlayAnnotationTool.areaReviewTools.count + 3 {
+                    != OverlayAnnotationTool.areaReviewTools.count + 4 {
                     failures.append("editing count \(editing.count)")
                 }
                 if actions.count != 7 { failures.append("action count \(actions.count)") }
@@ -5994,24 +5995,27 @@ enum SelfTest {
                     .map { buttonFrame12($0, in: cornerView) }
                 let cornerActionFrames = cornerButtons.filter { $0.tag < 100 }
                     .map { buttonFrame12($0, in: cornerView) }
-                // The companion placements in OverlayToolbarLayout.area put
-                // one group just beyond the other when a tiny corner selection
-                // cannot hold both; the allowance therefore has to include the
-                // group being cleared, or growing the tool rail by one button
-                // reads as a teleport. It still catches the real failure — a
-                // group jumping to the opposite screen edge.
+                // ADJACENCY, not a distance budget. Production either hugs
+                // the selection or sits immediately beyond the other group
+                // (the companion candidates in OverlayToolbarLayout.area), so
+                // the invariant is "touches one of those two" — which stays
+                // just as tight when a toolbar grows. A bound scaled to the
+                // toolbars' own size would have let a whole rail slide 400pt
+                // away and still pass.
+                let neighbourGap: CGFloat = 40
                 for (name, frames, companion) in [
                     ("tools", cornerToolFrames, cornerActionFrames),
                     ("actions", cornerActionFrames, cornerToolFrames),
                 ] {
-                    let clearance = union12(companion).map {
-                        max($0.width, $0.height)
-                    } ?? 0
-                    if let frame = union12(frames),
-                       separation12(frame, selection)
-                        > max(frame.width, frame.height) * 2 + 20 + clearance {
+                    guard let frame = union12(frames) else { continue }
+                    let toSelection = separation12(frame, selection)
+                    let toCompanion = union12(companion)
+                        .map { separation12(frame, $0) }
+                        ?? CGFloat.greatestFiniteMagnitude
+                    if min(toSelection, toCompanion) > neighbourGap {
                         layout12Failures.append(
-                            "corner\(corner) \(name) teleported \(frame)")
+                            "corner\(corner) \(name) teleported \(frame) "
+                                + "sel=\(toSelection) companion=\(toCompanion)")
                     }
                 }
             }
@@ -8270,6 +8274,261 @@ enum SelfTest {
                 check("sliceB-magnifier-redaction-freshness",
                       freshFailures.isEmpty,
                       freshFailures.joined(separator: " | "))
+            }
+
+            // 1e. Backdrop in Area Review: one timeline with the marks, two
+            // readings of the same freeze per terminal, and a compose failure
+            // that changes nothing at all.
+            do {
+                var bdFailures: [String] = []
+                if let bdScreen = NSScreen.main ?? NSScreen.screens.first {
+                    @MainActor final class RouteSpy {
+                        var copies: [CGSize] = []
+                        var pins: [CGSize] = []
+                        var editors: [CGSize] = []
+                        var ocr: [CGSize] = []
+                        var lastCaptures: [CGSize] = []
+                        var areaRects: [CGRect] = []
+                        var toasts: [String] = []
+                        func dependencies() -> CaptureActionRouter.Dependencies {
+                            CaptureActionRouter.Dependencies(
+                                copyToClipboard: { [self] in
+                                    copies.append(CGSize(
+                                        width: $0.cgImage.width,
+                                        height: $0.cgImage.height))
+                                },
+                                autoSave: { _, _ in }, saveAs: { _, _ in },
+                                pin: { [self] in
+                                    pins.append(CGSize(
+                                        width: $0.cgImage.width,
+                                        height: $0.cgImage.height))
+                                },
+                                ocrWithMode: { [self] image, _ in
+                                    ocr.append(CGSize(
+                                        width: image.cgImage.width,
+                                        height: image.cgImage.height))
+                                },
+                                openEditor: { [self] in
+                                    editors.append(CGSize(
+                                        width: $0.cgImage.width,
+                                        height: $0.cgImage.height))
+                                },
+                                toast: { [self] in toasts.append($0) },
+                                setLastCapture: { [self] in
+                                    lastCaptures.append(CGSize(
+                                        width: $0.cgImage.width,
+                                        height: $0.cgImage.height))
+                                },
+                                setLastAreaRect: { [self] in
+                                    areaRects.append($0)
+                                },
+                                logEvent: { _ in })
+                        }
+                    }
+                    @MainActor func bdReview(
+                        _ spy: RouteSpy, selection: CGRect
+                    ) -> (SelectionOverlay, SelectionOverlayView) {
+                        let overlay = SelectionOverlay(
+                            purpose: .areaReview,
+                            inputs: OverlaySessionInputs(
+                                afterShow: true, afterCopy: false,
+                                afterSave: false),
+                            completion: { _ in })
+                        overlay.routerDependenciesOverride = spy.dependencies()
+                        let view = SelectionOverlayView(
+                            mode: .area, screen: bdScreen,
+                            frozen: CapturedImage(
+                                cgImage: makeStripePattern(
+                                    width: Int(bdScreen.frame.width),
+                                    height: Int(bdScreen.frame.height),
+                                    seed: 0x0817_2026),
+                                scale: 1),
+                            windowList: [], owner: overlay)
+                        view.selectForTesting(rect: selection)
+                        return (overlay, view)
+                    }
+                    let bdSelection = CGRect(
+                        x: 200, y: 200, width: 320, height: 240)
+
+                    // --- One timeline. A preset sits BETWEEN two marks and
+                    // undoes in its own turn, which a parallel stack could not
+                    // reproduce.
+                    let orderSpy = RouteSpy()
+                    let (orderOverlay, orderView) = bdReview(
+                        orderSpy, selection: bdSelection)
+                    let orderSurface = orderView.annotationSurface
+                        ?? AnnotationSurface(pixelScale: 1)
+                    if orderView.annotationSurface == nil {
+                        bdFailures.append("no surface after review began")
+                    }
+                    orderSurface.addBlurForTesting(rect: CGRect(
+                        x: 210, y: 210, width: 40, height: 40))
+                    if !orderView.applyBackdropPreset(.ocean) {
+                        bdFailures.append("ocean refused")
+                    }
+                    orderSurface.addBlurForTesting(rect: CGRect(
+                        x: 300, y: 300, width: 40, height: 40))
+                    // Applying the SAME preset is not an edit.
+                    if orderView.applyBackdropPreset(.ocean) {
+                        bdFailures.append("same preset forked history")
+                    }
+                    let afterMarks = orderSurface.annotations.count
+                    _ = orderSurface.undo()
+                    if orderSurface.backdropPreset != .ocean {
+                        bdFailures.append("undo of a mark changed the preset")
+                    }
+                    _ = orderSurface.undo()
+                    if orderSurface.backdropPreset != BackdropPreset.none {
+                        bdFailures.append("undo did not reach the preset")
+                    }
+                    _ = orderSurface.undo()
+                    if !orderSurface.annotations.isEmpty {
+                        bdFailures.append("undo left \(orderSurface.annotations.count)")
+                    }
+                    _ = orderSurface.redo()
+                    _ = orderSurface.redo()
+                    if orderSurface.backdropPreset != .ocean {
+                        bdFailures.append("redo did not restore the preset")
+                    }
+                    // A fresh edit after undo drops the whole redo branch.
+                    _ = orderSurface.undo()
+                    orderSurface.addBlurForTesting(rect: CGRect(
+                        x: 400, y: 400, width: 20, height: 20))
+                    if orderSurface.canRedo {
+                        bdFailures.append("fork kept a redo branch")
+                    }
+                    if orderSurface.annotations.count >= afterMarks {
+                        bdFailures.append("fork did not drop the branch")
+                    }
+                    orderOverlay.dismissForTesting()
+
+                    // --- Two readings of one freeze. Expected sizes come from
+                    // the shared geometry type, not from the code under test.
+                    let dualSpy = RouteSpy()
+                    let (dualOverlay, dualView) = bdReview(
+                        dualSpy, selection: bdSelection)
+                    _ = dualView.applyBackdropPreset(.sunset)
+                    let innerPixels = CGSize(width: 320, height: 240)
+                    let expectedOuter = SliceBBackdrop.outerDimensions(
+                        innerWidth: 320, innerHeight: 240, preset: .sunset,
+                        pixelScale: 1)
+                    // The initial capture ran BEFORE any preset could exist,
+                    // so AutoSave's payload is the undecorated crop.
+                    if dualSpy.lastCaptures.first != innerPixels {
+                        bdFailures.append(
+                            "initial capture decorated \(String(describing: dualSpy.lastCaptures.first))")
+                    }
+
+                    dualView.performReviewActionForTesting(.ocr)
+                    if dualSpy.ocr.last != innerPixels {
+                        bdFailures.append(
+                            "OCR got a framed image \(String(describing: dualSpy.ocr.last))")
+                    }
+                    // Same call, two readings: the recognizer reads the crop,
+                    // the app remembers the picture the user saw.
+                    if let expectedOuter {
+                        let framed = CGSize(
+                            width: CGFloat(expectedOuter.width),
+                            height: CGFloat(expectedOuter.height))
+                        if dualSpy.lastCaptures.last != framed {
+                            bdFailures.append(
+                                "OCR remembered \(String(describing: dualSpy.lastCaptures.last)) want \(framed)")
+                        }
+                    }
+                    dualOverlay.dismissForTesting()
+
+                    let visualSpy = RouteSpy()
+                    let (visualOverlay, visualView) = bdReview(
+                        visualSpy, selection: bdSelection)
+                    _ = visualView.applyBackdropPreset(.sunset)
+                    // Preview geometry is the same layout the export uses.
+                    if let outer = visualView.backdropPreviewOuterRectForTesting,
+                       let expectedOuter {
+                        if abs(outer.width - CGFloat(expectedOuter.width)) > 0.5
+                            || abs(outer.height
+                                - CGFloat(expectedOuter.height)) > 0.5 {
+                            bdFailures.append(
+                                "preview \(outer.size) vs export \(expectedOuter)")
+                        }
+                    } else {
+                        bdFailures.append("no preview rect")
+                    }
+                    visualView.performReviewActionForTesting(.copy)
+                    if let expectedOuter {
+                        let want = CGSize(
+                            width: CGFloat(expectedOuter.width),
+                            height: CGFloat(expectedOuter.height))
+                        if visualSpy.copies.last != want {
+                            bdFailures.append(
+                                "Copy not framed \(String(describing: visualSpy.copies.last)) want \(want)")
+                        }
+                        if visualSpy.lastCaptures.last != want {
+                            bdFailures.append("lastCapture not framed")
+                        }
+                        if want == innerPixels {
+                            bdFailures.append("frame added nothing — oracle blind")
+                        }
+                    }
+                    // The crop the user chose is unchanged by the decoration.
+                    if visualSpy.areaRects.last?.size != innerPixels {
+                        bdFailures.append(
+                            "lastAreaRect moved with the frame \(String(describing: visualSpy.areaRects.last))")
+                    }
+                    visualOverlay.dismissForTesting()
+
+                    // --- Compose fails: nothing may change. Not the router,
+                    // not the phase, not history, and not the text still being
+                    // typed — which is exactly what committing the field
+                    // before the compose would have broken.
+                    let failSpy = RouteSpy()
+                    let (failOverlay, failView) = bdReview(
+                        failSpy, selection: bdSelection)
+                    _ = failView.applyBackdropPreset(.mint)
+                    failView.beginTextEntryForTesting(atView: CGPoint(
+                        x: 260, y: 260))
+                    // Typed, NOT committed: the terminal action is what must
+                    // decide whether this text becomes a mark.
+                    failView.typeTextForTesting("secret")
+                    let historyBefore = failView.annotationSurface?
+                        .annotations.count ?? -1
+                    ForcedOuterComposeFailure.scoped {
+                        failView.performReviewActionForTesting(.copy)
+                    }
+                    if !failSpy.copies.isEmpty {
+                        bdFailures.append("failed compose still copied")
+                    }
+                    if failOverlay.session.phase != .reviewing {
+                        bdFailures.append(
+                            "failed compose left phase \(failOverlay.session.phase)")
+                    }
+                    if failView.annotationSurface?.annotations.count
+                        != historyBefore {
+                        bdFailures.append("failed compose mutated history")
+                    }
+                    if failView.textFieldForTesting == nil {
+                        bdFailures.append("failed compose committed the text")
+                    }
+                    if failSpy.toasts.isEmpty {
+                        bdFailures.append("failed compose was silent")
+                    }
+                    // Recovering: the same click now works, and the text that
+                    // survived is in the exported image exactly once.
+                    failView.performReviewActionForTesting(.copy)
+                    if failSpy.copies.count != 1 {
+                        bdFailures.append(
+                            "recovery copies \(failSpy.copies.count)")
+                    }
+                    let textMarks = failView.annotationSurface?.annotations
+                        .filter { $0 is TextAnnotation }.count ?? -1
+                    if textMarks != 1 {
+                        bdFailures.append("text committed \(textMarks) times")
+                    }
+                    failOverlay.dismissForTesting()
+                } else {
+                    bdFailures.append("no screen")
+                }
+                check("sliceB-area-backdrop-routes", bdFailures.isEmpty,
+                      bdFailures.joined(separator: " | "))
             }
 
             // 1c. Keyboard is host-scoped. The panel deliberately shows no
@@ -10822,6 +11081,7 @@ enum SelfTest {
                 let expectedTags = OverlayAnnotationTool.areaReviewTools.map {
                     $0.toolbarTag
                 } + [
+                    OverlayAnnotationTool.backdropToolbarTag,
                     OverlayAnnotationTool.colorToolbarTag,
                     OverlayAnnotationTool.undoToolbarTag,
                     OverlayAnnotationTool.redoToolbarTag,
@@ -10833,8 +11093,8 @@ enum SelfTest {
                 let catalogPairs = view.reviewToolbarButtonsForTesting
                 let actualTags = buttonRefs.map(\.tag)
                 let sharedButtonAction: Selector? = buttonRefs.first?.action
-                // 13 tools + Color/Undo/Redo + 6 actions + Close.
-                if buttonRefs.count != 23 || expectedTags.count != 23
+                // 13 tools + Color/Undo/Redo + Backdrop + 6 actions + Close.
+                if buttonRefs.count != 24 || expectedTags.count != 24
                     || Set(actualTags) != Set(expectedTags)
                     || Set(actualTags).count != actualTags.count
                     || catalogPairs.map(\.tag) != expectedTags
@@ -13744,8 +14004,9 @@ enum SelfTest {
                         return own + allButtons(child)
                     }
                 }
-                let expectedTags = OverlayAnnotationTool.allCases.map(
+                let expectedTags = OverlayAnnotationTool.areaReviewTools.map(
                     \.toolbarTag) + [
+                        OverlayAnnotationTool.backdropToolbarTag,
                         OverlayAnnotationTool.colorToolbarTag,
                         OverlayAnnotationTool.undoToolbarTag,
                         OverlayAnnotationTool.redoToolbarTag,
