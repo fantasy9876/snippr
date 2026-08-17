@@ -12895,6 +12895,809 @@ enum SelfTest {
                   textKeyFailures.isEmpty,
                   textKeyFailures.joined(separator: " | "))
 
+            // M. A retained area-review host is inert after its first real
+            //    terminal Copy. `finish` cancels redactions BEFORE its
+            //    torn-down latch, so completion/current alone cannot prove
+            //    this: a replayed Close/Esc may leave those values unchanged
+            //    while still bumping every Blur generation.
+            var areaTerminalFailures: [String] = []
+            let runAreaPostTerminal = {
+                guard let screen = NSScreen.screens.first else {
+                    areaTerminalFailures.append("no-screen")
+                    return
+                }
+                guard SelectionOverlay.current == nil,
+                      ScrollResultPanel.current == nil else {
+                    areaTerminalFailures.append("dirty-current")
+                    return
+                }
+                func slots() -> Int {
+                    MainActor.assumeIsolated { SliceBRedactionJob.inFlight }
+                }
+                func owners() -> Int {
+                    MainActor.assumeIsolated {
+                        SliceBRedactionJob.ownerCountForTesting
+                    }
+                }
+                let slotBase = slots()
+                let ownerBase = owners()
+                guard slotBase == 0, ownerBase == 0 else {
+                    areaTerminalFailures.append(
+                        "dirty-jobs \(slotBase)/\(ownerBase)")
+                    return
+                }
+
+                final class TerminalSpy {
+                    var events: [String] = []
+                    var copied: [CapturedImage] = []
+                    var lasts: [CapturedImage] = []
+                    var autoSaves = 0
+                    var saveAs = 0
+                    var pins = 0
+                    var ocrs = 0
+                    var editors = 0
+                    var rects: [CGRect] = []
+                    var logs: [String] = []
+                    var handled = 0
+                    var cancelled = 0
+                    var other = 0
+                    var observe: ((String) -> Void)?
+
+                    func resetRoutes() {
+                        events = []
+                        copied = []
+                        lasts = []
+                        autoSaves = 0
+                        saveAs = 0
+                        pins = 0
+                        ocrs = 0
+                        editors = 0
+                        rects = []
+                        logs = []
+                    }
+
+                    var signature: String {
+                        "events=\(events),copy=\(copied.count),last="
+                            + "\(lasts.count),auto=\(autoSaves),save="
+                            + "\(saveAs),pin=\(pins),ocr=\(ocrs),editor="
+                            + "\(editors),rect=\(rects),log=\(logs),done="
+                            + "\(handled)/\(cancelled)/\(other)"
+                    }
+                }
+                final class TerminalSink: NSResponder {
+                    var wheels = 0
+                    override func scrollWheel(with event: NSEvent) {
+                        wheels += 1
+                    }
+                    override func keyDown(with event: NSEvent) {}
+                    override func performKeyEquivalent(
+                        with event: NSEvent
+                    ) -> Bool { true }
+                }
+
+                var widthValues: [String: CGFloat] = [:]
+                var widthWrites: [String] = []
+                let previousStore =
+                    AnnotationSurface.strokeWidthStoreOverrideForTesting
+                AnnotationSurface.strokeWidthStoreOverrideForTesting =
+                    OverlayStrokeWidthStore(
+                        read: { widthValues[$0] ?? 3 },
+                        write: { value, key in
+                            widthValues[key] = value
+                            widthWrites.append("\(key)=\(value)")
+                        })
+                defer {
+                    AnnotationSurface.strokeWidthStoreOverrideForTesting =
+                        previousStore
+                }
+
+                let spy = TerminalSpy()
+                func note(_ event: String) {
+                    spy.events.append(event)
+                    spy.observe?(event)
+                }
+                let frozen = CapturedImage(
+                    cgImage: makeNoiseImage(
+                        width: Int(screen.frame.width * 2),
+                        height: Int(screen.frame.height * 2)),
+                    scale: 2)
+                guard let overlay = SelectionOverlay.beginForTesting(
+                    purpose: .areaReview,
+                    inputs: OverlaySessionInputs(
+                        afterShow: true, afterCopy: false, afterSave: false),
+                    frozen: frozen, screen: screen,
+                    dependencies: CaptureActionRouter.Dependencies(
+                        copyToClipboard: {
+                            spy.copied.append($0)
+                            note("copy")
+                        },
+                        autoSave: { _, _ in spy.autoSaves += 1 },
+                        saveAs: { _, _ in spy.saveAs += 1 },
+                        pin: { _ in spy.pins += 1 },
+                        ocr: { _ in spy.ocrs += 1 },
+                        openEditor: { _ in spy.editors += 1 },
+                        toast: { note("toast:\($0)") },
+                        setLastCapture: {
+                            spy.lasts.append($0)
+                            note("lastCapture")
+                        },
+                        setLastAreaRect: {
+                            spy.rects.append($0)
+                            note("areaRect")
+                        },
+                        logEvent: {
+                            spy.logs.append($0)
+                            note("log")
+                        }),
+                    completion: { result in
+                        switch result {
+                        case .handled:
+                            spy.handled += 1
+                            note("completion:handled")
+                        case .cancelled:
+                            spy.cancelled += 1
+                            note("completion:cancelled")
+                        default:
+                            spy.other += 1
+                            note("completion:other")
+                        }
+                    }) else {
+                    areaTerminalFailures.append("no-overlay")
+                    return
+                }
+                var retainedWindow: NSWindow?
+                var copiedTerminally = false
+                defer {
+                    NSCursor.arrow.set()
+                    spy.observe = nil
+                    let cleanTerminal = copiedTerminally
+                        && overlay.session.phase == .completed
+                        && SelectionOverlay.current == nil
+                        && overlay.activeReviewViewForTesting == nil
+                        && retainedWindow?.isVisible == false
+                    if !cleanTerminal { overlay.dismissForTesting() }
+                    if overlay.session.phase != .completed
+                        || SelectionOverlay.current != nil
+                        || overlay.activeReviewViewForTesting != nil
+                        || retainedWindow?.isVisible == true {
+                        areaTerminalFailures.append("cleanup-lifecycle")
+                    }
+                }
+                guard let view = overlay.activeReviewViewForTesting,
+                      let window = view.window else {
+                    areaTerminalFailures.append("no-real-view")
+                    return
+                }
+                retainedWindow = window
+                let selection = CGRect(
+                    x: 70, y: 70,
+                    width: min(260, view.bounds.width - 140),
+                    height: min(190, view.bounds.height - 140))
+                guard selection.width >= 160, selection.height >= 120 else {
+                    areaTerminalFailures.append(
+                        "small-selection \(selection)")
+                    return
+                }
+                view.selectForTesting(rect: selection)
+                guard let surface = view.annotationSurface else {
+                    areaTerminalFailures.append("no-surface")
+                    return
+                }
+                let initialPixelRect = overlay.session.pixelRect
+                let expectedInitialLog =
+                    "capture source=areaReview px="
+                    + "\(Int(initialPixelRect.width))x"
+                    + "\(Int(initialPixelRect.height))"
+                if spy.events != ["lastCapture", "log"]
+                    || spy.lasts.count != 1 || !spy.copied.isEmpty
+                    || spy.logs != [expectedInitialLog]
+                    || spy.autoSaves != 0 || spy.saveAs != 0
+                    || spy.pins != 0 || spy.ocrs != 0
+                    || spy.editors != 0 || !spy.rects.isEmpty
+                    || spy.handled != 0 || spy.cancelled != 0
+                    || spy.other != 0 {
+                    areaTerminalFailures.append(
+                        "initial-routes \(spy.signature)")
+                }
+                spy.resetRoutes()
+
+                var history = 0
+                let productionHistory = surface.historyDidChange
+                surface.historyDidChange = {
+                    history += 1
+                    productionHistory?()
+                }
+                let spotFrom = CGPoint(
+                    x: selection.minX + 25, y: selection.minY + 25)
+                let spotTo = CGPoint(
+                    x: selection.minX + 105, y: selection.minY + 85)
+                view.clickReviewToolbarButtonForTesting(
+                    tag: OverlayAnnotationTool.spotlight.toolbarTag)
+                view.annotationDragForTesting(from: spotFrom, to: spotTo)
+                guard let spot = surface.annotations.last
+                    as? SpotlightAnnotation else {
+                    areaTerminalFailures.append("no-spotlight")
+                    return
+                }
+                let blurFrom = CGPoint(
+                    x: selection.minX + 120, y: selection.minY + 30)
+                let blurTo = CGPoint(
+                    x: selection.minX + 200, y: selection.minY + 90)
+                view.clickReviewToolbarButtonForTesting(
+                    tag: OverlayAnnotationTool.blur.toolbarTag)
+                view.annotationDragForTesting(from: blurFrom, to: blurTo)
+                guard let blur = surface.annotations.last as? BlurAnnotation,
+                      blur.redactionState == .rect else {
+                    areaTerminalFailures.append("no-regular-blur")
+                    return
+                }
+                let textPoint = CGPoint(
+                    x: selection.minX + 45, y: selection.maxY - 45)
+                view.clickReviewToolbarButtonForTesting(
+                    tag: OverlayAnnotationTool.text.toolbarTag)
+                view.annotationDragForTesting(
+                    from: textPoint, to: textPoint)
+                guard view.textFieldForTesting != nil else {
+                    areaTerminalFailures.append("no-text-field")
+                    return
+                }
+                view.commitTextEntryForTesting(text: "stable")
+                guard let text = surface.annotations.last as? TextAnnotation,
+                      text.text == "stable" else {
+                    areaTerminalFailures.append("no-text")
+                    return
+                }
+                let penFrom = CGPoint(
+                    x: selection.minX + 30, y: selection.midY)
+                let penTo = CGPoint(
+                    x: selection.maxX - 30, y: selection.midY + 35)
+                view.clickReviewToolbarButtonForTesting(
+                    tag: OverlayAnnotationTool.pen.toolbarTag)
+                view.annotationDragForTesting(from: penFrom, to: penTo)
+                guard let redoPen = surface.annotations.last as? PenAnnotation,
+                      surface.undo(), surface.canRedo else {
+                    areaTerminalFailures.append("no-redo-pen")
+                    return
+                }
+                let redoStackBefore = surface.redoAnnotationsForTesting
+                guard redoStackBefore.count == 1,
+                      redoStackBefore[0] === redoPen else {
+                    areaTerminalFailures.append("wrong-redo-stack")
+                    return
+                }
+
+                func wheelEvent(
+                    delta: Int32, precise: Bool, modified: Bool
+                ) -> NSEvent? {
+                    guard let cg = CGEvent(
+                        scrollWheelEvent2Source: nil,
+                        units: precise ? .pixel : .line,
+                        wheelCount: 1, wheel1: delta,
+                        wheel2: 0, wheel3: 0) else { return nil }
+                    if modified { cg.flags = .maskCommand }
+                    return NSEvent(cgEvent: cg)
+                }
+                let sink = TerminalSink()
+                let oldResponder = view.nextResponder
+                view.nextResponder = sink
+                defer { view.nextResponder = oldResponder }
+                guard let modifiedWheel = wheelEvent(
+                    delta: 3, precise: false, modified: true),
+                      let lineWheel = wheelEvent(
+                        delta: 3, precise: false, modified: false),
+                      let preciseWheel = wheelEvent(
+                        delta: 9, precise: true, modified: false) else {
+                    areaTerminalFailures.append("no-wheel-event")
+                    return
+                }
+                view.scrollWheel(with: modifiedWheel)
+                view.scrollWheel(with: lineWheel)
+                if sink.wheels != 1 || widthWrites.count != 1 {
+                    areaTerminalFailures.append(
+                        "wheel-positive \(sink.wheels)/\(widthWrites)")
+                }
+                view.clickReviewToolbarButtonForTesting(
+                    tag: OverlayAnnotationTool.select.toolbarTag)
+
+                @MainActor func allButtons(_ root: NSView) -> [NSButton] {
+                    root.subviews.flatMap { child -> [NSButton] in
+                        let own = (child as? NSButton).map { [$0] } ?? []
+                        return own + allButtons(child)
+                    }
+                }
+                let expectedTags = OverlayAnnotationTool.allCases.map(
+                    \.toolbarTag) + [
+                        OverlayAnnotationTool.colorToolbarTag,
+                        OverlayAnnotationTool.undoToolbarTag,
+                        OverlayAnnotationTool.redoToolbarTag,
+                    ] + Array(OverlayActionCatalog.items.indices) + [-1]
+                let buttonRefs = allButtons(view)
+                let buttonParents = buttonRefs.map(\.superview)
+                let buttonTargets = buttonRefs.map(\.target)
+                let buttonActions = buttonRefs.map(\.action)
+                let buttonEnabled = buttonRefs.map(\.isEnabled)
+                let buttonFrames = buttonRefs.map {
+                    $0.convert($0.bounds, to: view)
+                }
+                let buttonTints = buttonRefs.map(\.contentTintColor)
+                guard buttonRefs.count == expectedTags.count,
+                      buttonRefs.map(\.tag) == expectedTags,
+                      !buttonRefs.contains(where: {
+                          $0.target !== view || $0.action == nil
+                      }) else {
+                    areaTerminalFailures.append("button-catalog")
+                    return
+                }
+                guard let copyTag = OverlayActionCatalog.items.firstIndex(
+                    where: { $0.intent == .copy }),
+                      let copyButton = buttonRefs.first(
+                        where: { $0.tag == copyTag }) else {
+                    areaTerminalFailures.append("no-copy-button")
+                    return
+                }
+                guard let sharedToolbarAction = copyButton.action,
+                      buttonRefs.allSatisfy({
+                          $0.action == sharedToolbarAction
+                      }) else {
+                    areaTerminalFailures.append("button-selector")
+                    return
+                }
+
+                let selectionBefore = view.areaSelectionForTesting
+                let pixelRectBefore = overlay.session.pixelRect
+                let annotationsBefore = surface.annotations
+                let historyBefore = history
+                let toolBefore = surface.tool
+                let colorBefore = surface.color
+                let undoBefore = surface.canUndo
+                let canRedoBefore = surface.canRedo
+                let spotRect = spot.rect
+                let spotDim = spot.dimFraction
+                let spotBase = spot.baseBounds
+                let blurRect = blur.rect
+                let blurState = blur.redactionState
+                let blurGeneration = blur.redactionGeneration
+                let textOrigin = text.origin
+                let textValue = text.text
+                let textColor = text.color
+                let redoPoints = redoPen.points
+                let redoColor = redoPen.color
+                let redoWidth = redoPen.strokeWidthPt
+                let writesBeforeCopy = widthWrites
+                let widthsBeforeCopy = widthValues
+                let wheelsBeforeCopy = sink.wheels
+                let expectedGlobal = CGRect(
+                    x: selection.minX + screen.frame.minX,
+                    y: selection.minY + screen.frame.minY,
+                    width: selection.width, height: selection.height)
+                var lifecycleProblems: [String] = []
+                spy.observe = { event in
+                    if event == "completion:handled" {
+                        if overlay.session.phase != .completed
+                            || SelectionOverlay.current != nil
+                            || overlay.activeReviewViewForTesting != nil
+                            || window.isVisible || spy.handled != 1 {
+                            lifecycleProblems.append("completion-order")
+                        }
+                    } else if overlay.session.phase != .reviewing
+                        || SelectionOverlay.current !== overlay
+                        || !window.isVisible || spy.handled != 0 {
+                        lifecycleProblems.append("route-order:\(event)")
+                    }
+                }
+                copyButton.performClick(nil)
+                spy.observe = nil
+                copiedTerminally = overlay.session.phase == .completed
+                    && SelectionOverlay.current == nil && !window.isVisible
+
+                let expectedEvents = [
+                    "lastCapture", "copy", "toast:Screenshot copied",
+                    "areaRect", "completion:handled",
+                ]
+                guard spy.events == expectedEvents,
+                      spy.copied.count == 1, spy.lasts.count == 1 else {
+                    areaTerminalFailures.append(
+                        "copy-routes \(spy.signature)")
+                    return
+                }
+                let copiedImage = spy.copied[0]
+                let lastImage = spy.lasts[0]
+                let terminalSignature = spy.signature
+                if !lifecycleProblems.isEmpty
+                    || copiedImage.cgImage !== lastImage.cgImage
+                    || copiedImage.pixelSize != pixelRectBefore.size
+                    || spy.rects != [expectedGlobal]
+                    || spy.autoSaves != 0 || spy.saveAs != 0
+                    || spy.pins != 0 || spy.ocrs != 0
+                    || spy.editors != 0 || !spy.logs.isEmpty
+                    || spy.handled != 1 || spy.cancelled != 0
+                    || spy.other != 0 {
+                    areaTerminalFailures.append(
+                        "copy-positive \(lifecycleProblems) "
+                        + spy.signature)
+                }
+
+                func sameColor(_ lhs: NSColor?, _ rhs: NSColor?) -> Bool {
+                    switch (lhs, rhs) {
+                    case (nil, nil): return true
+                    case let (l?, r?): return l.isEqual(r)
+                    default: return false
+                    }
+                }
+                func exactButtons() -> Bool {
+                    let current = allButtons(view)
+                    guard current.count == buttonRefs.count,
+                          buttonRefs.count == expectedTags.count else {
+                        return false
+                    }
+                    for index in current.indices {
+                        let button = current[index]
+                        if button !== buttonRefs[index]
+                            || button.tag != expectedTags[index]
+                            || button.superview !== buttonParents[index]
+                            || button.target !== buttonTargets[index]
+                            || button.action != buttonActions[index]
+                            || button.isEnabled != buttonEnabled[index]
+                            || button.convert(button.bounds, to: view)
+                                != buttonFrames[index]
+                            || !sameColor(
+                                button.contentTintColor,
+                                buttonTints[index]) {
+                            return false
+                        }
+                    }
+                    return true
+                }
+                func exactAnnotations() -> Bool {
+                    let live = surface.annotations
+                    let liveRedo = surface.redoAnnotationsForTesting
+                    return live.count == annotationsBefore.count
+                        && zip(live, annotationsBefore).allSatisfy {
+                            $0.0 === $0.1
+                        }
+                        && liveRedo.count == redoStackBefore.count
+                        && zip(liveRedo, redoStackBefore).allSatisfy {
+                            $0.0 === $0.1
+                        }
+                        && live.count == 3 && live[0] === spot
+                        && live[1] === blur && live[2] === text
+                        && spot.rect == spotRect
+                        && spot.dimFraction == spotDim
+                        && spot.baseBounds == spotBase
+                        && blur.rect == blurRect
+                        && blur.redactionState == blurState
+                        && blur.redactionGeneration
+                            == blurGeneration + 1
+                        && text.origin == textOrigin && text.text == textValue
+                        && text.color.isEqual(textColor)
+                        && redoPen.points == redoPoints
+                        && redoPen.color.isEqual(redoColor)
+                        && redoPen.strokeWidthPt == redoWidth
+                }
+                func verifyFrozen(_ label: String) {
+                    if overlay.session.phase != .completed
+                        || SelectionOverlay.current != nil
+                        || overlay.activeReviewViewForTesting != nil
+                        || window.isVisible || view.window !== window
+                        || overlay.session.pixelRect != pixelRectBefore
+                        || view.areaSelectionForTesting != selectionBefore
+                        || view.areaDragActiveForTesting
+                        || view.isAnnotationDraggingForTesting
+                        || surface.isDragging || !exactAnnotations()
+                        || surface.canUndo != undoBefore
+                        || surface.canRedo != canRedoBefore
+                        || surface.tool != toolBefore
+                        || !surface.color.isEqual(colorBefore)
+                        || history != historyBefore
+                        || surface.redactionJobCountForTesting != 0
+                        || slots() != slotBase || owners() != ownerBase
+                        || !exactButtons()
+                        || widthWrites != writesBeforeCopy
+                        || widthValues != widthsBeforeCopy
+                        || sink.wheels != wheelsBeforeCopy
+                        || view.textFieldForTesting != nil
+                        || spy.signature != terminalSignature {
+                        areaTerminalFailures.append(
+                            "\(label) phase=\(overlay.session.phase) gen="
+                            + "\(blur.redactionGeneration) history=\(history) "
+                            + spy.signature)
+                    }
+                }
+                verifyFrozen("terminal-baseline")
+
+                func attempt(_ label: String, _ body: () -> Void) {
+                    body()
+                    verifyFrozen(label)
+                }
+                let directIntents: [(String, CaptureIntent)] = [
+                    ("copy", .copy), ("save", .save),
+                    ("pin", .pin), ("ocr", .ocr),
+                    ("translate", .translate),
+                    ("editor", .openEditor),
+                ]
+                for (label, intent) in directIntents {
+                    attempt("intent-\(label)") {
+                        view.performReviewActionForTesting(intent)
+                    }
+                }
+                for (index, button) in buttonRefs.enumerated() {
+                    attempt("button-click-\(index)-\(button.tag)") {
+                        button.performClick(nil)
+                    }
+                    attempt("button-action-\(index)-\(button.tag)") {
+                        guard buttonActions.indices.contains(index),
+                              buttonTargets.indices.contains(index),
+                              let action = buttonActions[index],
+                              let target = buttonTargets[index] else {
+                            areaTerminalFailures.append(
+                                "button-no-wiring-\(index)")
+                            return
+                        }
+                        if !NSApp.sendAction(
+                            action, to: target, from: button) {
+                            areaTerminalFailures.append(
+                                "button-unhandled-\(index)")
+                        }
+                    }
+                }
+                attempt("escape") { view.handleEscapeForTesting() }
+                attempt("outside") { view.handleOutsideClickForTesting() }
+                attempt("adjust-selection") {
+                    view.adjustSelectionForTesting(
+                        rect: selection.offsetBy(dx: 12, dy: 8))
+                }
+
+                func key(
+                    _ chars: String, code: UInt16,
+                    modifiers: NSEvent.ModifierFlags = []
+                ) -> NSEvent? {
+                    NSEvent.keyEvent(
+                        with: .keyDown, location: .zero,
+                        modifierFlags: modifiers, timestamp: 0,
+                        windowNumber: window.windowNumber, context: nil,
+                        characters: chars,
+                        charactersIgnoringModifiers: chars,
+                        isARepeat: false, keyCode: code)
+                }
+                let keyRoutes: [
+                    (String, String, UInt16, NSEvent.ModifierFlags, Bool)
+                ] = [
+                    ("escape", "\u{1b}", 53, [], false),
+                    ("return", "\r", 36, [], false),
+                    ("digit", "5", 23, [], false),
+                    ("tool", "o", 31, [], false),
+                    ("shift-b", "b", 11, [.shift], false),
+                    ("copy", "c", 8, [.command], true),
+                    ("undo", "z", 6, [.command], true),
+                ]
+                for route in keyRoutes {
+                    attempt("key-\(route.0)") {
+                        guard let event = key(
+                            route.1, code: route.2,
+                            modifiers: route.3) else {
+                            areaTerminalFailures.append(
+                                "key-no-event-\(route.0)")
+                            return
+                        }
+                        if route.4 {
+                            _ = view.performKeyEquivalent(with: event)
+                        } else {
+                            view.keyDown(with: event)
+                        }
+                    }
+                }
+
+                func mouseEvent(
+                    _ type: NSEvent.EventType, point: CGPoint,
+                    clicks: Int = 1
+                ) -> NSEvent? {
+                    NSEvent.mouseEvent(
+                        with: type, location: view.convert(point, to: nil),
+                        modifierFlags: [], timestamp: 0,
+                        windowNumber: window.windowNumber, context: nil,
+                        eventNumber: 0, clickCount: clicks, pressure: 1)
+                }
+                func mouseRoute(
+                    _ label: String, from: CGPoint, to: CGPoint,
+                    clicks: Int = 1
+                ) {
+                    guard let down = mouseEvent(
+                        .leftMouseDown, point: from, clicks: clicks),
+                          let drag = mouseEvent(
+                            .leftMouseDragged, point: to, clicks: clicks),
+                          let up = mouseEvent(
+                            .leftMouseUp, point: to, clicks: clicks) else {
+                        areaTerminalFailures.append("\(label)-no-event")
+                        return
+                    }
+                    view.mouseDown(with: down)
+                    verifyFrozen("\(label)-down")
+                    view.mouseDragged(with: drag)
+                    verifyFrozen("\(label)-drag")
+                    view.mouseUp(with: up)
+                    verifyFrozen("\(label)-up")
+                }
+                let center = CGPoint(
+                    x: selection.midX, y: selection.midY)
+                mouseRoute(
+                    "mouse-move", from: center,
+                    to: CGPoint(x: center.x + 25, y: center.y + 18))
+                mouseRoute(
+                    "mouse-resize",
+                    from: CGPoint(x: selection.minX, y: selection.minY),
+                    to: CGPoint(x: selection.minX - 18,
+                                y: selection.minY - 12))
+                let outside = CGPoint(
+                    x: max(view.bounds.minX + 5, selection.minX - 30),
+                    y: max(view.bounds.minY + 5, selection.minY - 30))
+                mouseRoute(
+                    "mouse-create", from: outside,
+                    to: CGPoint(x: outside.x + 20, y: outside.y + 16))
+                mouseRoute(
+                    "mouse-double", from: center, to: center, clicks: 2)
+
+                for (label, event) in [
+                    ("wheel-line", lineWheel),
+                    ("wheel-precise", preciseWheel),
+                    ("wheel-modified", modifiedWheel),
+                ] {
+                    attempt(label) { view.scrollWheel(with: event) }
+                }
+            }
+            runAreaPostTerminal()
+
+            // A healthy Copy commits and removes text BEFORE completion, so
+            // it cannot exercise the late field-editor callback. Isolate the
+            // phase guard with a second real host whose session is completed
+            // while a second caption is still live.
+            let runLateAreaText = {
+                guard let screen = NSScreen.screens.first,
+                      SelectionOverlay.current == nil else {
+                    areaTerminalFailures.append("late-text-dirty")
+                    return
+                }
+                var dependencyCalls = 0
+                var completionHandled = 0
+                var completionCancelled = 0
+                let deps = CaptureActionRouter.Dependencies(
+                    copyToClipboard: { _ in dependencyCalls += 1 },
+                    autoSave: { _, _ in dependencyCalls += 1 },
+                    saveAs: { _, _ in dependencyCalls += 1 },
+                    pin: { _ in dependencyCalls += 1 },
+                    ocr: { _ in dependencyCalls += 1 },
+                    openEditor: { _ in dependencyCalls += 1 },
+                    toast: { _ in dependencyCalls += 1 },
+                    setLastCapture: { _ in dependencyCalls += 1 },
+                    setLastAreaRect: { _ in dependencyCalls += 1 },
+                    logEvent: { _ in dependencyCalls += 1 })
+                guard let overlay = SelectionOverlay.beginForTesting(
+                    purpose: .areaReview,
+                    inputs: OverlaySessionInputs(
+                        afterShow: true, afterCopy: false, afterSave: false),
+                    frozen: CapturedImage(
+                        cgImage: makeSolidImage(
+                            width: Int(screen.frame.width * 2),
+                            height: Int(screen.frame.height * 2),
+                            color: NSColor.white.cgColor),
+                        scale: 2),
+                    screen: screen, dependencies: deps,
+                    completion: { result in
+                        switch result {
+                        case .handled: completionHandled += 1
+                        case .cancelled: completionCancelled += 1
+                        default: break
+                        }
+                    }) else {
+                    areaTerminalFailures.append("late-text-no-overlay")
+                    return
+                }
+                var retainedWindow: NSWindow?
+                defer {
+                    overlay.dismissForTesting()
+                    if SelectionOverlay.current != nil
+                        || overlay.activeReviewViewForTesting != nil
+                        || retainedWindow?.isVisible == true
+                        || completionHandled != 0
+                        || completionCancelled != 1 {
+                        areaTerminalFailures.append("late-text-cleanup")
+                    }
+                }
+                guard let view = overlay.activeReviewViewForTesting,
+                      let window = view.window else {
+                    areaTerminalFailures.append("late-text-no-view")
+                    return
+                }
+                retainedWindow = window
+                let selection = CGRect(
+                    x: 60, y: 60, width: 240, height: 180)
+                view.selectForTesting(rect: selection)
+                guard let surface = view.annotationSurface else {
+                    areaTerminalFailures.append("late-text-no-surface")
+                    return
+                }
+                dependencyCalls = 0
+                var history = 0
+                let productionHistory = surface.historyDidChange
+                surface.historyDidChange = {
+                    history += 1
+                    productionHistory?()
+                }
+                view.clickReviewToolbarButtonForTesting(
+                    tag: OverlayAnnotationTool.text.toolbarTag)
+                let firstPoint = CGPoint(
+                    x: selection.minX + 40, y: selection.minY + 50)
+                view.annotationDragForTesting(
+                    from: firstPoint, to: firstPoint)
+                view.commitTextEntryForTesting(text: "kept")
+                guard surface.annotations.count == 1,
+                      let kept = surface.annotations.first as? TextAnnotation,
+                      kept.text == "kept", history == 1 else {
+                    areaTerminalFailures.append("late-text-positive")
+                    return
+                }
+                let keptOrigin = kept.origin
+                let keptValue = kept.text
+                let keptColor = kept.color
+                let secondPoint = CGPoint(
+                    x: selection.minX + 90, y: selection.minY + 95)
+                view.annotationDragForTesting(
+                    from: secondPoint, to: secondPoint)
+                guard let field = view.textFieldForTesting,
+                      let editor = field.currentEditor() as? NSTextView,
+                      let delegate = field.delegate
+                        as? OverlayTextFieldDelegate,
+                      field.window === window,
+                      window.firstResponder === editor,
+                      editor.delegate === field else {
+                    areaTerminalFailures.append("late-text-no-editor")
+                    return
+                }
+                field.stringValue = "late"
+                editor.string = "late"
+                let historyBeforeLate = history
+                let annotationsBeforeLate = surface.annotations
+                guard field.stringValue == "late", editor.string == "late",
+                      view.textFieldForTesting === field,
+                      field.currentEditor() === editor,
+                      window.firstResponder === editor,
+                      window.fieldEditor(false, for: field) === editor,
+                      annotationsBeforeLate.count == 1,
+                      annotationsBeforeLate[0] === kept,
+                      historyBeforeLate == 1, dependencyCalls == 0 else {
+                    areaTerminalFailures.append("late-text-premise")
+                    return
+                }
+                overlay.session.forceComplete()
+                delegate.controlTextDidEndEditing(Notification(
+                    name: NSControl.textDidEndEditingNotification,
+                    object: field))
+                if view.textFieldForTesting != nil
+                    || field.superview != nil
+                    || field.window != nil
+                    || field.currentEditor() != nil
+                    || window.firstResponder === editor
+                    || surface.annotations.count != 1
+                    || surface.annotations.first !== kept
+                    || kept.origin != keptOrigin
+                    || kept.text != keptValue
+                    || !kept.color.isEqual(keptColor)
+                    || !zip(surface.annotations, annotationsBeforeLate)
+                        .allSatisfy({ $0.0 === $0.1 })
+                    || history != historyBeforeLate
+                    || dependencyCalls != 0
+                    || overlay.session.phase != .completed
+                    || SelectionOverlay.current !== overlay
+                    || !window.isVisible {
+                    areaTerminalFailures.append(
+                        "late-text-mutated history=\(history) deps="
+                        + "\(dependencyCalls)")
+                }
+            }
+            runLateAreaText()
+            check("sliceB-area-post-terminal-invariant",
+                  areaTerminalFailures.isEmpty,
+                  areaTerminalFailures.joined(separator: " | "))
+
             check("sliceB-drag-lifecycle-ordinary-branch",
                   branchFailures.isEmpty,
                   branchFailures.joined(separator: " | "))

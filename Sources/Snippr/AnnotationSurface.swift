@@ -191,6 +191,7 @@ final class AnnotationSurface: RedactionHost, RedactionJobObserver {
     var isEmpty: Bool { annotations.isEmpty }
     var canUndo: Bool { !annotations.isEmpty }
     var canRedo: Bool { !redoAnnotations.isEmpty }
+    var redoAnnotationsForTesting: [Annotation] { redoAnnotations }
 
     var adjustsStrokeWidth: Bool { tool.adjustsStrokeWidth }
 
