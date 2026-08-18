@@ -803,6 +803,22 @@ enum BackdropPreset: String, CaseIterable {
     case none, ocean, sunset, mint, graphite
 }
 
+/// How round the plate's corners are. Stored by NAME, so a build that predates
+/// a new case falls back to the default rather than to whatever number an enum
+/// happened to have.
+enum BackdropCornerStyle: String, CaseIterable {
+    case none, small, medium, large
+
+    var title: String {
+        switch self {
+        case .none: return "Square corners"
+        case .small: return "Small corners"
+        case .medium: return "Medium corners"
+        case .large: return "Large corners"
+        }
+    }
+}
+
 /// The ONE description of a framed document's geometry.
 ///
 /// Preview, the scroll document, fit, the size badge and export all read their
@@ -948,7 +964,50 @@ enum SliceBBackdrop {
     /// Corner radius and shadow are POINT metrics; padding is pixels. On a
     /// Retina document a fixed pixel radius would render at half the intended
     /// size, so the caller passes the document's scale.
+    /// The floor of the Medium step, and the number the spec gate still
+    /// freezes. The radius itself comes from `cornerRadius(documentPixels:
+    /// style:)`: a fixed 12 points is a rounding on a phone screenshot and an
+    /// invisible bevel on a 4K one — the owner's 3671 px capture came back
+    /// looking square because 12 is 0.3% of its width.
     static let cornerRadiusPt: CGFloat = 12
+
+    static let defaultCornerStyle: BackdropCornerStyle = .medium
+
+    /// Radius in DOCUMENT points: a fraction of the SHORT edge, so a panorama
+    /// and a tall scrolling capture round by the same amount, clamped at both
+    /// ends and never more than half the short edge — past that the plate is a
+    /// lozenge and the document has no corners left at all.
+    ///
+    /// The same table as the Windows build, to the digit, so a capture framed
+    /// on either platform looks like the same product.
+    static func cornerRadius(
+        documentPoints: CGSize, style: BackdropCornerStyle
+    ) -> CGFloat {
+        let shortEdge = max(0, min(documentPoints.width, documentPoints.height))
+        let (fraction, floor, cap): (CGFloat, CGFloat, CGFloat)
+        switch style {
+        case .none: return 0
+        case .small: (fraction, floor, cap) = (0.012, 8, 40)
+        case .medium: (fraction, floor, cap) = (0.024, 12, 72)
+        case .large: (fraction, floor, cap) = (0.040, 16, 120)
+        }
+        let radius = min(cap, max(floor, shortEdge * fraction))
+        return min(radius, shortEdge / 2)
+    }
+
+    /// What the user chose, or the default. Read here rather than passed from
+    /// six call sites: every drawing path in both hosts needs it, and a style
+    /// that travelled by argument would eventually arrive wrong at one of them.
+    /// Identifiers for the two sections of the Backdrop menu, so both hosts
+    /// and the gates agree on which row is which.
+    static let presetItemIdentifier =
+        NSUserInterfaceItemIdentifier("backdrop.preset")
+    static let cornerItemIdentifier =
+        NSUserInterfaceItemIdentifier("backdrop.corner")
+
+    static var cornerStyle: BackdropCornerStyle {
+        Settings.shared.backdropCornerStyle
+    }
     static let shadowOffsetPt: CGFloat = -8
     static let shadowBlurPt: CGFloat = 24
 
@@ -981,7 +1040,13 @@ enum SliceBBackdrop {
             offset: CGSize(width: 0, height: shadowOffsetPt * scale),
             blur: shadowBlurPt * scale,
             color: NSColor.black.withAlphaComponent(0.35).cgColor)
-        let radius = cornerRadiusPt * scale
+        // The radius is a DOCUMENT metric, so it comes from the document this
+        // frame is around — measured in points — and is then drawn at whatever
+        // scale the caller works in.
+        let radius = cornerRadius(
+            documentPoints: CGSize(
+                width: target.width / scale, height: target.height / scale),
+            style: cornerStyle) * scale
         let rounded = CGPath(
             roundedRect: target, cornerWidth: radius, cornerHeight: radius,
             transform: nil)
@@ -1092,7 +1157,12 @@ enum SliceBBackdrop {
         in ctx: CGContext, rect: CGRect, pixelScale: CGFloat
     ) {
         let scale = max(1, pixelScale)
-        let radius = cornerRadiusPt * scale
+        // The plate's OWN radius: a hairline curving by a different amount
+        // than the edge it softens reads as a second, wrong outline.
+        let radius = cornerRadius(
+            documentPoints: CGSize(
+                width: rect.width / scale, height: rect.height / scale),
+            style: cornerStyle) * scale
         // Inset by half the line width so the whole stroke lands INSIDE the
         // plate: a centred stroke would spill half of itself onto the frame.
         let inset = rect.insetBy(dx: 0.5 * scale, dy: 0.5 * scale)
@@ -1303,7 +1373,12 @@ enum SliceBBackdrop {
             documentPixelsPerUserUnit: 1)
         else { return nil }
         ctx.saveGState()
-        let radius = cornerRadiusPt * max(1, pixelScale)
+        let scaleForRadius = max(1, pixelScale)
+        let radius = cornerRadius(
+            documentPoints: CGSize(
+                width: target.width / scaleForRadius,
+                height: target.height / scaleForRadius),
+            style: cornerStyle) * scaleForRadius
         ctx.addPath(CGPath(
             roundedRect: target, cornerWidth: radius, cornerHeight: radius,
             transform: nil))

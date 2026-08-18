@@ -8757,6 +8757,69 @@ enum SelfTest {
                     || SliceBBackdrop.shadowSafetyFactor != 1.25 {
                     specFailures.append("geometry moved")
                 }
+                // The corner table, written here as literals rather than read
+                // back from the code it checks — and the SAME numbers the
+                // Windows build uses, so a capture framed on either platform
+                // is the same product.
+                let cornerCases:
+                    [(short: CGFloat, long: CGFloat,
+                      none: CGFloat, small: CGFloat,
+                      medium: CGFloat, large: CGFloat)] = [
+                    // the capture the owner complained about
+                    (1523, 3285, 0, 18.276, 36.552, 60.92),
+                    (1080, 1920, 0, 12.96, 25.92, 43.2),
+                    (400, 800, 0, 8, 12, 16),
+                    // tiny: the floors are floors, and half the short edge caps
+                    (20, 200, 0, 8, 10, 10),
+                ]
+                for c in cornerCases {
+                    let document = CGSize(width: c.long, height: c.short)
+                    let want: [(BackdropCornerStyle, CGFloat)] = [
+                        (.none, c.none), (.small, c.small),
+                        (.medium, c.medium), (.large, c.large),
+                    ]
+                    for (style, radius) in want {
+                        let got = SliceBBackdrop.cornerRadius(
+                            documentPoints: document, style: style)
+                        if abs(got - radius) > 0.01 {
+                            specFailures.append(
+                                "corner \(Int(c.short))pt \(style): \(got) want \(radius)")
+                        }
+                    }
+                    // Orientation cannot matter: the short edge decides.
+                    let rotated = SliceBBackdrop.cornerRadius(
+                        documentPoints: CGSize(width: c.short, height: c.long),
+                        style: .medium)
+                    if abs(rotated - c.medium) > 0.01 {
+                        specFailures.append(
+                            "corner \(Int(c.short))pt rotated: \(rotated)")
+                    }
+                    for style in BackdropCornerStyle.allCases
+                    where SliceBBackdrop.cornerRadius(
+                        documentPoints: document, style: style) > c.short / 2 + 0.01 {
+                        specFailures.append(
+                            "corner \(Int(c.short))pt \(style) exceeds half the edge")
+                    }
+                }
+                // The default is what a user who never opens the menu gets —
+                // asked through the formula, because comparing two constants
+                // is folded away and a check that cannot fail is not a check.
+                let reference = CGSize(width: 1920, height: 1080)
+                if abs(
+                    SliceBBackdrop.cornerRadius(
+                        documentPoints: reference,
+                        style: SliceBBackdrop.defaultCornerStyle)
+                        - SliceBBackdrop.cornerRadius(
+                            documentPoints: reference, style: .medium)) > 0.01 {
+                    specFailures.append("default corner style is not medium")
+                }
+                // And the old fixed radius is now the FLOOR of Medium, not the
+                // radius: a 4K capture must round more than a thumbnail does.
+                if SliceBBackdrop.cornerRadius(
+                    documentPoints: CGSize(width: 4000, height: 4000),
+                    style: .medium) <= SliceBBackdrop.cornerRadiusPt {
+                    specFailures.append("a 4K capture still rounds like a thumbnail")
+                }
                 check("sliceB-backdrop-presets-match-spec",
                       specFailures.isEmpty,
                       specFailures.prefix(6).joined(separator: " | "))
@@ -17022,7 +17085,11 @@ enum SelfTest {
                     let inField = field.convert(local, from: canvas)
                     let inWrapper = wrapper.convert(local, from: canvas)
                     let inner = layout.innerPointRect
-                    let radius = SliceBBackdrop.cornerRadiusPt
+                    // The radius the app DRAWS for this document, not the
+                    // constant it used to draw for every document.
+                    let radius = SliceBBackdrop.cornerRadius(
+                        documentPoints: layout.innerPointSize,
+                        style: SliceBBackdrop.cornerStyle)
                     let rounded = CGPath(
                         roundedRect: inner, cornerWidth: radius,
                         cornerHeight: radius, transform: nil)
@@ -17110,22 +17177,48 @@ enum SelfTest {
                     applyFailures.append("chooser-mutates")
                 }
                 let presets = BackdropPreset.allCases
-                if menu.items.count != presets.count {
-                    applyFailures.append("menu-count \(menu.items.count)")
+                // The menu carries two sections now — presets and corners —
+                // so it is read by SECTION rather than by row count.
+                func section(
+                    _ items: [NSMenuItem], _ id: NSUserInterfaceItemIdentifier
+                ) -> [NSMenuItem] {
+                    items.filter { $0.identifier == id }
                 }
-                let checked = menu.items.filter { $0.state == .on }
+                let presetItems = section(
+                    menu.items, SliceBBackdrop.presetItemIdentifier)
+                let cornerItems = section(
+                    menu.items, SliceBBackdrop.cornerItemIdentifier)
+                if presetItems.count != presets.count {
+                    applyFailures.append("menu-count \(presetItems.count)")
+                }
+                if cornerItems.count != BackdropCornerStyle.allCases.count {
+                    applyFailures.append("corner-count \(cornerItems.count)")
+                }
+                let checked = presetItems.filter { $0.state == .on }
                 if checked.count != 1
                     || checked.first?.tag != presets.firstIndex(of: .none) {
                     applyFailures.append("menu-check")
                 }
+                // Exactly one corner ticked, and it is the one in force.
+                let cornerChecked = cornerItems.filter { $0.state == .on }
+                if cornerChecked.count != 1
+                    || cornerChecked.first?.tag
+                        != BackdropCornerStyle.allCases.firstIndex(
+                            of: SliceBBackdrop.cornerStyle) {
+                    applyFailures.append("corner-check")
+                }
                 // Drive the menu the way the user does: real dispatch, not a
                 // direct perform, which would bypass validation and fire an
-                // item the user could never click.
-                if !menu.items.allSatisfy({ $0.isEnabled }) {
+                // item the user could never click. Separators are not items a
+                // user can click, so they are not asked to be enabled.
+                if !menu.items.allSatisfy({ $0.isSeparatorItem || $0.isEnabled }) {
                     applyFailures.append("menu-disabled")
                 }
                 if let mintIndex = menu.items.firstIndex(
-                    where: { $0.tag == presets.firstIndex(of: .mint) }) {
+                    where: {
+                        $0.identifier == SliceBBackdrop.presetItemIdentifier
+                            && $0.tag == presets.firstIndex(of: .mint)
+                    }) {
                     canvas.undoManager?.beginUndoGrouping()
                     menu.performActionForItem(at: mintIndex)
                     canvas.undoManager?.endUndoGrouping()
@@ -17195,6 +17288,7 @@ enum SelfTest {
                 // — the menu is a view of state, not a second source of it.
                 func checkedTag(_ label: String) -> Int? {
                     let items = wc.backdropMenu().items
+                        .filter { $0.identifier == SliceBBackdrop.presetItemIdentifier }
                     let on = items.filter { $0.state == .on }
                     if on.count != 1 {
                         applyFailures.append("\(label)-checks \(on.count)")

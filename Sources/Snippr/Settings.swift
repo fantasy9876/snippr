@@ -223,6 +223,7 @@ final class Settings {
         static let zoomReverseScroll = "zoomReverseScroll"
         static let preferZoom100 = "preferZoom100"
         static let escCopy = "escCopy"
+        static let backdropCorners = "backdropCorners"
         static let escSave = "escSave"
         static let confirmationStyle = "confirmationStyle"
         static let urlSchemeEnabled = "urlSchemeEnabled"
@@ -384,6 +385,18 @@ final class Settings {
     var preferZoom100: Bool {
         get { d.bool(forKey: Keys.preferZoom100) }
         set { d.set(newValue, forKey: Keys.preferZoom100) }
+    }
+
+    /// How round the Backdrop plate's corners are, by NAME: a build that
+    /// predates a case falls back to the default instead of to a stray number.
+    var backdropCornerStyle: BackdropCornerStyle {
+        get {
+            guard let raw = d.string(forKey: Keys.backdropCorners),
+                  let style = BackdropCornerStyle(rawValue: raw)
+            else { return SliceBBackdrop.defaultCornerStyle }
+            return style
+        }
+        set { d.set(newValue.rawValue, forKey: Keys.backdropCorners) }
     }
 
     var escCopy: Bool {

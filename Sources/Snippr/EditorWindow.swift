@@ -637,10 +637,39 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
                 action: #selector(backdropPresetChosen(_:)), keyEquivalent: "")
             item.target = self
             item.tag = index
+            // The menu has two sections now. Naming them is what lets a gate
+            // say "one preset ticked and one corner ticked" instead of
+            // counting rows and hoping.
+            item.identifier = SliceBBackdrop.presetItemIdentifier
             item.state = preset == canvas.backdropPreset ? .on : .off
             menu.addItem(item)
         }
+        // The corner choice lives in the SAME menu as the preset: it is a
+        // property of the frame, and a user looking for it will look here
+        // before they look in Settings.
+        menu.addItem(.separator())
+        for style in BackdropCornerStyle.allCases {
+            let item = NSMenuItem(
+                title: style.title,
+                action: #selector(backdropCornerChosen(_:)), keyEquivalent: "")
+            item.target = self
+            item.tag = BackdropCornerStyle.allCases.firstIndex(of: style) ?? 0
+            item.identifier = SliceBBackdrop.cornerItemIdentifier
+            item.state = style == SliceBBackdrop.cornerStyle ? .on : .off
+            menu.addItem(item)
+        }
         return menu
+    }
+
+    /// Sender is an NSMenuItem, so the style travels as an Int tag.
+    @objc func backdropCornerChosen(_ sender: NSMenuItem) {
+        let styles = BackdropCornerStyle.allCases
+        guard styles.indices.contains(sender.tag) else { return }
+        Settings.shared.backdropCornerStyle = styles[sender.tag]
+        // The corner changes the SHAPE of what is on screen, not its size, so
+        // the layout stands and everything that draws the plate repaints.
+        refreshBackdropLayout()
+        canvas.needsDisplay = true
     }
 
     @objc func showBackdropMenu(_ sender: NSButton) {
@@ -937,7 +966,11 @@ final class BackdropDocumentView: NSView {
         // frame edge the report was about, and it made the preview disagree
         // with an export that antialiases correctly. The live text field, the
         // one subview that needed the layer mask, carries its own clip now.
-        let radius = layout.isCollapsed ? 0 : SliceBBackdrop.cornerRadiusPt
+        let radius = layout.isCollapsed
+            ? 0
+            : SliceBBackdrop.cornerRadius(
+                documentPoints: layout.innerPointSize,
+                style: SliceBBackdrop.cornerStyle)
         canvas.documentCornerRadius = radius
         canvas.layer?.cornerRadius = 0
         canvas.layer?.masksToBounds = false
@@ -973,7 +1006,11 @@ final class BackdropDocumentView: NSView {
         guard hit !== self else { return nil }
         if !layout.isCollapsed, hit === canvas || hit?.isDescendant(of: canvas) == true {
             let inner = layout.innerPointRect
-            let radius = SliceBBackdrop.cornerRadiusPt
+            // The hit shape follows the DRAWN shape: a corner that looks cut
+            // but still swallows clicks is a worse lie than a square one.
+            let radius = SliceBBackdrop.cornerRadius(
+                documentPoints: layout.innerPointSize,
+                style: SliceBBackdrop.cornerStyle)
             let rounded = CGPath(
                 roundedRect: inner, cornerWidth: radius, cornerHeight: radius,
                 transform: nil)

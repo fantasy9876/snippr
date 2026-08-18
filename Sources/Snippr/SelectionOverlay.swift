@@ -691,10 +691,37 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
                 action: #selector(backdropPresetChosen(_:)), keyEquivalent: "")
             item.target = self
             item.tag = index
+            // The menu has two sections now. Naming them is what lets a gate
+            // say "one preset ticked and one corner ticked" instead of
+            // counting rows and hoping.
+            item.identifier = SliceBBackdrop.presetItemIdentifier
             item.state = preset == backdropPreset ? .on : .off
             menu.addItem(item)
         }
+        // The corner choice lives in the SAME menu as the preset: it is a
+        // property of the frame, and a user looking for it will look here
+        // before they look in Settings.
+        menu.addItem(.separator())
+        for style in BackdropCornerStyle.allCases {
+            let item = NSMenuItem(
+                title: style.title,
+                action: #selector(backdropCornerChosen(_:)), keyEquivalent: "")
+            item.target = self
+            item.tag = BackdropCornerStyle.allCases.firstIndex(of: style) ?? 0
+            item.identifier = SliceBBackdrop.cornerItemIdentifier
+            item.state = style == SliceBBackdrop.cornerStyle ? .on : .off
+            menu.addItem(item)
+        }
         return menu
+    }
+
+    /// Sender is an NSMenuItem, so the style travels as an Int tag.
+    @objc private func backdropCornerChosen(_ sender: NSMenuItem) {
+        let styles = BackdropCornerStyle.allCases
+        guard styles.indices.contains(sender.tag) else { return }
+        Settings.shared.backdropCornerStyle = styles[sender.tag]
+        updateTextEntryClip()
+        needsDisplay = true
     }
 
     private(set) var backdropMenuForTesting: NSMenu?
@@ -778,7 +805,9 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
         }
         field.wantsLayer = true
         let radius = backdropPreset == .none
-            ? 0 : SliceBBackdrop.cornerRadiusPt
+            ? 0
+            : SliceBBackdrop.cornerRadius(
+                documentPoints: plate.size, style: SliceBBackdrop.cornerStyle)
         let mask = (field.layer?.mask as? CAShapeLayer) ?? CAShapeLayer()
         mask.frame = field.bounds
         mask.path = CGPath(
@@ -1090,7 +1119,8 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
         let scale = frozen.scale
         let pad = layout.padPoints
         let outer = sel.insetBy(dx: -pad, dy: -pad)
-        let radius = SliceBBackdrop.cornerRadiusPt
+        let radius = SliceBBackdrop.cornerRadius(
+            documentPoints: sel.size, style: SliceBBackdrop.cornerStyle)
         let rounded = CGPath(
             roundedRect: sel, cornerWidth: radius, cornerHeight: radius,
             transform: nil)
