@@ -24,6 +24,8 @@
          by the default glob. -->
     <Compile Remove="Snippr.Win.ParityGate/**" />
     <None Include="Snippr.Win.ParityGate/**" />
+    <Compile Remove="Snippr.Win.RasterGate/**" />
+    <None Include="Snippr.Win.RasterGate/**" />
   </ItemGroup>
 
 </Project>

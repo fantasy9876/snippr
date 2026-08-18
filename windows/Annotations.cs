@@ -256,17 +256,123 @@ sealed class BlurAnnotation : Annotation
     public override Annotation Clone() => new BlurAnnotation { Rect = Rect };
 }
 
+/// Lights one rectangle by dimming everything around it. The hole IS the
+/// object: clicking the lit area selects the spotlight, clicking the dimmed
+/// surround does not.
+sealed class SpotlightAnnotation : Annotation
+{
+    public Rectangle Rect;
+    /// The area to dim — the document, normally. Empty means "just my rect",
+    /// which dims nothing and is how a half-built spotlight stays invisible.
+    public Rectangle BaseBounds;
+    /// 0.1 … 0.9, driven by the number keys.
+    public float DimFraction = 0.6f;
+
+    public override Rectangle Bounds => Rect;
+
+    public override void Draw(Graphics g, Bitmap? pixelated)
+    {
+        var canvas = BaseBounds.IsEmpty ? Rect : BaseBounds;
+        if (canvas.Width <= 0 || canvas.Height <= 0) return;
+        var state = g.Save();
+        using var path = new GraphicsPath { FillMode = FillMode.Alternate };
+        path.AddRectangle(canvas);
+        path.AddRectangle(Rect);
+        var alpha = (int)Math.Round(Math.Clamp(DimFraction, 0.1f, 0.9f) * 255);
+        using var brush = new SolidBrush(Color.FromArgb(alpha, Color.Black));
+        g.FillPath(brush, path);
+        g.Restore(state);
+    }
+
+    public override bool HitTest(Point p) => Rect.Contains(p);
+
+    public override void Move(int dx, int dy) => Rect.Offset(dx, dy);
+
+    public override Annotation Clone() => new SpotlightAnnotation
+    {
+        Rect = Rect, BaseBounds = BaseBounds, DimFraction = DimFraction,
+        Color = Color,
+    };
+}
+
+/// A loupe: the pixels under `SourceRect`, enlarged, drawn at `CalloutRect`.
+///
+/// `Snapshot` is sampled ONCE, after the redactions, and kept — so a callout
+/// can never resurrect pixels a pixelation covers, and it does not re-read the
+/// document every repaint. Dragging moves the callout only: re-aiming the
+/// source would show pixels the user never chose.
+sealed class MagnifierAnnotation : Annotation
+{
+    public Rectangle SourceRect;
+    public Rectangle CalloutRect;
+    public Bitmap? Snapshot;
+
+    public override Rectangle Bounds => CalloutRect;
+
+    public override void Draw(Graphics g, Bitmap? pixelated)
+    {
+        if (Snapshot == null || CalloutRect.Width <= 1 || CalloutRect.Height <= 1) return;
+        var state = g.Save();
+        g.InterpolationMode = InterpolationMode.NearestNeighbor;
+        g.PixelOffsetMode = PixelOffsetMode.Half;
+        // A soft drop shadow, then the patch, then the ring — the same order
+        // the macOS callout uses, so the two look like one feature.
+        using (var shadow = new SolidBrush(Color.FromArgb(70, Color.Black)))
+        {
+            var below = CalloutRect;
+            below.Offset(0, 2);
+            below.Inflate(2, 2);
+            g.FillRectangle(shadow, below);
+        }
+        g.DrawImage(Snapshot, CalloutRect);
+        using var pen = new Pen(Color.White, 2);
+        g.DrawRectangle(pen, CalloutRect);
+        g.Restore(state);
+    }
+
+    public override bool HitTest(Point p) => CalloutRect.Contains(p);
+
+    /// The callout travels; the source stays where it was aimed.
+    public override void Move(int dx, int dy) => CalloutRect.Offset(dx, dy);
+
+    /// A crop moves the whole document under the annotation, so BOTH rects
+    /// travel — otherwise the loupe would point at different pixels than the
+    /// ones the user picked.
+    public void TranslateForDocumentChange(int dx, int dy)
+    {
+        SourceRect.Offset(dx, dy);
+        CalloutRect.Offset(dx, dy);
+    }
+
+    public override Annotation Clone() => new MagnifierAnnotation
+    {
+        SourceRect = SourceRect, CalloutRect = CalloutRect,
+        // The patch is immutable once sampled, so clones share it rather than
+        // each holding a copy of the same pixels.
+        Snapshot = Snapshot, Color = Color,
+    };
+}
+
 static class AnnotationRenderer
 {
     /// Flatten base + annotations into a new bitmap.
-    public static Bitmap Flatten(Bitmap baseImage, IEnumerable<Annotation> annotations, Bitmap? pixelated)
+    ///
+    /// It goes through the compositor, like the preview does: phase order and
+    /// the magnifier's crop boundary must not be something only one of the two
+    /// knows about.
+    public static Bitmap Flatten(
+        Bitmap baseImage, IEnumerable<Annotation> annotations, Bitmap? pixelated,
+        Rectangle? visiblePixels = null)
     {
         var result = new Bitmap(baseImage.Width, baseImage.Height,
             System.Drawing.Imaging.PixelFormat.Format32bppArgb);
         using var g = Graphics.FromImage(result);
         g.SmoothingMode = SmoothingMode.AntiAlias;
         g.DrawImageUnscaled(baseImage, 0, 0);
-        foreach (var a in annotations) a.Draw(g, pixelated);
+        AnnotationCompositor.Draw(
+            annotations, g, baseImage,
+            visiblePixels ?? new Rectangle(0, 0, baseImage.Width, baseImage.Height),
+            pixelated);
         return result;
     }
 

@@ -1,0 +1,29 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <!-- Pixels need GDI+, and GDI+ needs Windows: this half of the gate runs
+         on the CI runner only. Everything that is numbers rather than pixels
+         belongs in Snippr.Win.ParityGate, which runs anywhere. -->
+    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <TargetPlatformMinVersion>10.0.17763.0</TargetPlatformMinVersion>
+    <UseWindowsForms>true</UseWindowsForms>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <AssemblyName>Snippr.Win.RasterGate</AssemblyName>
+    <RootNamespace>Snippr.Tests</RootNamespace>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="..\ToolCatalog.cs" Link="ToolCatalog.cs" />
+    <Compile Include="..\Backdrop.cs" Link="Backdrop.cs" />
+    <Compile Include="..\BackdropRender.cs" Link="BackdropRender.cs" />
+    <Compile Include="..\Annotations.cs" Link="Annotations.cs" />
+    <Compile Include="..\AnnotationCompositor.cs" Link="AnnotationCompositor.cs" />
+  </ItemGroup>
+
+</Project>

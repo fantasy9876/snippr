@@ -693,7 +693,28 @@ sealed class EditorForm : Form
         _pixelated?.Dispose();
         _pixelated = null;
         InvalidateScaledCache();
-        foreach (var a in _annotations) a.Move(-cropPx.X, -cropPx.Y);
+        foreach (var a in _annotations)
+        {
+            switch (a)
+            {
+                // A crop moves the whole document under the annotation, so a
+                // loupe's SOURCE travels with its callout — moving only the
+                // callout would leave it pointing at different pixels than the
+                // ones the user picked.
+                case MagnifierAnnotation mag:
+                    mag.TranslateForDocumentChange(-cropPx.X, -cropPx.Y);
+                    break;
+                // The dimmed area is the document, and the document just
+                // changed shape.
+                case SpotlightAnnotation spot:
+                    spot.Move(-cropPx.X, -cropPx.Y);
+                    spot.BaseBounds = new Rectangle(0, 0, cropPx.Width, cropPx.Height);
+                    break;
+                default:
+                    a.Move(-cropPx.X, -cropPx.Y);
+                    break;
+            }
+        }
         _selected = null;
         ApplyZoom(_zoom);
     }
@@ -784,8 +805,17 @@ sealed class EditorForm : Form
             g.ScaleTransform(o._zoom, o._zoom);
             bool needsPix = o._annotations.Any(a => a is BlurAnnotation) || o._draft is BlurAnnotation;
             var pix = needsPix ? o.Pixelated : null;
-            foreach (var a in o._annotations) a.Draw(g, pix);
-            o._draft?.Draw(g, pix);
+            // The SAME entry the export uses, with the SAME question about
+            // what will survive: while a crop is being dragged, the pending
+            // crop is what the export will contain, so a magnifier whose
+            // source has fallen outside it stops being drawn here too.
+            var marks = o._draft == null
+                ? o._annotations
+                : o._annotations.Concat([o._draft]);
+            AnnotationCompositor.Draw(
+                marks, g, o._image,
+                o._cropRectPx ?? new Rectangle(0, 0, o._image.Width, o._image.Height),
+                pix);
 
             if (o._selected != null)
             {
