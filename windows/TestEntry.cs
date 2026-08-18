@@ -191,6 +191,9 @@ static class TestEntry
             }
         }
 
+        // The summary goes in BEFORE the copy, or the artifact's log stops one
+        // line short of the answer — the first run's did.
+        Diag.Click("test", $"shot finished failures={failures} dir={dir}");
         Step("collect-logs", () =>
         {
             if (File.Exists(Diag.ClickLogPath))
@@ -198,8 +201,6 @@ static class TestEntry
             if (File.Exists(Diag.CrashLogPath))
                 File.Copy(Diag.CrashLogPath, Path.Combine(dir, "crash.log"), overwrite: true);
         });
-
-        Diag.Click("test", $"shot finished failures={failures} dir={dir}");
         // The job can read this without parsing a log.
         Environment.ExitCode = failures;
     }
