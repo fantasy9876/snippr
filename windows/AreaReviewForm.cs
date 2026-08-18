@@ -19,6 +19,8 @@ sealed class AreaReviewForm : Form
     Point _dragStartPx;
     Annotation? _selected;
     bool _movingSelection;
+    CropGrip _grip = CropGrip.None;
+    Rectangle _gripOriginal;
     TextBox? _textBox;
     TextAnnotation? _editingText;
     Bitmap? _pixelated;
@@ -171,6 +173,16 @@ sealed class AreaReviewForm : Form
 
         using (var pen = new Pen(Color.DeepSkyBlue, 1.6f))
             g.DrawRectangle(pen, crop);
+        // The handles are drawn from the same helper the hit test reads, so
+        // what the user grabs is what they can see.
+        using (var fill = new SolidBrush(Color.White))
+        using (var edge = new Pen(Color.DeepSkyBlue, 1.2f))
+            foreach (var handle in OverlayToolbarLayout.HandleRects(crop, 8f))
+            {
+                g.FillRectangle(fill, handle);
+                g.DrawRectangle(
+                    edge, handle.X, handle.Y, handle.Width, handle.Height);
+            }
         if (_selected != null)
         {
             using var sel = new Pen(Color.DeepSkyBlue, 1.5f) { DashStyle = DashStyle.Dash };
@@ -234,7 +246,13 @@ sealed class AreaReviewForm : Form
                 _selected = _session.Annotations.AsEnumerable().Reverse()
                     .FirstOrDefault(a => a.HitTest(px));
                 _movingSelection = _selected != null;
-                if (_movingSelection) _session.PushUndo();
+                if (_movingSelection) { _session.PushUndo(); break; }
+                // No mark under the pointer: the crop itself is what Select
+                // grabs. Adjusting it is not an edit of the document — the
+                // marks stay where they were put, and what changes is how much
+                // of them the picture contains.
+                _grip = AreaReviewCrop.GripAt(px, _session.PixelRect, HandleSize);
+                _gripOriginal = _session.PixelRect;
                 break;
             case Tool.Arrow or Tool.Line or Tool.Rect or Tool.Oval or Tool.Highlight:
                 _draft = new ShapeAnnotation
@@ -295,9 +313,37 @@ sealed class AreaReviewForm : Form
         RefreshSurface(all: false);
     }
 
+    float HandleSize => Theme.HandleHit * DeviceDpi / 96f;
+
+    /// The pointer shape that matches the grip, so the crop advertises what a
+    /// drag there will do before the user commits to it. It lives here rather
+    /// than beside the arithmetic because `Cursor` is WinForms, and the
+    /// arithmetic has to compile into a gate that has no windows at all.
+    static Cursor CursorFor(CropGrip grip) => grip switch
+    {
+        CropGrip.TopLeft or CropGrip.BottomRight => Cursors.SizeNWSE,
+        CropGrip.TopRight or CropGrip.BottomLeft => Cursors.SizeNESW,
+        CropGrip.Top or CropGrip.Bottom => Cursors.SizeNS,
+        CropGrip.Left or CropGrip.Right => Cursors.SizeWE,
+        CropGrip.Inside => Cursors.SizeAll,
+        _ => Cursors.Cross,
+    };
+
     void CanvasMouseMove(MouseEventArgs e)
     {
         var px = e.Location;
+        if (_grip != CropGrip.None)
+        {
+            _session.SetSelection(
+                AreaReviewCrop.Drag(_grip, _gripOriginal, _dragStartPx, px));
+            // The toolbar follows the crop DURING the drag: waiting for the
+            // release leaves it behind and makes the whole thing jump.
+            RefreshSurface(all: true);
+            return;
+        }
+        if (_tool == Tool.Select && e.Button == MouseButtons.None)
+            Cursor = CursorFor(
+                AreaReviewCrop.GripAt(px, _session.PixelRect, HandleSize));
         if (_movingSelection && _selected != null)
         {
             _selected.Move(px.X - _dragStartPx.X, px.Y - _dragStartPx.Y);
@@ -322,6 +368,12 @@ sealed class AreaReviewForm : Form
 
     void CanvasMouseUp(MouseEventArgs e)
     {
+        if (_grip != CropGrip.None)
+        {
+            _grip = CropGrip.None;
+            RefreshSurface(all: true);
+            return;
+        }
         if (_movingSelection) { _movingSelection = false; RefreshSurface(all: false); return; }
         if (_draft is MagnifierAnnotation pending)
         {

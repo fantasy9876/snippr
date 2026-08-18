@@ -25,6 +25,7 @@ static class Program
         failed += Check("win-area-review-crop-authority", CropAuthority());
         failed += Check("win-overlay-toolbar-layout", OverlayToolbarLayoutGate());
         failed += Check("win-area-review-chrome-hit-test", ChromeHitTest());
+        failed += Check("win-area-review-crop-drag", CropDrag());
         if (pending > 0)
             Console.WriteLine($"{pending} PARITY GATE(S) PENDING — not a pass");
         Console.WriteLine(failed == 0
@@ -148,6 +149,73 @@ static class Program
         if (!AreaReviewHitTest.IsCanvas(
             new Point(900, 550), placed.ToolFrame, placed.ActionFrame, chromeVisible: false))
             f.Add("hidden chrome still swallows");
+        return f;
+    }
+
+    /// Adjusting the crop while reviewing it: every handle moves the edge it
+    /// is drawn on, the body moves the whole rect, and dragging an edge past
+    /// its opposite gives a normalized rect rather than a negative one.
+    static List<string> CropDrag()
+    {
+        var f = new List<string>();
+        var crop = new Rectangle(100, 80, 200, 150);
+
+        // The hit regions come from the same helper that draws the handles, so
+        // grabbing what you can see is the property under test.
+        var handles = OverlayToolbarLayout.HandleRects(crop, 18f);
+        for (int i = 0; i < handles.Length; i++)
+        {
+            var centre = new Point(
+                (int)(handles[i].Left + handles[i].Width / 2),
+                (int)(handles[i].Top + handles[i].Height / 2));
+            var grip = AreaReviewCrop.GripAt(centre, crop, 18f);
+            if (grip != (CropGrip)i) f.Add($"handle {i} grabs {grip}");
+        }
+        if (AreaReviewCrop.GripAt(new Point(200, 150), crop, 18f) != CropGrip.Inside)
+            f.Add("body does not move the crop");
+        if (AreaReviewCrop.GripAt(new Point(20, 20), crop, 18f) != CropGrip.None)
+            f.Add("the surround grabs something");
+
+        // Each grip moves exactly the edges it names.
+        var moves = new (CropGrip Grip, Point From, Point To, Rectangle Want)[]
+        {
+            (CropGrip.Inside, new Point(200, 150), new Point(230, 170),
+                new Rectangle(130, 100, 200, 150)),
+            (CropGrip.Left, new Point(100, 150), new Point(140, 150),
+                new Rectangle(140, 80, 160, 150)),
+            (CropGrip.Right, new Point(300, 150), new Point(340, 155),
+                new Rectangle(100, 80, 240, 150)),
+            (CropGrip.Top, new Point(200, 80), new Point(200, 100),
+                new Rectangle(100, 100, 200, 130)),
+            (CropGrip.Bottom, new Point(200, 230), new Point(190, 200),
+                new Rectangle(100, 80, 200, 120)),
+            (CropGrip.TopLeft, new Point(100, 80), new Point(120, 100),
+                new Rectangle(120, 100, 180, 130)),
+            (CropGrip.BottomRight, new Point(300, 230), new Point(320, 250),
+                new Rectangle(100, 80, 220, 170)),
+            (CropGrip.TopRight, new Point(300, 80), new Point(280, 60),
+                new Rectangle(100, 60, 180, 170)),
+            (CropGrip.BottomLeft, new Point(100, 230), new Point(120, 210),
+                new Rectangle(120, 80, 180, 130)),
+        };
+        foreach (var (grip, from, to, want) in moves)
+        {
+            var got = AreaReviewCrop.Drag(grip, crop, from, to);
+            if (got != want) f.Add($"{grip}: {got} want {want}");
+        }
+
+        // Dragging an edge past its opposite normalizes instead of producing a
+        // negative rect that every later intersection would silently drop.
+        var flipped = AreaReviewCrop.Drag(
+            CropGrip.Left, crop, new Point(100, 150), new Point(360, 150));
+        if (flipped.Width <= 0 || flipped.Height <= 0 || flipped.Left != 300)
+            f.Add($"flip gave {flipped}");
+
+        // A drag reads the rect as it was when the drag STARTED, so the same
+        // pointer position always gives the same answer however it got there.
+        var once = AreaReviewCrop.Drag(CropGrip.Inside, crop, new Point(0, 0), new Point(40, 30));
+        var twice = AreaReviewCrop.Drag(CropGrip.Inside, crop, new Point(0, 0), new Point(40, 30));
+        if (once != twice) f.Add("drag is not a pure function of its endpoints");
         return f;
     }
 

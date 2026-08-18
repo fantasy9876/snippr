@@ -31,6 +31,7 @@
          it belongs on this side of the gate rather than the raster one. -->
     <Compile Include="..\Ui\OverlayToolbarLayout.cs" Link="OverlayToolbarLayout.cs" />
     <Compile Include="..\AreaReviewHitTest.cs" Link="AreaReviewHitTest.cs" />
+    <Compile Include="..\AreaReviewCrop.cs" Link="AreaReviewCrop.cs" />
   </ItemGroup>
 
 </Project>
