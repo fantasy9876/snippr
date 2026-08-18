@@ -77,11 +77,19 @@ sealed class HoverHint : Form
 
     /// Places a hint of <paramref name="size"/> relative to <paramref name="anchor"/>
     /// inside <paramref name="allowed"/>. Null when the leftover hole is under 60×24.
-    public static Rectangle? Place(Size size, Rectangle anchor, Rectangle allowed)
+    public static Rectangle? Place(Size size, Rectangle anchor, Rectangle allowed) =>
+        Place(size, anchor, allowed, 96);
+
+    /// The same placement, in real pixels for a given display. Minimums and
+    /// gaps are device-independent units: on a 150% display an unscaled 60×24
+    /// minimum lets a hint through that is two thirds the size it should be.
+    public static Rectangle? Place(Size size, Rectangle anchor, Rectangle allowed, int dpi)
     {
-        if (allowed.Width < Theme.HintMinW || allowed.Height < Theme.HintMinH)
+        int minW = Theme.Px(Theme.HintMinW, dpi);
+        int minH = Theme.Px(Theme.HintMinH, dpi);
+        if (allowed.Width < minW || allowed.Height < minH)
             return null;
-        int gap = (int)Math.Round(Theme.HintGap);
+        int gap = Theme.Px(Theme.HintGap, dpi);
         int x = anchor.Left + (anchor.Width - size.Width) / 2;
         x = Math.Clamp(x, allowed.Left, Math.Max(allowed.Left, allowed.Right - size.Width));
         int below = anchor.Bottom + gap;
@@ -93,7 +101,7 @@ sealed class HoverHint : Form
 
         var placed = new Rectangle(x, y, size.Width, size.Height);
         placed.Intersect(allowed);
-        if (placed.Width < Theme.HintMinW || placed.Height < Theme.HintMinH)
+        if (placed.Width < minW || placed.Height < minH)
             return null;
         return placed;
     }
@@ -129,17 +137,17 @@ sealed class HoverHint : Form
         var bounds = ClientRectangle;
         bounds.Width -= 1;
         bounds.Height -= 1;
-        using var path = Round(bounds, Theme.RadiusHint);
+        using var path = Round(bounds, Theme.PxF(Theme.RadiusHint, HostDpi));
         using var bg = new SolidBrush(Theme.HintBg);
         using var border = new Pen(Theme.HintBorder);
         g.FillPath(bg, path);
         g.DrawPath(border, path);
         if (_shown is null) return;
         var text = new Rectangle(
-            bounds.X + (int)Theme.HintPadX,
-            bounds.Y + (int)Theme.HintPadY,
-            bounds.Width - (int)Theme.HintPadX * 2,
-            bounds.Height - (int)Theme.HintPadY * 2);
+            bounds.X + Theme.Px(Theme.HintPadX, HostDpi),
+            bounds.Y + Theme.Px(Theme.HintPadY, HostDpi),
+            bounds.Width - Theme.Px(Theme.HintPadX, HostDpi) * 2,
+            bounds.Height - Theme.Px(Theme.HintPadY, HostDpi) * 2);
         TextRenderer.DrawText(
             g, _shown, Theme.HintFont, text, Theme.HintText,
             TextFormatFlags.WordBreak | TextFormatFlags.TextBoxControl | TextFormatFlags.NoPadding);
@@ -208,7 +216,7 @@ sealed class HoverHint : Form
         _shown = _pending;
         var size = Measure(_shown);
         var allowed = AllowedRect();
-        var placed = Place(size, _anchor, allowed);
+        var placed = Place(size, _anchor, allowed, HostDpi);
         if (placed is null)
         {
             HideNow();
@@ -224,19 +232,28 @@ sealed class HoverHint : Form
             SwpNoactivate | SwpShowwindow);
     }
 
+    /// The DPI of the display the HUD's host is on — every metric below is in
+    /// device-independent units and has to become pixels for THAT screen.
+    int HostDpi => _host.DeviceDpi;
+
     Size Measure(string text)
     {
-        int max = (int)Theme.HintMaxW;
+        int dpi = HostDpi;
+        int max = Theme.Px(Theme.HintMaxW, dpi);
+        int padX = Theme.Px(Theme.HintPadX, dpi);
+        int padY = Theme.Px(Theme.HintPadY, dpi);
+        int minW = Theme.Px(Theme.HintMinW, dpi);
+        int minH = Theme.Px(Theme.HintMinH, dpi);
         var area = AllowedRect();
-        int wrap = Math.Max(1, Math.Min(max, area.Width) - (int)Theme.HintPadX * 2);
+        int wrap = Math.Max(1, Math.Min(max, area.Width) - padX * 2);
         var measured = TextRenderer.MeasureText(
             text, Theme.HintFont, new Size(wrap, int.MaxValue),
             TextFormatFlags.WordBreak | TextFormatFlags.TextBoxControl | TextFormatFlags.NoPadding);
         int w = Math.Clamp(
-            measured.Width + (int)Theme.HintPadX * 2,
-            (int)Theme.HintMinW,
-            Math.Min(max, Math.Max((int)Theme.HintMinW, area.Width)));
-        int h = Math.Max((int)Theme.HintMinH, measured.Height + (int)Theme.HintPadY * 2);
+            measured.Width + padX * 2,
+            minW,
+            Math.Min(max, Math.Max(minW, area.Width)));
+        int h = Math.Max(minH, measured.Height + padY * 2);
         return new Size(w, h);
     }
 

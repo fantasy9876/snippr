@@ -28,6 +28,7 @@ static class Program
         failed += Check("win-area-review-crop-drag", CropDrag());
         failed += Check("win-editor-actions-match-catalog", EditorActionsMatchCatalog());
         failed += Check("win-backdrop-corner-radius-table", CornerRadiusTable());
+        failed += Check("win-chrome-fits-at-every-dpi", ChromeFitsAtEveryDpi());
         if (pending > 0)
             Console.WriteLine($"{pending} PARITY GATE(S) PENDING — not a pass");
         Console.WriteLine(failed == 0
@@ -325,6 +326,73 @@ static class Program
         if (BackdropSpec.CornerRadius(new Size(4000, 4000), BackdropCornerStyle.Medium)
             <= BackdropSpec.CornerRadiusPt)
             f.Add("a 4K capture still rounds like a thumbnail");
+        return f;
+    }
+
+    /// The chrome fits on the displays people actually have.
+    ///
+    /// Every chrome constant is written in device-independent units and was
+    /// used as pixels: at 150% two 35-unit rows do not fit a 70-pixel strip,
+    /// the tool row is left with nothing, and with overflow off its buttons are
+    /// not small — they are absent. "Ugly" and "no button works" were one
+    /// cause, and no gate could see it because no gate opened a window. This
+    /// one checks the arithmetic instead.
+    static List<string> ChromeFitsAtEveryDpi()
+    {
+        var f = new List<string>();
+        var actions = ToolCatalog.EditorActions.Count() + 4;
+        var tools = ToolCatalog.EditorTools.Count();
+        // 100%, 125%, 150%, 200% — the four Windows offers by default.
+        foreach (var dpi in new[] { 96, 120, 144, 192 })
+        {
+            var m = EditorChromeMetrics.For(dpi, actions, tools);
+            var tag = $"{dpi}dpi";
+            if (m.ButtonHeight <= 0 || m.ButtonWidth <= 0)
+                f.Add($"{tag}: button {m.ButtonWidth}x{m.ButtonHeight}");
+            // A row must hold its button, and the chrome must hold both rows.
+            if (m.RowHeight < m.ButtonHeight)
+                f.Add($"{tag}: row {m.RowHeight} < button {m.ButtonHeight}");
+            if (m.ChromeHeight < m.RowHeight * 2)
+                f.Add($"{tag}: chrome {m.ChromeHeight} < two rows of {m.RowHeight}");
+            // Everything grows WITH the display: a chrome that stays 70px on a
+            // 192dpi screen is the bug this gate exists for.
+            var atBase = EditorChromeMetrics.For(96, actions, tools);
+            var ratio = (float)dpi / 96f;
+            if (m.ChromeHeight < atBase.ChromeHeight * ratio - 2)
+                f.Add($"{tag}: chrome {m.ChromeHeight} did not scale ({atBase.ChromeHeight} at 96)");
+            if (m.ButtonWidth < atBase.ButtonWidth * ratio - 2)
+                f.Add($"{tag}: button did not scale");
+            if (m.IconSize < atBase.IconSize * ratio - 2)
+                f.Add($"{tag}: icon did not scale");
+            // The window may not be allowed to be narrower than its own
+            // toolbar: an item that does not fit is not moved, it is gone.
+            if (m.MinimumWindowWidth < m.RequiredWidth)
+                f.Add($"{tag}: minimum {m.MinimumWindowWidth} < required {m.RequiredWidth}");
+            // …and it still has to fit a laptop. 1366 physical pixels is the
+            // narrowest screen worth supporting; at 192dpi that is a 683-unit
+            // desktop, so the check is in units rather than pixels.
+            if (m.MinimumWindowWidth > ThemeMetrics.Px(1366, dpi))
+                f.Add($"{tag}: minimum {m.MinimumWindowWidth} wider than a small laptop");
+        }
+        // And the overlay toolbar's own layout survives the same four, for the
+        // smallest selection the plan names.
+        foreach (var dpi in new[] { 96, 120, 144, 192 })
+        {
+            var scale = dpi / 96f;
+            var metrics = OverlayToolbarLayout.Metrics.Standard.Scaled(scale);
+            var screen = new RectangleF(0, 0, 1920, 1080);
+            var selection = new RectangleF(920, 520, 80, 40);
+            var area = OverlayToolbarLayout.Compute(
+                selection, screen, ToolCatalog.OverlayTools.Count(),
+                ToolCatalog.OverlayActions.Count(), 18 * scale, metrics);
+            if (area is not { } placed) { f.Add($"{dpi}dpi: overlay layout null"); continue; }
+            if (placed.ToolButtonFrames.Length != ToolCatalog.OverlayTools.Count()
+                || placed.ActionButtonFrames.Length != ToolCatalog.OverlayActions.Count())
+                f.Add($"{dpi}dpi: overlay dropped buttons");
+            foreach (var b in placed.ToolButtonFrames.Concat(placed.ActionButtonFrames))
+                if (b.Width < 1 || b.Height < 1)
+                    f.Add($"{dpi}dpi: overlay button collapsed to {b.Size}");
+        }
         return f;
     }
 

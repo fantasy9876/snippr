@@ -28,7 +28,7 @@ sealed class ToolbarRenderer : ToolStripProfessionalRenderer
         if (fill is null) return;
         var r = new Rectangle(Point.Empty, e.Item.Size);
         r.Inflate(-1, -2);
-        using var path = Round(r, Theme.RadiusBtn);
+        using var path = Round(r, Theme.PxF(Theme.RadiusBtn, e.ToolStrip?.DeviceDpi ?? 96));
         using var brush = new SolidBrush(fill.Value);
         e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
         e.Graphics.FillPath(brush, path);

@@ -30,6 +30,8 @@
     <!-- The overlay toolbar's geometry, from the UI lane. Pure arithmetic, so
          it belongs on this side of the gate rather than the raster one. -->
     <Compile Include="..\Ui\OverlayToolbarLayout.cs" Link="OverlayToolbarLayout.cs" />
+    <Compile Include="..\Ui\ThemeMetrics.cs" Link="ThemeMetrics.cs" />
+    <Compile Include="..\Ui\EditorChromeMetrics.cs" Link="EditorChromeMetrics.cs" />
     <Compile Include="..\AreaReviewHitTest.cs" Link="AreaReviewHitTest.cs" />
     <Compile Include="..\AreaReviewCrop.cs" Link="AreaReviewCrop.cs" />
     <Compile Include="..\EditorActionRouter.cs" Link="EditorActionRouter.cs" />

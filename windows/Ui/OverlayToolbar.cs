@@ -235,7 +235,7 @@ sealed class OverlayToolbar : Control
             var r = ClientRectangle;
             r.Width -= 1;
             r.Height -= 1;
-            using var path = Round(r, Theme.RadiusChrome);
+            using var path = Round(r, Theme.PxF(Theme.RadiusChrome, DeviceDpi));
             using var fill = new SolidBrush(Theme.ChromeRaised);
             using var border = new Pen(Theme.Hairline);
             g.FillPath(fill, path);
@@ -279,7 +279,7 @@ sealed class OverlayToolbar : Control
                 : null;
             if (fill is not null)
             {
-                using var path = Round(r, Theme.RadiusBtn);
+                using var path = Round(r, Theme.PxF(Theme.RadiusBtn, DeviceDpi));
                 using var brush = new SolidBrush(fill.Value);
                 g.FillPath(brush, path);
             }

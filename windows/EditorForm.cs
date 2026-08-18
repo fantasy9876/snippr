@@ -36,7 +36,18 @@ sealed class EditorForm : Form
     readonly Dictionary<Tool, ToolStripButton> _toolButtons = new();
     HoverHint? _actionHint;
     HoverHint? _toolHint;
-    static readonly Bitmap IconSlot = new(20, 20);
+    /// A transparent stand-in that gives every button an image box of the
+    /// right SIZE; the renderer paints the real vector on top. It has to be
+    /// scaled too, or the icon area stays 20px while the button grows.
+    static readonly Dictionary<int, Bitmap> IconSlots = new();
+
+    static Bitmap SlotFor(int size)
+    {
+        if (IconSlots.TryGetValue(size, out var slot)) return slot;
+        slot = new Bitmap(Math.Max(1, size), Math.Max(1, size));
+        IconSlots[size] = slot;
+        return slot;
+    }
     TextBox? _textBox;
     TextAnnotation? _editingText;
 
@@ -76,11 +87,15 @@ sealed class EditorForm : Form
         BackColor = Theme.Window;
         KeyPreview = true;
         StartPosition = FormStartPosition.CenterScreen;
-        MinimumSize = new Size((int)Theme.EditorMinW, (int)(Theme.EditorChromeH + Theme.EditorMinViewportH));
+        MinimumSize = new Size(
+            Theme.Px(Theme.EditorMinW, DeviceDpi),
+            Theme.Px(Theme.EditorChromeH + Theme.EditorMinViewportH, DeviceDpi));
 
         var wa = Screen.FromPoint(Cursor.Position).WorkingArea;
         ClientSize = new Size(
-            Math.Min(Math.Max(image.Width, (int)Theme.EditorMinW), (int)(wa.Width * 0.9)),
+            Math.Min(
+                Math.Max(image.Width, Theme.Px(Theme.EditorMinW, DeviceDpi)),
+                (int)(wa.Width * 0.9)),
             Math.Min(image.Height, (int)(wa.Height * 0.85)) + (int)Theme.EditorChromeH);
 
         _canvas = new CanvasControl(this);
@@ -130,8 +145,14 @@ sealed class EditorForm : Form
 
     void BuildToolbar()
     {
+        // Real pixels for this display, not device-independent units used as
+        // if they were pixels.
+        var metrics = EditorChromeMetrics.For(
+            DeviceDpi,
+            ToolCatalog.EditorActions.Count() + 4, // + separator and three labels
+            ToolCatalog.EditorTools.Count());
         _chrome.Dock = DockStyle.Top;
-        _chrome.Height = (int)Theme.EditorChromeH;
+        _chrome.Height = metrics.ChromeHeight;
         _chrome.BackColor = Theme.Chrome;
         _chrome.Padding = Padding.Empty;
 
@@ -145,11 +166,13 @@ sealed class EditorForm : Form
             var b = new ToolStripButton
             {
                 DisplayStyle = ToolStripItemDisplayStyle.Image,
-                Image = IconSlot,
+                Image = SlotFor(metrics.IconSize),
                 ImageScaling = ToolStripItemImageScaling.None,
                 AutoSize = false,
-                Size = new Size((int)Theme.EditorBtnW, (int)Theme.EditorBtnH),
-                Margin = new Padding((int)Theme.Spacing, 3, (int)Theme.Spacing, 3),
+                Size = new Size(metrics.ButtonWidth, metrics.ButtonHeight),
+                Margin = new Padding(
+                    metrics.Spacing, Theme.Px(3, DeviceDpi),
+                    metrics.Spacing, Theme.Px(3, DeviceDpi)),
                 Padding = Padding.Empty,
                 ToolTipText = tip,
                 Tag = new IconRef(key),
@@ -213,8 +236,16 @@ sealed class EditorForm : Form
         // Last-docked Top wins the top edge: add tools first, then actions.
         _chrome.Controls.Add(_toolBar);
         _chrome.Controls.Add(_actionBar);
-        _actionBar.Height = (int)Theme.EditorRowH;
-        _toolBar.Height = (int)Theme.EditorRowH;
+        _actionBar.Height = metrics.RowHeight;
+        _toolBar.Height = metrics.RowHeight;
+        // A window narrow enough to hide a button is a window that must not
+        // exist: with overflow off an item that does not fit is not moved
+        // anywhere, it is simply gone.
+        MinimumSize = new Size(
+            Math.Max(MinimumSize.Width, metrics.MinimumWindowWidth),
+            Math.Max(
+                MinimumSize.Height,
+                metrics.ChromeHeight + Theme.Px(Theme.EditorMinViewportH, DeviceDpi)));
 
         _actionBar.Name = "actions";
         _toolBar.Name = "tools";
@@ -250,7 +281,11 @@ sealed class EditorForm : Form
         strip.Padding = new Padding((int)Theme.Pad, 0, (int)Theme.Pad, 0);
         strip.AutoSize = false;
         strip.ShowItemToolTips = false;
-        strip.CanOverflow = false;
+        // Overflow ON. It is the ugly answer, and it is still better than the
+        // alternative this build shipped with: an item that does not fit is
+        // not moved anywhere, it is not drawn at all, and the user is left
+        // with a toolbar that silently lost half its buttons.
+        strip.CanOverflow = true;
     }
 
     void UpdateColorSwatch()
