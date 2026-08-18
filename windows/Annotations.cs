@@ -1,4 +1,5 @@
 using System.Drawing.Drawing2D;
+using System.Drawing.Imaging;
 
 namespace Snippr;
 
@@ -377,22 +378,68 @@ static class AnnotationRenderer
     }
 
     /// Blocky pixelated copy used by BlurAnnotation.
+    /// Blocky pixelated copy used by BlurAnnotation.
+    ///
+    /// Every block is the AVERAGE of the pixels it covers, computed here
+    /// rather than by asking GDI+ to shrink the image. Its downscaler is not
+    /// an area filter: at a 14× reduction it samples rather than averages, so
+    /// a block could come back as one source pixel's exact colour — a redaction
+    /// that hands back original values, and one the magnifier gate caught
+    /// carrying pure source red through a "pixelated" area. Averaging also
+    /// matches what the macOS build produces, so a redaction looks the same on
+    /// both platforms.
     public static Bitmap Pixelate(Bitmap src, int block = 14)
     {
-        int sw = Math.Max(1, src.Width / block), sh = Math.Max(1, src.Height / block);
-        using var small = new Bitmap(sw, sh);
-        using (var g = Graphics.FromImage(small))
+        block = Math.Max(1, block);
+        int w = src.Width, h = src.Height;
+        var bounds = new Rectangle(0, 0, w, h);
+        var result = new Bitmap(w, h, PixelFormat.Format32bppArgb);
+
+        var srcData = src.LockBits(bounds, ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
+        var pixels = new byte[srcData.Stride * h];
+        System.Runtime.InteropServices.Marshal.Copy(srcData.Scan0, pixels, 0, pixels.Length);
+        src.UnlockBits(srcData);
+
+        var dstData = result.LockBits(bounds, ImageLockMode.WriteOnly, PixelFormat.Format32bppArgb);
+        var outPixels = new byte[dstData.Stride * h];
+        for (int by = 0; by < h; by += block)
         {
-            g.InterpolationMode = InterpolationMode.Bilinear;
-            g.DrawImage(src, 0, 0, sw, sh);
+            int yEnd = Math.Min(by + block, h);
+            for (int bx = 0; bx < w; bx += block)
+            {
+                int xEnd = Math.Min(bx + block, w);
+                long b = 0, g2 = 0, r = 0, a = 0;
+                int count = (xEnd - bx) * (yEnd - by);
+                for (int y = by; y < yEnd; y++)
+                {
+                    int row = y * srcData.Stride;
+                    for (int x = bx; x < xEnd; x++)
+                    {
+                        int i = row + x * 4;
+                        b += pixels[i];
+                        g2 += pixels[i + 1];
+                        r += pixels[i + 2];
+                        a += pixels[i + 3];
+                    }
+                }
+                byte ab = (byte)(b / count), ag = (byte)(g2 / count);
+                byte ar = (byte)(r / count), aa = (byte)(a / count);
+                for (int y = by; y < yEnd; y++)
+                {
+                    int row = y * dstData.Stride;
+                    for (int x = bx; x < xEnd; x++)
+                    {
+                        int i = row + x * 4;
+                        outPixels[i] = ab;
+                        outPixels[i + 1] = ag;
+                        outPixels[i + 2] = ar;
+                        outPixels[i + 3] = aa;
+                    }
+                }
+            }
         }
-        var result = new Bitmap(src.Width, src.Height);
-        using (var g = Graphics.FromImage(result))
-        {
-            g.InterpolationMode = InterpolationMode.NearestNeighbor;
-            g.PixelOffsetMode = PixelOffsetMode.Half;
-            g.DrawImage(small, 0, 0, src.Width, src.Height);
-        }
+        System.Runtime.InteropServices.Marshal.Copy(outPixels, 0, dstData.Scan0, outPixels.Length);
+        result.UnlockBits(dstData);
         return result;
     }
 }

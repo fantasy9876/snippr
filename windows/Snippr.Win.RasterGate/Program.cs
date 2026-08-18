@@ -312,6 +312,42 @@ static class Program
         {
             if (DiffersFromBaseline(covered, coveredPlain) == 0)
                 f.Add("redacted-source:callout-vanished");
+            // The real invariant, stated as itself: what the loupe shows IS
+            // the redacted document, enlarged. Asking merely "is any raw colour
+            // left" made the gate depend on how the pixelation happens to
+            // average, which is not what the callout promises.
+            int mismatched = 0, probed = 0;
+            string firstMismatch = "";
+            for (int cy = callout.Top + 6; cy < callout.Bottom - 6; cy++)
+            {
+                for (int cx = callout.Left + 6; cx < callout.Right - 6; cx++)
+                {
+                    var sx = (cx - callout.X) * secret.Width / callout.Width;
+                    var sy = (cy - callout.Y) * secret.Height / callout.Height;
+                    var got = At(covered, cx, cy);
+                    probed++;
+                    var matched = false;
+                    // A one-pixel rounding difference in the magnification is
+                    // not a leak, so the neighbours count as a match too.
+                    for (int dy = -1; dy <= 1 && !matched; dy++)
+                        for (int dx = -1; dx <= 1 && !matched; dx++)
+                        {
+                            var px = Math.Clamp(secret.X + sx + dx, secret.Left, secret.Right - 1);
+                            var py = Math.Clamp(secret.Y + sy + dy, secret.Top, secret.Bottom - 1);
+                            if (Near(got, At(coveredPlain, px, py), 4)) matched = true;
+                        }
+                    if (!matched)
+                    {
+                        mismatched++;
+                        if (firstMismatch.Length == 0)
+                            firstMismatch = $"@{cx},{cy}={got.R},{got.G},{got.B}";
+                    }
+                }
+            }
+            if (mismatched * 100 > probed)
+                f.Add($"callout is not the redacted document ({mismatched}/{probed}) {firstMismatch}");
+            // And with the pixelation averaging as it must, no source colour
+            // survives it untouched.
             var raw = RawPixels(covered);
             if (raw > 0) f.Add($"callout resurrected raw pixels ({raw}px)");
         }
