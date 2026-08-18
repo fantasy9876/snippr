@@ -20,7 +20,7 @@ sealed class Timeline<TState>
     /// holding unmanaged resources (a bitmap, say) can release the ones no
     /// longer reachable. It is never called for a state that is merely moving
     /// between the two stacks.
-    public Action<IReadOnlyList<TState>>? Discarding;
+    public Action<IReadOnlyList<TState>>? Discarding { get; set; }
 
     public bool CanUndo => _undo.Count > 0;
     public bool CanRedo => _redo.Count > 0;
