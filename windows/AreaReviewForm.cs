@@ -82,7 +82,7 @@ sealed class AreaReviewForm : Form
             // action — try that reading first.
             if (Enum.TryParse<BackdropPreset>(key, ignoreCase: true, out var preset))
             {
-                if (_session.ApplyBackdrop(preset)) Refresh(all: true);
+                if (_session.ApplyBackdrop(preset)) RefreshSurface(all: true);
                 return;
             }
             var entry = ToolCatalog.OverlayActions.FirstOrDefault(a => a.IconKey == key);
@@ -195,11 +195,16 @@ sealed class AreaReviewForm : Form
         return _pixelated ??= AnnotationRenderer.Pixelate(_session.Frozen);
     }
 
-    void Refresh(bool all)
+    void RefreshSurface(bool all)
     {
         if (all) PlaceToolbar();
         UpdateToolbarState();
-        Invalidate();
+        // The toolbar is a CHILD covering the entire surface, and a child is
+        // not repainted when its parent is invalidated — the picture under it
+        // would keep showing what it showed before the mark was made. It is
+        // transparent, so invalidating it is what renders this form's drawing
+        // again underneath it.
+        Invalidate(true);
     }
 
     // ---------- tools ----------
@@ -287,7 +292,7 @@ sealed class AreaReviewForm : Form
                 BeginText(px);
                 break;
         }
-        Refresh(all: false);
+        RefreshSurface(all: false);
     }
 
     void CanvasMouseMove(MouseEventArgs e)
@@ -297,7 +302,7 @@ sealed class AreaReviewForm : Form
         {
             _selected.Move(px.X - _dragStartPx.X, px.Y - _dragStartPx.Y);
             _dragStartPx = px;
-            Invalidate();
+            Invalidate(true);
             return;
         }
         switch (_draft)
@@ -312,18 +317,18 @@ sealed class AreaReviewForm : Form
                 break;
             default: return;
         }
-        Invalidate();
+        Invalidate(true);
     }
 
     void CanvasMouseUp(MouseEventArgs e)
     {
-        if (_movingSelection) { _movingSelection = false; Refresh(all: false); return; }
+        if (_movingSelection) { _movingSelection = false; RefreshSurface(all: false); return; }
         if (_draft is MagnifierAnnotation pending)
         {
             _draft = null;
             var made = _session.MakeMagnifier(pending.SourceRect);
             if (made != null) _session.Add(made);
-            Refresh(all: false);
+            RefreshSurface(all: false);
             return;
         }
         if (_draft != null)
@@ -332,7 +337,7 @@ sealed class AreaReviewForm : Form
             if (bounds.Width > 2 || bounds.Height > 2 || _draft is PenAnnotation)
                 _session.Add(_draft);
             _draft = null;
-            Refresh(all: false);
+            RefreshSurface(all: false);
         }
     }
 
@@ -372,7 +377,7 @@ sealed class AreaReviewForm : Form
         CancelText();
         if (text.Length == 0) return;
         _session.Add(new TextAnnotation { Origin = origin, Color = colour, Text = text });
-        Refresh(all: false);
+        RefreshSurface(all: false);
     }
 
     void CancelText()
@@ -394,10 +399,10 @@ sealed class AreaReviewForm : Form
         switch (action)
         {
             case OverlayAction.Undo:
-                if (_session.Undo()) Refresh(all: true);
+                if (_session.Undo()) RefreshSurface(all: true);
                 return;
             case OverlayAction.Redo:
-                if (_session.Redo()) Refresh(all: true);
+                if (_session.Redo()) RefreshSurface(all: true);
                 return;
             case OverlayAction.Color:
                 PickColor();
@@ -447,10 +452,10 @@ sealed class AreaReviewForm : Form
         {
             case Keys.Escape: Close(); return true;
             case Keys.Control | Keys.Z:
-                if (_session.Undo()) Refresh(all: true);
+                if (_session.Undo()) RefreshSurface(all: true);
                 return true;
             case Keys.Control | Keys.Y:
-                if (_session.Redo()) Refresh(all: true);
+                if (_session.Redo()) RefreshSurface(all: true);
                 return true;
             case Keys.Control | Keys.C: Invoke(OverlayAction.Copy); return true;
             case Keys.Control | Keys.S: Invoke(OverlayAction.Save); return true;
