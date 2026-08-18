@@ -22,12 +22,17 @@ sealed class EditorForm : Form
 
     readonly Panel _scroller = new();
     readonly CanvasControl _canvas;
-    readonly ToolStrip _bar = new();
+    readonly Panel _chrome = new();
+    readonly ToolStrip _actionBar = new();
+    readonly ToolStrip _toolBar = new();
     ToolStripLabel _sizeLabel = new();
     ToolStripLabel _zoomLabel = new();
     ToolStripLabel _widthLabel = new();
     ToolStripButton _colorButton = new();
     readonly Dictionary<Tool, ToolStripButton> _toolButtons = new();
+    HoverHint? _actionHint;
+    HoverHint? _toolHint;
+    static readonly Bitmap IconSlot = new(20, 20);
     TextBox? _textBox;
     TextAnnotation? _editingText;
 
@@ -57,24 +62,26 @@ sealed class EditorForm : Form
         _image = image;
         try { _color = ColorTranslator.FromHtml(AppSettings.Current.LastColor); } catch { }
         Text = "Snippr";
-        BackColor = Color.FromArgb(28, 30, 36);
+        AutoScaleMode = AutoScaleMode.Dpi;
+        BackColor = Theme.Window;
         KeyPreview = true;
         StartPosition = FormStartPosition.CenterScreen;
+        MinimumSize = new Size((int)Theme.EditorMinW, (int)(Theme.EditorChromeH + Theme.EditorMinViewportH));
 
         var wa = Screen.FromPoint(Cursor.Position).WorkingArea;
         ClientSize = new Size(
-            Math.Min(Math.Max(image.Width, 640), (int)(wa.Width * 0.9)),
-            Math.Min(image.Height, (int)(wa.Height * 0.85)) + 40);
+            Math.Min(Math.Max(image.Width, (int)Theme.EditorMinW), (int)(wa.Width * 0.9)),
+            Math.Min(image.Height, (int)(wa.Height * 0.85)) + (int)Theme.EditorChromeH);
 
         _canvas = new CanvasControl(this);
         BuildToolbar();
 
         _scroller.Dock = DockStyle.Fill;
         _scroller.AutoScroll = true;
-        _scroller.BackColor = Color.FromArgb(33, 36, 43);
+        _scroller.BackColor = Theme.Canvas;
         _scroller.Controls.Add(_canvas);
         Controls.Add(_scroller);
-        Controls.Add(_bar);
+        Controls.Add(_chrome);
         _previewTimer.Tick += (_, _) => { _previewTimer.Stop(); _canvas.Invalidate(); };
         _scroller.Resize += (_, _) => CenterCanvas();
 
@@ -105,93 +112,122 @@ sealed class EditorForm : Form
 
     void BuildToolbar()
     {
-        _bar.Dock = DockStyle.Top;
-        _bar.GripStyle = ToolStripGripStyle.Hidden;
-        _bar.BackColor = Color.FromArgb(22, 24, 29);
-        _bar.ForeColor = Color.Gainsboro;
-        _bar.Renderer = new DarkToolRenderer();
-        // 50% larger controls for readability
-        _bar.Font = new Font("Segoe UI", 13.5f);
-        _bar.ImageScalingSize = new Size(30, 30);
-        _bar.Padding = new Padding(8, 5, 8, 5);
-        _bar.AutoSize = true;
+        _chrome.Dock = DockStyle.Top;
+        _chrome.Height = (int)Theme.EditorChromeH;
+        _chrome.BackColor = Theme.Chrome;
+        _chrome.Padding = Padding.Empty;
 
-        ToolStripButton Btn(string text, string tip, EventHandler onClick)
+        StyleStrip(_actionBar);
+        StyleStrip(_toolBar);
+        _actionBar.Dock = DockStyle.Top;
+        _toolBar.Dock = DockStyle.Fill;
+
+        ToolStripButton IconBtn(ToolStrip strip, string key, string tip, EventHandler onClick)
         {
-            var b = new ToolStripButton(text)
+            var b = new ToolStripButton
             {
+                DisplayStyle = ToolStripItemDisplayStyle.Image,
+                Image = IconSlot,
+                ImageScaling = ToolStripItemImageScaling.None,
+                AutoSize = false,
+                Size = new Size((int)Theme.EditorBtnW, (int)Theme.EditorBtnH),
+                Margin = new Padding((int)Theme.Spacing, 3, (int)Theme.Spacing, 3),
+                Padding = Padding.Empty,
                 ToolTipText = tip,
-                ForeColor = Color.Gainsboro,
-                Padding = new Padding(6, 3, 6, 3),
-                Margin = new Padding(2, 1, 2, 1),
+                Tag = new IconRef(key),
             };
             b.Click += onClick;
-            _bar.Items.Add(b);
+            strip.Items.Add(b);
             return b;
         }
 
-        Btn("Copy", "Copy to clipboard and close (Ctrl+C)", (_, _) => CopyAndClose());
-        Btn("Save", "Save as… (Ctrl+S)", (_, _) => SaveWithDialog());
-        Btn("Pin", "Pin to screen (Ctrl+P)", (_, _) => PinAndClose());
-        Btn("OCR", "Recognize text in the image", (_, _) => RunOcr());
-        Btn("🌐", "OCR + translate", (_, _) => RunTranslate());
-        _bar.Items.Add(new ToolStripSeparator());
+        IconBtn(_actionBar, "copy", "Copy to clipboard (Ctrl+C)", (_, _) => CopyAndClose());
+        IconBtn(_actionBar, "save", "Save as… (Ctrl+S)", (_, _) => SaveWithDialog());
+        IconBtn(_actionBar, "pin", "Pin to screen (Ctrl+P)", (_, _) => PinAndClose());
+        IconBtn(_actionBar, "ocr", "Recognize text", (_, _) => RunOcr());
+        IconBtn(_actionBar, "translate", "Recognize + translate", (_, _) => RunTranslate());
+        _actionBar.Items.Add(new ToolStripSeparator { AutoSize = false, Size = new Size(8, 18) });
 
-        (Tool, string, string)[] tools =
-        {
-            (Tool.Select, "▲", "Select / move (V)"),
-            (Tool.Arrow, "↗", "Arrow (A)"),
-            (Tool.Line, "╱", "Line (L)"),
-            (Tool.Rect, "▭", "Rectangle (R)"),
-            (Tool.Oval, "◯", "Oval (O)"),
-            (Tool.Highlight, "▉", "Highlighter (H)"),
-            (Tool.Pen, "✎", "Pen (P)"),
-            (Tool.Text, "T", "Text (T)"),
-            (Tool.Counter, "①", "Counter (N)"),
-            (Tool.Blur, "▩", "Pixelate (B)"),
-            (Tool.Crop, "✂", "Crop (C)"),
-        };
-        foreach (var (tool, glyph, tip) in tools)
-        {
-            var b = Btn(glyph, tip, (_, _) => SelectTool(tool));
-            _toolButtons[tool] = b;
-        }
-
-        _bar.Items.Add(new ToolStripSeparator());
-        _colorButton = new ToolStripButton("") { ToolTipText = "Annotation color" };
-        _colorButton.Click += (_, _) => PickColor();
-        _bar.Items.Add(_colorButton);
+        _colorButton = IconBtn(_actionBar, "color", "Annotation color", (_, _) => PickColor());
         UpdateColorSwatch();
 
-        _widthLabel = new ToolStripLabel("") { ForeColor = Color.Silver, ToolTipText = "Độ dày nét — lăn chuột trên ảnh để chỉnh" };
-        _bar.Items.Add(_widthLabel);
+        _widthLabel = new ToolStripLabel("")
+        {
+            ForeColor = Theme.IconMuted,
+            Font = Theme.ChromeFont,
+            ToolTipText = "Stroke width — scroll on the image",
+        };
+        _actionBar.Items.Add(_widthLabel);
         UpdateWidthLabel();
 
-        _zoomLabel = new ToolStripLabel("100%") { Alignment = ToolStripItemAlignment.Right, ForeColor = Color.Silver };
-        _sizeLabel = new ToolStripLabel("") { Alignment = ToolStripItemAlignment.Right, ForeColor = Color.Silver };
-        _bar.Items.Add(_zoomLabel);
-        _bar.Items.Add(_sizeLabel);
+        _zoomLabel = new ToolStripLabel("100%")
+        {
+            Alignment = ToolStripItemAlignment.Right,
+            ForeColor = Theme.IconMuted,
+            Font = Theme.ChromeFont,
+        };
+        _sizeLabel = new ToolStripLabel("")
+        {
+            Alignment = ToolStripItemAlignment.Right,
+            ForeColor = Theme.IconMuted,
+            Font = Theme.ChromeFont,
+        };
+        _actionBar.Items.Add(_zoomLabel);
+        _actionBar.Items.Add(_sizeLabel);
+
+        (Tool Tool, string Key, string Tip)[] tools =
+        [
+            (Tool.Select, "select", "Select / move (V)"),
+            (Tool.Arrow, "arrow", "Arrow (A)"),
+            (Tool.Line, "line", "Line (L)"),
+            (Tool.Rect, "rect", "Rectangle (R)"),
+            (Tool.Oval, "oval", "Oval (O)"),
+            (Tool.Highlight, "highlight", "Highlighter (H)"),
+            (Tool.Pen, "pen", "Pen (P)"),
+            (Tool.Text, "text", "Text (T)"),
+            (Tool.Counter, "counter", "Counter (N)"),
+            (Tool.Blur, "pixelate", "Pixelate (B)"),
+            (Tool.Crop, "crop", "Crop (C)"),
+        ];
+        foreach (var (tool, key, tip) in tools)
+            _toolButtons[tool] = IconBtn(_toolBar, key, tip, (_, _) => SelectTool(tool));
+
+        // Last-docked Top wins the top edge: add tools first, then actions.
+        _chrome.Controls.Add(_toolBar);
+        _chrome.Controls.Add(_actionBar);
+        _actionBar.Height = (int)Theme.EditorRowH;
+        _toolBar.Height = (int)Theme.EditorRowH;
+
+        _actionHint = HoverHint.Attach(_actionBar, pt => _actionBar.GetItemAt(pt)?.ToolTipText);
+        _toolHint = HoverHint.Attach(_toolBar, pt => _toolBar.GetItemAt(pt)?.ToolTipText);
 
         SelectTool(Tool.Select);
         RefreshLabels();
     }
 
+    static void StyleStrip(ToolStrip strip)
+    {
+        strip.GripStyle = ToolStripGripStyle.Hidden;
+        strip.BackColor = Theme.Chrome;
+        strip.ForeColor = Theme.Icon;
+        strip.Renderer = new ToolbarRenderer();
+        strip.Font = Theme.ChromeFont;
+        strip.ImageScalingSize = new Size((int)Theme.EditorIcon, (int)Theme.EditorIcon);
+        strip.Padding = new Padding((int)Theme.Pad, 0, (int)Theme.Pad, 0);
+        strip.AutoSize = false;
+        strip.ShowItemToolTips = false;
+        strip.CanOverflow = false;
+    }
+
     void UpdateColorSwatch()
     {
-        var bmp = new Bitmap(20, 20);
-        using (var g = Graphics.FromImage(bmp))
-        {
-            g.SmoothingMode = SmoothingMode.AntiAlias;
-            using var brush = new SolidBrush(_color);
-            g.FillEllipse(brush, 1, 1, 18, 18);
-            g.DrawEllipse(Pens.Gray, 1, 1, 18, 18);
-        }
-        _colorButton.Image = bmp;
-        _colorButton.DisplayStyle = ToolStripItemDisplayStyle.Image;
+        _colorButton.Tag = new IconRef("color", _color);
+        _colorButton.Invalidate();
     }
 
     void PickColor()
     {
+        _actionHint?.HideNow();
         using var dlg = new ColorDialog { Color = _color, FullOpen = true };
         if (dlg.ShowDialog(this) == DialogResult.OK)
         {
@@ -285,7 +321,7 @@ sealed class EditorForm : Form
 
     void UpdateWidthLabel()
     {
-        _widthLabel.Text = $"✏ {AppSettings.Current.GetToolWidth(_tool.ToString()):0.#}";
+        _widthLabel.Text = $"{AppSettings.Current.GetToolWidth(_tool.ToString()):0.0} pt";
     }
 
     void SelectTool(Tool tool)
@@ -293,6 +329,8 @@ sealed class EditorForm : Form
         CommitText();
         _tool = tool;
         foreach (var (t, b) in _toolButtons) b.Checked = t == tool;
+        _actionHint?.HideNow();
+        _toolHint?.HideNow();
         UpdateWidthLabel();
         _canvas.Cursor = tool switch
         {
@@ -796,33 +834,5 @@ sealed class EditorForm : Form
                 base.OnMouseWheel(e); // bubbles to the scroll panel
             }
         }
-    }
-}
-
-/// Flat dark theme for the editor toolbar (hover + checked states).
-sealed class DarkToolRenderer : ToolStripProfessionalRenderer
-{
-    protected override void OnRenderToolStripBackground(ToolStripRenderEventArgs e)
-    {
-        e.Graphics.Clear(Color.FromArgb(22, 24, 29));
-    }
-
-    protected override void OnRenderButtonBackground(ToolStripItemRenderEventArgs e)
-    {
-        if (e.Item is ToolStripButton b && (b.Selected || b.Checked))
-        {
-            using var brush = new SolidBrush(
-                b.Checked ? Color.FromArgb(0, 120, 212) : Color.FromArgb(58, 62, 72));
-            var r = new Rectangle(Point.Empty, e.Item.Size);
-            r.Inflate(-1, -2);
-            e.Graphics.FillRectangle(brush, r);
-        }
-    }
-
-    protected override void OnRenderSeparator(ToolStripSeparatorRenderEventArgs e)
-    {
-        using var pen = new Pen(Color.FromArgb(52, 56, 66));
-        int x = e.Item.Width / 2;
-        e.Graphics.DrawLine(pen, x, 6, x, e.Item.Height - 6);
     }
 }
