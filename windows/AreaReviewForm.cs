@@ -48,6 +48,11 @@ sealed class AreaReviewForm : Form
     internal void ApplyPresetForTesting(string presetId) =>
         _toolbar.RaiseActionForTesting(presetId);
 
+    /// The picture a terminal route would hand over — without handing it over.
+    /// Pressing Copy for real closes the surface and reaches for a clipboard
+    /// the runner does not have.
+    internal Bitmap RouteImageForTesting(OverlayAction action) => _session.ForRoute(action);
+
     public static (OverlayAction? Action, Bitmap? Image, Rectangle Rect) Review(
         Bitmap frozen, Rectangle bounds, Rectangle selectionLocal)
     {

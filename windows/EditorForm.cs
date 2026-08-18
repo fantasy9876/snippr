@@ -57,6 +57,15 @@ sealed class EditorForm : Form
     /// Runs exactly what the toolbar button for this action runs.
     internal void PressForTesting(OverlayAction action) => Run(action);
 
+    /// The picture a terminal route would hand over, without handing it over:
+    /// pressing Copy for real closes the editor and reaches for a clipboard a
+    /// runner does not have.
+    internal Bitmap RouteImageForTesting(OverlayAction action) => ForRoute(action);
+
+    /// Dismisses anything the last press opened, so the next step is not
+    /// waiting behind a menu.
+    internal void CloseMenusForTesting() => _backdropMenu.Close();
+
     public static void OpenWith(Bitmap image)
     {
         var f = new EditorForm(image);

@@ -91,22 +91,68 @@ static class TestEntry
     }
 
     /// No desktop, no clicks, no waiting: each surface is built, laid out,
-    /// painted into a bitmap, and asked to run the actions its buttons run.
-    /// What comes out is a picture of the chrome and a log of what happened —
-    /// which is what "the buttons do nothing" needs in order to be answered.
+    /// painted into a bitmap, and asked to run what its buttons run.
+    ///
+    /// Two things it deliberately does NOT press. A terminal action (Copy,
+    /// Save, Pin, OCR, Open editor) closes the surface and reaches for a
+    /// clipboard or a file dialog the runner has not got — pressing Copy and
+    /// then anything else is an `ObjectDisposedException` caused by the test,
+    /// not by the app. And the colour button opens a modal dialog, which on a
+    /// runner means waiting until the job times out. The terminal routes are
+    /// still checked, by asking them for their picture instead of pressing
+    /// them: same code, no clipboard, no dialog, no teardown.
+    ///
+    /// Every step is separate. One failing step is recorded and the rest still
+    /// run, because a smoke run that stops at the first problem hides the ones
+    /// behind it. The exit code is the number of steps that failed.
     static void Shot(string dir, string? imagePath)
     {
         Directory.CreateDirectory(dir);
         using var picture = Load(imagePath);
+        int failures = 0;
+
+        void Step(string name, Action body)
+        {
+            try
+            {
+                body();
+                Diag.Click("test", $"step ok: {name}");
+            }
+            catch (Exception ex)
+            {
+                failures++;
+                Diag.Crash($"test-step:{name}", ex);
+            }
+        }
 
         using (var editor = EditorForm.CreateForTesting(new Bitmap(picture)))
         {
-            editor.Size = new Size(1400, 900);
-            editor.CreateControl();
-            editor.PerformLayout();
-            Capture(editor, Path.Combine(dir, "editor.png"));
-            editor.PressForTesting(OverlayAction.Copy);
-            editor.PressForTesting(OverlayAction.Undo);
+            Step("editor-layout", () =>
+            {
+                editor.Size = new Size(1400, 900);
+                editor.CreateControl();
+                editor.PerformLayout();
+            });
+            Step("editor-shot", () => Capture(editor, Path.Combine(dir, "editor.png")));
+            // Safe presses: nothing modal, nothing that closes the form.
+            Step("editor-undo", () => editor.PressForTesting(OverlayAction.Undo));
+            Step("editor-redo", () => editor.PressForTesting(OverlayAction.Redo));
+            Step("editor-backdrop-menu", () =>
+            {
+                editor.PressForTesting(OverlayAction.Backdrop);
+                editor.CloseMenusForTesting();
+            });
+            // The terminal routes, asked rather than pressed.
+            foreach (var action in RouteDecoration.VisualRoutes
+                .Concat(RouteDecoration.SemanticRoutes))
+            {
+                var route = action;
+                Step($"editor-route-{route}", () =>
+                {
+                    using var image = editor.RouteImageForTesting(route);
+                    Diag.Click("test", $"editor route {route} -> {image.Width}x{image.Height}");
+                });
+            }
         }
 
         var bounds = new Rectangle(0, 0, picture.Width, picture.Height);
@@ -116,19 +162,42 @@ static class TestEntry
         using (var review = AreaReviewForm.CreateForTesting(
             new Bitmap(picture), bounds, selection))
         {
-            review.CreateControl();
-            review.PerformLayout();
-            review.PlaceToolbarForTesting();
-            Capture(review, Path.Combine(dir, "review.png"));
-            review.PressToolForTesting("magnifier");
-            review.PressActionForTesting("backdrop");
-            review.ApplyPresetForTesting("ocean");
-            Capture(review, Path.Combine(dir, "review-ocean.png"));
+            Step("review-layout", () =>
+            {
+                review.CreateControl();
+                review.PerformLayout();
+                review.PlaceToolbarForTesting();
+            });
+            Step("review-shot", () => Capture(review, Path.Combine(dir, "review.png")));
+            Step("review-tool-magnifier", () => review.PressToolForTesting("magnifier"));
+            Step("review-tool-select", () => review.PressToolForTesting("select"));
+            Step("review-preset-ocean", () => review.ApplyPresetForTesting("ocean"));
+            Step("review-shot-ocean",
+                () => Capture(review, Path.Combine(dir, "review-ocean.png")));
+            Step("review-undo", () => review.PressActionForTesting("undo"));
+            foreach (var action in RouteDecoration.VisualRoutes
+                .Concat(RouteDecoration.SemanticRoutes))
+            {
+                var route = action;
+                Step($"review-route-{route}", () =>
+                {
+                    using var image = review.RouteImageForTesting(route);
+                    Diag.Click("test", $"review route {route} -> {image.Width}x{image.Height}");
+                });
+            }
         }
 
-        File.Copy(Diag.ClickLogPath, Path.Combine(dir, "click.log"), overwrite: true);
-        if (File.Exists(Diag.CrashLogPath))
-            File.Copy(Diag.CrashLogPath, Path.Combine(dir, "crash.log"), overwrite: true);
+        Step("collect-logs", () =>
+        {
+            if (File.Exists(Diag.ClickLogPath))
+                File.Copy(Diag.ClickLogPath, Path.Combine(dir, "click.log"), overwrite: true);
+            if (File.Exists(Diag.CrashLogPath))
+                File.Copy(Diag.CrashLogPath, Path.Combine(dir, "crash.log"), overwrite: true);
+        });
+
+        Diag.Click("test", $"shot finished failures={failures} dir={dir}");
+        // The job can read this without parsing a log.
+        Environment.ExitCode = failures;
     }
 
     static void Capture(Form form, string path)
