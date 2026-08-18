@@ -945,12 +945,50 @@ final class AnnotationSurface: RedactionHost, RedactionJobObserver {
     nonisolated(unsafe) static var flattenAllocationsForTesting = 0
     /// S2 fail-first hooks: production does not write these until regional
     /// pixelation exists.  Tests use them to reject a hidden full-image cache.
-    nonisolated(unsafe) static var regionalPixelateAllocationsForTesting = 0
-    nonisolated(unsafe) static var lastRegionalPixelateRectForTesting: CGRect?
+    ///
+    /// LOCKED, all of it. `pixellateRegion` runs wherever the render runs, and
+    /// compose can run off the main thread — two threads appending to the same
+    /// Swift array is unsynchronised copy-on-write, which corrupts a refcount
+    /// and crashes inside `Array.append` with EXC_BAD_ACCESS. That is the
+    /// intermittent selftest crash: the harness is not at fault, the
+    /// instrumentation on the production render path is. The same lesson the
+    /// grain blit counter already learned.
+    private static let regionalLock = NSLock()
+    private nonisolated(unsafe) static var regionalAllocations = 0
+    private nonisolated(unsafe) static var regionalLastRect: CGRect?
+    private nonisolated(unsafe) static var regionalRects: [CGRect] = []
+    private nonisolated(unsafe) static var regionalLastBaseSize: CGSize?
+
+    nonisolated static var regionalPixelateAllocationsForTesting: Int {
+        get { regionalLock.withLock { regionalAllocations } }
+        set { regionalLock.withLock { regionalAllocations = newValue } }
+    }
+    nonisolated static var lastRegionalPixelateRectForTesting: CGRect? {
+        get { regionalLock.withLock { regionalLastRect } }
+        set { regionalLock.withLock { regionalLastRect = newValue } }
+    }
     /// Every region Core Image was actually asked to materialize, so a gate can
     /// prove no allocation strayed outside the mask.
-    nonisolated(unsafe) static var allRegionalPixelateRectsForTesting: [CGRect] = []
-    nonisolated(unsafe) static var lastRegionalPixelateBaseSizeForTesting: CGSize?
+    nonisolated static var allRegionalPixelateRectsForTesting: [CGRect] {
+        get { regionalLock.withLock { regionalRects } }
+        set { regionalLock.withLock { regionalRects = newValue } }
+    }
+    nonisolated static var lastRegionalPixelateBaseSizeForTesting: CGSize? {
+        get { regionalLock.withLock { regionalLastBaseSize } }
+        set { regionalLock.withLock { regionalLastBaseSize = newValue } }
+    }
+
+    /// One locked write for the whole record. Four separate locked writes
+    /// would still let a reader see half of one render's numbers beside half
+    /// of another's.
+    nonisolated static func recordRegionalPixelate(region: CGRect, baseSize: CGSize) {
+        regionalLock.withLock {
+            regionalAllocations += 1
+            regionalLastRect = region
+            regionalRects.append(region)
+            regionalLastBaseSize = baseSize
+        }
+    }
     /// Test hook: simulates destination-allocation failure.
     var forceRenderFailureForTesting = false
     /// Test hook kept for the S2 gates: it now drives the SHARED low-level

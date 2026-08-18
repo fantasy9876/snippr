@@ -17109,6 +17109,76 @@ enum SelfTest {
                 } else {
                     chromeFailures.append("no-field")
                 }
+                // Choosing a CORNER from the same menu has to move everything
+                // that describes the plate, not just what draws it. The style
+                // is read live from Settings, so the draw path and the hit test
+                // follow it for free — the clip on the document and the mask on
+                // the caption are written once, by `applyLayout`, and a handler
+                // that skipped it left them a radius behind: preview against
+                // export, and a corner that looked cut while still taking
+                // clicks. The gate drives the real menu row rather than calling
+                // the setter, because it is the wiring that was wrong.
+                let styleBefore = Settings.shared.backdropCornerStyle
+                defer { Settings.shared.backdropCornerStyle = styleBefore }
+                let cornerMenu = wc.backdropMenu()
+                let largeTag = BackdropCornerStyle.allCases.firstIndex(of: .large)
+                if let row = cornerMenu.items.firstIndex(where: {
+                    $0.identifier == SliceBBackdrop.cornerItemIdentifier
+                        && $0.tag == largeTag
+                }) {
+                    cornerMenu.performActionForItem(at: row)
+                } else {
+                    chromeFailures.append("corner-row-missing")
+                }
+                if Settings.shared.backdropCornerStyle != .large {
+                    chromeFailures.append("corner-not-stored")
+                }
+                let wantRadius = SliceBBackdrop.cornerRadius(
+                    documentPoints: canvas.backdropLayout.innerPointSize,
+                    style: .large)
+                if abs(canvas.documentCornerRadius - wantRadius) > 0.01 {
+                    chromeFailures.append(
+                        "corner-clip \(canvas.documentCornerRadius) want \(wantRadius)")
+                }
+                // A point inside the OLD curve and outside the NEW one, in
+                // the CANVAS' own coordinates — the document's corner is its
+                // origin. After the change it must belong to the frame in
+                // every reading: not drawn, not clickable, not inside the
+                // caption's mask.
+                let oldRadius = SliceBBackdrop.cornerRadius(
+                    documentPoints: canvas.backdropLayout.innerPointSize,
+                    style: .medium)
+                if wantRadius > oldRadius + 1 {
+                    // The arc's closest approach to the corner is at
+                    // r(1 - 1/√2) along the diagonal; a point nearer than that
+                    // for the NEW radius but further than it for the old one
+                    // is exactly the sliver the change gives back to the frame.
+                    let inset = (
+                        oldRadius * (1 - 1 / 2.squareRoot())
+                            + wantRadius * (1 - 1 / 2.squareRoot())) / 2
+                    let probe = CGPoint(x: inset, y: inset)
+                    let newCurve = CGPath(
+                        roundedRect: canvas.bounds, cornerWidth: wantRadius,
+                        cornerHeight: wantRadius, transform: nil)
+                    let oldCurve = CGPath(
+                        roundedRect: canvas.bounds, cornerWidth: oldRadius,
+                        cornerHeight: oldRadius, transform: nil)
+                    if newCurve.contains(probe) || !oldCurve.contains(probe) {
+                        chromeFailures.append(
+                            "corner-probe \(probe) new \(wantRadius) old \(oldRadius)")
+                    }
+                    if let wrapper = wc.documentWrapperForTesting,
+                       wrapper.hitTest(wrapper.convert(probe, from: canvas)) != nil {
+                        chromeFailures.append(
+                            "corner-still-takes-clicks \(probe) r \(wantRadius)")
+                    }
+                    if let field = canvas.textFieldForTesting,
+                       let mask = field.layer?.mask as? CAShapeLayer,
+                       mask.path?.contains(field.convert(probe, from: canvas)) == true {
+                        chromeFailures.append(
+                            "corner-caption-mask-stale \(probe) r \(wantRadius)")
+                    }
+                }
                 canvas.undoManager?.groupsByEvent = previousGrouping
                 wc.window?.close()
             }

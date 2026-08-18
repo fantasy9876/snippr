@@ -703,11 +703,9 @@ enum AnnotationRenderer {
         // Record the exact extent passed to Core Image, not merely the blur's
         // requested bounds. This keeps the allocation gate coupled to the
         // actual output materialization call.
-        AnnotationSurface.regionalPixelateAllocationsForTesting += 1
-        AnnotationSurface.lastRegionalPixelateRectForTesting = region
-        AnnotationSurface.allRegionalPixelateRectsForTesting.append(region)
-        AnnotationSurface.lastRegionalPixelateBaseSizeForTesting = CGSize(
-            width: image.width, height: image.height)
+        AnnotationSurface.recordRegionalPixelate(
+            region: region,
+            baseSize: CGSize(width: image.width, height: image.height))
         guard let materialized = ciContext.createCGImage(out, from: region)
         else { return nil }
         // Only a SUCCESSFUL allocation is recorded: recording before the call

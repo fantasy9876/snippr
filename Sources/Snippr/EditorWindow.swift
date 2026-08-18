@@ -666,9 +666,15 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
         let styles = BackdropCornerStyle.allCases
         guard styles.indices.contains(sender.tag) else { return }
         Settings.shared.backdropCornerStyle = styles[sender.tag]
-        // The corner changes the SHAPE of what is on screen, not its size, so
-        // the layout stands and everything that draws the plate repaints.
-        refreshBackdropLayout()
+        // NOT `refreshBackdropLayout()`: that returns early when the layout is
+        // unchanged, and the corner style is not part of the layout — it is
+        // read live from Settings. Going through it left the document's clip
+        // and the caption's mask on the OLD radius while the frame, the
+        // hairline and the corner hit test had already moved to the new one:
+        // preview against export, and a corner that looked cut while still
+        // swallowing clicks.
+        documentWrapper?.applyLayout(canvas.backdropLayout)
+        documentWrapper?.needsDisplay = true
         canvas.needsDisplay = true
     }
 
