@@ -23,8 +23,7 @@ static class Program
         failed += Check("win-backdrop-undo-timeline", UndoTimeline());
         failed += Check("win-backdrop-route-table", RouteTable());
         failed += Check("win-area-review-crop-authority", CropAuthority());
-        failed += Pend("win-overlay-toolbar-layout",
-            "OverlayToolbar (lane UI) is not merged yet");
+        failed += Check("win-overlay-toolbar-layout", OverlayToolbarLayoutGate());
         if (pending > 0)
             Console.WriteLine($"{pending} PARITY GATE(S) PENDING — not a pass");
         Console.WriteLine(failed == 0
@@ -76,6 +75,24 @@ static class Program
             if (CropGeometry.Canonical(once, capture) != once)
                 f.Add($"not idempotent for {proposed}");
         }
+        return f;
+    }
+
+    /// The toolbar fits, on every screen the plan names, for a selection of
+    /// 80×40 as well as a full-screen one — and it does not sit on top of the
+    /// selection while there is room beside it. The fixtures come from the UI
+    /// lane's own layout code; the counts come from the catalog, so a tool
+    /// added to one and not the other is caught here rather than by a user
+    /// finding a button missing.
+    static List<string> OverlayToolbarLayoutGate()
+    {
+        var f = new List<string>(
+            OverlayToolbarLayout.GateFixtures(
+                ToolCatalog.OverlayTools.Count(), ToolCatalog.OverlayActions.Count()));
+        // The layout is asked about the catalog's real sizes above; this makes
+        // the dependency explicit, so a silent default cannot stand in for it.
+        if (ToolCatalog.OverlayTools.Count() != 12) f.Add("overlay tool count moved");
+        if (ToolCatalog.OverlayActions.Count() != 11) f.Add("overlay action count moved");
         return f;
     }
 

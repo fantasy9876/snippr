@@ -22,8 +22,7 @@ static class Program
         failed += Check("win-spotlight-dim", SpotlightDim());
         failed += Check("win-backdrop-export-routes", ExportRoutes());
         failed += Check("win-area-review-payloads", AreaReviewPayloads());
-        failed += Pend("win-hover-hint-clamped",
-            "HoverHint (lane UI) is not merged yet");
+        failed += Check("win-hover-hint-clamped", HoverHintClamped());
         if (pending > 0)
             Console.WriteLine($"{pending} RASTER GATE(S) PENDING — not a pass");
         Console.WriteLine(failed == 0
@@ -479,6 +478,44 @@ static class Program
                 if (leaked != 0) f.Add($"callout survived the crop move ({leaked}px)");
             }
         }
+        return f;
+    }
+
+    /// A hint must land on the screen, whatever button it belongs to. The
+    /// buttons that matter are the ones in the corners: a hint placed below a
+    /// button at the bottom edge, or centred on a button at the left edge, is
+    /// exactly where an off-screen rect comes from.
+    static List<string> HoverHintClamped()
+    {
+        var f = new List<string>();
+        var screen = new Rectangle(0, 0, 1920, 1080);
+        var size = new Size(160, 28);
+        var corners = new (string Where, Rectangle Anchor)[]
+        {
+            ("top-left", new Rectangle(0, 0, 34, 30)),
+            ("top-right", new Rectangle(1886, 0, 34, 30)),
+            ("bottom-left", new Rectangle(0, 1050, 34, 30)),
+            ("bottom-right", new Rectangle(1886, 1050, 34, 30)),
+            ("middle", new Rectangle(940, 520, 34, 30)),
+        };
+        foreach (var (where, anchor) in corners)
+        {
+            var placed = HoverHint.Place(size, anchor, screen);
+            if (placed is not Rectangle rect) { f.Add($"{where}: no placement"); continue; }
+            if (!screen.Contains(rect)) f.Add($"{where}: {rect} outside {screen}");
+            if (rect.Width < size.Width || rect.Height < size.Height)
+                f.Add($"{where}: truncated to {rect.Size}");
+            // It must not cover the button it describes.
+            if (rect.IntersectsWith(anchor)) f.Add($"{where}: hint covers its button");
+        }
+        // Below by preference, above when there is no room below.
+        var bottom = HoverHint.Place(size, new Rectangle(940, 1046, 34, 30), screen);
+        if (bottom is Rectangle b && b.Top > 1046) f.Add("bottom button: hint pushed off");
+        var top = HoverHint.Place(size, new Rectangle(940, 4, 34, 30), screen);
+        if (top is Rectangle t && t.Top < 34) f.Add("top button: hint sits above the screen edge");
+        // And a hole too small for a hint gets none rather than a sliver.
+        if (HoverHint.Place(size, new Rectangle(0, 0, 34, 30), new Rectangle(0, 0, 40, 12)) != null)
+            f.Add("sliver accepted");
         return f;
     }
 

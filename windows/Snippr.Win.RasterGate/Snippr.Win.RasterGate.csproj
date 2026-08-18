@@ -26,6 +26,8 @@
     <Compile Include="..\AnnotationCompositor.cs" Link="AnnotationCompositor.cs" />
     <Compile Include="..\Timeline.cs" Link="Timeline.cs" />
     <Compile Include="..\CropGeometry.cs" Link="CropGeometry.cs" />
+    <Compile Include="..\Ui\Theme.cs" Link="Theme.cs" />
+    <Compile Include="..\Ui\HoverHint.cs" Link="HoverHint.cs" />
     <Compile Include="..\AreaReviewSession.cs" Link="AreaReviewSession.cs" />
   </ItemGroup>
 
