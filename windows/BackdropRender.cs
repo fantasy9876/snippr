@@ -142,7 +142,14 @@ static class BackdropRender
         g.SmoothingMode = SmoothingMode.AntiAlias;
         DrawFill(g, size, preset, documentPixelsPerUserUnit);
 
-        var scale = Math.Max(1f, pixelScale);
+        // NOT clamped to 1. The radius and the shadow are point metrics, and
+        // the caller's scale is whatever the picture is being drawn at — a
+        // device scale in the export, a ZOOM in the preview. Refusing to go
+        // below 1 kept them at full size while everything around them shrank,
+        // so at 50% the preview wore a corner and a shadow half again too big
+        // and read darker than the picture it was previewing. Only zooms under
+        // 1 were affected, which is exactly what the gate found.
+        var scale = Math.Max(0.01f, pixelScale);
         var radius = BackdropSpec.CornerRadiusPt * scale;
         using var plate = RoundedRect(target, radius);
         DrawPlateShadow(g, plate, scale);
@@ -186,7 +193,9 @@ static class BackdropRender
     /// clip, so it sits on the screenshot rather than under it.
     public static void DrawPlateHairline(Graphics g, RectangleF rect, float pixelScale)
     {
-        var scale = Math.Max(1f, pixelScale);
+        // Same reason as the frame's: this is a point metric following the
+        // scale the picture is drawn at, which can be below 1.
+        var scale = Math.Max(0.01f, pixelScale);
         var radius = BackdropSpec.CornerRadiusPt * scale;
         // Inset by half the line width so the whole stroke lands INSIDE the
         // plate; a centred stroke spills half of itself onto the frame.
@@ -277,7 +286,7 @@ static class BackdropRender
         DrawFrame(g, new SizeF(outer.Width, outer.Height), target, preset, pixelScale);
 
         var state = g.Save();
-        var radius = BackdropSpec.CornerRadiusPt * Math.Max(1f, pixelScale);
+        var radius = BackdropSpec.CornerRadiusPt * Math.Max(0.01f, pixelScale);
         using (var plate = RoundedRect(target, radius))
         using (var document = new TextureBrush(image))
         {

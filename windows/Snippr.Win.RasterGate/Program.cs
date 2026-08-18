@@ -572,7 +572,7 @@ static class Program
                 g.DrawImage(exported, new Rectangle(0, 0, outerW, outerH));
             }
 
-            int differing = 0, probed = 0;
+            int differing = 0, probed = 0, worst = 0;
             string first = "";
             for (int y = 0; y < outerH; y++)
                 for (int x = 0; x < outerW; x++)
@@ -583,14 +583,24 @@ static class Program
                     if (x >= docRect.Left - 2 && x < docRect.Right + 2
                         && y >= docRect.Top - 2 && y < docRect.Bottom + 2) continue;
                     probed++;
-                    if (Near(At(preview, x, y), At(reference, x, y), 12)) continue;
+                    var got = At(preview, x, y);
+                    var want = At(reference, x, y);
+                    worst = Math.Max(
+                        worst,
+                        Math.Max(
+                            Math.Abs(got.R - want.R),
+                            Math.Max(Math.Abs(got.G - want.G), Math.Abs(got.B - want.B))));
+                    if (Near(got, want, 12)) continue;
                     differing++;
                     if (first.Length == 0)
-                        first = $"@{zoom}x {x},{y} preview {At(preview, x, y)} export {At(reference, x, y)}";
+                        first = $"{x},{y} preview {got} export {want}";
                 }
+            // Every zoom is reported, whatever the earlier ones did: reading
+            // one failure and guessing about the other two costs a CI round
+            // trip that the log could have paid for.
             if (probed == 0) { f.Add($"{zoom}x: nothing probed"); continue; }
             if (differing * 50 > probed)
-                f.Add($"{zoom}x: frame differs ({differing}/{probed}) {first}");
+                f.Add($"{zoom}x: frame differs ({differing}/{probed}, worst {worst}) {first}");
 
             // The hairline is ON the document's edge at every zoom. It is
             // white at 16% over the picture, so the edge reads lighter than
