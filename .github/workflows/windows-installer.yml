@@ -824,10 +824,17 @@ jobs:
           $out = Join-Path $pwd 'smoke-out'
           New-Item -ItemType Directory -Force $out | Out-Null
           Write-Host "running $($env:SMOKE_EXE) --test-shot $out"
-          & $env:SMOKE_EXE --test-shot $out
-          $code = $LASTEXITCODE
-          Write-Host "test-shot exit=$code"
+          # Snippr is a WinExe: `& exe` returns before the process exits and
+          # leaves $LASTEXITCODE empty. `$null -ne 0` is true, so the job
+          # threw while the app was still writing the log (run 32121325861:
+          # throw 09:27:21.6, first app line 09:27:22.19).
+          $p = Start-Process -FilePath $env:SMOKE_EXE `
+            -ArgumentList @('--test-shot', $out) `
+            -Wait -PassThru -NoNewWindow
+          $code = $p.ExitCode
+          Write-Host "test-shot exit=$code pid=$($p.Id)"
           Get-ChildItem $out | Format-Table Name, Length
+          if ($null -eq $code) { throw "win-ui-smoke --test-shot produced no exit code" }
           if ($code -ne 0) { throw "win-ui-smoke --test-shot failed $code step(s)" }
 
       - name: Upload smoke shots
