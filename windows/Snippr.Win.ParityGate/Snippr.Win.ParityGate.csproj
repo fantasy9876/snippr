@@ -6,7 +6,12 @@
          numbers and tables, so it runs on the CI runner AND on the macOS
          machine the port is written on. net8.0 is what CI has; net10.0 is what
          the dev machine has. Pixels belong in the Windows-only raster gate. -->
-    <TargetFrameworks>net8.0;net10.0</TargetFrameworks>
+    <!-- CI pins the .NET 8 SDK, which cannot target net10.0 at all: a second
+         TFM listed unconditionally fails RESTORE there, `-f net8.0` or not.
+         So the extra local framework appears only on an SDK new enough to
+         build it, which is the dev machine. -->
+    <TargetFrameworks>net8.0</TargetFrameworks>
+    <TargetFrameworks Condition="$([MSBuild]::VersionGreaterThanOrEquals('$(NETCoreSdkVersion)', '10.0'))">net8.0;net10.0</TargetFrameworks>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <InvariantGlobalization>true</InvariantGlobalization>
