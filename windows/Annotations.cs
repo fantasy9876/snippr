@@ -2,8 +2,6 @@ using System.Drawing.Drawing2D;
 
 namespace Snippr;
 
-enum Tool { Select, Arrow, Line, Rect, Oval, Highlight, Pen, Text, Counter, Blur, Crop }
-
 /// All coordinates are in image pixel space.
 abstract class Annotation
 {

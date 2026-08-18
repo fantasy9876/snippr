@@ -19,6 +19,11 @@
   <ItemGroup>
     <Compile Remove="Snippr.Win.StitcherGate/**" />
     <None Include="Snippr.Win.StitcherGate/**" />
+    <!-- Same reason as the stitcher gate: the gate projects live under
+         windows/ and their build output would otherwise be swept into the app
+         by the default glob. -->
+    <Compile Remove="Snippr.Win.ParityGate/**" />
+    <None Include="Snippr.Win.ParityGate/**" />
   </ItemGroup>
 
 </Project>

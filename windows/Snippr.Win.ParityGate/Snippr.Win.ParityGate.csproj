@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <!-- Deliberately NOT a Windows target: everything this gate checks is
+         numbers and tables, so it runs on the CI runner AND on the macOS
+         machine the port is written on. net8.0 is what CI has; net10.0 is what
+         the dev machine has. Pixels belong in the Windows-only raster gate. -->
+    <TargetFrameworks>net8.0;net10.0</TargetFrameworks>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <AssemblyName>Snippr.Win.ParityGate</AssemblyName>
+    <RootNamespace>Snippr.Tests</RootNamespace>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="..\ToolCatalog.cs" Link="ToolCatalog.cs" />
+    <Compile Include="..\Backdrop.cs" Link="Backdrop.cs" />
+  </ItemGroup>
+
+</Project>
