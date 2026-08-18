@@ -233,6 +233,35 @@ jobs:
           dotnet run --project windows/Snippr.Win.StitcherGate/Snippr.Win.StitcherGate.csproj
           -c Release --no-launch-profile
 
+      # Guarded: these projects land on feat/win-parity-tools. A branch
+      # without them (main today, feat/win-parity-ui) stays green. Honey
+      # rebases onto this commit so workflow_dispatch on that branch
+      # actually runs RasterGate — dispatch uses the workflow file at the
+      # dispatched ref, not main.
+      - name: ParityGate (catalog / literals / geometry)
+        shell: pwsh
+        run: |
+          $proj = 'windows/Snippr.Win.ParityGate/Snippr.Win.ParityGate.csproj'
+          if (-not (Test-Path $proj)) {
+            Write-Host "ParityGate skip: $proj not present"
+            exit 0
+          }
+          Write-Host "ParityGate run -f net8.0: $proj"
+          dotnet run --project $proj -c Release -f net8.0 --no-launch-profile
+          if ($LASTEXITCODE -ne 0) { throw "ParityGate failed: $LASTEXITCODE" }
+
+      - name: RasterGate (GDI+ pixels)
+        shell: pwsh
+        run: |
+          $proj = 'windows/Snippr.Win.RasterGate/Snippr.Win.RasterGate.csproj'
+          if (-not (Test-Path $proj)) {
+            Write-Host "RasterGate skip: $proj not present"
+            exit 0
+          }
+          Write-Host "RasterGate run (single TFM net8.0-windows): $proj"
+          dotnet run --project $proj -c Release --no-launch-profile
+          if ($LASTEXITCODE -ne 0) { throw "RasterGate failed: $LASTEXITCODE" }
+
       - name: Build Win app (Release)
         run: dotnet build windows/Snippr.Win.csproj -c Release
 
