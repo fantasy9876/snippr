@@ -22,6 +22,7 @@ static class Program
         failed += Check("win-backdrop-compose-geometry", ComposeGeometry());
         failed += Check("win-backdrop-undo-timeline", UndoTimeline());
         failed += Check("win-backdrop-route-table", RouteTable());
+        failed += Check("win-area-review-crop-authority", CropAuthority());
         failed += Pend("win-overlay-toolbar-layout",
             "OverlayToolbar (lane UI) is not merged yet");
         if (pending > 0)
@@ -38,6 +39,46 @@ static class Program
     /// its reason and is counted, and the summary says so — but it does not
     /// fail the job, because a step that throws here would stop the gates
     /// after it from ever running. Zero pending is a release condition.
+    /// The crop the review surface reports is the crop the export makes: one
+    /// integral rect, clamped to the capture, never empty. A rect that is
+    /// merely "close" puts the border, the toolbar and the frame in one place
+    /// and the exported pixels in another.
+    ///
+    /// The arithmetic lives in `CropGeometry` so it can be checked here; the
+    /// session that uses it needs a bitmap, so its own gate is the raster one.
+    static List<string> CropAuthority()
+    {
+        var f = new List<string>();
+        var capture = new Size(600, 500);
+        var cases = new (Rectangle Proposed, Rectangle Want)[]
+        {
+            // ordinary
+            (new Rectangle(100, 80, 200, 150), new Rectangle(100, 80, 200, 150)),
+            // hanging off the right and bottom edges: clamped, not shifted
+            (new Rectangle(560, 460, 100, 100), new Rectangle(560, 460, 40, 40)),
+            // starting off the left/top edge
+            (new Rectangle(-30, -20, 100, 90), new Rectangle(0, 0, 70, 70)),
+            // degenerate: never empty, because a zero-wide crop has no export
+            (new Rectangle(10, 10, 0, 0), new Rectangle(10, 10, 1, 1)),
+            // entirely outside
+            (new Rectangle(900, 900, 50, 50), new Rectangle(600, 500, 1, 1)),
+        };
+        foreach (var (proposed, want) in cases)
+        {
+            var got = CropGeometry.Canonical(proposed, capture);
+            if (got != want) f.Add($"{proposed} -> {got} want {want}");
+        }
+        // Canonicalizing twice changes nothing: the rect the UI stores is
+        // already the one the export uses.
+        foreach (var (proposed, _) in cases)
+        {
+            var once = CropGeometry.Canonical(proposed, capture);
+            if (CropGeometry.Canonical(once, capture) != once)
+                f.Add($"not idempotent for {proposed}");
+        }
+        return f;
+    }
+
     static int Pend(string name, string reason)
     {
         Console.WriteLine($"PEND {name} {reason}");

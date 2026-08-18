@@ -26,6 +26,7 @@
     <!-- The timeline RULES are platform-free on purpose; the editor's wiring
          to them is checked in the raster gate, where GDI+ lives. -->
     <Compile Include="..\Timeline.cs" Link="Timeline.cs" />
+    <Compile Include="..\CropGeometry.cs" Link="CropGeometry.cs" />
   </ItemGroup>
 
 </Project>

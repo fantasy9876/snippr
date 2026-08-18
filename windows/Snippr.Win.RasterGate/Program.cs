@@ -21,6 +21,7 @@ static class Program
         failed += Check("win-magnifier-crop-privacy", MagnifierPrivacy());
         failed += Check("win-spotlight-dim", SpotlightDim());
         failed += Check("win-backdrop-export-routes", ExportRoutes());
+        failed += Check("win-area-review-payloads", AreaReviewPayloads());
         failed += Pend("win-hover-hint-clamped",
             "HoverHint (lane UI) is not merged yet");
         if (pending > 0)
@@ -382,6 +383,102 @@ static class Program
         // The dimming stops AT the edge, not a few pixels in.
         if (!Near(At(bmp, lit.X + 1, lit.Y + 1), Color.White, 4))
             f.Add("dim bleeds into the lit rect");
+        return f;
+    }
+
+    // ---------- area review ----------
+
+    /// The review surface produces the same two readings the editor does, from
+    /// a crop that can still move under it.
+    static List<string> AreaReviewPayloads()
+    {
+        var f = new List<string>();
+        using var desktop = CheckeredDocument(
+            600, 500, Color.FromArgb(255, 30, 90, 200), Color.FromArgb(255, 240, 240, 240));
+        var crop = new Rectangle(100, 80, 200, 150);
+        var session = new AreaReviewSession(desktop, crop);
+
+        // A mark inside the crop, and one entirely outside it.
+        var inside = new BlurAnnotation { Rect = new Rectangle(140, 120, 40, 40) };
+        var outside = new BlurAnnotation { Rect = new Rectangle(20, 20, 40, 40) };
+        session.Add(inside);
+        session.Add(outside);
+
+        using (var semantic = session.Semantic())
+        {
+            if (semantic.Width != crop.Width || semantic.Height != crop.Height)
+                f.Add($"semantic {semantic.Width}x{semantic.Height} want {crop.Size}");
+            // The inside mark landed, shifted into the crop's coordinates.
+            int changed = 0;
+            for (int y = 4; y < 36; y++)
+                for (int x = 4; x < 36; x++)
+                {
+                    var docPixel = At(desktop, inside.Rect.X + x, inside.Rect.Y + y);
+                    var cropPixel = At(
+                        semantic, inside.Rect.X - crop.X + x, inside.Rect.Y - crop.Y + y);
+                    if (!Near(docPixel, cropPixel, 2)) changed++;
+                }
+            if (changed * 2 < 32 * 32) f.Add($"mark not in the crop ({changed})");
+        }
+
+        // Framed: outer size from the layout, and `.none` untouched.
+        session.ApplyBackdrop(BackdropPreset.Graphite);
+        var layout = new BackdropLayout(crop.Size, 1, BackdropPreset.Graphite);
+        using (var visual = session.Visual())
+        {
+            if (visual.Width != layout.OuterSize.Width || visual.Height != layout.OuterSize.Height)
+                f.Add($"visual {visual.Width}x{visual.Height} want {layout.OuterSize}");
+        }
+        if (session.ExportedSize != layout.OuterSize)
+            f.Add($"badge {session.ExportedSize} want {layout.OuterSize}");
+        using (var copy = session.ForRoute(OverlayAction.Copy))
+        using (var ocr = session.ForRoute(OverlayAction.Ocr))
+        {
+            if (copy.Width != layout.OuterSize.Width) f.Add("Copy not framed");
+            if (ocr.Width != crop.Width) f.Add("OCR framed");
+        }
+        session.ApplyBackdrop(BackdropPreset.None);
+
+        // A magnifier made here, then the crop moves off its source: preview
+        // and export stop showing it, because the compositor is asked the same
+        // question by both.
+        var mag = session.MakeMagnifier(new Rectangle(140, 120, 40, 40));
+        if (mag == null) f.Add("no magnifier");
+        else
+        {
+            session.Add(mag);
+            if (!session.PixelRect.Contains(mag.CalloutRect))
+                f.Add($"callout parked outside the crop {mag.CalloutRect}");
+            using (var withCallout = session.Semantic())
+            {
+                session.Annotations.Remove(mag);
+                using var without = session.Semantic();
+                session.Annotations.Add(mag);
+                int drawn = 0;
+                var local = new Rectangle(
+                    mag.CalloutRect.X - crop.X, mag.CalloutRect.Y - crop.Y,
+                    mag.CalloutRect.Width, mag.CalloutRect.Height);
+                for (int y = local.Top + 4; y < local.Bottom - 4; y++)
+                    for (int x = local.Left + 4; x < local.Right - 4; x++)
+                        if (!Near(At(withCallout, x, y), At(without, x, y), 2)) drawn++;
+                if (drawn == 0) f.Add("callout not drawn inside the crop");
+            }
+            // Move the crop so the SOURCE falls outside it. The callout is
+            // still where it was; what changed is that its source is no longer
+            // part of the picture.
+            session.SetSelection(new Rectangle(180, 140, 200, 150));
+            using (var moved = session.Semantic())
+            {
+                session.Annotations.Remove(mag);
+                using var movedWithout = session.Semantic();
+                session.Annotations.Add(mag);
+                int leaked = 0;
+                for (int y = 0; y < moved.Height; y++)
+                    for (int x = 0; x < moved.Width; x++)
+                        if (!Near(At(moved, x, y), At(movedWithout, x, y), 2)) leaked++;
+                if (leaked != 0) f.Add($"callout survived the crop move ({leaked}px)");
+            }
+        }
         return f;
     }
 
