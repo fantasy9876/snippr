@@ -416,6 +416,13 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
     var hasAreaSelectionForTesting: Bool { areaSelection != nil }
     var areaSelectionForTesting: CGRect? { areaSelection }
     var areaDragActiveForTesting: Bool { areaDrag != nil }
+    /// Which corner/edge a live mouseDown grabbed, if any. The gate that
+    /// proves inset handles are wired uses this instead of re-deriving
+    /// geometry: what it reads is what the user grabbed.
+    var areaDragHandleForTesting: SelectionHandle? {
+        if case .resizing(let handle, _) = areaDrag { return handle }
+        return nil
+    }
     var isAnnotationDraggingForTesting: Bool { annotationDragging }
     var isReviewingForTesting: Bool { isReviewing }
     var reviewToolbarFrameForTesting: CGRect? {
@@ -1192,13 +1199,26 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
         return sel.insetBy(dx: -layout.padPoints, dy: -layout.padPoints)
     }
 
+    /// Radius the plate actually draws. No plate (or style None) keeps the
+    /// handles on the geometric corners — same as capture, which has no
+    /// preset yet.
+    private func reviewCornerRadius(for rect: CGRect) -> CGFloat {
+        guard isReviewing, backdropPreset != .none else { return 0 }
+        return SliceBBackdrop.cornerRadius(
+            documentPoints: rect.size, style: SliceBBackdrop.cornerStyle)
+    }
+
     private func drawSelectionHandles(for rect: CGRect, in ctx: CGContext) {
         ctx.saveGState()
         defer { ctx.restoreGState() }
         ctx.setFillColor(NSColor.white.cgColor)
         ctx.setStrokeColor(NSColor.controlAccentColor.cgColor)
         ctx.setLineWidth(1)
-        for (_, handleRect) in EditableSelectionGeometry.handleRects(for: rect) {
+        for (_, handleRect) in EditableSelectionGeometry.handleRects(
+            for: rect,
+            cornerRadius: reviewCornerRadius(for: rect),
+            shrinkToArc: true
+        ) {
             ctx.fill(handleRect)
             ctx.stroke(handleRect)
         }
@@ -1378,7 +1398,10 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
             }
         }
         if let selection = areaSelection,
-           let handle = EditableSelectionGeometry.handle(at: p, in: selection) {
+           let handle = EditableSelectionGeometry.handle(
+            at: p, in: selection,
+            cornerRadius: reviewCornerRadius(for: selection)
+           ) {
             areaDrag = .resizing(handle: handle, original: selection)
             handle.cursor.set()
             return
@@ -1762,7 +1785,10 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
         addCursorRect(bounds, cursor: .crosshair)
         if let selection = areaSelection {
             addCursorRect(selection, cursor: .openHand)
-            for (handle, rect) in EditableSelectionGeometry.handleRects(for: selection, size: 18) {
+            let radius = reviewCornerRadius(for: selection)
+            for (handle, rect) in EditableSelectionGeometry.handleRects(
+                for: selection, size: 18, cornerRadius: radius
+            ) {
                 addCursorRect(rect, cursor: handle.cursor)
             }
         }
@@ -1770,7 +1796,10 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
 
     private func updateAreaCursor(at point: CGPoint) {
         if let selection = areaSelection,
-                  let handle = EditableSelectionGeometry.handle(at: point, in: selection) {
+                  let handle = EditableSelectionGeometry.handle(
+                    at: point, in: selection,
+                    cornerRadius: reviewCornerRadius(for: selection)
+                  ) {
             handle.cursor.set()
         } else if let selection = areaSelection, selection.contains(point) {
             NSCursor.openHand.set()

@@ -57,14 +57,41 @@ enum EditableSelectionGeometry {
         )
     }
 
-    static func handle(at point: CGPoint, in rect: CGRect, tolerance: CGFloat = 9) -> SelectionHandle? {
+    /// Inset of a corner handle onto the 45° point of a rounded plate:
+    /// `d = R × (1 − 1/√2)`. Radius 0 is the geometric corner. Same table
+    /// as Windows `OverlayToolbarLayout.HandleRects`.
+    static func cornerInset(forRadius radius: CGFloat) -> CGFloat {
+        radius > 0 ? radius * (1 - 1 / CGFloat(2).squareRoot()) : 0
+    }
+
+    /// The grab/draw centre. Mid-edge handles never move; corners move
+    /// inward along the plate arc when `cornerRadius > 0`.
+    static func handlePoint(
+        _ handle: SelectionHandle, in rect: CGRect, cornerRadius: CGFloat = 0
+    ) -> CGPoint {
+        let d = cornerInset(forRadius: cornerRadius)
+        var point = handle.point(in: rect)
+        switch handle {
+        case .bottomLeft: point.x += d; point.y += d
+        case .topLeft: point.x += d; point.y -= d
+        case .bottomRight: point.x -= d; point.y += d
+        case .topRight: point.x -= d; point.y -= d
+        default: break
+        }
+        return point
+    }
+
+    static func handle(
+        at point: CGPoint, in rect: CGRect, tolerance: CGFloat = 9,
+        cornerRadius: CGFloat = 0
+    ) -> SelectionHandle? {
         // Corners take priority when a selection is small and hit targets overlap.
         let priority: [SelectionHandle] = [
             .bottomLeft, .bottomRight, .topLeft, .topRight,
             .bottom, .top, .left, .right,
         ]
         return priority.first { handle in
-            let p = handle.point(in: rect)
+            let p = handlePoint(handle, in: rect, cornerRadius: cornerRadius)
             return abs(point.x - p.x) <= tolerance && abs(point.y - p.y) <= tolerance
         }
     }
@@ -121,12 +148,38 @@ enum EditableSelectionGeometry {
         return CGRect(x: left, y: bottom, width: right - left, height: top - bottom)
     }
 
-    static func handleRects(for rect: CGRect, size: CGFloat = 7) -> [(SelectionHandle, CGRect)] {
-        SelectionHandle.allCases.map { handle in
-            let point = handle.point(in: rect)
+    /// Eight crop handles. `cornerRadius` 0 (preset none, or style None)
+    /// is bit-identical to the geometric corners. A positive radius moves
+    /// only the corner centres onto the 45° point of the plate arc so a
+    /// square handle does not sit on the cut and read as a square corner.
+    ///
+    /// `shrinkToArc` is the drawn corner square only: if half its side
+    /// would still cover the geometric corner, that square shrinks to
+    /// `2d` (floor 5). Mid-edge squares stay at `size`. Hit-testing keeps
+    /// the 18 pt size at the same centres — pass `false` (the default)
+    /// there. Overlay toolbar layout does not pass a radius: the rail
+    /// still avoids the geometric corners.
+    static func handleRects(
+        for rect: CGRect, size: CGFloat = 7,
+        cornerRadius: CGFloat = 0, shrinkToArc: Bool = false
+    ) -> [(SelectionHandle, CGRect)] {
+        let d = cornerInset(forRadius: cornerRadius)
+        var cornerSize = size
+        if shrinkToArc, d > 0, size / 2 > d {
+            cornerSize = max(5, 2 * d)
+        }
+        return SelectionHandle.allCases.map { handle in
+            let point = handlePoint(handle, in: rect, cornerRadius: cornerRadius)
+            let side: CGFloat
+            switch handle {
+            case .bottomLeft, .bottomRight, .topLeft, .topRight:
+                side = cornerSize
+            default:
+                side = size
+            }
             return (handle, CGRect(
-                x: point.x - size / 2, y: point.y - size / 2,
-                width: size, height: size
+                x: point.x - side / 2, y: point.y - side / 2,
+                width: side, height: side
             ))
         }
     }
