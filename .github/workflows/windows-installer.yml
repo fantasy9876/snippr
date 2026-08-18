@@ -359,8 +359,9 @@ jobs:
           }
           Write-Host "NSIS setup icon PASS: $($setup[0].FullName)"
 
+      # Always publish. Tagged runs sign this exe. Untagged runs need the same
+      # self-contained zip so the owner can run --test-shot without a tag.
       - name: Publish self-contained exe
-        if: inputs.tag != ''
         run: >
           dotnet publish windows/Snippr.Win.csproj -c Release -r win-x64
           --self-contained -p:PublishSingleFile=true
@@ -368,6 +369,34 @@ jobs:
           -p:EnableCompressionInSingleFile=true
           -p:PublishReadyToRun=true
           -p:TieredPGO=true
+
+      - name: Portable ZIP (untagged)
+        if: inputs.tag == ''
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem -Recurse -Path windows -Filter Snippr.exe |
+            Where-Object { $_.FullName -like '*publish*' } | Select-Object -First 1
+          if (-not $exe) { throw "publish output not found" }
+          Write-Host "Found $($exe.FullName)"
+          New-Item -ItemType Directory -Force dist/portable | Out-Null
+          Copy-Item $exe.FullName dist/portable/Snippr.exe
+          Compress-Archive -Path $exe.FullName `
+            -DestinationPath dist/portable/Snippr-portable-win-x64.zip -Force
+          $h = Get-FileHash -Algorithm SHA256 dist/portable/Snippr-portable-win-x64.zip
+          $line = "$($h.Hash.ToLower())  Snippr-portable-win-x64.zip"
+          Write-Host $line
+          $line | Set-Content -Encoding ascii dist/portable/SHA256SUMS
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "## Untagged portable"
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value ""
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "Unsigned self-contained zip for owner ``--test-shot``. Not a release."
+
+      - name: Upload untagged portable zip
+        if: ${{ always() && inputs.tag == '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-portable
+          if-no-files-found: error
+          path: dist/portable/
 
       - name: Stage exe next to installer script
         if: inputs.tag != ''
@@ -756,3 +785,55 @@ jobs:
             $setup[0].FullName `
             windows/Snippr-portable-win-x64.zip `
             windows/SHA256SUMS
+
+  # Headless UI smoke: open both surfaces off-screen, press only the safe
+  # buttons, ask the terminal routes for their picture, write PNGs + logs.
+  # Needs the portable artifact from `build` (tagged or untagged).
+  win-ui-smoke:
+    needs: build
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    timeout-minutes: 15
+    steps:
+      - name: Download portable
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-portable
+          path: portable
+
+      - name: Locate Snippr.exe
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem -Recurse portable -Filter Snippr.exe | Select-Object -First 1
+          if (-not $exe) {
+            $zip = Get-ChildItem -Recurse portable -Filter Snippr-portable-win-x64.zip |
+              Select-Object -First 1
+            if (-not $zip) { throw "neither Snippr.exe nor portable zip in artifact" }
+            Expand-Archive $zip.FullName -DestinationPath portable/unpacked -Force
+            $exe = Get-ChildItem -Recurse portable/unpacked -Filter Snippr.exe |
+              Select-Object -First 1
+          }
+          if (-not $exe) { throw "Snippr.exe missing after unpack" }
+          Write-Host "SMOKE_EXE=$($exe.FullName)"
+          Add-Content -Path $env:GITHUB_ENV -Value "SMOKE_EXE=$($exe.FullName)"
+
+      - name: Run --test-shot
+        shell: pwsh
+        run: |
+          $out = Join-Path $pwd 'smoke-out'
+          New-Item -ItemType Directory -Force $out | Out-Null
+          Write-Host "running $($env:SMOKE_EXE) --test-shot $out"
+          & $env:SMOKE_EXE --test-shot $out
+          $code = $LASTEXITCODE
+          Write-Host "test-shot exit=$code"
+          Get-ChildItem $out | Format-Table Name, Length
+          if ($code -ne 0) { throw "win-ui-smoke --test-shot failed $code step(s)" }
+
+      - name: Upload smoke shots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: win-ui-smoke
+          if-no-files-found: warn
+          path: smoke-out/
