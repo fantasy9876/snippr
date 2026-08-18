@@ -40,6 +40,12 @@ sealed class EditorForm : Form
     TextBox? _textBox;
     TextAnnotation? _editingText;
 
+    /// Builds an editor without showing it, for the headless smoke entry.
+    internal static EditorForm CreateForTesting(Bitmap image) => new(image);
+
+    /// Runs exactly what the toolbar button for this action runs.
+    internal void PressForTesting(OverlayAction action) => Run(action);
+
     public static void OpenWith(Bitmap image)
     {
         var f = new EditorForm(image);
@@ -210,6 +216,11 @@ sealed class EditorForm : Form
         _actionBar.Height = (int)Theme.EditorRowH;
         _toolBar.Height = (int)Theme.EditorRowH;
 
+        _actionBar.Name = "actions";
+        _toolBar.Name = "tools";
+        // Measured AFTER layout, so the log carries what the user is actually
+        // looking at rather than what the constants asked for.
+        _chrome.Layout += (_, _) => Diag.Chrome("editor", _chrome, _actionBar, _toolBar);
         _actionHint = HoverHint.Attach(_actionBar, pt => _actionBar.GetItemAt(pt)?.ToolTipText);
         _toolHint = HoverHint.Attach(_toolBar, pt => _toolBar.GetItemAt(pt)?.ToolTipText);
 

@@ -38,8 +38,54 @@ static class Diag
         var version = Assembly.GetExecutingAssembly()
             .GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion
             ?? Application.ProductVersion;
+        // The exe path is here because "I installed the update" and "the
+        // running process is the update" are different statements, and only
+        // one of them can be checked from a log.
         Click("app", $"start version={version} os={Environment.OSVersion.Version} " +
-            $"dpiAware={Application.HighDpiMode} screens={Screen.AllScreens.Length}");
+            $"exe={Environment.ProcessPath} dpiAware={Application.HighDpiMode} " +
+            $"screens={Screen.AllScreens.Length} " +
+            $"primary={Screen.PrimaryScreen?.Bounds.Size} dpi={PrimaryDpi()}");
+    }
+
+    static int PrimaryDpi()
+    {
+        try
+        {
+            using var probe = new Form();
+            return probe.DeviceDpi;
+        }
+        catch { return -1; }
+    }
+
+    /// What a toolbar ACTUALLY measured, once it exists.
+    ///
+    /// A row squeezed to nothing looks exactly like a row whose buttons do not
+    /// work, and the difference is three numbers. Chrome sizes are written in
+    /// device-independent units; if they are used as pixels on a 150% display
+    /// the rows do not fit and the buttons are simply not there to click.
+    public static void Chrome(string surface, Control host, params ToolStrip[] strips)
+    {
+        var parts = new List<string>
+        {
+            $"dpi={host.DeviceDpi}",
+            $"host={host.Width}x{host.Height}",
+        };
+        foreach (var strip in strips)
+        {
+            var visible = 0;
+            var last = Rectangle.Empty;
+            foreach (ToolStripItem item in strip.Items)
+            {
+                if (item.Bounds.Right <= strip.Width && item.Bounds.Bottom <= strip.Height
+                    && item.Bounds.Width > 0 && item.Bounds.Height > 0)
+                    visible++;
+                last = item.Bounds;
+            }
+            parts.Add(
+                $"{strip.Name ?? "strip"}={strip.Width}x{strip.Height} " +
+                $"items={strip.Items.Count} fitting={visible} last={last}");
+        }
+        Click(surface, "chrome " + string.Join(" | ", parts));
     }
 
     /// One line per user action: which surface, which control, what happened.

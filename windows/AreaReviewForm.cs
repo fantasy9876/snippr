@@ -30,6 +30,24 @@ sealed class AreaReviewForm : Form
     public Bitmap? Result { get; private set; }
     public Rectangle ResultVirtualRect { get; private set; }
 
+    /// The same surface, unshown, for the headless smoke entry.
+    internal static AreaReviewForm CreateForTesting(
+        Bitmap frozen, Rectangle bounds, Rectangle selectionLocal) =>
+        new(frozen, bounds, selectionLocal);
+
+    internal void PlaceToolbarForTesting() => PlaceToolbar();
+
+    /// Presses a toolbar button the way the control does: by raising the same
+    /// key the button raises, through the same binding.
+    internal void PressToolForTesting(string iconKey) =>
+        _toolbar.RaiseToolForTesting(iconKey);
+
+    internal void PressActionForTesting(string iconKey) =>
+        _toolbar.RaiseActionForTesting(iconKey);
+
+    internal void ApplyPresetForTesting(string presetId) =>
+        _toolbar.RaiseActionForTesting(presetId);
+
     public static (OverlayAction? Action, Bitmap? Image, Rectangle Rect) Review(
         Bitmap frozen, Rectangle bounds, Rectangle selectionLocal)
     {

@@ -67,6 +67,14 @@ sealed class OverlayToolbar : Control
         _menu.PresetChosen += (_, id) => ActionInvoked?.Invoke(this, id);
     }
 
+    /// Raises exactly what a click on that button raises. The headless smoke
+    /// entry uses it: no desktop, no mouse, same path.
+    internal void RaiseToolForTesting(string iconKey) =>
+        ToolSelected?.Invoke(this, iconKey);
+
+    internal void RaiseActionForTesting(string iconKey) =>
+        ActionInvoked?.Invoke(this, iconKey);
+
     public BackdropMenu Menu => _menu;
     public HoverHint Hint => _hint;
 

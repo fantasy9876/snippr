@@ -13,6 +13,11 @@ static class Program
         // the only witness to a click that went nowhere.
         Diag.Install();
 
+        // Test entries run without the single-instance mutex on purpose: they
+        // are for a runner or an owner who already has Snippr in the tray, and
+        // refusing to start would defeat the point.
+        if (TestEntry.Handle(Environment.GetCommandLineArgs())) return;
+
         using var mutex = new Mutex(true, "SnipprWinSingleInstance", out bool isFirst);
         if (!isFirst)
         {
