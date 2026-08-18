@@ -132,7 +132,8 @@ static class BackdropRender
     /// continuous across the plate's edge instead of restarting there.
     public static void DrawFrame(
         Graphics g, SizeF size, RectangleF target, BackdropPreset preset,
-        float pixelScale, float documentPixelsPerUserUnit = 1)
+        float pixelScale, float documentPixelsPerUserUnit = 1,
+        BackdropCornerStyle corners = BackdropSpec.DefaultCornerStyle)
     {
         if (preset == BackdropPreset.None) return;
         var state = g.Save();
@@ -150,7 +151,12 @@ static class BackdropRender
         // and read darker than the picture it was previewing. Only zooms under
         // 1 were affected, which is exactly what the gate found.
         var scale = Math.Max(0.01f, pixelScale);
-        var radius = BackdropSpec.CornerRadiusPt * scale;
+        // The radius is a DOCUMENT metric, so it is computed from the document
+        // this frame is around — in document pixels — and then drawn at
+        // whatever scale the caller is working in.
+        var documentSize = new Size(
+            (int)Math.Round(target.Width / scale), (int)Math.Round(target.Height / scale));
+        var radius = BackdropSpec.CornerRadius(documentSize, corners) * scale;
         using var plate = RoundedRect(target, radius);
         DrawPlateShadow(g, plate, scale);
 
@@ -191,12 +197,18 @@ static class BackdropRender
     /// The 1px white line that softens the plate's clipped edge. Drawn AFTER
     /// the document and its marks and BEFORE any chrome, inside the plate's
     /// clip, so it sits on the screenshot rather than under it.
-    public static void DrawPlateHairline(Graphics g, RectangleF rect, float pixelScale)
+    public static void DrawPlateHairline(
+        Graphics g, RectangleF rect, float pixelScale,
+        BackdropCornerStyle corners = BackdropSpec.DefaultCornerStyle)
     {
         // Same reason as the frame's: this is a point metric following the
-        // scale the picture is drawn at, which can be below 1.
+        // scale the picture is drawn at, which can be below 1. The radius has
+        // to be the plate's own, or the line and the edge it softens curve
+        // differently.
         var scale = Math.Max(0.01f, pixelScale);
-        var radius = BackdropSpec.CornerRadiusPt * scale;
+        var documentSize = new Size(
+            (int)Math.Round(rect.Width / scale), (int)Math.Round(rect.Height / scale));
+        var radius = BackdropSpec.CornerRadius(documentSize, corners) * scale;
         // Inset by half the line width so the whole stroke lands INSIDE the
         // plate; a centred stroke spills half of itself onto the frame.
         var inset = RectangleF.Inflate(rect, -0.5f * scale, -0.5f * scale);
@@ -236,7 +248,8 @@ static class BackdropRender
     /// tile has to be drawn 256 units wide or the preview shows a grain half
     /// the size of the exported one.
     public static void DrawFrameForPreview(
-        Graphics g, RectangleF documentInView, float zoom, BackdropPreset preset)
+        Graphics g, RectangleF documentInView, float zoom, BackdropPreset preset,
+        BackdropCornerStyle corners = BackdropSpec.DefaultCornerStyle)
     {
         if (preset == BackdropPreset.None) return;
         var documentPixels = new Size(
@@ -251,14 +264,17 @@ static class BackdropRender
         g.TranslateTransform(documentInView.X - pad, documentInView.Y - pad);
         DrawFrame(
             g, outer, new RectangleF(pad, pad, documentInView.Width, documentInView.Height),
-            preset, zoom, documentPixelsPerUserUnit: 1 / Math.Max(0.0001f, zoom));
+            preset, zoom, documentPixelsPerUserUnit: 1 / Math.Max(0.0001f, zoom),
+            corners: corners);
         g.Restore(state);
     }
 
     /// The exported picture: the document inside its frame. `.none` hands the
     /// input straight back — not one byte is touched, and nothing is
     /// allocated.
-    public static Bitmap? Compose(Bitmap image, BackdropPreset preset, float pixelScale = 1)
+    public static Bitmap? Compose(
+        Bitmap image, BackdropPreset preset, float pixelScale = 1,
+        BackdropCornerStyle corners = BackdropSpec.DefaultCornerStyle)
     {
         if (preset == BackdropPreset.None) return image;
         var layout = new BackdropLayout(new Size(image.Width, image.Height), pixelScale, preset);
@@ -283,10 +299,13 @@ static class BackdropRender
         g.SmoothingMode = SmoothingMode.AntiAlias;
         var target = new RectangleF(
             layout.Pad, layout.Pad, image.Width, image.Height);
-        DrawFrame(g, new SizeF(outer.Width, outer.Height), target, preset, pixelScale);
+        DrawFrame(
+            g, new SizeF(outer.Width, outer.Height), target, preset, pixelScale,
+            corners: corners);
 
         var state = g.Save();
-        var radius = BackdropSpec.CornerRadiusPt * Math.Max(0.01f, pixelScale);
+        var radius = BackdropSpec.CornerRadius(
+            new Size(image.Width, image.Height), corners) * Math.Max(0.01f, pixelScale);
         using (var plate = RoundedRect(target, radius))
         using (var document = new TextureBrush(image))
         {
@@ -304,7 +323,7 @@ static class BackdropRender
             g.PixelOffsetMode = PixelOffsetMode.Half;
             g.FillPath(document, plate);
         }
-        DrawPlateHairline(g, target, pixelScale);
+        DrawPlateHairline(g, target, pixelScale, corners);
         g.Restore(state);
         return result;
     }

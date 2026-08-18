@@ -4,6 +4,13 @@ namespace Snippr;
 
 enum BackdropPreset { None, Ocean, Sunset, Mint, Graphite }
 
+/// How round the plate's corners are.
+///
+/// A fixed 12 px radius is a rounding on a phone screenshot and an invisible
+/// bevel on a 4K one — the owner's 3671 px capture came back looking square
+/// because 12 px is 0.3% of its width. The radius follows the picture now.
+enum BackdropCornerStyle { None, Small, Medium, Large }
+
 /// The backdrop's NUMBERS, ported 1:1 from `Sources/Snippr/SliceBContract.swift`
 /// (`SliceBBackdrop`) and from the literal table the macOS gate
 /// `sliceB-backdrop-presets-match-spec` checks it against.
@@ -27,7 +34,34 @@ static class BackdropSpec
     public const float MinPadding = 40f;
     /// A 40 000 px scrolling capture would otherwise get 2 400 px of padding.
     public const float MaxPadding = 320f;
+    /// Kept as the floor of the Medium step and as the number every existing
+    /// literal in the gates refers to; the radius itself now comes from
+    /// `CornerRadius`.
     public const float CornerRadiusPt = 12f;
+
+    public const BackdropCornerStyle DefaultCornerStyle = BackdropCornerStyle.Medium;
+
+    /// Radius in DOCUMENT pixels: a fraction of the SHORT edge, so a wide
+    /// panorama and a tall scrolling capture get the same visual roundness,
+    /// clamped at both ends — small enough never to eat a corner of a tiny
+    /// crop, large enough to be visible on a 4K one.
+    public static float CornerRadius(Size document, BackdropCornerStyle style)
+    {
+        var shortEdge = Math.Max(0, Math.Min(document.Width, document.Height));
+        var (fraction, floor, cap) = style switch
+        {
+            BackdropCornerStyle.None => (0f, 0f, 0f),
+            BackdropCornerStyle.Small => (0.012f, 8f, 40f),
+            BackdropCornerStyle.Medium => (0.024f, 12f, 72f),
+            BackdropCornerStyle.Large => (0.040f, 16f, 120f),
+            _ => (0f, 0f, 0f),
+        };
+        if (fraction == 0) return 0;
+        var radius = Math.Clamp(shortEdge * fraction, floor, cap);
+        // Never more than half the short edge: past that the "rounded" plate
+        // is a lozenge, and the document loses its own corners entirely.
+        return Math.Min(radius, shortEdge / 2f);
+    }
     public const float ShadowOffsetPt = -8f;
     public const float ShadowBlurPt = 24f;
     public const float ShadowAlpha = 0.35f;

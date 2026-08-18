@@ -27,6 +27,7 @@ static class Program
         failed += Check("win-area-review-chrome-hit-test", ChromeHitTest());
         failed += Check("win-area-review-crop-drag", CropDrag());
         failed += Check("win-editor-actions-match-catalog", EditorActionsMatchCatalog());
+        failed += Check("win-backdrop-corner-radius-table", CornerRadiusTable());
         if (pending > 0)
             Console.WriteLine($"{pending} PARITY GATE(S) PENDING — not a pass");
         Console.WriteLine(failed == 0
@@ -255,6 +256,75 @@ static class Program
         // And the editor cannot open itself.
         if (EditorActionRouter.IsHandled(OverlayAction.OpenEditor))
             f.Add("the editor offers to open an editor");
+        return f;
+    }
+
+    /// The corner radius, as a table written here rather than read back from
+    /// the code it checks.
+    ///
+    /// The owner's 3671 px capture came back looking square because the radius
+    /// was a fixed 12 px — 0.3% of its width. It follows the picture now, so
+    /// what this pins is that it follows it by the agreed amounts, that it
+    /// never eats a small crop's corner, and that None really is none.
+    static List<string> CornerRadiusTable()
+    {
+        var f = new List<string>();
+        // document short edge -> expected radius, per style
+        var cases = new (int Short, int Long, float None, float Small, float Medium, float Large)[]
+        {
+            // the owner's capture: ~1523 short edge. 1.2/2.4/4.0% of it, all
+            // still under their caps — where the old fixed 12 px sat, which is
+            // why that picture read as square.
+            (1523, 3285, 0, 18.276f, 36.552f, 60.92f),
+            // a 1080p window
+            (1080, 1920, 0, 12.96f, 25.92f, 43.2f),
+            // a small crop
+            (400, 800, 0, 8, 12, 16),
+            // a tiny one: the floors are floors, and half the short edge caps them
+            (20, 200, 0, 8, 10, 10),
+        };
+        foreach (var (shortEdge, longEdge, none, small, medium, large) in cases)
+        {
+            var document = new Size(longEdge, shortEdge);
+            var want = new (BackdropCornerStyle Style, float Radius)[]
+            {
+                (BackdropCornerStyle.None, none),
+                (BackdropCornerStyle.Small, small),
+                (BackdropCornerStyle.Medium, medium),
+                (BackdropCornerStyle.Large, large),
+            };
+            foreach (var (style, radius) in want)
+            {
+                var got = BackdropSpec.CornerRadius(document, style);
+                if (Math.Abs(got - radius) > 0.01f)
+                    f.Add($"{shortEdge}px {style}: {got} want {radius}");
+            }
+            // Orientation must not matter: a tall capture and a wide one with
+            // the same short edge round the same amount.
+            var rotated = BackdropSpec.CornerRadius(
+                new Size(shortEdge, longEdge), BackdropCornerStyle.Medium);
+            if (Math.Abs(rotated - medium) > 0.01f)
+                f.Add($"{shortEdge}px rotated: {rotated} want {medium}");
+            // And no radius may exceed half the short edge, or the plate stops
+            // being a rectangle at all.
+            foreach (var style in Enum.GetValues<BackdropCornerStyle>())
+                if (BackdropSpec.CornerRadius(document, style) > shortEdge / 2f + 0.01f)
+                    f.Add($"{shortEdge}px {style}: bigger than half the edge");
+        }
+        // The default is what an owner who never opens settings gets. Asked
+        // through the formula rather than as `Default == Medium`: comparing two
+        // constants is folded away at compile time, and a check that cannot
+        // fail is not a check.
+        var reference = new Size(1920, 1080);
+        if (Math.Abs(
+                BackdropSpec.CornerRadius(reference, BackdropSpec.DefaultCornerStyle)
+                    - BackdropSpec.CornerRadius(reference, BackdropCornerStyle.Medium))
+            > 0.01f)
+            f.Add("the default is not Medium");
+        // The old fixed radius is now the FLOOR of Medium, not the radius.
+        if (BackdropSpec.CornerRadius(new Size(4000, 4000), BackdropCornerStyle.Medium)
+            <= BackdropSpec.CornerRadiusPt)
+            f.Add("a 4K capture still rounds like a thumbnail");
         return f;
     }
 

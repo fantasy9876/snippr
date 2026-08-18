@@ -8,6 +8,10 @@ static class Program
         Application.SetHighDpiMode(HighDpiMode.PerMonitorV2);
         Application.EnableVisualStyles();
         Application.SetCompatibleTextRenderingDefault(false);
+        // Before anything else: whatever happens next, there will be a record
+        // of it. This machine cannot run Windows UI, so the app's own log is
+        // the only witness to a click that went nowhere.
+        Diag.Install();
 
         using var mutex = new Mutex(true, "SnipprWinSingleInstance", out bool isFirst);
         if (!isFirst)
@@ -20,6 +24,14 @@ static class Program
             return;
         }
 
-        Application.Run(new TrayContext());
+        try
+        {
+            Application.Run(new TrayContext());
+        }
+        catch (Exception ex)
+        {
+            Diag.Crash("run", ex);
+            throw;
+        }
     }
 }

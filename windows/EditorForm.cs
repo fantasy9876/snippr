@@ -358,6 +358,7 @@ sealed class EditorForm : Form
 
     void SelectTool(Tool tool)
     {
+        Diag.Click("editor", $"tool={tool}");
         CommitText();
         _tool = tool;
         foreach (var (t, b) in _toolButtons) b.Checked = t == tool;
@@ -379,6 +380,7 @@ sealed class EditorForm : Form
     /// the editor does cannot drift apart.
     void Run(OverlayAction action)
     {
+        Diag.Click("editor", $"action={action} tool={_tool} backdrop={_backdrop}");
         switch (action)
         {
             case OverlayAction.Backdrop:
@@ -460,7 +462,8 @@ sealed class EditorForm : Form
     {
         if (_backdrop == BackdropPreset.None) return;
         BackdropRender.DrawFrameForPreview(
-            e.Graphics, _canvas.Bounds, _zoom, _backdrop);
+            e.Graphics, _canvas.Bounds, _zoom, _backdrop,
+            AppSettings.Current.CornerStyle);
     }
 
     internal void ZoomBy(float factor) => ApplyZoom(_zoom * factor);
@@ -546,7 +549,8 @@ sealed class EditorForm : Form
     {
         var inner = Flatten();
         if (_backdrop == BackdropPreset.None) return inner;
-        var composed = BackdropRender.Compose(inner, _backdrop);
+        var composed = BackdropRender.Compose(
+            inner, _backdrop, corners: AppSettings.Current.CornerStyle);
         if (composed == null || ReferenceEquals(composed, inner)) return inner;
         inner.Dispose();
         return composed;
@@ -1036,7 +1040,8 @@ sealed class EditorForm : Form
             // 100% drew the line off the edge of the document entirely.
             if (o._backdrop != BackdropPreset.None)
                 BackdropRender.DrawPlateHairline(
-                    g, new RectangleF(0, 0, o._image.Width, o._image.Height), 1f);
+                    g, new RectangleF(0, 0, o._image.Width, o._image.Height), 1f,
+                    AppSettings.Current.CornerStyle);
 
             if (o._selected != null)
             {

@@ -40,7 +40,11 @@ sealed class AreaReviewForm : Form
 
     AreaReviewForm(Bitmap frozen, Rectangle bounds, Rectangle selectionLocal)
     {
-        _session = new AreaReviewSession(frozen, selectionLocal);
+        Diag.Click("review", $"open bounds={bounds} selection={selectionLocal}");
+        _session = new AreaReviewSession(frozen, selectionLocal)
+        {
+            Corners = AppSettings.Current.CornerStyle,
+        };
         _virtualBounds = bounds;
         FormBorderStyle = FormBorderStyle.None;
         StartPosition = FormStartPosition.Manual;
@@ -78,6 +82,10 @@ sealed class AreaReviewForm : Form
         _toolbar.ToolSelected += (_, key) =>
         {
             var entry = ToolCatalog.OverlayTools.FirstOrDefault(e => e.IconKey == key);
+            // The key is logged whether or not it matched: an unmatched key is
+            // silent by design, and silence is what a user reports as "the
+            // button does nothing".
+            Diag.Click("review", $"tool key={key} matched={entry.IconKey == key}");
             if (entry.IconKey == key) SelectTool(entry.Tool);
         };
         _toolbar.ActionInvoked += (_, key) =>
@@ -87,10 +95,12 @@ sealed class AreaReviewForm : Form
             // action — try that reading first.
             if (Enum.TryParse<BackdropPreset>(key, ignoreCase: true, out var preset))
             {
+                Diag.Click("review", $"preset={preset}");
                 if (_session.ApplyBackdrop(preset)) RefreshSurface(all: true);
                 return;
             }
             var entry = ToolCatalog.OverlayActions.FirstOrDefault(a => a.IconKey == key);
+            Diag.Click("review", $"action key={key} matched={entry.IconKey == key}");
             if (entry.IconKey == key) Invoke(entry.Action);
         };
         UpdateToolbarState();
@@ -147,17 +157,13 @@ sealed class AreaReviewForm : Form
         // the picture the export will write rather than a bare selection.
         if (_session.Backdrop != BackdropPreset.None)
         {
-            var layout = new BackdropLayout(crop.Size, 1, _session.Backdrop);
-            var outer = new RectangleF(
-                crop.X - layout.Pad, crop.Y - layout.Pad,
-                layout.OuterSize.Width, layout.OuterSize.Height);
-            var state = g.Save();
-            g.TranslateTransform(outer.X, outer.Y);
-            BackdropRender.DrawFrame(
-                g, new SizeF(outer.Width, outer.Height),
-                new RectangleF(layout.Pad, layout.Pad, crop.Width, crop.Height),
-                _session.Backdrop, 1);
-            g.Restore(state);
+            // The same entry the editor's preview uses, so there is one
+            // description of a frame and one of its corners. It places itself
+            // AROUND the document rect it is given, so what it needs is the
+            // crop — the padding is its own business.
+            BackdropRender.DrawFrameForPreview(
+                g, new RectangleF(crop.X, crop.Y, crop.Width, crop.Height), 1f,
+                _session.Backdrop, _session.Corners);
         }
 
         // Everything outside the crop is dimmed — with a frame on, the frame
@@ -181,7 +187,7 @@ sealed class AreaReviewForm : Form
         g.Restore(marks);
 
         if (_session.Backdrop != BackdropPreset.None)
-            BackdropRender.DrawPlateHairline(g, crop, 1);
+            BackdropRender.DrawPlateHairline(g, crop, 1, _session.Corners);
 
         using (var pen = new Pen(Color.DeepSkyBlue, 1.6f))
             g.DrawRectangle(pen, crop);
@@ -459,6 +465,7 @@ sealed class AreaReviewForm : Form
 
     void Invoke(OverlayAction action)
     {
+        Diag.Click("review", $"invoke={action} tool={_tool} crop={_session.PixelRect}");
         CommitText();
         switch (action)
         {

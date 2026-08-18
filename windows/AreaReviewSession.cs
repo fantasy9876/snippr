@@ -22,6 +22,12 @@ sealed class AreaReviewSession
     public List<Annotation> Annotations { get; } = new();
     public BackdropPreset Backdrop { get; private set; } = BackdropPreset.None;
 
+    /// How round the plate's corners are. Handed IN by the surface that owns
+    /// the user's settings rather than read from them here: this type is
+    /// compiled into a gate that has no settings file and no reason to want
+    /// one.
+    public BackdropCornerStyle Corners { get; set; } = BackdropSpec.DefaultCornerStyle;
+
     readonly Timeline<AreaReviewState> _history = new();
     Rectangle _selection;
 
@@ -128,7 +134,7 @@ sealed class AreaReviewSession
     {
         var inner = Semantic();
         if (Backdrop == BackdropPreset.None) return inner;
-        var composed = BackdropRender.Compose(inner, Backdrop);
+        var composed = BackdropRender.Compose(inner, Backdrop, corners: Corners);
         if (composed == null || ReferenceEquals(composed, inner)) return inner;
         inner.Dispose();
         return composed;

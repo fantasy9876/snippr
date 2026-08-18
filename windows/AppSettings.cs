@@ -8,6 +8,17 @@ class AppSettings
         Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
     public string Format { get; set; } = "auto"; // auto | png
     public bool AfterShow { get; set; } = true;
+
+    /// How round the Backdrop plate's corners are. Stored by name so an older
+    /// build reading a newer file falls back to the default rather than to
+    /// whatever number an enum happened to have.
+    public string BackdropCorners { get; set; } =
+        BackdropSpec.DefaultCornerStyle.ToString();
+
+    public BackdropCornerStyle CornerStyle =>
+        Enum.TryParse<BackdropCornerStyle>(BackdropCorners, ignoreCase: true, out var style)
+            ? style
+            : BackdropSpec.DefaultCornerStyle;
     public bool AfterCopy { get; set; } = false;
     public bool AfterSave { get; set; } = false;
     public bool LaunchAtStartup { get; set; } = false;

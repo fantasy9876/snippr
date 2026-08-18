@@ -231,6 +231,7 @@ sealed class SettingsForm : Form
     readonly CheckBox _save = new() { Text = "Save to folder" };
     readonly CheckBox _startup = new() { Text = "Launch Snippr at startup" };
     readonly CheckBox _escCopy = new() { Text = "Esc in editor copies image, then closes" };
+    readonly ComboBox _corners = new();
     readonly HotkeyBox _hkFullscreen = new();
     readonly HotkeyBox _hkArea = new();
     readonly HotkeyBox _hkWindow = new();
@@ -296,6 +297,20 @@ sealed class SettingsForm : Form
         Controls.Add(_escCopy);
         y += 32;
 
+        L("Backdrop corners");
+        _corners.DropDownStyle = ComboBoxStyle.DropDownList;
+        _corners.Items.AddRange(new object[] { "Square", "Small", "Medium", "Large" });
+        _corners.SelectedIndex = s.CornerStyle switch
+        {
+            BackdropCornerStyle.None => 0,
+            BackdropCornerStyle.Small => 1,
+            BackdropCornerStyle.Large => 3,
+            _ => 2,
+        };
+        _corners.SetBounds(160, y, 210, 24);
+        Controls.Add(_corners);
+        y += 34;
+
         y += 8;
         var hotkeyHeader = new Label
         {
@@ -344,6 +359,13 @@ sealed class SettingsForm : Form
         s.AfterSave = _save.Checked;
         s.LaunchAtStartup = _startup.Checked;
         s.EscCopy = _escCopy.Checked;
+        s.BackdropCorners = _corners.SelectedIndex switch
+        {
+            0 => nameof(BackdropCornerStyle.None),
+            1 => nameof(BackdropCornerStyle.Small),
+            3 => nameof(BackdropCornerStyle.Large),
+            _ => nameof(BackdropCornerStyle.Medium),
+        };
         s.HotkeyFullscreen = _hkFullscreen.Combo;
         s.HotkeyArea = _hkArea.Combo;
         s.HotkeyWindow = _hkWindow.Combo;

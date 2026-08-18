@@ -77,7 +77,10 @@ sealed class TrayContext : ApplicationContext
         void Add(string text, Action onClick, string? shortcut = null)
         {
             var item = new ToolStripMenuItem(text) { ShortcutKeyDisplayString = shortcut };
-            item.Click += (_, _) => onClick();
+            // Every tray item records that it was pressed and what it ran. If a
+            // menu entry "does nothing", the log says whether the click arrived
+            // and whether the flow threw on its way out.
+            item.Click += (_, _) => Diag.Run("tray", text, onClick);
             menu.Items.Add(item);
         }
 
@@ -109,6 +112,7 @@ sealed class TrayContext : ApplicationContext
 
     void OnHotkey(int id)
     {
+        Diag.Click("hotkey", $"id={id} busy={CaptureBusy}");
         if (CaptureBusy) return;
         switch (id)
         {
@@ -136,6 +140,7 @@ sealed class TrayContext : ApplicationContext
         try
         {
             var (action, image, rect) = AreaReviewForm.Review(frozen, bounds, selection);
+            Diag.Click("review", $"finished action={action} image={image != null} rect={rect}");
             if (image == null) return; // closed without asking for anything
             // The rect the app remembers is the crop, undecorated, whatever
             // the picture ended up carrying around it.

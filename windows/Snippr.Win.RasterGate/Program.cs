@@ -23,6 +23,7 @@ static class Program
         failed += Check("win-backdrop-export-routes", ExportRoutes());
         failed += Check("win-area-review-payloads", AreaReviewPayloads());
         failed += Check("win-backdrop-preview-matches-export", PreviewMatchesExport());
+        failed += Check("win-backdrop-corner-radius-pixels", CornerRadiusPixels());
         failed += Check("win-hover-hint-clamped", HoverHintClamped());
         if (pending > 0)
             Console.WriteLine($"{pending} RASTER GATE(S) PENDING — not a pass");
@@ -625,6 +626,87 @@ static class Program
                 g, new RectangleF(pad, pad, 240, 180), 1f, BackdropPreset.Sunset);
         if (Near(At(other, 4, 4), At(exported, 4, 4), 3))
             f.Add("presets are indistinguishable at the probe");
+        return f;
+    }
+
+    /// The radius is not just a number in a table: the plate really is cut
+    /// that far in, and the preview cuts it the same way.
+    ///
+    /// Measured by walking the document's top edge inward until the frame stops
+    /// and the document starts — which is the corner's chord, and grows with
+    /// the style.
+    static List<string> CornerRadiusPixels()
+    {
+        var f = new List<string>();
+        using var doc = Document(600, 400);
+
+        int CutAt(Bitmap picture, int pad)
+        {
+            // Along the document's top row, how many pixels from its left edge
+            // are still frame rather than document?
+            for (int x = 0; x < 300; x++)
+                if (Near(At(picture, pad + x, pad + 1), Color.FromArgb(20, 200, 90), 40))
+                    return x;
+            return -1;
+        }
+
+        var measured = new Dictionary<BackdropCornerStyle, int>();
+        foreach (var style in Enum.GetValues<BackdropCornerStyle>())
+        {
+            using var framed = BackdropRender.Compose(
+                doc, BackdropPreset.Ocean, corners: style)!;
+            var layout = new BackdropLayout(new Size(600, 400), 1, BackdropPreset.Ocean);
+            var cut = CutAt(framed, (int)layout.Pad);
+            if (cut < 0) { f.Add($"{style}: document never starts"); continue; }
+            measured[style] = cut;
+            var want = BackdropSpec.CornerRadius(new Size(600, 400), style);
+            // The chord at one row in is a shade under the radius; what matters
+            // is that it TRACKS the radius rather than a constant.
+            if (cut > want + 3) f.Add($"{style}: cut {cut}px for radius {want}");
+        }
+        if (measured.TryGetValue(BackdropCornerStyle.None, out var none) && none > 1)
+            f.Add($"None still rounds ({none}px)");
+        if (measured.TryGetValue(BackdropCornerStyle.Small, out var small)
+            && measured.TryGetValue(BackdropCornerStyle.Large, out var large)
+            && large <= small)
+            f.Add($"Large ({large}) does not round more than Small ({small})");
+        if (measured.TryGetValue(BackdropCornerStyle.Medium, out var medium)
+            && medium <= (int)BackdropSpec.CornerRadiusPt / 2)
+            f.Add($"Medium on a 400px edge is still the old fixed corner ({medium}px)");
+
+        // And the preview cuts the same corner as the export, at each style.
+        foreach (var style in new[] { BackdropCornerStyle.Small, BackdropCornerStyle.Large })
+        {
+            var layout = new BackdropLayout(new Size(600, 400), 1, BackdropPreset.Ocean);
+            var pad = (int)layout.Pad;
+            using var preview = new Bitmap(
+                layout.OuterSize.Width, layout.OuterSize.Height, PixelFormat.Format32bppArgb);
+            using (var g = Graphics.FromImage(preview))
+            {
+                using (var basecoat = new SolidBrush(
+                    BackdropSpec.GradientStops(BackdropPreset.Ocean)[0].Color))
+                    g.FillRectangle(basecoat, 0, 0, preview.Width, preview.Height);
+                BackdropRender.DrawFrameForPreview(
+                    g, new RectangleF(pad, pad, 600, 400), 1f, BackdropPreset.Ocean, style);
+                var state = g.Save();
+                using (var plate = BackdropRender.RoundedRect(
+                    new RectangleF(pad, pad, 600, 400),
+                    BackdropSpec.CornerRadius(new Size(600, 400), style)))
+                using (var brush = new TextureBrush(doc) { WrapMode = WrapMode.Clamp })
+                {
+                    brush.TranslateTransform(pad, pad);
+                    g.SmoothingMode = SmoothingMode.AntiAlias;
+                    g.FillPath(brush, plate);
+                }
+                g.Restore(state);
+            }
+            using var exported = BackdropRender.Compose(
+                doc, BackdropPreset.Ocean, corners: style)!;
+            var previewCut = CutAt(preview, pad);
+            var exportCut = CutAt(exported, pad);
+            if (previewCut < 0 || exportCut < 0 || Math.Abs(previewCut - exportCut) > 2)
+                f.Add($"{style}: preview cuts {previewCut}px, export {exportCut}px");
+        }
         return f;
     }
 
