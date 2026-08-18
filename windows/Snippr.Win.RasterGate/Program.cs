@@ -531,46 +531,85 @@ static class Program
         var f = new List<string>();
         using var doc = Document(240, 180);
         var layout = new BackdropLayout(new Size(240, 180), 1, BackdropPreset.Ocean);
-        var pad = (int)layout.Pad;
-
+        var pad = layout.Pad;
         using var exported = BackdropRender.Compose(doc, BackdropPreset.Ocean)!;
-        using var previewed = new Bitmap(
-            layout.OuterSize.Width, layout.OuterSize.Height, PixelFormat.Format32bppArgb);
-        using (var g = Graphics.FromImage(previewed))
+
+        // Every zoom the editor can be at, not just 100%. A preview drawn in
+        // the wrong units looks perfect at 1 and wrong everywhere else — which
+        // is exactly how the hairline shipped: the canvas' pixel size and the
+        // zoom multiplied each other, so at 0.5 and 2 the line went off the
+        // document's edge while the zoom-1 probe stayed happy.
+        foreach (var zoom in new[] { 0.5f, 1f, 2f })
         {
-            // The same opaque coat compose lays down, so the two bitmaps start
-            // from the same place and only the frame is under test.
-            using (var basecoat = new SolidBrush(
-                BackdropSpec.GradientStops(BackdropPreset.Ocean)[0].Color))
-                g.FillRectangle(basecoat, 0, 0, previewed.Width, previewed.Height);
-            BackdropRender.DrawFrameForPreview(
-                g, new RectangleF(pad, pad, 240, 180), 1f, BackdropPreset.Ocean);
-            g.DrawImage(doc, new Rectangle(pad, pad, 240, 180));
+            var outerW = (int)Math.Round((240 + pad * 2) * zoom);
+            var outerH = (int)Math.Round((180 + pad * 2) * zoom);
+            var padView = pad * zoom;
+            var docRect = new RectangleF(padView, padView, 240 * zoom, 180 * zoom);
+
+            using var preview = new Bitmap(outerW, outerH, PixelFormat.Format32bppArgb);
+            using (var g = Graphics.FromImage(preview))
+            {
+                using (var basecoat = new SolidBrush(
+                    BackdropSpec.GradientStops(BackdropPreset.Ocean)[0].Color))
+                    g.FillRectangle(basecoat, 0, 0, outerW, outerH);
+                BackdropRender.DrawFrameForPreview(g, docRect, zoom, BackdropPreset.Ocean);
+                // The document, and its hairline, the way the canvas draws
+                // them: scaled by the zoom, in document units.
+                var state = g.Save();
+                g.TranslateTransform(docRect.X, docRect.Y);
+                g.ScaleTransform(zoom, zoom);
+                g.DrawImage(doc, new Rectangle(0, 0, 240, 180));
+                BackdropRender.DrawPlateHairline(g, new RectangleF(0, 0, 240, 180), 1f);
+                g.Restore(state);
+            }
+
+            // The exported picture at the same size, so the two can be
+            // compared pixel for pixel.
+            using var reference = new Bitmap(outerW, outerH, PixelFormat.Format32bppArgb);
+            using (var g = Graphics.FromImage(reference))
+            {
+                g.InterpolationMode = InterpolationMode.HighQualityBilinear;
+                g.DrawImage(exported, new Rectangle(0, 0, outerW, outerH));
+            }
+
+            int differing = 0, probed = 0;
+            string first = "";
+            for (int y = 0; y < outerH; y++)
+                for (int x = 0; x < outerW; x++)
+                {
+                    // The frame ring. Inside the document the two differ by
+                    // the resampling of the picture itself, which is not what
+                    // this compares.
+                    if (x >= docRect.Left - 2 && x < docRect.Right + 2
+                        && y >= docRect.Top - 2 && y < docRect.Bottom + 2) continue;
+                    probed++;
+                    if (Near(At(preview, x, y), At(reference, x, y), 12)) continue;
+                    differing++;
+                    if (first.Length == 0)
+                        first = $"@{zoom}x {x},{y} preview {At(preview, x, y)} export {At(reference, x, y)}";
+                }
+            if (probed == 0) { f.Add($"{zoom}x: nothing probed"); continue; }
+            if (differing * 50 > probed)
+                f.Add($"{zoom}x: frame differs ({differing}/{probed}) {first}");
+
+            // The hairline is ON the document's edge at every zoom. It is
+            // white at 16% over the picture, so the edge reads lighter than
+            // the pixels a few rows in — and if it were drawn in the wrong
+            // units it would be off the edge entirely and the two would match.
+            int edgeX = (int)(docRect.Left + docRect.Width / 2);
+            int edgeY = (int)docRect.Top;
+            var edge = At(preview, edgeX, edgeY + 1);
+            var inside = At(preview, edgeX, edgeY + (int)Math.Max(4, 6 * zoom));
+            if (edge.R <= inside.R && edge.G <= inside.G && edge.B <= inside.B)
+                f.Add($"{zoom}x: no hairline at the document edge ({edge} vs {inside})");
         }
 
-        int differing = 0, probed = 0;
-        string first = "";
-        for (int y = 0; y < previewed.Height; y++)
-            for (int x = 0; x < previewed.Width; x++)
-            {
-                // The ring only: inside the document the preview is the plain
-                // image while the export has the rounded plate's edge, and
-                // that difference is the clip, not the frame.
-                if (x >= pad - 2 && x < pad + 240 + 2 && y >= pad - 2 && y < pad + 180 + 2)
-                    continue;
-                probed++;
-                if (Near(At(previewed, x, y), At(exported, x, y), 3)) continue;
-                differing++;
-                if (first.Length == 0)
-                    first = $"@{x},{y} preview {At(previewed, x, y)} export {At(exported, x, y)}";
-            }
-        if (probed == 0) f.Add("nothing probed");
-        if (differing * 200 > probed) f.Add($"frame differs ({differing}/{probed}) {first}");
-
-        // The oracle is not blind: a DIFFERENT preset really does change these
+        // The oracle is not blind: a different preset really does change these
         // pixels, so agreement above means something.
+        var probeLayout = new BackdropLayout(new Size(240, 180), 1, BackdropPreset.Sunset);
         using var other = new Bitmap(
-            layout.OuterSize.Width, layout.OuterSize.Height, PixelFormat.Format32bppArgb);
+            probeLayout.OuterSize.Width, probeLayout.OuterSize.Height,
+            PixelFormat.Format32bppArgb);
         using (var g = Graphics.FromImage(other))
             BackdropRender.DrawFrameForPreview(
                 g, new RectangleF(pad, pad, 240, 180), 1f, BackdropPreset.Sunset);

@@ -425,6 +425,14 @@ sealed class EditorForm : Form
         _zoom = Math.Clamp(zoom, 0.1f, 8f);
         _canvas.Size = new Size(
             (int)(_image.Width * _zoom), (int)(_image.Height * _zoom));
+        // What can be scrolled to is the whole picture, frame included. A
+        // panel derives its scrollable extent from where its CHILDREN end, and
+        // the frame is not a child — so without this the right and bottom
+        // padding simply could not be reached on any capture bigger than the
+        // window, which is most of them.
+        var pad = (int)Math.Round(PadView);
+        _scroller.AutoScrollMinSize = new Size(
+            _canvas.Width + pad * 2, _canvas.Height + pad * 2);
         CenterCanvas();
         _canvas.Invalidate();
         _scroller.Invalidate();
@@ -1021,9 +1029,14 @@ sealed class EditorForm : Form
 
             // Straight after the document and its marks, and BEFORE any chrome:
             // the same place compose puts it.
+            //
+            // In DOCUMENT units, because the context is still scaled by the
+            // zoom here: passing the canvas' pixel size and the zoom again
+            // multiplied both by the zoom a second time, which at anything but
+            // 100% drew the line off the edge of the document entirely.
             if (o._backdrop != BackdropPreset.None)
                 BackdropRender.DrawPlateHairline(
-                    g, new RectangleF(0, 0, o._canvas.Width, o._canvas.Height), o._zoom);
+                    g, new RectangleF(0, 0, o._image.Width, o._image.Height), 1f);
 
             if (o._selected != null)
             {

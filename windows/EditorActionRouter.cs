@@ -19,5 +19,9 @@ static class EditorActionRouter
             or OverlayAction.Close => true,
         // The editor cannot open itself.
         OverlayAction.OpenEditor => false,
+        // An action added to the enum and forgotten here must FAIL, loudly, in
+        // the gate — silently answering "the editor does not handle it" is the
+        // exact shape of the missing Backdrop button.
+        _ => throw new ArgumentOutOfRangeException(nameof(action), action, null),
     };
 }
