@@ -216,6 +216,36 @@ static class BackdropRender
         return path;
     }
 
+    /// The frame as a PREVIEW draws it: around a document already on screen at
+    /// `zoom`, in the graphics' own units.
+    ///
+    /// The editor and the review surface both come here, and so does the gate,
+    /// because "preview matches export" is only true if there is one place
+    /// that decides what the frame is. The scales are the whole content: the
+    /// radius and the shadow are point metrics and must grow with the zoom,
+    /// while the grain's period is fixed in DOCUMENT pixels, so at 2× a 128px
+    /// tile has to be drawn 256 units wide or the preview shows a grain half
+    /// the size of the exported one.
+    public static void DrawFrameForPreview(
+        Graphics g, RectangleF documentInView, float zoom, BackdropPreset preset)
+    {
+        if (preset == BackdropPreset.None) return;
+        var documentPixels = new Size(
+            (int)Math.Round(documentInView.Width / Math.Max(0.0001f, zoom)),
+            (int)Math.Round(documentInView.Height / Math.Max(0.0001f, zoom)));
+        var layout = new BackdropLayout(documentPixels, 1, preset);
+        if (layout.IsCollapsed) return;
+        var pad = layout.Pad * zoom;
+        var outer = new SizeF(
+            documentInView.Width + pad * 2, documentInView.Height + pad * 2);
+        var state = g.Save();
+        g.TranslateTransform(documentInView.X - pad, documentInView.Y - pad);
+        DrawFrame(
+            g, outer, new RectangleF(pad, pad, documentInView.Width, documentInView.Height),
+            preset, zoom, documentPixelsPerUserUnit: 1 / Math.Max(0.0001f, zoom));
+        g.Restore(state);
+    }
+
     /// The exported picture: the document inside its frame. `.none` hands the
     /// input straight back — not one byte is touched, and nothing is
     /// allocated.

@@ -26,6 +26,7 @@ static class Program
         failed += Check("win-overlay-toolbar-layout", OverlayToolbarLayoutGate());
         failed += Check("win-area-review-chrome-hit-test", ChromeHitTest());
         failed += Check("win-area-review-crop-drag", CropDrag());
+        failed += Check("win-editor-actions-match-catalog", EditorActionsMatchCatalog());
         if (pending > 0)
             Console.WriteLine($"{pending} PARITY GATE(S) PENDING — not a pass");
         Console.WriteLine(failed == 0
@@ -225,6 +226,35 @@ static class Program
         var once = AreaReviewCrop.Drag(CropGrip.Inside, crop, new Point(0, 0), new Point(40, 30));
         var twice = AreaReviewCrop.Drag(CropGrip.Inside, crop, new Point(0, 0), new Point(40, 30));
         if (once != twice) f.Add("drag is not a pure function of its endpoints");
+        return f;
+    }
+
+    /// Everything the catalog offers the editor, the editor does — and
+    /// nothing else. The editor advertised a Backdrop button in the table for
+    /// a whole release candidate while having none on screen, because the
+    /// action row was hand-written and only the tool row came from the table.
+    /// This is the gate that would have caught it.
+    static List<string> EditorActionsMatchCatalog()
+    {
+        var f = new List<string>();
+        foreach (var entry in ToolCatalog.EditorActions)
+            if (!EditorActionRouter.IsHandled(entry.Action))
+                f.Add($"{entry.Action}: offered, not handled");
+        foreach (OverlayAction action in Enum.GetValues<OverlayAction>())
+        {
+            var offered = ToolCatalog.EditorActions.Any(a => a.Action == action);
+            if (EditorActionRouter.IsHandled(action) && !offered)
+                f.Add($"{action}: handled, not offered");
+        }
+        // Backdrop is the point of the exercise: it must be in the editor, and
+        // it must do something there.
+        if (!ToolCatalog.EditorActions.Any(a => a.Action == OverlayAction.Backdrop))
+            f.Add("the editor lost Backdrop");
+        if (!EditorActionRouter.IsHandled(OverlayAction.Backdrop))
+            f.Add("Backdrop does nothing in the editor");
+        // And the editor cannot open itself.
+        if (EditorActionRouter.IsHandled(OverlayAction.OpenEditor))
+            f.Add("the editor offers to open an editor");
         return f;
     }
 

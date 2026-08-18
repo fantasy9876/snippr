@@ -32,6 +32,7 @@
     <Compile Include="..\Ui\OverlayToolbarLayout.cs" Link="OverlayToolbarLayout.cs" />
     <Compile Include="..\AreaReviewHitTest.cs" Link="AreaReviewHitTest.cs" />
     <Compile Include="..\AreaReviewCrop.cs" Link="AreaReviewCrop.cs" />
+    <Compile Include="..\EditorActionRouter.cs" Link="EditorActionRouter.cs" />
   </ItemGroup>
 
 </Project>

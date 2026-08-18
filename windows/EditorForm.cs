@@ -88,6 +88,11 @@ sealed class EditorForm : Form
         Controls.Add(_chrome);
         _previewTimer.Tick += (_, _) => { _previewTimer.Stop(); _canvas.Invalidate(); };
         _scroller.Resize += (_, _) => CenterCanvas();
+        _scroller.Paint += DrawBackdropAround;
+        // Scrolling a panel BLITS what it already has and repaints only the
+        // strip that came into view, so a frame drawn on the panel would smear
+        // behind the document instead of travelling with it.
+        _scroller.Scroll += (_, _) => _scroller.Invalidate();
 
         ApplyZoom(1f);
         // Disposed (not FormClosed) so the prewarm instance — which is
@@ -148,14 +153,19 @@ sealed class EditorForm : Form
             return b;
         }
 
-        IconBtn(_actionBar, "copy", "Copy to clipboard (Ctrl+C)", (_, _) => CopyAndClose());
-        IconBtn(_actionBar, "save", "Save as… (Ctrl+S)", (_, _) => SaveWithDialog());
-        IconBtn(_actionBar, "pin", "Pin to screen (Ctrl+P)", (_, _) => PinAndClose());
-        IconBtn(_actionBar, "ocr", "Recognize text", (_, _) => RunOcr());
-        IconBtn(_actionBar, "translate", "Recognize + translate", (_, _) => RunTranslate());
+        // The action row comes from the catalog too. A hand-written list here
+        // is how the editor ended up advertising a Backdrop button in the
+        // table and not having one on screen — the tool row was built from the
+        // table and this one was not, so nothing could tell them apart.
+        foreach (var entry in ToolCatalog.EditorActions)
+        {
+            var action = entry.Action;
+            var button = IconBtn(
+                _actionBar, entry.IconKey, entry.HintText, (_, _) => Run(action));
+            if (action == OverlayAction.Color) _colorButton = button;
+            if (action == OverlayAction.Backdrop) _backdropButton = button;
+        }
         _actionBar.Items.Add(new ToolStripSeparator { AutoSize = false, Size = new Size(8, 18) });
-
-        _colorButton = IconBtn(_actionBar, "color", "Annotation color", (_, _) => PickColor());
         UpdateColorSwatch();
 
         _widthLabel = new ToolStripLabel("")
@@ -202,6 +212,17 @@ sealed class EditorForm : Form
 
         _actionHint = HoverHint.Attach(_actionBar, pt => _actionBar.GetItemAt(pt)?.ToolTipText);
         _toolHint = HoverHint.Attach(_toolBar, pt => _toolBar.GetItemAt(pt)?.ToolTipText);
+
+        _backdropMenu.PresetChosen += (_, id) =>
+        {
+            if (Enum.TryParse<BackdropPreset>(id, ignoreCase: true, out var preset)
+                && ApplyBackdrop(preset))
+            {
+                // The frame changes the SIZE of what is on screen, so the
+                // layout has to be redone, not just repainted.
+                ApplyZoom(_zoom);
+            }
+        };
 
         SelectTool(Tool.Select);
         RefreshLabels();
@@ -351,6 +372,35 @@ sealed class EditorForm : Form
         };
     }
 
+    ToolStripButton? _backdropButton;
+    readonly BackdropMenu _backdropMenu = new();
+
+    /// One entry for every toolbar action, so what the catalog offers and what
+    /// the editor does cannot drift apart.
+    void Run(OverlayAction action)
+    {
+        switch (action)
+        {
+            case OverlayAction.Backdrop:
+                if (_backdropButton != null)
+                    _backdropMenu.Show(
+                        _actionBar,
+                        new Point(
+                            _backdropButton.Bounds.Left,
+                            _backdropButton.Bounds.Bottom));
+                break;
+            case OverlayAction.Color: PickColor(); break;
+            case OverlayAction.Undo: Undo(); break;
+            case OverlayAction.Redo: Redo(); break;
+            case OverlayAction.Copy: CopyAndClose(); break;
+            case OverlayAction.Save: SaveWithDialog(); break;
+            case OverlayAction.Pin: PinAndClose(); break;
+            case OverlayAction.Ocr: RunOcr(); break;
+            case OverlayAction.Translate: RunTranslate(); break;
+            case OverlayAction.Close: Close(); break;
+        }
+    }
+
     void RefreshLabels()
     {
         // What the badge promises is what the export writes: with a frame on,
@@ -364,6 +414,12 @@ sealed class EditorForm : Form
 
     // ---------- zoom ----------
 
+    /// The frame's padding, in the view's own units.
+    float PadView => _backdrop == BackdropPreset.None
+        ? 0
+        : new BackdropLayout(
+            new Size(_image.Width, _image.Height), 1, _backdrop).Pad * _zoom;
+
     internal void ApplyZoom(float zoom)
     {
         _zoom = Math.Clamp(zoom, 0.1f, 8f);
@@ -371,17 +427,32 @@ sealed class EditorForm : Form
             (int)(_image.Width * _zoom), (int)(_image.Height * _zoom));
         CenterCanvas();
         _canvas.Invalidate();
+        _scroller.Invalidate();
         RefreshLabels();
     }
 
     /// Keeps the shot centered when it's smaller than the viewport.
     void CenterCanvas()
     {
+        // What is centred is the whole PICTURE — the document and the frame
+        // around it — so the padding is reserved rather than drawn over the
+        // neighbouring chrome.
+        var pad = (int)Math.Round(PadView);
         var vp = _scroller.ClientSize;
-        int x = Math.Max(0, (vp.Width - _canvas.Width) / 2);
-        int y = Math.Max(0, (vp.Height - _canvas.Height) / 2);
+        int x = Math.Max(0, (vp.Width - (_canvas.Width + pad * 2)) / 2) + pad;
+        int y = Math.Max(0, (vp.Height - (_canvas.Height + pad * 2)) / 2) + pad;
         var scroll = _scroller.AutoScrollPosition;
         _canvas.Location = new Point(x + scroll.X, y + scroll.Y);
+    }
+
+    /// The frame is drawn AROUND the canvas, by the view that owns the space
+    /// around it — the same division the macOS build settled on, and the
+    /// reason the document's own coordinates stay exactly what they were.
+    void DrawBackdropAround(object? sender, PaintEventArgs e)
+    {
+        if (_backdrop == BackdropPreset.None) return;
+        BackdropRender.DrawFrameForPreview(
+            e.Graphics, _canvas.Bounds, _zoom, _backdrop);
     }
 
     internal void ZoomBy(float factor) => ApplyZoom(_zoom * factor);
@@ -440,6 +511,8 @@ sealed class EditorForm : Form
         PushUndo();
         _backdrop = preset;
         RefreshLabels();
+        CenterCanvas();
+        _scroller.Invalidate();
         _canvas.Invalidate();
         return true;
     }
@@ -945,6 +1018,12 @@ sealed class EditorForm : Form
                 marks, g, o._image,
                 o._cropRectPx ?? new Rectangle(0, 0, o._image.Width, o._image.Height),
                 pix);
+
+            // Straight after the document and its marks, and BEFORE any chrome:
+            // the same place compose puts it.
+            if (o._backdrop != BackdropPreset.None)
+                BackdropRender.DrawPlateHairline(
+                    g, new RectangleF(0, 0, o._canvas.Width, o._canvas.Height), o._zoom);
 
             if (o._selected != null)
             {

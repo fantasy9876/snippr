@@ -22,6 +22,7 @@ static class Program
         failed += Check("win-spotlight-dim", SpotlightDim());
         failed += Check("win-backdrop-export-routes", ExportRoutes());
         failed += Check("win-area-review-payloads", AreaReviewPayloads());
+        failed += Check("win-backdrop-preview-matches-export", PreviewMatchesExport());
         failed += Check("win-hover-hint-clamped", HoverHintClamped());
         if (pending > 0)
             Console.WriteLine($"{pending} RASTER GATE(S) PENDING — not a pass");
@@ -516,6 +517,65 @@ static class Program
         // And a hole too small for a hint gets none rather than a sliver.
         if (HoverHint.Place(size, new Rectangle(0, 0, 34, 30), new Rectangle(0, 0, 40, 12)) != null)
             f.Add("sliver accepted");
+        return f;
+    }
+
+    /// What a preview draws around the document and what the export writes
+    /// around it are the same frame — same geometry, same ramp, same wash.
+    ///
+    /// Both go through `DrawFrameForPreview`/`Compose`, which share `DrawFrame`;
+    /// this renders each one and compares the ring of frame around the
+    /// document, which is the part a second drawing path would get wrong.
+    static List<string> PreviewMatchesExport()
+    {
+        var f = new List<string>();
+        using var doc = Document(240, 180);
+        var layout = new BackdropLayout(new Size(240, 180), 1, BackdropPreset.Ocean);
+        var pad = (int)layout.Pad;
+
+        using var exported = BackdropRender.Compose(doc, BackdropPreset.Ocean)!;
+        using var previewed = new Bitmap(
+            layout.OuterSize.Width, layout.OuterSize.Height, PixelFormat.Format32bppArgb);
+        using (var g = Graphics.FromImage(previewed))
+        {
+            // The same opaque coat compose lays down, so the two bitmaps start
+            // from the same place and only the frame is under test.
+            using (var basecoat = new SolidBrush(
+                BackdropSpec.GradientStops(BackdropPreset.Ocean)[0].Color))
+                g.FillRectangle(basecoat, 0, 0, previewed.Width, previewed.Height);
+            BackdropRender.DrawFrameForPreview(
+                g, new RectangleF(pad, pad, 240, 180), 1f, BackdropPreset.Ocean);
+            g.DrawImage(doc, new Rectangle(pad, pad, 240, 180));
+        }
+
+        int differing = 0, probed = 0;
+        string first = "";
+        for (int y = 0; y < previewed.Height; y++)
+            for (int x = 0; x < previewed.Width; x++)
+            {
+                // The ring only: inside the document the preview is the plain
+                // image while the export has the rounded plate's edge, and
+                // that difference is the clip, not the frame.
+                if (x >= pad - 2 && x < pad + 240 + 2 && y >= pad - 2 && y < pad + 180 + 2)
+                    continue;
+                probed++;
+                if (Near(At(previewed, x, y), At(exported, x, y), 3)) continue;
+                differing++;
+                if (first.Length == 0)
+                    first = $"@{x},{y} preview {At(previewed, x, y)} export {At(exported, x, y)}";
+            }
+        if (probed == 0) f.Add("nothing probed");
+        if (differing * 200 > probed) f.Add($"frame differs ({differing}/{probed}) {first}");
+
+        // The oracle is not blind: a DIFFERENT preset really does change these
+        // pixels, so agreement above means something.
+        using var other = new Bitmap(
+            layout.OuterSize.Width, layout.OuterSize.Height, PixelFormat.Format32bppArgb);
+        using (var g = Graphics.FromImage(other))
+            BackdropRender.DrawFrameForPreview(
+                g, new RectangleF(pad, pad, 240, 180), 1f, BackdropPreset.Sunset);
+        if (Near(At(other, 4, 4), At(exported, 4, 4), 3))
+            f.Add("presets are indistinguishable at the probe");
         return f;
     }
 
