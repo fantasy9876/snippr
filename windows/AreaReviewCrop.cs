@@ -23,9 +23,10 @@ static class AreaReviewCrop
     /// The handle under a point, or `Inside` for the body of the crop, or
     /// `None` for the surround. Handles win over the body: they overlap it,
     /// and a corner grab must resize rather than move.
-    public static CropGrip GripAt(Point point, Rectangle selection, float handleSize)
+    public static CropGrip GripAt(
+        Point point, Rectangle selection, float handleSize, float cornerRadius = 0)
     {
-        var handles = OverlayToolbarLayout.HandleRects(selection, handleSize);
+        var handles = OverlayToolbarLayout.HandleRects(selection, handleSize, cornerRadius);
         for (int i = 0; i < handles.Length; i++)
             if (handles[i].Contains(point)) return (CropGrip)i;
         return selection.Contains(point) ? CropGrip.Inside : CropGrip.None;
