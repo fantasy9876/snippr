@@ -124,6 +124,22 @@ static class Program
         return bmp;
     }
 
+    /// A document with DETAIL in it.
+    ///
+    /// Pixelating a flat colour gives that same flat colour back, so a gate
+    /// that redacts a solid fixture and then looks for a change finds none and
+    /// blames the pipeline — which is exactly what the first CI run reported.
+    /// A two-pixel check pattern averages to something visibly different, so
+    /// "the redaction is in this image" is a question the pixels can answer.
+    static Bitmap CheckeredDocument(int w, int h, Color a, Color b)
+    {
+        var bmp = new Bitmap(w, h, PixelFormat.Format32bppArgb);
+        for (int y = 0; y < h; y++)
+            for (int x = 0; x < w; x++)
+                bmp.SetPixel(x, y, ((x / 2) + (y / 2)) % 2 == 0 ? a : b);
+        return bmp;
+    }
+
     static List<string> ComposePixels()
     {
         var f = new List<string>();
@@ -151,13 +167,20 @@ static class Program
         // …while a point a radius in is document.
         if (!Near(At(framed, pad + 20, pad + 20), Color.FromArgb(20, 200, 90), 6))
             f.Add($"plate over-clipped {At(framed, pad + 20, pad + 20)}");
-        // Every pixel is opaque: a frame with holes would print as black.
-        for (int i = 0; i < 40; i++)
-        {
-            var x = i * (framed.Width - 1) / 39;
-            if (At(framed, x, 0).A != 255 || At(framed, x, framed.Height - 1).A != 255)
-                f.Add("frame not opaque");
-        }
+        // EVERY pixel is opaque — not a sample of them. An exported picture
+        // with a translucent edge prints as a dark fringe wherever it lands,
+        // and the first CI run found exactly that along all four sides.
+        int sheer = 0;
+        var firstSheer = "";
+        for (int y = 0; y < framed.Height; y++)
+            for (int x = 0; x < framed.Width; x++)
+                if (At(framed, x, y).A != 255)
+                {
+                    sheer++;
+                    if (firstSheer.Length == 0)
+                        firstSheer = $"@{x},{y}=A{At(framed, x, y).A}";
+                }
+        if (sheer > 0) f.Add($"frame not opaque: {sheer}px {firstSheer}");
         return f;
     }
 
@@ -201,57 +224,96 @@ static class Program
         var secret = new Rectangle(20, 20, 40, 40);
         var callout = new Rectangle(180, 180, 80, 80);
 
+        // The secret is a fine check pattern, not a flat colour: pixelating a
+        // flat colour returns it unchanged, so "the callout shows raw pixels"
+        // and "the callout shows the redaction" would look identical — the
+        // first CI run failed on exactly that fixture, not on the code.
         Bitmap Source()
         {
             var bmp = new Bitmap(320, 300, PixelFormat.Format32bppArgb);
-            using var g = Graphics.FromImage(bmp);
+            using (var g = Graphics.FromImage(bmp))
             using (var grey = new SolidBrush(Color.FromArgb(255, 140, 140, 140)))
                 g.FillRectangle(grey, 0, 0, 320, 300);
-            using (var red = new SolidBrush(Color.FromArgb(255, 255, 0, 0)))
-                g.FillRectangle(red, secret);
+            for (int y = secret.Top; y < secret.Bottom; y++)
+                for (int x = secret.Left; x < secret.Right; x++)
+                    bmp.SetPixel(x, y, ((x / 2) + (y / 2)) % 2 == 0
+                        ? Color.FromArgb(255, 255, 0, 0)
+                        : Color.FromArgb(255, 255, 255, 255));
             return bmp;
         }
-        static bool IsRed(Color c) => c.R > 150 && c.G < 110 && c.B < 110;
+        // Raw, as in "these bytes came straight off the source": pure red only
+        // survives where nothing averaged it.
+        static bool IsRaw(Color c) => c.R > 240 && c.G < 60 && c.B < 60;
 
         using var baseImage = Source();
-        Bitmap Shot(Rectangle visible, IEnumerable<BlurAnnotation>? redactions = null)
+        Bitmap Shot(Rectangle visible, bool withMagnifier, IEnumerable<BlurAnnotation>? redactions = null)
         {
-            var mag = new MagnifierAnnotation
-            {
-                SourceRect = secret,
-                CalloutRect = callout,
-                Snapshot = AnnotationCompositor.MagnifierSnapshot(
-                    baseImage, secret, redactions ?? []),
-            };
+            var marks = new List<Annotation>();
+            if (redactions != null) marks.AddRange(redactions);
+            if (withMagnifier)
+                marks.Add(new MagnifierAnnotation
+                {
+                    SourceRect = secret,
+                    CalloutRect = callout,
+                    Snapshot = AnnotationCompositor.MagnifierSnapshot(
+                        baseImage, secret, redactions ?? []),
+                });
             var bmp = new Bitmap(320, 300, PixelFormat.Format32bppArgb);
             using var g = Graphics.FromImage(bmp);
             g.DrawImageUnscaled(baseImage, 0, 0);
-            AnnotationCompositor.Draw([mag], g, baseImage, visible, null);
+            using var pixelated = AnnotationRenderer.Pixelate(baseImage);
+            AnnotationCompositor.Draw(marks, g, baseImage, visible, pixelated);
             return bmp;
         }
 
-        // Premise: with the source wholly inside the crop the callout IS drawn.
-        using (var inside = Shot(new Rectangle(0, 0, 320, 300)))
-            if (!IsRed(At(inside, callout.X + 40, callout.Y + 40)))
-                f.Add("inside-crop:not-drawn");
-        // Wholly outside.
-        using (var outside = Shot(new Rectangle(150, 150, 170, 150)))
-            if (IsRed(At(outside, callout.X + 40, callout.Y + 40)))
-                f.Add("outside-crop:leaked");
+        // Is anything at all drawn where the callout would be? Compared against
+        // the same scene without it, so the answer does not depend on what
+        // colour a loupe happens to show.
+        int DiffersFromBaseline(Bitmap shot, Bitmap baseline)
+        {
+            int n = 0;
+            for (int y = callout.Top + 4; y < callout.Bottom - 4; y++)
+                for (int x = callout.Left + 4; x < callout.Right - 4; x++)
+                    if (!Near(At(shot, x, y), At(baseline, x, y), 2)) n++;
+            return n;
+        }
+        int RawPixels(Bitmap shot)
+        {
+            int n = 0;
+            for (int y = callout.Top + 4; y < callout.Bottom - 4; y++)
+                for (int x = callout.Left + 4; x < callout.Right - 4; x++)
+                    if (IsRaw(At(shot, x, y))) n++;
+            return n;
+        }
+
+        using var plain = Shot(new Rectangle(0, 0, 320, 300), withMagnifier: false);
+
+        // Premise: with the source wholly inside the crop the callout IS drawn,
+        // and it really does carry the source's own pixels.
+        using (var inside = Shot(new Rectangle(0, 0, 320, 300), true))
+        {
+            if (DiffersFromBaseline(inside, plain) == 0) f.Add("inside-crop:not-drawn");
+            if (RawPixels(inside) == 0) f.Add("inside-crop:probe-blind");
+        }
+        // Wholly outside the crop: nothing at all, not even a frame.
+        using (var outside = Shot(new Rectangle(150, 150, 170, 150), true))
+            if (DiffersFromBaseline(outside, plain) != 0) f.Add("outside-crop:leaked");
         // Only PARTLY outside is still a leak of the part that is out, so the
         // test is `contains`, not `intersects`.
-        using (var partial = Shot(new Rectangle(40, 40, 280, 260)))
-            if (IsRed(At(partial, callout.X + 40, callout.Y + 40)))
-                f.Add("partial-crop:leaked");
+        using (var partial = Shot(new Rectangle(40, 40, 280, 260), true))
+            if (DiffersFromBaseline(partial, plain) != 0) f.Add("partial-crop:leaked");
 
-        // And the patch is sampled AFTER the redactions: a callout over a
-        // pixelated area must show the pixelation, not the pixels under it.
+        // And the patch is sampled AFTER the redactions: over a pixelated area
+        // the callout must carry the pixelation, with no raw pixel left in it,
+        // while still being drawn.
         var blur = new BlurAnnotation { Rect = secret };
-        using (var covered = Shot(new Rectangle(0, 0, 320, 300), [blur]))
+        using (var covered = Shot(new Rectangle(0, 0, 320, 300), true, [blur]))
+        using (var coveredPlain = Shot(new Rectangle(0, 0, 320, 300), false, [blur]))
         {
-            var patch = At(covered, callout.X + 40, callout.Y + 40);
-            if (IsRed(patch) && patch.R > 240 && patch.G < 30)
-                f.Add($"callout resurrected raw pixels {patch}");
+            if (DiffersFromBaseline(covered, coveredPlain) == 0)
+                f.Add("redacted-source:callout-vanished");
+            var raw = RawPixels(covered);
+            if (raw > 0) f.Add($"callout resurrected raw pixels ({raw}px)");
         }
         return f;
     }
@@ -297,7 +359,8 @@ static class Program
     static List<string> ExportRoutes()
     {
         var f = new List<string>();
-        using var doc = Document(320, 240);
+        using var doc = CheckeredDocument(
+            320, 240, Color.FromArgb(255, 20, 200, 90), Color.FromArgb(255, 245, 245, 245));
         var blur = new BlurAnnotation { Rect = new Rectangle(40, 40, 60, 60) };
         using var pixelated = AnnotationRenderer.Pixelate(doc);
         using var inner = AnnotationRenderer.Flatten(doc, [blur], pixelated);
@@ -321,10 +384,17 @@ static class Program
             if (!Near(innerPixel, visualPixel, 2))
                 f.Add($"@{x}: framed {visualPixel} vs document {innerPixel}");
         }
-        // The redaction survived into both, so this comparison is not being
-        // made between two copies of an unmarked image.
-        if (Near(At(inner, 70, 70), At(doc, 70, 70), 1))
-            f.Add("redaction missing from the document reading");
+        // The redaction survived into both, so the comparison above is not
+        // being made between two copies of an unmarked image. Counted over the
+        // whole covered area rather than at one point: a pixelated block can
+        // land on the value that was already there.
+        int changed = 0;
+        for (int y = blur.Rect.Top + 2; y < blur.Rect.Bottom - 2; y++)
+            for (int x = blur.Rect.Left + 2; x < blur.Rect.Right - 2; x++)
+                if (!Near(At(inner, x, y), At(doc, x, y), 2)) changed++;
+        var covered = (blur.Rect.Width - 4) * (blur.Rect.Height - 4);
+        if (changed * 2 < covered)
+            f.Add($"redaction missing from the document reading ({changed}/{covered})");
 
         // `.none` adds nothing at all — the same object comes back, so no
         // route can quietly pay for a copy.

@@ -28,6 +28,15 @@ static class BackdropRender
         var canvas = new RectangleF(0, 0, size.Width, size.Height);
         var state = g.Save();
         g.SetClip(canvas, CombineMode.Intersect);
+        // The background is rectangles, and antialiasing them is not just
+        // pointless — an antialiased fill (and an antialiased CLIP) leaves the
+        // outermost row and column only partly covered, so the exported frame
+        // came back with alpha below 255 all the way round its edge. A frame
+        // with a translucent border prints as a dark fringe wherever it lands
+        // on something else. The rounded plate and the hairline still get
+        // antialiasing; they ask for it below.
+        g.SmoothingMode = SmoothingMode.None;
+        g.PixelOffsetMode = PixelOffsetMode.Half;
 
         var stops = BackdropSpec.GradientStops(preset);
         var (start, end) = BackdropSpec.GradientAxis(size.Width, size.Height);
@@ -220,6 +229,18 @@ static class BackdropRender
 
         var result = new Bitmap(outer.Width, outer.Height, PixelFormat.Format32bppArgb);
         using var g = Graphics.FromImage(result);
+        // A fresh bitmap is fully transparent, and everything drawn onto it
+        // blends. Laying down one opaque coat first means no combination of
+        // antialiasing, clipping or a translucent grain can leave a hole in an
+        // exported picture.
+        using (var basecoat = new SolidBrush(
+            Color.FromArgb(255, BackdropSpec.GradientStops(preset)[0].Color)))
+        {
+            var mode = g.CompositingMode;
+            g.CompositingMode = CompositingMode.SourceCopy;
+            g.FillRectangle(basecoat, 0, 0, outer.Width, outer.Height);
+            g.CompositingMode = mode;
+        }
         g.SmoothingMode = SmoothingMode.AntiAlias;
         var target = new RectangleF(
             layout.Pad, layout.Pad, image.Width, image.Height);
@@ -228,9 +249,22 @@ static class BackdropRender
         var state = g.Save();
         var radius = BackdropSpec.CornerRadiusPt * Math.Max(1f, pixelScale);
         using (var plate = RoundedRect(target, radius))
-            g.SetClip(plate, CombineMode.Intersect);
-        g.PixelOffsetMode = PixelOffsetMode.HighQuality;
-        g.DrawImage(image, target);
+        using (var document = new TextureBrush(image))
+        {
+            // FillPath, not SetClip. A GDI+ clip region has no antialiasing at
+            // all, so clipping the document to the plate gave the corners a
+            // visible staircase — the very thing the frame is there to avoid.
+            // Painting the image THROUGH the path as a brush antialiases the
+            // edge the way the plate's own outline is.
+            // Clamp, not tile: an antialiased edge samples a hair outside the
+            // image, and a tiling brush would answer with the pixels from the
+            // opposite side of the picture.
+            document.WrapMode = WrapMode.Clamp;
+            document.TranslateTransform(target.X, target.Y);
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            g.PixelOffsetMode = PixelOffsetMode.Half;
+            g.FillPath(document, plate);
+        }
         DrawPlateHairline(g, target, pixelScale);
         g.Restore(state);
         return result;
