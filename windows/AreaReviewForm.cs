@@ -61,7 +61,10 @@ sealed class AreaReviewForm : Form
         // tools usable at all; `AreaReviewHitTest` decides which are chrome.
         _toolbar.MouseDown += (_, e) => ForwardIfCanvas(e, CanvasMouseDown);
         _toolbar.MouseMove += (_, e) => ForwardIfCanvas(e, CanvasMouseMove);
-        _toolbar.MouseUp += (_, e) => ForwardIfCanvas(e, CanvasMouseUp);
+        // Always: a release ENDS whatever is in flight, wherever the pointer
+        // happens to be. Filtering it would leave the surface believing a drag
+        // is still going after the button came up over a button.
+        _toolbar.MouseUp += (_, e) => ForwardIfCanvas(e, CanvasMouseUp, always: true);
         Shown += (_, _) => PlaceToolbar();
     }
 
@@ -116,10 +119,19 @@ sealed class AreaReviewForm : Form
             : (RectangleF.Empty, RectangleF.Empty);
     }
 
-    void ForwardIfCanvas(MouseEventArgs e, Action<MouseEventArgs> handler)
+    /// A gesture is under way: a crop being dragged, a mark being drawn, or a
+    /// mark being moved.
+    bool DragInProgress =>
+        _grip != CropGrip.None || _draft != null || _movingSelection;
+
+    void ForwardIfCanvas(
+        MouseEventArgs e, Action<MouseEventArgs> handler, bool always = false)
     {
         var (tool, action) = ChromeFrames();
-        if (AreaReviewHitTest.IsCanvas(e.Location, tool, action, chromeVisible: true))
+        if (always
+            || AreaReviewHitTest.IsCanvas(
+                e.Location, tool, action,
+                chromeVisible: true, dragInProgress: DragInProgress))
             handler(e);
     }
 

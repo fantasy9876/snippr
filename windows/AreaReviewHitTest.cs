@@ -14,8 +14,19 @@ static class AreaReviewHitTest
     public static bool IsChrome(Point point, RectangleF toolFrame, RectangleF actionFrame) =>
         toolFrame.Contains(point) || actionFrame.Contains(point);
 
-    /// True when a click at this point should draw on the capture.
+    /// True when this event should reach the picture.
+    ///
+    /// `dragInProgress` is not a convenience: once a gesture has begun the
+    /// mouse is CAPTURED, so every later event belongs to that gesture no
+    /// matter what the pointer is over. Asking the hit test again mid-drag
+    /// dropped the events whose pointer crossed the toolbar — a crop that
+    /// stalled while the pointer passed the rail, and a pen stroke with a gap
+    /// in it. Worse, the toolbar is re-placed DURING a crop drag, so the
+    /// chrome could move under the pointer and open a dead zone that was not
+    /// there when the drag started. The hit test decides whether a gesture may
+    /// BEGIN; it does not get to interrupt one.
     public static bool IsCanvas(
-        Point point, RectangleF toolFrame, RectangleF actionFrame, bool chromeVisible) =>
-        !chromeVisible || !IsChrome(point, toolFrame, actionFrame);
+        Point point, RectangleF toolFrame, RectangleF actionFrame,
+        bool chromeVisible, bool dragInProgress) =>
+        dragInProgress || !chromeVisible || !IsChrome(point, toolFrame, actionFrame);
 }

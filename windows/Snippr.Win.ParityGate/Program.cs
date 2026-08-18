@@ -125,8 +125,15 @@ static class Program
             if (!AreaReviewHitTest.IsChrome(centre, placed.ToolFrame, placed.ActionFrame))
                 f.Add($"{name} centre is not chrome");
             if (AreaReviewHitTest.IsCanvas(
-                centre, placed.ToolFrame, placed.ActionFrame, chromeVisible: true))
+                centre, placed.ToolFrame, placed.ActionFrame,
+                chromeVisible: true, dragInProgress: false))
                 f.Add($"{name} centre draws");
+            // …but a gesture already under way owns the mouse: the pointer
+            // crossing the rail must not swallow the events that belong to it.
+            if (!AreaReviewHitTest.IsCanvas(
+                centre, placed.ToolFrame, placed.ActionFrame,
+                chromeVisible: true, dragInProgress: true))
+                f.Add($"{name} interrupts a drag");
         }
 
         // Inside the selection, and in the empty surround: the picture. These
@@ -140,14 +147,16 @@ static class Program
         })
         {
             if (!AreaReviewHitTest.IsCanvas(
-                point, placed.ToolFrame, placed.ActionFrame, chromeVisible: true))
+                point, placed.ToolFrame, placed.ActionFrame,
+                chromeVisible: true, dragInProgress: false))
                 f.Add($"{name} swallowed by the toolbar");
         }
 
         // With no chrome placed — a selection too small for a toolbar — every
         // point draws, including the ones a stale frame would have claimed.
         if (!AreaReviewHitTest.IsCanvas(
-            new Point(900, 550), placed.ToolFrame, placed.ActionFrame, chromeVisible: false))
+            new Point(900, 550), placed.ToolFrame, placed.ActionFrame,
+            chromeVisible: false, dragInProgress: false))
             f.Add("hidden chrome still swallows");
         return f;
     }
