@@ -18,6 +18,9 @@
   <ItemGroup>
     <Compile Include="..\ToolCatalog.cs" Link="ToolCatalog.cs" />
     <Compile Include="..\Backdrop.cs" Link="Backdrop.cs" />
+    <!-- The timeline RULES are platform-free on purpose; the editor's wiring
+         to them is checked in the raster gate, where GDI+ lives. -->
+    <Compile Include="..\Timeline.cs" Link="Timeline.cs" />
   </ItemGroup>
 
 </Project>

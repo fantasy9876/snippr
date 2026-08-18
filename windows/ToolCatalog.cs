@@ -140,3 +140,35 @@ static class ToolCatalog
         return null;
     }
 }
+
+/// Which reading of the document an action takes.
+///
+/// Anything that produces a PICTURE gets the framed one, so the user receives
+/// what they were looking at. The recognizer gets the DOCUMENT: a decorative
+/// frame adds no text and would shift every box it finds off the source. This
+/// table is the mapping itself, so the editor and the review surface cannot
+/// answer the question differently.
+static class RouteDecoration
+{
+    public static bool UsesDecoration(OverlayAction action) => action switch
+    {
+        OverlayAction.Copy or OverlayAction.Save or OverlayAction.Pin
+            or OverlayAction.OpenEditor => true,
+        OverlayAction.Ocr or OverlayAction.Translate => false,
+        // Everything else does not export a picture at all.
+        _ => false,
+    };
+
+    /// The routes that MUST receive the framed picture. Named separately so a
+    /// gate can prove none of them silently drops off the list.
+    public static readonly OverlayAction[] VisualRoutes =
+    [
+        OverlayAction.Copy, OverlayAction.Save, OverlayAction.Pin,
+        OverlayAction.OpenEditor,
+    ];
+
+    public static readonly OverlayAction[] SemanticRoutes =
+    [
+        OverlayAction.Ocr, OverlayAction.Translate,
+    ];
+}

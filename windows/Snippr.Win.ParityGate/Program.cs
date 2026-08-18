@@ -21,6 +21,7 @@ static class Program
         failed += Check("win-backdrop-presets-match-spec", PresetsMatchSpec());
         failed += Check("win-backdrop-compose-geometry", ComposeGeometry());
         failed += Check("win-backdrop-undo-timeline", UndoTimeline());
+        failed += Check("win-backdrop-route-table", RouteTable());
         failed += Check("win-overlay-toolbar-layout", OverlayToolbarLayout());
         Console.WriteLine(failed == 0
             ? "ALL PARITY GATES PASSED"
@@ -326,8 +327,110 @@ static class Program
 
     // ---------- still RED ----------
 
-    static List<string> UndoTimeline() =>
-        ["not implemented: EditorForm backdrop state is not on the undo timeline yet"];
+    /// The rules the editor's history obeys, exercised on the same `Timeline`
+    /// the editor uses. A backdrop preset lives on THIS timeline, not on a
+    /// second one — with two stacks, undo after mark, preset, mark walks them
+    /// in an order the user never performed.
+    ///
+    /// The states here are strings so the rules can be read at a glance; that
+    /// the editor really pushes its preset through this class is the raster
+    /// gate's business, where the editor can be constructed.
+    static List<string> UndoTimeline()
+    {
+        var f = new List<string>();
+        var t = new Timeline<string>();
+        var discarded = new List<string>();
+        t.Discarding = dropped => discarded.AddRange(dropped);
+
+        if (t.CanUndo || t.CanRedo) f.Add("fresh timeline is not empty");
+
+        // mark -> preset -> mark, then undo three times: the preset takes its
+        // own turn, in the middle, exactly where the user put it.
+        var current = "blank";
+        void Edit(string next) { t.Push(current); current = next; }
+        Edit("mark1");
+        Edit("mark1+ocean");
+        Edit("mark1+ocean+mark2");
+        foreach (var want in new[] { "mark1+ocean", "mark1", "blank" })
+        {
+            if (!t.TryUndo(current, out var previous)) { f.Add($"undo ran out before {want}"); break; }
+            current = previous;
+            if (current != want) f.Add($"undo gave {current} want {want}");
+        }
+        if (t.CanUndo) f.Add("undo left history behind");
+
+        // and redo walks back up the same three steps
+        foreach (var want in new[] { "mark1", "mark1+ocean", "mark1+ocean+mark2" })
+        {
+            if (!t.TryRedo(current, out var next)) { f.Add($"redo ran out before {want}"); break; }
+            current = next;
+            if (current != want) f.Add($"redo gave {current} want {want}");
+        }
+
+        // A new edit after an undo FORKS: the abandoned future is discarded,
+        // once, and is not reachable again.
+        t.TryUndo(current, out current);
+        discarded.Clear();
+        Edit("mark1+ocean+mark3");
+        if (t.CanRedo) f.Add("fork kept a redo branch");
+        if (discarded.Count != 1 || discarded[0] != "mark1+ocean+mark2")
+            f.Add($"fork discarded [{string.Join(",", discarded)}]");
+
+        // Undoing and redoing must not discard anything: those states are
+        // moving between the stacks, not leaving.
+        discarded.Clear();
+        t.TryUndo(current, out current);
+        t.TryRedo(current, out current);
+        if (discarded.Count != 0) f.Add($"undo/redo discarded {discarded.Count}");
+
+        // Depth is symmetric: what goes down one stack comes up the other.
+        var before = t.UndoDepth;
+        t.TryUndo(current, out current);
+        if (t.UndoDepth != before - 1 || t.RedoDepth != 1)
+            f.Add($"depth {t.UndoDepth}/{t.RedoDepth} from {before}");
+
+        // Clearing hands every state back exactly once, so an owner holding
+        // unmanaged memory can release it.
+        discarded.Clear();
+        var total = t.UndoDepth + t.RedoDepth;
+        t.Clear();
+        if (discarded.Count != total) f.Add($"clear discarded {discarded.Count} of {total}");
+        if (t.CanUndo || t.CanRedo) f.Add("clear left history");
+        return f;
+    }
+
+    /// Which route gets the frame and which gets the document. The pixels
+    /// each route actually receives are the raster gate's business; this is
+    /// the mapping, and a route that silently fell off the visual list would
+    /// hand the user an undecorated picture with no other symptom.
+    static List<string> RouteTable()
+    {
+        var f = new List<string>();
+        foreach (var action in RouteDecoration.VisualRoutes)
+            if (!RouteDecoration.UsesDecoration(action)) f.Add($"{action} lost its frame");
+        foreach (var action in RouteDecoration.SemanticRoutes)
+            if (RouteDecoration.UsesDecoration(action)) f.Add($"{action} reads the frame");
+        // Every route that produces a picture must be on one list or the
+        // other, and on exactly one.
+        foreach (var action in new[]
+        {
+            OverlayAction.Copy, OverlayAction.Save, OverlayAction.Pin,
+            OverlayAction.OpenEditor, OverlayAction.Ocr, OverlayAction.Translate,
+        })
+        {
+            var visual = RouteDecoration.VisualRoutes.Contains(action);
+            var semantic = RouteDecoration.SemanticRoutes.Contains(action);
+            if (visual == semantic) f.Add($"{action} is on {(visual ? "both" : "neither")} list");
+        }
+        // Choosing a colour or opening the backdrop menu exports nothing.
+        foreach (var action in new[]
+        {
+            OverlayAction.Color, OverlayAction.Undo, OverlayAction.Redo,
+            OverlayAction.Backdrop, OverlayAction.Close,
+        })
+            if (RouteDecoration.UsesDecoration(action)) f.Add($"{action} exports");
+        return f;
+    }
 
     static List<string> OverlayToolbarLayout() =>
         ["not implemented: OverlayToolbar (lane UI) is not merged yet"];

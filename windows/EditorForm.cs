@@ -7,8 +7,12 @@ sealed class EditorForm : Form
     Bitmap _image;
     Bitmap? _pixelated;
     readonly List<Annotation> _annotations = new();
-    readonly Stack<(Bitmap img, List<Annotation> anns)> _undo = new();
-    readonly Stack<(Bitmap img, List<Annotation> anns)> _redo = new();
+    /// One timeline for everything the user can undo — the marks AND the
+    /// backdrop preset. macOS proved a second stack for the frame walks the
+    /// two histories in an order nobody performed: mark, preset, mark must
+    /// undo as mark, preset, mark.
+    readonly Timeline<EditorState> _history = new();
+    BackdropPreset _backdrop = BackdropPreset.None;
 
     Tool _tool = Tool.Select;
     Color _color = Color.Red;
@@ -101,10 +105,13 @@ sealed class EditorForm : Form
         _pixelated = null;
         InvalidateScaledCache();
         var seen = new HashSet<Bitmap>(ReferenceEqualityComparer.Instance) { _image };
-        foreach (var (img, _) in _undo) seen.Add(img);
-        foreach (var (img, _) in _redo) seen.Add(img);
-        _undo.Clear();
-        _redo.Clear();
+        // Teardown releases everything, including the bitmap still on screen,
+        // so the collector here is deliberately wider than the fork handler.
+        _history.Discarding = dropped =>
+        {
+            foreach (var state in dropped) seen.Add(state.Image);
+        };
+        _history.Clear();
         foreach (var bmp in seen) bmp.Dispose();
     }
 
@@ -175,22 +182,17 @@ sealed class EditorForm : Form
         _actionBar.Items.Add(_zoomLabel);
         _actionBar.Items.Add(_sizeLabel);
 
-        (Tool Tool, string Key, string Tip)[] tools =
-        [
-            (Tool.Select, "select", "Select / move (V)"),
-            (Tool.Arrow, "arrow", "Arrow (A)"),
-            (Tool.Line, "line", "Line (L)"),
-            (Tool.Rect, "rect", "Rectangle (R)"),
-            (Tool.Oval, "oval", "Oval (O)"),
-            (Tool.Highlight, "highlight", "Highlighter (H)"),
-            (Tool.Pen, "pen", "Pen (P)"),
-            (Tool.Text, "text", "Text (T)"),
-            (Tool.Counter, "counter", "Counter (N)"),
-            (Tool.Blur, "pixelate", "Pixelate (B)"),
-            (Tool.Crop, "crop", "Crop (C)"),
-        ];
-        foreach (var (tool, key, tip) in tools)
-            _toolButtons[tool] = IconBtn(_toolBar, key, tip, (_, _) => SelectTool(tool));
+        // Which buttons exist, in which order, with which icon and which text:
+        // all of it from the catalog. A second list here is how a toolbar ends
+        // up advertising a key its host does not route, or missing a tool the
+        // review surface has — and it is where Spotlight and Magnifier would
+        // have gone missing.
+        foreach (var entry in ToolCatalog.EditorTools)
+        {
+            var tool = entry.Tool;
+            _toolButtons[tool] = IconBtn(
+                _toolBar, entry.IconKey, entry.HintText, (_, _) => SelectTool(tool));
+        }
 
         // Last-docked Top wins the top edge: add tools first, then actions.
         _chrome.Controls.Add(_toolBar);
@@ -244,8 +246,17 @@ sealed class EditorForm : Form
         }
     }
 
-    void RunOcr() => TextResultForm.RunOcrFlow(Flatten());
-    void RunTranslate() => TextResultForm.RunOcrFlow(Flatten(), autoTranslate: true);
+    // Semantic routes by the shared table: the recognizer reads the document,
+    // never the frame around it.
+    void RunOcr() => TextResultForm.RunOcrFlow(ForRoute(OverlayAction.Ocr));
+    void RunTranslate() =>
+        TextResultForm.RunOcrFlow(ForRoute(OverlayAction.Translate), autoTranslate: true);
+
+    /// One freeze, two readings — which one an action gets is not decided
+    /// here, it is looked up, so the editor and the review surface cannot
+    /// drift apart on it.
+    internal Bitmap ForRoute(OverlayAction action) =>
+        RouteDecoration.UsesDecoration(action) ? Composed() : Flatten();
 
     static bool IsStrokeTool(Tool t) =>
         t is Tool.Arrow or Tool.Line or Tool.Rect or Tool.Oval or Tool.Pen;
@@ -342,7 +353,12 @@ sealed class EditorForm : Form
 
     void RefreshLabels()
     {
-        _sizeLabel.Text = $"{_image.Width}×{_image.Height}px";
+        // What the badge promises is what the export writes: with a frame on,
+        // that is the OUTER picture, not the document inside it.
+        var exported = BackdropSpec.OuterDimensions(
+            _image.Width, _image.Height, _backdrop)
+            ?? new Size(_image.Width, _image.Height);
+        _sizeLabel.Text = $"{exported.Width}×{exported.Height}px";
         _zoomLabel.Text = $"{(int)Math.Round(_zoom * 100)}%  ";
     }
 
@@ -372,59 +388,87 @@ sealed class EditorForm : Form
 
     // ---------- undo ----------
 
+    EditorState Snapshot() => new(
+        _image, _annotations.Select(a => a.Clone()).ToList(), _backdrop);
+
     void PushUndo()
     {
-        _undo.Push((_image, _annotations.Select(a => a.Clone()).ToList()));
-        // bitmaps dropped from the redo stack are unreachable from now on —
-        // dispose the ones not still referenced by the undo stack or the canvas
-        if (_redo.Count > 0)
+        _history.Discarding ??= dropped =>
         {
+            // States that just left the timeline for good. A bitmap in one of
+            // them may still be the canvas' own, or still be reachable from
+            // the other stack, so only the unreachable ones are released.
             var live = new HashSet<Bitmap>(ReferenceEqualityComparer.Instance) { _image };
-            foreach (var (img, _) in _undo) live.Add(img);
-            foreach (var (img, _) in _redo)
-            {
-                if (!live.Contains(img)) img.Dispose();
-            }
-            _redo.Clear();
-        }
+            foreach (var state in dropped)
+                if (!live.Contains(state.Image)) state.Image.Dispose();
+        };
+        _history.Push(Snapshot());
     }
 
     void Undo()
     {
-        if (_undo.Count == 0) return;
-        _redo.Push((_image, _annotations.Select(a => a.Clone()).ToList()));
-        Restore(_undo.Pop());
+        if (_history.TryUndo(Snapshot(), out var previous)) Restore(previous);
     }
 
     void Redo()
     {
-        if (_redo.Count == 0) return;
-        _undo.Push((_image, _annotations.Select(a => a.Clone()).ToList()));
-        Restore(_redo.Pop());
+        if (_history.TryRedo(Snapshot(), out var next)) Restore(next);
     }
 
-    void Restore((Bitmap img, List<Annotation> anns) state)
+    void Restore(EditorState state)
     {
-        if (!ReferenceEquals(state.img, _image))
+        if (!ReferenceEquals(state.Image, _image))
         {
-            _image = state.img;
+            _image = state.Image;
             _pixelated?.Dispose();
             _pixelated = null;
             InvalidateScaledCache();
         }
         _annotations.Clear();
-        _annotations.AddRange(state.anns);
+        _annotations.AddRange(state.Annotations);
+        _backdrop = state.Backdrop;
         _selected = null;
         ApplyZoom(_zoom);
     }
 
+    /// Choosing a preset is ONE undo step, and choosing the one already in use
+    /// is no step at all — a no-op that forked the redo branch would throw away
+    /// a future the user never left.
+    internal bool ApplyBackdrop(BackdropPreset preset)
+    {
+        if (preset == _backdrop) return false;
+        PushUndo();
+        _backdrop = preset;
+        RefreshLabels();
+        _canvas.Invalidate();
+        return true;
+    }
+
+    internal BackdropPreset BackdropPresetForTesting => _backdrop;
+
     // ---------- actions ----------
 
-    Bitmap Flatten()
+    /// The DOCUMENT: the crop the user selected with their marks on it, and
+    /// no decoration. This is what the recognizer reads — a frame adds no text
+    /// and would shift every box it finds off the source.
+    internal Bitmap Flatten()
     {
         CommitText();
         bool needsPix = _annotations.Any(a => a is BlurAnnotation);
         return AnnotationRenderer.Flatten(_image, _annotations, needsPix ? Pixelated : null);
+    }
+
+    /// The PICTURE: the document inside its frame. Everything that produces an
+    /// image for the user — Copy, Save, Pin — sends this, so what they get is
+    /// what they were reviewing.
+    internal Bitmap Composed()
+    {
+        var inner = Flatten();
+        if (_backdrop == BackdropPreset.None) return inner;
+        var composed = BackdropRender.Compose(inner, _backdrop);
+        if (composed == null || ReferenceEquals(composed, inner)) return inner;
+        inner.Dispose();
+        return composed;
     }
 
     Bitmap Pixelated => _pixelated ??= AnnotationRenderer.Pixelate(_image);
@@ -469,7 +513,7 @@ sealed class EditorForm : Form
 
     void CopyAndClose()
     {
-        using var flat = Flatten();
+        using var flat = ForRoute(OverlayAction.Copy);
         // Clipboard.SetImage throws when another process holds the clipboard
         // (clipboard managers, RDP) — don't lose the shot behind a crash dialog
         try
@@ -487,7 +531,7 @@ sealed class EditorForm : Form
 
     void SaveWithDialog()
     {
-        using var flat = Flatten();
+        using var flat = ForRoute(OverlayAction.Save);
         using var dlg = new SaveFileDialog
         {
             Filter = "PNG image|*.png|JPEG image|*.jpg",
@@ -504,7 +548,7 @@ sealed class EditorForm : Form
 
     void PinAndClose()
     {
-        new PinForm(Flatten()).Show();
+        new PinForm(ForRoute(OverlayAction.Pin)).Show();
         Close();
     }
 
@@ -554,6 +598,8 @@ sealed class EditorForm : Form
             case Keys.T: SelectTool(Tool.Text); return true;
             case Keys.N: SelectTool(Tool.Counter); return true;
             case Keys.B: SelectTool(Tool.Blur); return true;
+            case Keys.S: SelectTool(Tool.Spotlight); return true;
+            case Keys.M: SelectTool(Tool.Magnifier); return true;
             case Keys.C: SelectTool(Tool.Crop); return true;
         }
         return base.ProcessCmdKey(ref msg, keyData);
@@ -606,6 +652,23 @@ sealed class EditorForm : Form
             case Tool.Blur:
                 _draft = new BlurAnnotation { Rect = new Rectangle(px, Size.Empty) };
                 break;
+            case Tool.Spotlight:
+                _draft = new SpotlightAnnotation
+                {
+                    Rect = new Rectangle(px, Size.Empty),
+                    BaseBounds = new Rectangle(0, 0, _image.Width, _image.Height),
+                };
+                break;
+            case Tool.Magnifier:
+                // The drag picks the SOURCE. Where the callout ends up is
+                // decided on release, and moved afterwards by dragging it —
+                // re-aiming a callout would show pixels the user never chose.
+                _draft = new MagnifierAnnotation
+                {
+                    SourceRect = new Rectangle(px, Size.Empty),
+                    CalloutRect = new Rectangle(px, Size.Empty),
+                };
+                break;
             case Tool.Crop:
                 _cropRectPx = new Rectangle(px, Size.Empty);
                 break;
@@ -651,6 +714,24 @@ sealed class EditorForm : Form
                     _canvas.Invalidate();
                 }
                 break;
+            case Tool.Spotlight:
+                if (_draft is SpotlightAnnotation spot)
+                {
+                    spot.Rect = RectFrom(_dragStartPx, px);
+                    _canvas.Invalidate();
+                }
+                break;
+            case Tool.Magnifier:
+                if (_draft is MagnifierAnnotation mag)
+                {
+                    mag.SourceRect = RectFrom(_dragStartPx, px);
+                    // While the drag is live the callout tracks the source at
+                    // 1:1, so the user is shown the region they are choosing
+                    // rather than a loupe of a rect that does not exist yet.
+                    mag.CalloutRect = mag.SourceRect;
+                    _canvas.Invalidate();
+                }
+                break;
             case Tool.Crop:
                 _cropRectPx = RectFrom(_dragStartPx, px);
                 _canvas.Invalidate();
@@ -658,8 +739,25 @@ sealed class EditorForm : Form
         }
     }
 
+    /// Magnification the callout uses when it is first placed.
+    const float MagnifierZoom = 2.5f;
+
     internal void CanvasMouseUp(MouseEventArgs e)
     {
+        if (_draft is MagnifierAnnotation pending) FinishMagnifier(pending);
+        if (_draft is SpotlightAnnotation lit)
+        {
+            // Exactly one spotlight: a second one would dim the first one's
+            // lit area, which reads as a bug rather than as two lights.
+            if (lit.Rect.Width > 2 && lit.Rect.Height > 2)
+            {
+                PushUndo();
+                _annotations.RemoveAll(a => a is SpotlightAnnotation);
+                _annotations.Add(lit);
+            }
+            _draft = null;
+            _canvas.Invalidate();
+        }
         if (_draft != null)
         {
             var b = _draft.Bounds;
@@ -678,6 +776,37 @@ sealed class EditorForm : Form
             _canvas.Invalidate();
         }
         _movingSelection = false;
+    }
+
+    /// Samples the chosen source ONCE, after the redactions, and parks the
+    /// callout beside it inside the document. A source that cannot be sampled
+    /// — too small, or off the image — leaves no annotation at all rather than
+    /// an empty loupe.
+    void FinishMagnifier(MagnifierAnnotation mag)
+    {
+        _draft = null;
+        var source = Rectangle.Intersect(
+            mag.SourceRect, new Rectangle(0, 0, _image.Width, _image.Height));
+        if (source.Width <= 4 || source.Height <= 4) { _canvas.Invalidate(); return; }
+        mag.SourceRect = source;
+        mag.Snapshot = AnnotationCompositor.MagnifierSnapshot(
+            _image, source, _annotations.OfType<BlurAnnotation>());
+        if (mag.Snapshot == null) { _canvas.Invalidate(); return; }
+
+        var size = new Size(
+            (int)(source.Width * MagnifierZoom), (int)(source.Height * MagnifierZoom));
+        // Below and to the right if there is room, otherwise the other way —
+        // a callout parked off the document could never be dragged back.
+        var x = source.Right + 16 + size.Width <= _image.Width
+            ? source.Right + 16
+            : Math.Max(0, source.Left - 16 - size.Width);
+        var y = source.Bottom + 16 + size.Height <= _image.Height
+            ? source.Bottom + 16
+            : Math.Max(0, source.Top - 16 - size.Height);
+        mag.CalloutRect = new Rectangle(x, y, size.Width, size.Height);
+        PushUndo();
+        _annotations.Add(mag);
+        _canvas.Invalidate();
     }
 
     static Rectangle RectFrom(Point a, Point b) => Rectangle.FromLTRB(

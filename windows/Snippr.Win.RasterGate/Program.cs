@@ -273,8 +273,49 @@ static class Program
 
     // ---------- still RED ----------
 
-    static List<string> ExportRoutes() =>
-        ["not implemented: EditorForm/AreaReviewForm export routes are not wired yet"];
+    /// The pixels each kind of route receives. Which route is which is the
+    /// parity gate's `win-backdrop-route-table`; this checks that the two
+    /// readings really are one freeze seen twice — the visual one framed, the
+    /// semantic one untouched. That the editor calls through the table is
+    /// wiring, and is on the owner's RC checklist.
+    static List<string> ExportRoutes()
+    {
+        var f = new List<string>();
+        using var doc = Document(320, 240);
+        var blur = new BlurAnnotation { Rect = new Rectangle(40, 40, 60, 60) };
+        using var pixelated = AnnotationRenderer.Pixelate(doc);
+        using var inner = AnnotationRenderer.Flatten(doc, [blur], pixelated);
+
+        var layout = new BackdropLayout(new Size(320, 240), 1, BackdropPreset.Mint);
+        using var visual = BackdropRender.Compose(inner, BackdropPreset.Mint)!;
+        if (visual.Width != layout.OuterSize.Width || visual.Height != layout.OuterSize.Height)
+            f.Add($"visual {visual.Width}x{visual.Height} want {layout.OuterSize}");
+        // The semantic reading is the document, at the document's size.
+        if (inner.Width != 320 || inner.Height != 240)
+            f.Add($"semantic {inner.Width}x{inner.Height}");
+
+        // Same freeze: the marks are in BOTH readings, at the same place, and
+        // the frame is only around the outside.
+        var pad = (int)layout.Pad;
+        for (int i = 0; i < 12; i++)
+        {
+            var x = 30 + i * 20;
+            var innerPixel = At(inner, x, 70);
+            var visualPixel = At(visual, x + pad, 70 + pad);
+            if (!Near(innerPixel, visualPixel, 2))
+                f.Add($"@{x}: framed {visualPixel} vs document {innerPixel}");
+        }
+        // The redaction survived into both, so this comparison is not being
+        // made between two copies of an unmarked image.
+        if (Near(At(inner, 70, 70), At(doc, 70, 70), 1))
+            f.Add("redaction missing from the document reading");
+
+        // `.none` adds nothing at all — the same object comes back, so no
+        // route can quietly pay for a copy.
+        if (!ReferenceEquals(BackdropRender.Compose(inner, BackdropPreset.None), inner))
+            f.Add("none allocated");
+        return f;
+    }
 
     static List<string> HoverHintClamped() =>
         ["not implemented: HoverHint (lane UI) is not merged yet"];
