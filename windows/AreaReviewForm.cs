@@ -178,16 +178,11 @@ sealed class AreaReviewForm : Form
 
         // The frame is drawn AROUND the crop, on the desktop, so the user sees
         // the picture the export will write rather than a bare selection.
-        if (_session.Backdrop != BackdropPreset.None)
-        {
-            // The same entry the editor's preview uses, so there is one
-            // description of a frame and one of its corners. It places itself
-            // AROUND the document rect it is given, so what it needs is the
-            // crop — the padding is its own business.
-            BackdropRender.DrawFrameForPreview(
-                g, new RectangleF(crop.X, crop.Y, crop.Width, crop.Height), 1f,
-                _session.Backdrop, _session.Corners);
-        }
+        // Frame first, document back on top — the order compose uses, and the
+        // reason it looks right there. Drawing the frame over the desktop and
+        // stopping left the user reviewing a rectangle of gradient.
+        AreaReviewPreview.Paint(
+            g, _session.Frozen, crop, _session.Backdrop, _session.Corners);
 
         // Everything outside the crop is dimmed — with a frame on, the frame
         // is part of what survives, so the hole is the outer rect.

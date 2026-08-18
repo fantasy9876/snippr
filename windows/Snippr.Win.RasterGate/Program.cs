@@ -24,6 +24,7 @@ static class Program
         failed += Check("win-area-review-payloads", AreaReviewPayloads());
         failed += Check("win-backdrop-preview-matches-export", PreviewMatchesExport());
         failed += Check("win-backdrop-corner-radius-pixels", CornerRadiusPixels());
+        failed += Check("win-area-review-preview-shows-document", ReviewPreviewShowsDocument());
         failed += Check("win-hover-hint-clamped", HoverHintClamped());
         if (pending > 0)
             Console.WriteLine($"{pending} RASTER GATE(S) PENDING — not a pass");
@@ -706,6 +707,52 @@ static class Program
             var exportCut = CutAt(exported, pad);
             if (previewCut < 0 || exportCut < 0 || Math.Abs(previewCut - exportCut) > 2)
                 f.Add($"{style}: preview cuts {previewCut}px, export {exportCut}px");
+        }
+        return f;
+    }
+
+    /// With a preset on, the review surface still shows the DOCUMENT.
+    ///
+    /// The frame's fill covers the whole outer rect, so a surface that paints
+    /// it over the desktop and stops leaves the user reviewing a rectangle of
+    /// gradient — which is what the first smoke run photographed. The gate that
+    /// existed checked the PAYLOAD, and the payload was always right; nothing
+    /// looked at the preview.
+    static List<string> ReviewPreviewShowsDocument()
+    {
+        var f = new List<string>();
+        var crop = new Rectangle(200, 150, 400, 300);
+        using var desktop = CheckeredDocument(
+            1000, 700, Color.FromArgb(255, 20, 200, 90), Color.FromArgb(255, 245, 245, 245));
+
+        foreach (var preset in new[] { BackdropPreset.Ocean, BackdropPreset.Graphite })
+        {
+            using var canvas = new Bitmap(1000, 700, PixelFormat.Format32bppArgb);
+            using (var g = Graphics.FromImage(canvas))
+            {
+                g.DrawImageUnscaled(desktop, 0, 0);
+                AreaReviewPreview.Paint(
+                    g, desktop, crop, preset, BackdropCornerStyle.Medium);
+            }
+            // The middle of the crop is the document, pixel for pixel.
+            int wrong = 0;
+            for (int y = crop.Top + 40; y < crop.Bottom - 40; y += 7)
+                for (int x = crop.Left + 40; x < crop.Right - 40; x += 7)
+                    if (!Near(At(canvas, x, y), At(desktop, x, y), 6)) wrong++;
+            if (wrong > 0) f.Add($"{preset}: {wrong} document pixels covered by the frame");
+
+            // …and the frame IS there, outside it: the padding is no longer
+            // desktop.
+            var pad = (int)new BackdropLayout(crop.Size, 1, preset).Pad;
+            var outside = new Point(crop.Left - pad / 2, crop.Top + crop.Height / 2);
+            if (Near(At(canvas, outside.X, outside.Y), At(desktop, outside.X, outside.Y), 6))
+                f.Add($"{preset}: no frame drawn beside the crop");
+
+            // The corner is cut: a pixel just inside the crop's square corner
+            // belongs to the frame, not to the document.
+            var cornerPixel = At(canvas, crop.Left + 2, crop.Top + 2);
+            if (Near(cornerPixel, At(desktop, crop.Left + 2, crop.Top + 2), 6))
+                f.Add($"{preset}: crop corner is square in the preview");
         }
         return f;
     }

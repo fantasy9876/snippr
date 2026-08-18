@@ -130,8 +130,7 @@ static class TestEntry
             Step("editor-layout", () =>
             {
                 editor.Size = new Size(1400, 900);
-                editor.CreateControl();
-                editor.PerformLayout();
+                Reveal(editor);
             });
             Step("editor-shot", () => Capture(editor, Path.Combine(dir, "editor.png")));
             // Safe presses: nothing modal, nothing that closes the form.
@@ -164,14 +163,19 @@ static class TestEntry
         {
             Step("review-layout", () =>
             {
-                review.CreateControl();
-                review.PerformLayout();
+                Reveal(review);
                 review.PlaceToolbarForTesting();
+                review.Refresh();
             });
             Step("review-shot", () => Capture(review, Path.Combine(dir, "review.png")));
             Step("review-tool-magnifier", () => review.PressToolForTesting("magnifier"));
             Step("review-tool-select", () => review.PressToolForTesting("select"));
-            Step("review-preset-ocean", () => review.ApplyPresetForTesting("ocean"));
+            Step("review-preset-ocean", () =>
+            {
+                review.ApplyPresetForTesting("ocean");
+                review.Refresh();
+                Application.DoEvents();
+            });
             Step("review-shot-ocean",
                 () => Capture(review, Path.Combine(dir, "review-ocean.png")));
             Step("review-undo", () => review.PressActionForTesting("undo"));
@@ -200,11 +204,46 @@ static class TestEntry
         Environment.ExitCode = failures;
     }
 
+    /// Puts the form on screen — off the side of every monitor — so it lays
+    /// out and paints. `DrawToBitmap` on a form that was never shown gives
+    /// back an empty rectangle: the first smoke run's `editor.png` was a slab
+    /// of background with no toolbar in it, which says nothing about anything.
+    static void Reveal(Form form)
+    {
+        form.StartPosition = FormStartPosition.Manual;
+        form.ShowInTaskbar = false;
+        form.Location = new Point(-32000, -32000);
+        form.Show();
+        form.Refresh();
+        Application.DoEvents();
+    }
+
     static void Capture(Form form, string path)
     {
         using var bmp = new Bitmap(Math.Max(1, form.Width), Math.Max(1, form.Height));
         form.DrawToBitmap(bmp, new Rectangle(0, 0, bmp.Width, bmp.Height));
         bmp.Save(path, ImageFormat.Png);
-        Diag.Click("test", $"captured {Path.GetFileName(path)} {bmp.Width}x{bmp.Height}");
+        var colours = DistinctColours(bmp);
+        Diag.Click(
+            "test",
+            $"captured {Path.GetFileName(path)} {bmp.Width}x{bmp.Height} colours={colours}");
+        // A picture of nothing passes every check that only asks whether a file
+        // was written. Three colours is a low bar and a blank capture is under
+        // it.
+        if (colours < 3)
+            throw new InvalidOperationException(
+                $"{Path.GetFileName(path)} is blank ({colours} colours)");
+    }
+
+    static int DistinctColours(Bitmap bmp)
+    {
+        var seen = new HashSet<int>();
+        for (int y = 0; y < bmp.Height; y += 4)
+            for (int x = 0; x < bmp.Width; x += 4)
+            {
+                seen.Add(bmp.GetPixel(x, y).ToArgb());
+                if (seen.Count >= 16) return seen.Count;
+            }
+        return seen.Count;
     }
 }

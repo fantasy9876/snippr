@@ -105,7 +105,8 @@ sealed class EditorForm : Form
             Math.Min(
                 Math.Max(image.Width, Theme.Px(Theme.EditorMinW, DeviceDpi)),
                 (int)(wa.Width * 0.9)),
-            Math.Min(image.Height, (int)(wa.Height * 0.85)) + (int)Theme.EditorChromeH);
+            Math.Min(image.Height, (int)(wa.Height * 0.85))
+                + Theme.Px(Theme.EditorChromeH, DeviceDpi));
 
         _canvas = new CanvasControl(this);
         BuildToolbar();

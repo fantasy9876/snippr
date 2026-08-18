@@ -368,11 +368,12 @@ static class Program
             // toolbar: an item that does not fit is not moved, it is gone.
             if (m.MinimumWindowWidth < m.RequiredWidth)
                 f.Add($"{tag}: minimum {m.MinimumWindowWidth} < required {m.RequiredWidth}");
-            // …and it still has to fit a laptop. 1366 physical pixels is the
-            // narrowest screen worth supporting; at 192dpi that is a 683-unit
-            // desktop, so the check is in units rather than pixels.
-            if (m.MinimumWindowWidth > ThemeMetrics.Px(1366, dpi))
-                f.Add($"{tag}: minimum {m.MinimumWindowWidth} wider than a small laptop");
+            // …and it still has to fit a screen. The comparison is in PHYSICAL
+            // pixels on both sides: scaling the bound by the same DPI as the
+            // thing being measured made a check that could never fail, which
+            // is worse than no check — it reads as coverage.
+            if (m.MinimumWindowWidth > 1920)
+                f.Add($"{tag}: minimum {m.MinimumWindowWidth}px wider than a 1920 screen");
         }
         // And the overlay toolbar's own layout survives the same four, for the
         // smallest selection the plan names.
@@ -393,6 +394,14 @@ static class Program
                 if (b.Width < 1 || b.Height < 1)
                     f.Add($"{dpi}dpi: overlay button collapsed to {b.Size}");
         }
+        // What does NOT fit, said out loud rather than left to a bound that
+        // never bites: twenty-four buttons at 200% need more width than a
+        // 1366-pixel laptop has, and the overflow chevron is what saves it.
+        var smallLaptop = EditorChromeMetrics.For(192, actions, tools);
+        if (smallLaptop.MinimumWindowWidth <= 1366)
+            f.Add(
+                "the 200% case now fits 1366px — check that overflow is still " +
+                "needed, or tighten this expectation");
         return f;
     }
 
