@@ -24,6 +24,7 @@ static class Program
         failed += Check("win-backdrop-route-table", RouteTable());
         failed += Check("win-area-review-crop-authority", CropAuthority());
         failed += Check("win-overlay-toolbar-layout", OverlayToolbarLayoutGate());
+        failed += Check("win-area-review-chrome-hit-test", ChromeHitTest());
         if (pending > 0)
             Console.WriteLine($"{pending} PARITY GATE(S) PENDING — not a pass");
         Console.WriteLine(failed == 0
@@ -93,6 +94,60 @@ static class Program
         // the dependency explicit, so a silent default cannot stand in for it.
         if (ToolCatalog.OverlayTools.Count() != 12) f.Add("overlay tool count moved");
         if (ToolCatalog.OverlayActions.Count() != 11) f.Add("overlay action count moved");
+        return f;
+    }
+
+    /// The toolbar is a transparent control over the whole screen, so every
+    /// click lands on IT — including the ones meant to draw. Only the rail and
+    /// the strip are chrome; everything else has to reach the picture, or the
+    /// tools would be dead everywhere except inside the panels.
+    static List<string> ChromeHitTest()
+    {
+        var f = new List<string>();
+        var screen = new RectangleF(0, 0, 1920, 1080);
+        var selection = new RectangleF(700, 400, 400, 300);
+        var metrics = OverlayToolbarLayout.Metrics.Standard;
+        var area = OverlayToolbarLayout.Compute(
+            selection, screen,
+            ToolCatalog.OverlayTools.Count(), ToolCatalog.OverlayActions.Count(),
+            18f, metrics);
+        if (area is not { } placed) { f.Add("no layout for the fixture"); return f; }
+
+        // Inside the panels: chrome.
+        foreach (var (name, frame) in new[]
+        {
+            ("rail", placed.ToolFrame), ("strip", placed.ActionFrame),
+        })
+        {
+            var centre = new Point(
+                (int)(frame.Left + frame.Width / 2), (int)(frame.Top + frame.Height / 2));
+            if (!AreaReviewHitTest.IsChrome(centre, placed.ToolFrame, placed.ActionFrame))
+                f.Add($"{name} centre is not chrome");
+            if (AreaReviewHitTest.IsCanvas(
+                centre, placed.ToolFrame, placed.ActionFrame, chromeVisible: true))
+                f.Add($"{name} centre draws");
+        }
+
+        // Inside the selection, and in the empty surround: the picture. These
+        // are the clicks a swallowed event would lose.
+        foreach (var (name, point) in new[]
+        {
+            ("selection centre", new Point(900, 550)),
+            ("selection corner", new Point((int)selection.Left + 3, (int)selection.Top + 3)),
+            ("far corner", new Point(5, 5)),
+            ("below everything", new Point(960, 1075)),
+        })
+        {
+            if (!AreaReviewHitTest.IsCanvas(
+                point, placed.ToolFrame, placed.ActionFrame, chromeVisible: true))
+                f.Add($"{name} swallowed by the toolbar");
+        }
+
+        // With no chrome placed — a selection too small for a toolbar — every
+        // point draws, including the ones a stale frame would have claimed.
+        if (!AreaReviewHitTest.IsCanvas(
+            new Point(900, 550), placed.ToolFrame, placed.ActionFrame, chromeVisible: false))
+            f.Add("hidden chrome still swallows");
         return f;
     }
 

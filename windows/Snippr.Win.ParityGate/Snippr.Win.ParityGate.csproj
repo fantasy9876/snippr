@@ -30,6 +30,7 @@
     <!-- The overlay toolbar's geometry, from the UI lane. Pure arithmetic, so
          it belongs on this side of the gate rather than the raster one. -->
     <Compile Include="..\Ui\OverlayToolbarLayout.cs" Link="OverlayToolbarLayout.cs" />
+    <Compile Include="..\AreaReviewHitTest.cs" Link="AreaReviewHitTest.cs" />
   </ItemGroup>
 
 </Project>

@@ -129,11 +129,60 @@ sealed class TrayContext : ApplicationContext
     void CaptureArea()
     {
         if (CaptureBusy) return;
-        var (shot, rect) = OverlayForm.SelectArea();
-        if (shot == null) return;
-        AppSettings.Current.LastArea = rect;
-        AppSettings.Current.Save();
-        HandleResult(shot);
+        // Selection first, then review ON the frozen desktop: the crop can
+        // still move, and the marks are made before anything is handed over.
+        var (frozen, bounds, selection) = OverlayForm.SelectForReview();
+        if (frozen == null) return;
+        try
+        {
+            var (action, image, rect) = AreaReviewForm.Review(frozen, bounds, selection);
+            if (image == null) return; // closed without asking for anything
+            // The rect the app remembers is the crop, undecorated, whatever
+            // the picture ended up carrying around it.
+            AppSettings.Current.LastArea = rect;
+            AppSettings.Current.Save();
+            RouteReviewed(action, image);
+        }
+        finally
+        {
+            frozen.Dispose();
+        }
+    }
+
+    /// One reviewed capture, sent where the user asked. `HandleResult` is what
+    /// the settings-driven routes do; the review surface's own buttons are
+    /// explicit, so they say exactly where the picture goes.
+    void RouteReviewed(OverlayAction? action, Bitmap image)
+    {
+        switch (action)
+        {
+            case OverlayAction.Copy:
+                if (TryCopyImage(image)) ToastForm.Show("Copied to clipboard");
+                else ToastForm.Show("Clipboard đang bận — thử lại sau giây lát");
+                image.Dispose();
+                break;
+            case OverlayAction.Save:
+                if (CaptureUtil.SaveToFolder(image) is string path)
+                    ToastForm.Show($"Saved {Path.GetFileName(path)}");
+                else ToastForm.Show("Save failed");
+                image.Dispose();
+                break;
+            case OverlayAction.Pin:
+                new PinForm(image).Show();
+                break;
+            case OverlayAction.OpenEditor:
+                EditorForm.OpenWith(image);
+                break;
+            case OverlayAction.Ocr:
+                TextResultForm.RunOcrFlow(image);
+                break;
+            case OverlayAction.Translate:
+                TextResultForm.RunOcrFlow(image, autoTranslate: true);
+                break;
+            default:
+                image.Dispose();
+                break;
+        }
     }
 
     void CaptureWindow()

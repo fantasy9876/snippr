@@ -37,6 +37,36 @@ sealed class OverlayForm : Form
         return (null, Rectangle.Empty);
     }
 
+    /// Selection only, keeping the frozen desktop alive for the caller.
+    ///
+    /// `SelectArea` crops and disposes, which is what every route wanted until
+    /// the review surface: reviewing happens ON the frozen desktop, and the
+    /// crop can still move while it does, so the caller needs the whole
+    /// picture and the rect — not a cut-out of it. The caller owns the bitmap.
+    public static (Bitmap? Frozen, Rectangle Bounds, Rectangle SelectionLocal) SelectForReview()
+    {
+        var frozen = CaptureUtil.VirtualScreen(out var bounds);
+        using var overlay = new OverlayForm(frozen, bounds);
+        IsActive = true;
+        try
+        {
+            overlay.ShowDialog();
+        }
+        finally
+        {
+            IsActive = false;
+        }
+        if (overlay.SelectedVirtualRect is Rectangle rect
+            && rect.Width > 3 && rect.Height > 3)
+        {
+            var local = new Rectangle(
+                rect.X - bounds.X, rect.Y - bounds.Y, rect.Width, rect.Height);
+            return (frozen, bounds, local);
+        }
+        frozen.Dispose();
+        return (null, bounds, Rectangle.Empty);
+    }
+
     OverlayForm(Bitmap frozen, Rectangle virtualBounds)
     {
         _frozen = frozen;
