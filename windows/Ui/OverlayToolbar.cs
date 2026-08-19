@@ -16,6 +16,9 @@ sealed class OverlayToolbar : Control
 {
     public event EventHandler<string>? ToolSelected;
     public event EventHandler<string>? ActionInvoked;
+    /// The plate's corner rounding, chosen from the backdrop menu. Not an
+    /// action id: it carries a style, and it does not displace the tool.
+    public event EventHandler<BackdropCornerStyle>? CornerChosen;
 
     readonly ChromePanel _rail = new();
     readonly ChromePanel _strip = new();
@@ -71,6 +74,7 @@ sealed class OverlayToolbar : Control
         // Honey binds Menu.PresetChosen for compose. Forward the same id so a
         // single ActionInvoked listener can see "none|ocean|sunset|mint|graphite".
         _menu.PresetChosen += (_, id) => ActionInvoked?.Invoke(this, id);
+        _menu.CornerChosen += (_, style) => CornerChosen?.Invoke(this, style);
     }
 
     /// Raises exactly what a click on that button raises. The headless smoke

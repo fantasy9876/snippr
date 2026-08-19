@@ -58,6 +58,7 @@ sealed class AreaReviewForm : Form
     internal Control ChromeForTesting => _toolbar;
     internal HoverHint HintForTesting => _toolbar.Hint;
     internal int AnnotationCountForTesting => _session.Annotations.Count;
+    internal BackdropCornerStyle CornersForTesting => _session.Corners;
 
     /// Smoke parks this form off-screen (`Reveal` at -32000), so it cannot
     /// place the machine cursor and still round-trip through `PointToClient`.
@@ -148,6 +149,16 @@ sealed class AreaReviewForm : Form
             // button does nothing".
             Diag.Click("review", $"tool key={key} matched={entry.IconKey == key}");
             if (entry.IconKey == key) SelectTool(entry.Tool);
+        };
+        _toolbar.CornerChosen += (_, style) =>
+        {
+            // The session snapshotted the setting when it opened, so both have
+            // to move or the next repaint puts the old radius back.
+            _session.Corners = style;
+            AppSettings.Current.BackdropCorners = style.ToString();
+            AppSettings.Current.Save();
+            Diag.Click("review", $"corners={style}");
+            RefreshSurface(all: true);
         };
         _toolbar.ActionInvoked += (_, key) =>
         {

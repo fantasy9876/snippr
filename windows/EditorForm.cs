@@ -265,6 +265,14 @@ sealed class EditorForm : Form
         _actionHint = HoverHint.Attach(_actionBar, pt => _actionBar.GetItemAt(pt)?.ToolTipText);
         _toolHint = HoverHint.Attach(_toolBar, pt => _toolBar.GetItemAt(pt)?.ToolTipText);
 
+        _backdropMenu.CornerChosen += (_, style) =>
+        {
+            AppSettings.Current.BackdropCorners = style.ToString();
+            AppSettings.Current.Save();
+            // The plate's corners do not change its SIZE, so a repaint is
+            // enough here — unlike choosing a preset.
+            _canvas.Invalidate();
+        };
         _backdropMenu.PresetChosen += (_, id) =>
         {
             if (Enum.TryParse<BackdropPreset>(id, ignoreCase: true, out var preset)

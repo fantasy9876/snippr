@@ -341,6 +341,34 @@ static class TestEntry
                             + $"needs {need}px for its label");
                 }
             });
+            Step("review-backdrop-corner-rows", () =>
+            {
+                // The corner setting existed on Windows since 1.2.11 with no
+                // way to reach it. Clicking the row has to move the LIVE
+                // session, not only the stored setting: the session took its
+                // copy when the surface opened.
+                var menu = review.BackdropMenuForTesting;
+                menu.RaiseOpeningForTesting();
+                var rows = menu.Items.OfType<ToolStripMenuItem>()
+                    .Where(i => i.Tag is BackdropCornerStyle).ToList();
+                if (rows.Count != 4)
+                    throw new InvalidOperationException(
+                        $"{rows.Count} corner rows, want 4");
+                var before = review.CornersForTesting;
+                var target = rows.First(
+                    i => (BackdropCornerStyle)i.Tag! == BackdropCornerStyle.Large);
+                target.PerformClick();
+                Application.DoEvents();
+                if (review.CornersForTesting != BackdropCornerStyle.Large)
+                    throw new InvalidOperationException(
+                        $"session corners {review.CornersForTesting}, want Large");
+                menu.RaiseOpeningForTesting();
+                if (!rows.First(i => (BackdropCornerStyle)i.Tag! == BackdropCornerStyle.Large).Checked)
+                    throw new InvalidOperationException("Large row is not ticked");
+                // Leave the machine as we found it.
+                AppSettings.Current.BackdropCorners = before.ToString();
+                AppSettings.Current.Save();
+            });
             Step("review-preset-ocean", () =>
             {
                 review.ApplyPresetForTesting("ocean");
