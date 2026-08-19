@@ -4565,6 +4565,133 @@ enum SelfTest {
                 at: CGPoint(x: initialSelection.maxX + 3, y: initialSelection.maxY - 2),
                 in: initialSelection
               ) == .topRight)
+
+        // Corner handles sit on the 45° point of the plate arc so the
+        // square does not cover the cut. Radius 0 is the eight centres
+        // selection-handle-hit already uses. Mid-edge handles never
+        // move. Hit size stays 18; shrink is the drawn square only.
+        let insetCrop = CGRect(x: 100, y: 80, width: 200, height: 150)
+        let insetBaseline = EditableSelectionGeometry.handleRects(
+            for: insetCrop, size: 18)
+        let insetZero = EditableSelectionGeometry.handleRects(
+            for: insetCrop, size: 18, cornerRadius: 0)
+        var insetFails: [String] = []
+        if insetBaseline.count != 8 {
+            insetFails.append("expected 8 handles, got \(insetBaseline.count)")
+        }
+        for (got, want) in zip(insetBaseline, insetZero)
+        where got.0 != want.0 || got.1 != want.1 {
+            insetFails.append("radius 0 moved \(got.0)")
+        }
+        for (handle, rect) in insetBaseline {
+            let centre = CGPoint(x: rect.midX, y: rect.midY)
+            if EditableSelectionGeometry.handle(
+                at: centre, in: insetCrop, tolerance: 9
+            ) != handle {
+                insetFails.append("radius 0 \(handle) no longer grabs itself")
+            }
+        }
+        let insetRadius: CGFloat = 37
+        let insetD = EditableSelectionGeometry.cornerInset(forRadius: insetRadius)
+        let insetRects = EditableSelectionGeometry.handleRects(
+            for: insetCrop, size: 18, cornerRadius: insetRadius)
+        func insetCentre(_ rect: CGRect) -> CGPoint {
+            CGPoint(x: rect.midX, y: rect.midY)
+        }
+        func insetDist(_ a: CGPoint, _ b: CGPoint) -> CGFloat {
+            hypot(a.x - b.x, a.y - b.y)
+        }
+        let insetBaseByHandle = Dictionary(
+            uniqueKeysWithValues: insetBaseline.map { ($0.0, $0.1) })
+        let insetByHandle = Dictionary(
+            uniqueKeysWithValues: insetRects.map { ($0.0, $0.1) })
+        let insetCorners: [SelectionHandle] = [
+            .bottomLeft, .bottomRight, .topLeft, .topRight,
+        ]
+        let insetEdges: [SelectionHandle] = [.bottom, .top, .left, .right]
+        for handle in insetEdges {
+            guard let moved = insetByHandle[handle],
+                  let base = insetBaseByHandle[handle] else {
+                insetFails.append("missing mid-edge \(handle)"); continue
+            }
+            if insetDist(insetCentre(moved), insetCentre(base)) > 0.01 {
+                insetFails.append("mid-edge \(handle) moved")
+            }
+            if abs(moved.width - 18) > 0.01 {
+                insetFails.append("hit \(handle) shrank to \(moved.width)")
+            }
+        }
+        let insetWant: [SelectionHandle: (CGFloat, CGFloat)] = [
+            .bottomLeft: (insetD, insetD),
+            .topLeft: (insetD, -insetD),
+            .bottomRight: (-insetD, insetD),
+            .topRight: (-insetD, -insetD),
+        ]
+        for handle in insetCorners {
+            guard let moved = insetByHandle[handle],
+                  let base = insetBaseByHandle[handle],
+                  let delta = insetWant[handle] else {
+                insetFails.append("missing corner \(handle)"); continue
+            }
+            let got = insetCentre(moved)
+            let expect = CGPoint(
+                x: insetCentre(base).x + delta.0,
+                y: insetCentre(base).y + delta.1)
+            if insetDist(got, expect) > 0.01 {
+                insetFails.append("corner \(handle): \(got) want \(expect)")
+            }
+            if abs(moved.width - 18) > 0.01 {
+                insetFails.append("hit corner \(handle) shrank to \(moved.width)")
+            }
+            if EditableSelectionGeometry.handle(
+                at: got, in: insetCrop, tolerance: 9,
+                cornerRadius: insetRadius
+            ) != handle {
+                insetFails.append("inset \(handle) does not grab itself")
+            }
+            if EditableSelectionGeometry.handle(
+                at: insetCentre(base), in: insetCrop, tolerance: 9,
+                cornerRadius: insetRadius
+            ) == handle {
+                insetFails.append("geometric \(handle) still grabs")
+            }
+        }
+        // Drawn 8 pt square on Medium floor 12 → d ≈ 3.51: 4 > d so the
+        // square shrinks to 2d (floor 5). Size 7 does not (3.5 < d) —
+        // that is the production draw size, covered by the owner case
+        // below. Centres stay on the arc.
+        let floorR: CGFloat = 12
+        let floorD = EditableSelectionGeometry.cornerInset(forRadius: floorR)
+        let drawn = EditableSelectionGeometry.handleRects(
+            for: insetCrop, size: 8, cornerRadius: floorR, shrinkToArc: true)
+        let wantVisual = max(5 as CGFloat, 2 * floorD)
+        let drawnByHandle = Dictionary(
+            uniqueKeysWithValues: drawn.map { ($0.0, $0.1) })
+        for handle in insetCorners {
+            guard let rect = drawnByHandle[handle] else { continue }
+            if abs(rect.width - wantVisual) > 0.01 {
+                insetFails.append(
+                    "visual \(handle) size \(rect.width) want \(wantVisual)")
+            }
+        }
+        for handle in insetEdges {
+            guard let rect = drawnByHandle[handle] else { continue }
+            if abs(rect.width - 8) > 0.01 {
+                insetFails.append("visual mid-edge \(handle) shrank to \(rect.width)")
+            }
+        }
+        // Owner-sized crop, Medium 37 pt: 7/2 < d, so the square stays 7.
+        let ownerCrop = CGRect(x: 0, y: 0, width: 2400, height: 1523)
+        let ownerDrawn = EditableSelectionGeometry.handleRects(
+            for: ownerCrop, size: 7, cornerRadius: insetRadius, shrinkToArc: true)
+        for (handle, rect) in ownerDrawn where insetCorners.contains(handle) {
+            if abs(rect.width - 7) > 0.01 {
+                insetFails.append("owner visual \(handle) size \(rect.width) want 7")
+            }
+        }
+        check("selection-handle-inset",
+              insetFails.isEmpty,
+              insetFails.prefix(6).joined(separator: " | "))
         let pixelCrop = EditableSelectionGeometry.pixelCropRect(
             for: initialSelection, in: selectionBounds, scale: 2
         )
@@ -5691,6 +5818,70 @@ enum SelfTest {
                   movePixelsLive && movePixelsNoJump
                     && resizePixelsLive && resizePixelsNoJump,
                   "moveLive \(movePixelsLive) moveNoJump \(movePixelsNoJump) resizeLive \(resizePixelsLive) resizeNoJump \(resizePixelsNoJump)")
+
+            // Wiring, not just the helper: after Ocean is on, a mouseDown
+            // at the geometric corner must not grab the handle, and a
+            // mouseDown on the 45° point must. Restoring radius 0 (the
+            // old call) makes the first assertion go red — that is the
+            // mutation this exists to catch.
+            let (insetOverlay, insetView) = reviewView()
+            _ = insetOverlay
+            // Geometric-corner probe only works when d > hit half (9):
+            // Medium on a small crop floors at 12 (d ≈ 3.5) and the 18 pt
+            // hit still covers the cut. Large on a screen-sized crop
+            // matches the owner case (d > 9).
+            let insetSel = CGRect(
+                x: 40, y: 40,
+                width: max(200, b.width - 80),
+                height: max(160, b.height - 80))
+            insetView.selectForTesting(rect: insetSel)
+            var wireFails: [String] = []
+            if !insetView.isReviewingForTesting {
+                wireFails.append("not reviewing")
+            }
+            if !insetView.applyBackdropPreset(.ocean) {
+                wireFails.append("ocean refused")
+            }
+            let styleBefore = Settings.shared.backdropCornerStyle
+            Settings.shared.backdropCornerStyle = .large
+            defer { Settings.shared.backdropCornerStyle = styleBefore }
+            let liveSel = insetView.areaSelectionForTesting ?? insetSel
+            let liveR = SliceBBackdrop.cornerRadius(
+                documentPoints: liveSel.size, style: .large)
+            let liveD = EditableSelectionGeometry.cornerInset(forRadius: liveR)
+            if liveR <= 0 { wireFails.append("large radius is 0") }
+            if liveD <= 9 {
+                wireFails.append("d \(liveD) ≤ 9, geometric probe is inside the hit")
+            }
+            let geoTR = SelectionHandle.topRight.point(in: liveSel)
+            let arcTR = EditableSelectionGeometry.handlePoint(
+                .topRight, in: liveSel, cornerRadius: liveR)
+            // Exact maxX/maxY is outside CGRect.contains and would
+            // cancel review. Nudge onto the crop; stay farther than
+            // the 9 pt hit from the inset centre.
+            let geoInside = CGPoint(x: geoTR.x - 0.5, y: geoTR.y - 0.5)
+            if let down = liveMouse(.leftMouseDown, arcTR) {
+                insetView.mouseDown(with: down)
+            }
+            if insetView.areaDragHandleForTesting != .topRight {
+                wireFails.append(
+                    "arc corner grabs \(String(describing: insetView.areaDragHandleForTesting))")
+            }
+            if let up = liveMouse(.leftMouseUp, arcTR) {
+                insetView.mouseUp(with: up)
+            }
+            if let down = liveMouse(.leftMouseDown, geoInside) {
+                insetView.mouseDown(with: down)
+            }
+            if insetView.areaDragHandleForTesting == .topRight {
+                wireFails.append("geometric corner still grabs")
+            }
+            if let up = liveMouse(.leftMouseUp, geoInside) {
+                insetView.mouseUp(with: up)
+            }
+            check("overlay-handle-inset-wired",
+                  wireFails.isEmpty,
+                  wireFails.joined(separator: " | "))
 
             // S5 fail-first: Translate is a real shared toolbar action and
             // both terminal hosts claim it BEFORE the dependency can
