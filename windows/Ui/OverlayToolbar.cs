@@ -3,9 +3,15 @@ using System.Drawing.Drawing2D;
 namespace Snippr;
 
 /// Floating overlay chrome. Raises IconKey strings only — no OverlayAction
-/// enum (that lives in Honey's ToolCatalog). Honey binds the catalog on rebase:
-/// <c>SetTools(ToolCatalog.OverlayTools.Select(e => (e.IconKey, e.HintText)))</c>
-/// and maps the raised key back to the catalog row.
+/// enum (that lives in ToolCatalog).
+///
+/// This control deliberately does NOT answer WM_NCHITTEST with HTTRANSPARENT
+/// outside its rail and strip. It used to, from the days when it was a shell
+/// with no host; `AreaReviewForm` then docked it Fill over the whole surface
+/// and routed the picture's mouse events THROUGH it, and the two rules were
+/// never reconciled. Click-through won, so every press on the picture fell to
+/// a form that has no mouse handlers: no drawing, no crop drag, no cursor —
+/// which is what "none of the buttons work" turned out to be.
 sealed class OverlayToolbar : Control
 {
     public event EventHandler<string>? ToolSelected;
@@ -192,22 +198,6 @@ sealed class OverlayToolbar : Control
         int n = Math.Min(buttons.Count, local.Length);
         for (int i = 0; i < n; i++)
             buttons[i].Bounds = Rectangle.Round(local[i]);
-    }
-
-    protected override void WndProc(ref Message m)
-    {
-        const int WmNcHitTest = 0x0084;
-        const int HtTransparent = -1;
-        if (m.Msg == WmNcHitTest)
-        {
-            var pt = PointToClient(Control.MousePosition);
-            if (!_rail.Bounds.Contains(pt) && !_strip.Bounds.Contains(pt))
-            {
-                m.Result = HtTransparent;
-                return;
-            }
-        }
-        base.WndProc(ref m);
     }
 
     protected override void Dispose(bool disposing)

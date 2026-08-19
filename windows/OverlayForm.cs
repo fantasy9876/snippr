@@ -73,6 +73,13 @@ sealed class OverlayForm : Form
         _virtualBounds = virtualBounds;
         FormBorderStyle = FormBorderStyle.None;
         StartPosition = FormStartPosition.Manual;
+        // WinForms clamps Form.Size to SystemInformation.MaxWindowTrackSize —
+        // the PRIMARY monitor plus a border — unless MaximumSize says
+        // otherwise. On a multi-monitor desktop the virtual screen is wider
+        // than that, so the overlay silently came up smaller than the picture
+        // it is showing and the chrome was laid out against a client area
+        // that did not reach the crop. Set the ceiling before the bounds.
+        MaximumSize = virtualBounds.Size;
         Bounds = virtualBounds;
         TopMost = true;
         ShowInTaskbar = false;

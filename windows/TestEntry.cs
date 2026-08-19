@@ -1,4 +1,5 @@
 using System.Drawing.Imaging;
+using System.Runtime.InteropServices;
 
 namespace Snippr;
 
@@ -18,6 +19,33 @@ namespace Snippr;
 ///                                    and exit — no interactive desktop needed
 static class TestEntry
 {
+    [DllImport("user32.dll")]
+    static extern IntPtr WindowFromPoint(Point point);
+
+    [DllImport("user32.dll", CharSet = CharSet.Auto)]
+    static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    static extern bool IsWindowVisible(IntPtr hWnd);
+
+    [DllImport("user32.dll", EntryPoint = "GetWindowLongPtr")]
+    static extern IntPtr GetWindowLongPtr(IntPtr hWnd, int index);
+
+    const int WmMouseMove = 0x0200;
+    const int WmLButtonDown = 0x0201;
+    const int WmLButtonUp = 0x0202;
+    const int GwlExStyle = -20;
+    const long WsExTopmost = 0x00000008;
+
+    /// lParam for a mouse message: y in the high word, x in the low word,
+    /// both as *signed* 16-bit values — the review surface lives at negative
+    /// client coordinates while the smoke keeps it off-screen.
+    static IntPtr MouseLParam(Point p) =>
+        (IntPtr)(((p.Y & 0xFFFF) << 16) | (p.X & 0xFFFF));
+
+    static void SendMouse(Control target, int message, Point clientPoint) =>
+        SendMessage(target.Handle, message, IntPtr.Zero, MouseLParam(clientPoint));
+
     /// True when the arguments asked for a test entry and it has run.
     public static bool Handle(string[] args)
     {
@@ -210,6 +238,91 @@ static class TestEntry
                         "select outside crop kept SizeAll");
                 review.PointerClientForTesting = null;
             });
+            Step("review-client-equals-bounds", () =>
+            {
+                // WinForms clamps Form.Size to the PRIMARY monitor unless
+                // MaximumSize says otherwise, and this runner's screen is
+                // smaller than the picture. Without the ceiling the overlay
+                // comes up short and lays its chrome out against a client
+                // area that never reaches the crop.
+                if (review.ClientSize != review.Bounds.Size)
+                    throw new InvalidOperationException(
+                        $"client {review.ClientSize} != bounds {review.Bounds.Size}");
+            });
+            Step("review-canvas-click-reaches-tool", () =>
+            {
+                // Two halves, and they prove different things.
+                //
+                // First: who does WINDOWS say owns a point over the picture?
+                // The chrome is docked over the whole surface and forwards
+                // what lands on it; when it answered HTTRANSPARENT the press
+                // fell to a form with no mouse handlers and nothing drew.
+                // Posting a message cannot catch that — posting skips hit
+                // testing entirely — so ask the OS with the form on-screen.
+                var home = review.Location;
+                review.Location = Point.Empty;
+                Application.DoEvents();
+                var crop = review.SelectionForTesting;
+                var centre = new Point(
+                    crop.X + crop.Width / 2, crop.Y + crop.Height / 2);
+                var owner = WindowFromPoint(review.PointToScreen(centre));
+                var chrome = review.ChromeForTesting;
+                if (owner != chrome.Handle)
+                    throw new InvalidOperationException(
+                        $"point in the crop belongs to {owner}, not the chrome {chrome.Handle}");
+                review.Location = home;
+                Application.DoEvents();
+
+                // Second: the forwarding itself. An Arrow dragged across the
+                // crop has to leave exactly one mark behind.
+                review.PressToolForTesting("arrow");
+                int before = review.AnnotationCountForTesting;
+                var from = new Point(crop.X + 40, crop.Y + 40);
+                var to = new Point(crop.X + 160, crop.Y + 120);
+                SendMouse(chrome, WmLButtonDown, from);
+                SendMouse(chrome, WmMouseMove, to);
+                SendMouse(chrome, WmLButtonUp, to);
+                Application.DoEvents();
+                int after = review.AnnotationCountForTesting;
+                if (after != before + 1)
+                    throw new InvalidOperationException(
+                        $"arrow drag left {after - before} marks, want 1");
+                review.PressToolForTesting("select");
+            });
+            Step("review-hint-visible-and-topmost", () =>
+            {
+                // The hint was created with CreateHandle + SWP_SHOWWINDOW, so
+                // WinForms never knew it was visible (HideNow was a no-op) and
+                // it sat in the normal band UNDER its own TopMost host — the
+                // overlay could not show a hint at all.
+                var chrome = review.ChromeForTesting;
+                var hint = review.HintForTesting;
+                var button = FirstLeaf(chrome);
+                SendMouse(button, WmMouseMove,
+                    new Point(button.Width / 2, button.Height / 2));
+                var deadline = DateTime.UtcNow.AddSeconds(3);
+                while (DateTime.UtcNow < deadline && !hint.IsHandleCreated)
+                {
+                    Application.DoEvents();
+                    Thread.Sleep(30);
+                }
+                while (DateTime.UtcNow < deadline
+                    && !IsWindowVisible(hint.Handle))
+                {
+                    Application.DoEvents();
+                    Thread.Sleep(30);
+                }
+                if (!IsWindowVisible(hint.Handle))
+                    throw new InvalidOperationException("hint never became visible");
+                long ex = (long)GetWindowLongPtr(hint.Handle, GwlExStyle);
+                if ((ex & WsExTopmost) == 0)
+                    throw new InvalidOperationException(
+                        $"hint is not WS_EX_TOPMOST (exstyle 0x{ex:X})");
+                hint.HideNow();
+                Application.DoEvents();
+                if (IsWindowVisible(hint.Handle))
+                    throw new InvalidOperationException("HideNow left the hint up");
+            });
             Step("review-backdrop-menu-labels", () =>
             {
                 // The menu showed five swatches and no words: AutoSize was
@@ -267,6 +380,15 @@ static class TestEntry
     /// out and paints. `DrawToBitmap` on a form that was never shown gives
     /// back an empty rectangle: the first smoke run's `editor.png` was a slab
     /// of background with no toolbar in it, which says nothing about anything.
+    /// The deepest child of <paramref name="root"/> — an overlay toolbar
+    /// button, for a hint that only fires over one.
+    static Control FirstLeaf(Control root)
+    {
+        var c = root;
+        while (c.Controls.Count > 0) c = c.Controls[0];
+        return c;
+    }
+
     static void Reveal(Form form)
     {
         form.StartPosition = FormStartPosition.Manual;

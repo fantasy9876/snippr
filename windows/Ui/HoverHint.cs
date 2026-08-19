@@ -16,7 +16,11 @@ sealed class HoverHint : Form
     const uint SwpNomove = 0x0002;
     const uint SwpNoactivate = 0x0010;
     const uint SwpShowwindow = 0x0040;
-    static readonly IntPtr HwndTop = IntPtr.Zero;
+    /// HWND_TOPMOST, not HWND_TOP. The hint is owned by a form that is itself
+    /// TopMost and covers the whole desktop, so merely being at the top of the
+    /// normal band puts it UNDER its own host — which is why the overlay never
+    /// showed a hint while the editor, an ordinary window, always did.
+    static readonly IntPtr HwndTopmost = new(-1);
 
     readonly Control _host;
     readonly Func<Point, string?> _hintAt;
@@ -72,7 +76,7 @@ sealed class HoverHint : Form
         _delay.Stop();
         _pending = null;
         _shown = null;
-        if (IsHandleCreated && Visible) Hide();
+        if (IsHandleCreated) Hide();
     }
 
     /// Places a hint of <paramref name="size"/> relative to <paramref name="anchor"/>
@@ -225,9 +229,14 @@ sealed class HoverHint : Form
         Size = placed.Value.Size;
         Location = placed.Value.Location;
         Invalidate();
-        if (!IsHandleCreated) CreateHandle();
+        // Show() rather than CreateHandle()+SWP_SHOWWINDOW: showing behind
+        // WinForms' back left `Visible` false forever, so every HideNow() was
+        // a no-op and the hint could only ever be replaced, never dismissed.
+        // ShowWithoutActivation and WS_EX_NOACTIVATE keep the focus where it
+        // is, which is what the raw call was really for.
+        if (!Visible) Show();
         SetWindowPos(
-            Handle, HwndTop, placed.Value.X, placed.Value.Y,
+            Handle, HwndTopmost, placed.Value.X, placed.Value.Y,
             placed.Value.Width, placed.Value.Height,
             SwpNoactivate | SwpShowwindow);
     }
@@ -259,7 +268,12 @@ sealed class HoverHint : Form
 
     Rectangle AllowedRect()
     {
-        var screen = Screen.FromControl(_host).WorkingArea;
+        // The display the hinted BUTTON is on, not the one the host is on:
+        // the overlay's host spans the whole virtual desktop, so asking about
+        // the host answers with whichever monitor happens to hold its origin.
+        var screen = _anchor.IsEmpty
+            ? Screen.FromControl(_host).WorkingArea
+            : Screen.FromRectangle(_anchor).WorkingArea;
         if (_host.FindForm() is Form form)
         {
             var hostScreen = form.RectangleToScreen(form.ClientRectangle);

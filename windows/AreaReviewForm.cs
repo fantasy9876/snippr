@@ -52,6 +52,13 @@ sealed class AreaReviewForm : Form
 
     internal BackdropMenu BackdropMenuForTesting => _toolbar.Menu;
 
+    /// The chrome control itself. The smoke asks Windows who owns a point and
+    /// what a real message does with it, which is the half of the input path
+    /// no direct-invoke hook can stand in for.
+    internal Control ChromeForTesting => _toolbar;
+    internal HoverHint HintForTesting => _toolbar.Hint;
+    internal int AnnotationCountForTesting => _session.Annotations.Count;
+
     /// Smoke parks this form off-screen (`Reveal` at -32000), so it cannot
     /// place the machine cursor and still round-trip through `PointToClient`.
     /// Production always reads `Cursor.Position`; tests set this instead.
@@ -95,6 +102,13 @@ sealed class AreaReviewForm : Form
         _virtualBounds = bounds;
         FormBorderStyle = FormBorderStyle.None;
         StartPosition = FormStartPosition.Manual;
+        // WinForms clamps Form.Size to SystemInformation.MaxWindowTrackSize —
+        // the PRIMARY monitor plus a border — unless MaximumSize says
+        // otherwise. On a multi-monitor desktop the virtual screen is wider
+        // than that, so the overlay silently came up smaller than the picture
+        // it is showing and the chrome was laid out against a client area
+        // that did not reach the crop. Set the ceiling before the bounds.
+        MaximumSize = bounds.Size;
         Bounds = bounds;
         TopMost = true;
         ShowInTaskbar = false;
