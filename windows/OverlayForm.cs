@@ -73,12 +73,10 @@ sealed class OverlayForm : Form
         _virtualBounds = virtualBounds;
         FormBorderStyle = FormBorderStyle.None;
         StartPosition = FormStartPosition.Manual;
-        // WinForms clamps Form.Size to SystemInformation.MaxWindowTrackSize —
-        // the PRIMARY monitor plus a border — unless MaximumSize says
-        // otherwise. On a multi-monitor desktop the virtual screen is wider
-        // than that, so the overlay silently came up smaller than the picture
-        // it is showing and the chrome was laid out against a client area
-        // that did not reach the crop. Set the ceiling before the bounds.
+        // WinForms clamps Form.Size to SystemInformation.MaxWindowTrackSize.
+        // That metric is the whole desktop, so asking for the virtual screen
+        // is within it; the ceiling is set anyway, before the bounds, so the
+        // window is never the thing that trims itself.
         MaximumSize = virtualBounds.Size;
         Bounds = virtualBounds;
         TopMost = true;
@@ -90,19 +88,13 @@ sealed class OverlayForm : Form
             | ControlStyles.OptimizedDoubleBuffer, true);
     }
 
-    /// The window must be allowed to be as large as the picture it shows —
-    /// see Native.AnswerMinMaxInfo. MaximumSize alone left it clamped to the
-    /// primary monitor, which CI caught: bounds 1280x800, client 1044x788.
-    protected override void WndProc(ref Message m)
-    {
-        if (Native.AnswerMinMaxInfo(ref m, _virtualBounds)) return;
-        base.WndProc(ref m);
-    }
-
+    /// What the window asked for and what it got. `MaxWindowTrackSize` is the
+    /// whole DESKTOP, not the primary monitor, so a window asking for the
+    /// virtual screen is not trimmed — but that is a claim about someone
+    /// else's machine, and this line is how it gets checked on theirs.
     protected override void OnHandleCreated(EventArgs e)
     {
         base.OnHandleCreated(e);
-        Native.ForceClientSize(Handle, _virtualBounds.Size);
         Diag.Click(
             "overlay",
             $"window asked={_virtualBounds.Size} got={Size} client={ClientSize}");

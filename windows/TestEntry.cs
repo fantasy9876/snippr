@@ -182,12 +182,22 @@ static class TestEntry
             }
         }
 
-        var bounds = new Rectangle(0, 0, picture.Width, picture.Height);
+        // Production hands the review surface the VIRTUAL SCREEN and a frozen
+        // capture of exactly that, so the smoke does the same. Asking for a
+        // fixture-sized window instead made the runner clamp it — the desktop
+        // there is smaller than the fixture — and sent us hunting a
+        // multi-monitor bug that the clamp's own definition rules out
+        // (MaxWindowTrackSize is the whole desktop, not the primary monitor).
+        var desktop = SystemInformation.VirtualScreen;
+        var bounds = new Rectangle(0, 0, desktop.Width, desktop.Height);
+        using var frozen = new Bitmap(bounds.Width, bounds.Height);
+        using (var g = Graphics.FromImage(frozen))
+            g.DrawImage(picture, 0, 0, bounds.Width, bounds.Height);
         var selection = new Rectangle(
-            picture.Width / 6, picture.Height / 6,
-            picture.Width * 2 / 3, picture.Height * 2 / 3);
+            bounds.Width / 6, bounds.Height / 6,
+            bounds.Width * 2 / 3, bounds.Height * 2 / 3);
         using (var review = AreaReviewForm.CreateForTesting(
-            new Bitmap(picture), bounds, selection))
+            new Bitmap(frozen), bounds, selection))
         {
             Step("review-layout", () =>
             {
@@ -246,9 +256,9 @@ static class TestEntry
                 // is short — this check passed on a run whose log showed the
                 // clamp happening (asked 1280x800, client 1044x788). The
                 // runner's screen is smaller than the picture, so this is the
-                // real test of the WM_GETMINMAXINFO answer.
-                // SIZE only: where the window sits is the caller's business,
-                // and the smoke parks this one off-screen on purpose.
+                // The surface must cover the desktop it asked for. Size only:
+                // where the window sits is the caller's business, and the
+                // smoke parks this one off-screen on purpose.
                 var want = review.RequestedBoundsForTesting.Size;
                 if (review.Size != want)
                     throw new InvalidOperationException(
@@ -314,8 +324,15 @@ static class TestEntry
                 var chrome = review.ChromeForTesting;
                 var hint = review.HintForTesting;
                 var button = FirstLeaf(chrome);
-                SendMouse(button, WmMouseMove,
-                    new Point(button.Width / 2, button.Height / 2));
+                var centre = new Point(button.Width / 2, button.Height / 2);
+                // Put the REAL cursor on the button first. A posted
+                // WM_MOUSEMOVE makes WinForms start tracking, and the moment
+                // the physical pointer is found elsewhere a WM_MOUSELEAVE
+                // arrives and clears the pending hint before its 450 ms timer
+                // can fire — the hint is then working exactly as designed and
+                // the gate is testing where the runner's mouse happens to be.
+                Cursor.Position = button.PointToScreen(centre);
+                SendMouse(button, WmMouseMove, centre);
                 var deadline = DateTime.UtcNow.AddSeconds(3);
                 while (DateTime.UtcNow < deadline && !hint.IsHandleCreated)
                 {
