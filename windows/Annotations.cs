@@ -310,13 +310,17 @@ sealed class MagnifierAnnotation : Annotation
 
     public override Rectangle Bounds => CalloutRect;
 
+    /// Review and editor share this so a live preview cannot be sized from a
+    /// different default than the committed loupe.
+    public const float DefaultZoom = 2.5f;
+
     /// Where the callout for `source` sits: to the right and below by 16 px
     /// when that fits inside `bounds`, otherwise flipped the other way and
     /// clamped. Same arithmetic `MakeMagnifier` and the editor used to inline,
     /// so a live drag preview cannot park somewhere the committed loupe will
     /// not.
     public static Rectangle PlaceCallout(
-        Rectangle source, Rectangle bounds, float zoom = 2.5f)
+        Rectangle source, Rectangle bounds, float zoom = DefaultZoom)
     {
         var size = new Size(
             (int)(source.Width * zoom), (int)(source.Height * zoom));
@@ -363,8 +367,9 @@ sealed class MagnifierAnnotation : Annotation
         g.Restore(state);
     }
 
-    /// 1 px dark line outside, 1 px white line inside: visible on light and
-    /// dark pixels alike, and never covering the source pixels themselves.
+    /// 1 px dark line outside SourceRect, 1 px white line on its outermost
+    /// row and column: visible on light and dark pixels alike. The interior
+    /// of the source stays untouched.
     static void DrawSourceFrame(Graphics g, Rectangle src)
     {
         if (src.Width <= 1 || src.Height <= 1) return;

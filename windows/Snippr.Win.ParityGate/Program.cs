@@ -372,8 +372,8 @@ static class Program
             if (got != want) f.Add($"select {grip} -> {got} want {want}");
         }
 
-        // After a tool switch the form only knows the tool, so it asks with
-        // None: drawing tools must not keep a leftover SizeAll.
+        // Drawing tools ignore the hit: a leftover Select grip cannot stick
+        // after the switch, whether the pointer is inside the crop or not.
         if (AreaReviewCursor.For(Tool.Magnifier, CropGrip.None) != ReviewCursorKind.Cross)
             f.Add("magnifier after switch is not Cross");
         if (AreaReviewCursor.For(Tool.Pen, CropGrip.Inside) != ReviewCursorKind.Cross)

@@ -190,10 +190,25 @@ static class TestEntry
                 () => Capture(review, Path.Combine(dir, "review-magnifier-drag.png")));
             Step("review-tool-select", () =>
             {
+                var crop = review.SelectionForTesting;
+                // Two directions, both premises set by the test: inside the
+                // crop must become SizeAll (CropGrip.None would still pass a
+                // one-way "not SizeAll outside"), and outside must not keep
+                // the leftover SizeAll. The form is parked at -32000, so the
+                // machine cursor cannot be the premise.
+                review.PointerClientForTesting = new Point(crop.X + 24, crop.Y + 24);
                 review.PressToolForTesting("select");
-                if (review.CursorForTesting != Cursors.Cross)
+                if (review.CursorForTesting != Cursors.SizeAll)
                     throw new InvalidOperationException(
-                        $"select cursor is {review.CursorForTesting} want Cross");
+                        $"select inside crop is {review.CursorForTesting} want SizeAll");
+
+                review.PointerClientForTesting = new Point(crop.X - 24, crop.Y - 24);
+                review.PressToolForTesting("magnifier");
+                review.PressToolForTesting("select");
+                if (review.CursorForTesting == Cursors.SizeAll)
+                    throw new InvalidOperationException(
+                        "select outside crop kept SizeAll");
+                review.PointerClientForTesting = null;
             });
             Step("review-preset-ocean", () =>
             {

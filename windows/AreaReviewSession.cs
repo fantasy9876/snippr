@@ -153,7 +153,8 @@ sealed class AreaReviewSession
     /// Samples a callout's source once, after the redactions — the same rule
     /// the editor uses, kept here so the review surface cannot acquire a
     /// weaker one.
-    public MagnifierAnnotation? MakeMagnifier(Rectangle source, float zoom = 2.5f)
+    public MagnifierAnnotation? MakeMagnifier(
+        Rectangle source, float zoom = MagnifierAnnotation.DefaultZoom)
     {
         var region = Rectangle.Intersect(source, PixelRect);
         if (region.Width <= 4 || region.Height <= 4) return null;

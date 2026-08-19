@@ -50,6 +50,11 @@ sealed class AreaReviewForm : Form
 
     internal Rectangle SelectionForTesting => _session.PixelRect;
 
+    /// Smoke parks this form off-screen (`Reveal` at -32000), so it cannot
+    /// place the machine cursor and still round-trip through `PointToClient`.
+    /// Production always reads `Cursor.Position`; tests set this instead.
+    internal Point? PointerClientForTesting { get; set; }
+
     /// Presses Magnifier and leaves the drag live, so smoke can photograph
     /// the source frame and the dashed callout before a snapshot exists.
     internal void DragMagnifierForTesting(Point from, Point to)
@@ -283,11 +288,14 @@ sealed class AreaReviewForm : Form
         _tool = tool;
         _toolbar.Hint.HideNow();
         UpdateToolbarState();
-        // Re-evaluate immediately: a leftover SizeAll/SizeNWSE from Select
-        // is what made every tool look like a hand. Until the next move we
-        // only know the tool, not the hit, so the grip is None.
-        Cursor = CursorFor(tool, CropGrip.None);
+        // Re-evaluate immediately at the pointer: switching back to Select
+        // while the pointer is inside the crop must be SizeAll, not Cross
+        // until the next move. Drawing tools stay Cross regardless of hit.
+        ApplyCursor(CurrentPointerClient());
     }
+
+    Point CurrentPointerClient() =>
+        PointerClientForTesting ?? PointToClient(Cursor.Position);
 
     void CanvasMouseDown(MouseEventArgs e)
     {
@@ -435,8 +443,13 @@ sealed class AreaReviewForm : Form
             case SpotlightAnnotation spot: spot.Rect = RectFrom(_dragStartPx, px); break;
             case MagnifierAnnotation mag:
                 mag.SourceRect = RectFrom(_dragStartPx, px);
+                // Same region MakeMagnifier will commit: a drag that leaves
+                // the crop must not park the dashed outline somewhere the
+                // loupe will not land.
                 mag.CalloutRect = MagnifierAnnotation.PlaceCallout(
-                    mag.SourceRect, _session.PixelRect);
+                    Rectangle.Intersect(mag.SourceRect, _session.PixelRect),
+                    _session.PixelRect,
+                    MagnifierAnnotation.DefaultZoom);
                 break;
             default: return;
         }
