@@ -17311,6 +17311,22 @@ enum SelfTest {
                 // the setter, because it is the wiring that was wrong.
                 let styleBefore = Settings.shared.backdropCornerStyle
                 defer { Settings.shared.backdropCornerStyle = styleBefore }
+                // START from Medium, and make the surface reflect it. Without
+                // this the gate's ability to fail depended on the MACHINE: a
+                // user (or an earlier run) leaving Large in defaults meant the
+                // clip was already 16, clicking Large was a no-op, and the
+                // check stayed green even with the wiring reverted. A gate
+                // that only fails on some machines is not a gate.
+                Settings.shared.backdropCornerStyle = .medium
+                wc.documentWrapperForTesting?.applyLayout(canvas.backdropLayout)
+                let startRadius = SliceBBackdrop.cornerRadius(
+                    documentPoints: canvas.backdropLayout.innerPointSize,
+                    style: .medium)
+                if abs(canvas.documentCornerRadius - startRadius) > 0.01 {
+                    chromeFailures.append(
+                        "corner-precondition \(canvas.documentCornerRadius) "
+                            + "want \(startRadius)")
+                }
                 let cornerMenu = wc.backdropMenu()
                 let largeTag = BackdropCornerStyle.allCases.firstIndex(of: .large)
                 if let row = cornerMenu.items.firstIndex(where: {
