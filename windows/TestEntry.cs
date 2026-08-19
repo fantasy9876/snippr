@@ -378,6 +378,76 @@ static class TestEntry
                         $"arrow drag left {after - before} marks, want 1");
                 review.PressToolForTesting("select");
             });
+            Step("review-partial-repaint-matches-full", () =>
+            {
+                // The damage-limited repaint path, which nothing else here can
+                // reach. Every other capture in this file goes through
+                // `DrawToBitmap`, and that ALWAYS paints the whole client — so
+                // a mark drawn incrementally could be leaving stale pixels on
+                // the surface the user is looking at and every gate would stay
+                // green.
+                //
+                // So: photograph the real screen mid-drag, force a full
+                // repaint, photograph it again. The two must be the same
+                // picture. A third shot from before the drag is the positive
+                // premise — without it this passes by comparing two identical
+                // pictures of nothing.
+                var home = review.Location;
+                review.Location = Point.Empty;
+                Application.DoEvents();
+                review.Refresh();
+                Application.DoEvents();
+
+                var crop = review.SelectionForTesting;
+                var chrome = review.ChromeForTesting;
+                var area = review.RectangleToScreen(crop);
+                using var rest = CaptureUtil.Rect(area)
+                    ?? throw new InvalidOperationException($"cannot photograph {area}");
+
+                review.PressToolForTesting("arrow");
+                var from = new Point(crop.X + 60, crop.Y + 60);
+                var to = new Point(crop.X + 260, crop.Y + 200);
+                SendMouse(chrome, WmLButtonDown, from);
+                // Several moves, because one move is one damage rect and the
+                // bug this looks for is the union of several going wrong.
+                for (int i = 1; i <= 8; i++)
+                    SendMouse(chrome, WmMouseMove, new Point(
+                        from.X + (to.X - from.X) * i / 8,
+                        from.Y + (to.Y - from.Y) * i / 8));
+                Application.DoEvents();
+                // Update, NOT Refresh: flush the damage the drag asked for
+                // without inventing any more of it.
+                review.Update();
+                Application.DoEvents();
+                using var incremental = CaptureUtil.Rect(area)
+                    ?? throw new InvalidOperationException($"cannot photograph {area}");
+
+                review.Refresh();
+                Application.DoEvents();
+                using var whole = CaptureUtil.Rect(area)
+                    ?? throw new InvalidOperationException($"cannot photograph {area}");
+
+                // End the gesture and leave the tool as we found it before
+                // anything can throw.
+                SendMouse(chrome, WmLButtonUp, to);
+                Application.DoEvents();
+                review.PressToolForTesting("select");
+                review.Location = home;
+                Application.DoEvents();
+
+                int drawn = Differing(rest, incremental, out _);
+                if (drawn == 0)
+                    throw new InvalidOperationException(
+                        "the drag drew nothing — this step proves nothing");
+                int stale = Differing(incremental, whole, out var firstStale);
+                Diag.Click(
+                    "test",
+                    $"partial repaint area={area} drew={drawn}px stale={stale}px");
+                if (stale > 0)
+                    throw new InvalidOperationException(
+                        $"damage-limited repaint left {stale}px that a full one "
+                        + $"paints differently{firstStale}");
+            });
             Step("review-hint-visible-and-topmost", () =>
             {
                 // The hint was created with CreateHandle + SWP_SHOWWINDOW, so
@@ -587,6 +657,29 @@ static class TestEntry
         if (colours < 3)
             throw new InvalidOperationException(
                 $"{Path.GetFileName(path)} is blank ({colours} colours)");
+    }
+
+    /// How many sampled pixels differ between two shots of the same rectangle,
+    /// and where the first one was. Every second pixel: a repaint that went
+    /// wrong is wrong in regions, never in one lone pixel, and the whole grid
+    /// costs a second per comparison on the runner.
+    static int Differing(Bitmap a, Bitmap b, out string first)
+    {
+        first = "";
+        if (a.Width != b.Width || a.Height != b.Height)
+        {
+            first = $" (sizes differ {a.Width}x{a.Height} vs {b.Width}x{b.Height})";
+            return int.MaxValue;
+        }
+        int count = 0;
+        for (int y = 0; y < a.Height; y += 2)
+            for (int x = 0; x < a.Width; x += 2)
+                if (a.GetPixel(x, y).ToArgb() != b.GetPixel(x, y).ToArgb())
+                {
+                    count++;
+                    if (first.Length == 0) first = $" first@{x},{y}";
+                }
+        return count;
     }
 
     static int DistinctColours(Bitmap bmp)
