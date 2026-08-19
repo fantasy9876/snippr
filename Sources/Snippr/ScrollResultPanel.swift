@@ -356,6 +356,7 @@ final class ScrollResultPanel: NSPanel {
                 button.tag == tool.toolbarTag ? .controlAccentColor : .labelColor
         }
         if tool != .text { annotationHost?.commitActiveTextEntry() }
+        annotationHost?.toolDidChange()
     }
 
     private func performHistoryAction(redo: Bool) {
@@ -726,6 +727,30 @@ final class AnnotationHostView: NSView, RedactionSurfaceDelegate {
 
     override var acceptsFirstResponder: Bool { true }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    /// The panel has no selection geometry of its own — one tool, one
+    /// meaning over the whole image — so the cursor is a table of one entry
+    /// rather than the overlay's ordered list. Select falls through to the
+    /// panel background (see `hitTest`), which is what moves the window.
+    var cursorForTool: AppCursor {
+        surface.tool == .select ? .arrow : AppCursor.drawing(surface.tool)
+    }
+
+    override func resetCursorRects() {
+        addCursorRect(bounds, cursor: cursorForTool.cursor)
+    }
+
+    /// The toolbar owns the tool, so it has to say when it changed: AppKit
+    /// caches cursor rects until they are invalidated, and the pointer would
+    /// otherwise keep describing the previous tool.
+    func toolDidChange() {
+        cursorToolForTesting = surface.tool
+        window?.invalidateCursorRects(for: self)
+    }
+
+    /// The tool `toolDidChange` was last told about — evidence that the
+    /// toolbar route reaches this view, which is the wiring the gate is for.
+    private(set) var cursorToolForTesting: OverlayAnnotationTool?
 
     private func showStrokeHUD(width: CGFloat, color: NSColor) {
         let container = strokeHUDContainer ?? self

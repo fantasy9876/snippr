@@ -5883,6 +5883,169 @@ enum SelfTest {
                   wireFails.isEmpty,
                   wireFails.joined(separator: " | "))
 
+            // The pointer must answer to the TOOL, not to geometry alone.
+            // Before this, every point inside the crop was an open hand while
+            // the very same click drew with the pen — the cursor promised a
+            // move the app never performed. Real mouseMoved events go in and
+            // the cursor production actually set comes back out, so reverting
+            // to the unconditional openHand turns this red.
+            let (cursorOverlay, cursorView) = reviewView()
+            _ = cursorOverlay
+            let cursorSel = CGRect(
+                x: 60, y: 60,
+                width: max(220, b.width - 200),
+                height: max(160, b.height - 200))
+            cursorView.selectForTesting(rect: cursorSel)
+            var cursorFails: [String] = []
+            if !cursorView.isReviewingForTesting {
+                cursorFails.append("not reviewing")
+            }
+            let cursorLive = cursorView.areaSelectionForTesting ?? cursorSel
+            let cursorCentre = CGPoint(x: cursorLive.midX, y: cursorLive.midY)
+            let cursorOutside = CGPoint(x: 20, y: 20)
+            let cursorRightHandle = SelectionHandle.right.point(in: cursorLive)
+            if cursorLive.contains(cursorOutside) {
+                cursorFails.append("outside probe is inside the crop")
+            }
+            if cursorLive.contains(cursorRightHandle) {
+                // maxX is outside CGRect.contains, so mouseDown falls through
+                // to the handle branch there — the premise the "a drawing
+                // tool does not swallow the frame" case rests on.
+                cursorFails.append("edge handle probe counts as inside")
+            }
+            @MainActor func moveCursor(to point: CGPoint) {
+                guard let move = liveMouse(.mouseMoved, point) else {
+                    cursorFails.append("no mouseMoved event")
+                    return
+                }
+                cursorView.mouseMoved(with: move)
+            }
+            @MainActor func expectCursor(
+                _ tool: OverlayAnnotationTool, at point: CGPoint,
+                _ want: AppCursor, _ label: String
+            ) {
+                cursorView.clickReviewToolbarButtonForTesting(
+                    tag: tool.toolbarTag)
+                moveCursor(to: point)
+                let got = cursorView.currentCursorForTesting
+                if got != want {
+                    cursorFails.append(
+                        "\(label): got \(String(describing: got)) want \(want)")
+                }
+            }
+            expectCursor(.select, at: cursorCentre, .openHand, "select inside")
+            expectCursor(.pen, at: cursorCentre, .crosshair, "pen inside")
+            expectCursor(
+                .highlight, at: cursorCentre, .crosshair, "highlight inside")
+            expectCursor(.magnifier, at: cursorCentre, .crosshair, "magnifier inside")
+            expectCursor(.text, at: cursorCentre, .iBeam, "text inside")
+            expectCursor(
+                .select, at: cursorRightHandle, .resize(.right),
+                "select edge handle")
+            // A drawing tool does not swallow the frame: the handle square
+            // straddles the edge and a mouseDown out there still resizes.
+            expectCursor(
+                .pen, at: cursorRightHandle, .resize(.right), "pen edge handle")
+            expectCursor(.pen, at: cursorOutside, .crosshair, "pen outside")
+            // Switching tools re-derives where the pointer already is — no
+            // mouse movement in between, which is the state a keyboard tool
+            // switch leaves the app in.
+            expectCursor(.pen, at: cursorCentre, .crosshair, "pen before switch")
+            cursorView.clickReviewToolbarButtonForTesting(
+                tag: OverlayAnnotationTool.select.toolbarTag)
+            if cursorView.currentCursorForTesting != .openHand {
+                cursorFails.append(
+                    "tool switch did not re-derive: \(String(describing: cursorView.currentCursorForTesting))")
+            }
+            check("overlay-cursor-follows-tool", cursorFails.isEmpty,
+                  cursorFails.joined(separator: " | "))
+
+            // Editor: select is the one tool whose cursor depends on what is
+            // under the pointer, so it is read over a real annotation and
+            // over empty canvas, with the annotation's own hitTest asserting
+            // both premises first.
+            var editorCursorFails: [String] = []
+            let cursorEditorImage = CapturedImage(
+                cgImage: makeNoiseImage(width: 200, height: 160), scale: 1)
+            let cursorWC = EditorWindowController.open(
+                with: cursorEditorImage, forceFitForTesting: true)
+            let cursorCanvas = cursorWC.canvasForTesting
+            let cursorMark = BlurAnnotation(uiScale: 1)
+            cursorMark.rect = CGRect(x: 40, y: 40, width: 60, height: 40)
+            cursorCanvas.annotations = [cursorMark]
+            let overMark = CGPoint(x: cursorMark.rect.midX, y: cursorMark.rect.midY)
+            let overEmpty = CGPoint(x: 170, y: 140)
+            if !cursorMark.hitTest(overMark) {
+                editorCursorFails.append("probe is not on the annotation")
+            }
+            if cursorMark.hitTest(overEmpty) {
+                editorCursorFails.append("empty probe is on the annotation")
+            }
+            @MainActor func expectEditorCursor(
+                _ tool: EditorTool, at point: CGPoint,
+                _ want: AppCursor, _ label: String
+            ) {
+                cursorCanvas.currentTool = tool
+                guard let move = NSEvent.mouseEvent(
+                    with: .mouseMoved,
+                    location: cursorCanvas.convert(point, to: nil),
+                    modifierFlags: [], timestamp: 0,
+                    windowNumber: cursorCanvas.window?.windowNumber ?? 0,
+                    context: nil, eventNumber: 0, clickCount: 1, pressure: 1)
+                else {
+                    editorCursorFails.append("no mouseMoved event")
+                    return
+                }
+                cursorCanvas.mouseMoved(with: move)
+                let got = cursorCanvas.currentCursorForTesting
+                if got != want {
+                    editorCursorFails.append(
+                        "\(label): got \(String(describing: got)) want \(want)")
+                }
+            }
+            expectEditorCursor(.select, at: overMark, .openHand, "select over mark")
+            expectEditorCursor(.select, at: overEmpty, .arrow, "select over empty")
+            expectEditorCursor(.pen, at: overMark, .crosshair, "pen over mark")
+            expectEditorCursor(.text, at: overEmpty, .iBeam, "text")
+            expectEditorCursor(.magnifier, at: overEmpty, .crosshair, "magnifier")
+            cursorWC.window?.close()
+            check("editor-cursor-follows-tool", editorCursorFails.isEmpty,
+                  editorCursorFails.joined(separator: " | "))
+
+            // Panel: no selection geometry, so the tool alone decides — and
+            // the toolbar has to tell the host, or AppKit keeps serving the
+            // previous tool's cached rects.
+            var panelCursorFails: [String] = []
+            let cursorPanel = ScrollResultPanel.show(
+                image: CapturedImage(
+                    cgImage: makeNoiseImage(width: 180, height: 140), scale: 1),
+                inputs: OverlaySessionInputs(
+                    afterShow: true, afterCopy: false, afterSave: false),
+                screen: screen, dependencies: noopDeps())
+            if let panelHost = cursorPanel.annotationHostForTesting {
+                let panelCases: [(OverlayAnnotationTool, AppCursor)] = [
+                    (.select, .arrow), (.pen, .crosshair),
+                    (.highlight, .crosshair), (.text, .iBeam),
+                    (.spotlight, .crosshair),
+                ]
+                for (tool, want) in panelCases {
+                    cursorPanel.clickToolbarButtonForTesting(tag: tool.toolbarTag)
+                    if panelHost.cursorForTool != want {
+                        panelCursorFails.append(
+                            "\(tool): \(panelHost.cursorForTool) want \(want)")
+                    }
+                    if panelHost.cursorToolForTesting != tool {
+                        panelCursorFails.append(
+                            "\(tool): host never told, saw \(String(describing: panelHost.cursorToolForTesting))")
+                    }
+                }
+            } else {
+                panelCursorFails.append("no annotation host")
+            }
+            cursorPanel.dismissForTesting()
+            check("panel-cursor-follows-tool", panelCursorFails.isEmpty,
+                  panelCursorFails.joined(separator: " | "))
+
             // S5 fail-first: Translate is a real shared toolbar action and
             // both terminal hosts claim it BEFORE the dependency can
             // synchronously re-enter. The dependency observes teardown,
