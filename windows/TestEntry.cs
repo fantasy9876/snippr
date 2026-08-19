@@ -238,16 +238,22 @@ static class TestEntry
                         "select outside crop kept SizeAll");
                 review.PointerClientForTesting = null;
             });
-            Step("review-client-equals-bounds", () =>
+            Step("review-covers-requested-bounds", () =>
             {
-                // WinForms clamps Form.Size to the PRIMARY monitor unless
-                // MaximumSize says otherwise, and this runner's screen is
-                // smaller than the picture. Without the ceiling the overlay
-                // comes up short and lays its chrome out against a client
-                // area that never reaches the crop.
-                if (review.ClientSize != review.Bounds.Size)
+                // Against the rectangle the surface was ASKED for, not against
+                // its own bounds. Windows clamps the window and its client
+                // area TOGETHER, so client-vs-bounds agrees while the window
+                // is short — this check passed on a run whose log showed the
+                // clamp happening (asked 1280x800, client 1044x788). The
+                // runner's screen is smaller than the picture, so this is the
+                // real test of the WM_GETMINMAXINFO answer.
+                var want = review.RequestedBoundsForTesting;
+                if (review.Bounds != want)
                     throw new InvalidOperationException(
-                        $"client {review.ClientSize} != bounds {review.Bounds.Size}");
+                        $"bounds {review.Bounds} != requested {want}");
+                if (review.ClientSize != want.Size)
+                    throw new InvalidOperationException(
+                        $"client {review.ClientSize} != requested {want.Size}");
             });
             Step("review-canvas-click-reaches-tool", () =>
             {
@@ -295,6 +301,14 @@ static class TestEntry
                 // WinForms never knew it was visible (HideNow was a no-op) and
                 // it sat in the normal band UNDER its own TopMost host — the
                 // overlay could not show a hint at all.
+                // On screen first. The hint clamps itself to the display its
+                // anchor is on, intersected with the host's client rect — and
+                // the smoke parks this form at -32000, where that intersection
+                // is empty and the hint correctly refuses to appear. Hovering
+                // off-screen tested the parking, not the hint.
+                var home = review.Location;
+                review.Location = Point.Empty;
+                Application.DoEvents();
                 var chrome = review.ChromeForTesting;
                 var hint = review.HintForTesting;
                 var button = FirstLeaf(chrome);
@@ -320,7 +334,10 @@ static class TestEntry
                         $"hint is not WS_EX_TOPMOST (exstyle 0x{ex:X})");
                 hint.HideNow();
                 Application.DoEvents();
-                if (IsWindowVisible(hint.Handle))
+                bool stillUp = IsWindowVisible(hint.Handle);
+                review.Location = home;
+                Application.DoEvents();
+                if (stillUp)
                     throw new InvalidOperationException("HideNow left the hint up");
             });
             Step("review-backdrop-menu-labels", () =>

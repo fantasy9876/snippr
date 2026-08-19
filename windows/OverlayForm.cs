@@ -90,6 +90,16 @@ sealed class OverlayForm : Form
             | ControlStyles.OptimizedDoubleBuffer, true);
     }
 
+    /// The window must be allowed to be as large as the picture it shows —
+    /// see Native.AnswerMinMaxInfo. MaximumSize alone left it clamped to the
+    /// primary monitor, which CI caught: bounds 1280x800, client 1044x788.
+    protected override void WndProc(ref Message m)
+    {
+        if (Native.AnswerMinMaxInfo(ref m, _virtualBounds)) return;
+        base.WndProc(ref m);
+    }
+
+
     Rectangle? SelectionLocal
     {
         get

@@ -23,6 +23,48 @@ static class Native
         public int Left, Top, Right, Bottom;
     }
 
+    public const int WM_GETMINMAXINFO = 0x0024;
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct POINT
+    {
+        public int X, Y;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct MINMAXINFO
+    {
+        public POINT Reserved;
+        public POINT MaxSize;
+        public POINT MaxPosition;
+        public POINT MinTrackSize;
+        public POINT MaxTrackSize;
+    }
+
+    /// Lets a borderless window be BIGGER than the primary monitor.
+    ///
+    /// Windows caps every window at `MaxWindowTrackSize` — the primary
+    /// display plus a border — and answers WM_GETMINMAXINFO with that unless
+    /// the window says otherwise here. `Form.MaximumSize` is not enough: it
+    /// keeps WinForms' own Size property from clamping, but the OS still
+    /// trims the window at creation. Both overlays span the VIRTUAL desktop,
+    /// which on a second monitor is wider than the cap, so without this the
+    /// window comes up short and every layout that measures the client area
+    /// is working from a surface that does not reach the picture.
+    ///
+    /// Returns true when the message was answered and must not reach base.
+    public static bool AnswerMinMaxInfo(ref Message m, Rectangle bounds)
+    {
+        if (m.Msg != WM_GETMINMAXINFO) return false;
+        var info = Marshal.PtrToStructure<MINMAXINFO>(m.LParam);
+        info.MaxPosition = new POINT { X = bounds.X, Y = bounds.Y };
+        info.MaxSize = new POINT { X = bounds.Width, Y = bounds.Height };
+        info.MaxTrackSize = new POINT { X = bounds.Width, Y = bounds.Height };
+        Marshal.StructureToPtr(info, m.LParam, false);
+        m.Result = IntPtr.Zero;
+        return true;
+    }
+
     public const int DWMWA_EXTENDED_FRAME_BOUNDS = 9;
 
     [DllImport("dwmapi.dll")]

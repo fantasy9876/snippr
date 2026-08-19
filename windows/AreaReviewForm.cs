@@ -59,6 +59,10 @@ sealed class AreaReviewForm : Form
     internal HoverHint HintForTesting => _toolbar.Hint;
     internal int AnnotationCountForTesting => _session.Annotations.Count;
     internal BackdropCornerStyle CornersForTesting => _session.Corners;
+    /// The rectangle the surface was ASKED to cover. Comparing the client
+    /// area with the form's own bounds proves nothing: Windows clamps both
+    /// together, so they agree while the window is short.
+    internal Rectangle RequestedBoundsForTesting => _virtualBounds;
 
     /// Smoke parks this form off-screen (`Reveal` at -32000), so it cannot
     /// place the machine cursor and still round-trip through `PointToClient`.
@@ -333,6 +337,15 @@ sealed class AreaReviewForm : Form
 
     Point CurrentPointerClient() =>
         PointerClientForTesting ?? PointToClient(Cursor.Position);
+
+    /// The window must be allowed to be as large as the picture it shows —
+    /// see Native.AnswerMinMaxInfo. MaximumSize alone left it clamped to the
+    /// primary monitor, which CI caught: bounds 1280x800, client 1044x788.
+    protected override void WndProc(ref Message m)
+    {
+        if (Native.AnswerMinMaxInfo(ref m, _virtualBounds)) return;
+        base.WndProc(ref m);
+    }
 
     void CanvasMouseDown(MouseEventArgs e)
     {
