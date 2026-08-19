@@ -232,6 +232,7 @@ sealed class SettingsForm : Form
     readonly CheckBox _startup = new() { Text = "Launch Snippr at startup" };
     readonly CheckBox _escCopy = new() { Text = "Esc in editor copies image, then closes" };
     readonly ComboBox _corners = new();
+    readonly ComboBox _ocrLang = new();
     readonly HotkeyBox _hkFullscreen = new();
     readonly HotkeyBox _hkArea = new();
     readonly HotkeyBox _hkWindow = new();
@@ -243,7 +244,7 @@ sealed class SettingsForm : Form
         MaximizeBox = false;
         MinimizeBox = false;
         StartPosition = FormStartPosition.CenterScreen;
-        ClientSize = new Size(460, 484);
+        ClientSize = new Size(460, 518);
         Font = new Font("Segoe UI", 9.5f);
 
         var s = AppSettings.Current;
@@ -311,6 +312,23 @@ sealed class SettingsForm : Form
         Controls.Add(_corners);
         y += 34;
 
+        // Same three choices as macOS, same names. Windows ships no
+        // Vietnamese recognizer, so Vietnamese+ falls back to English and the
+        // OCR flow says so — the setting is what lets someone ASK, and being
+        // told is the point.
+        L("OCR language");
+        _ocrLang.DropDownStyle = ComboBoxStyle.DropDownList;
+        _ocrLang.Items.AddRange(new object[] { "English+", "Vietnamese+", "Auto" });
+        _ocrLang.SelectedIndex = s.OcrPreference switch
+        {
+            OcrLanguagePreference.VietnamesePlus => 1,
+            OcrLanguagePreference.Auto => 2,
+            _ => 0,
+        };
+        _ocrLang.SetBounds(160, y, 210, 24);
+        Controls.Add(_ocrLang);
+        y += 34;
+
         y += 8;
         var hotkeyHeader = new Label
         {
@@ -365,6 +383,12 @@ sealed class SettingsForm : Form
             1 => nameof(BackdropCornerStyle.Small),
             3 => nameof(BackdropCornerStyle.Large),
             _ => nameof(BackdropCornerStyle.Medium),
+        };
+        s.OcrLanguage = _ocrLang.SelectedIndex switch
+        {
+            1 => nameof(OcrLanguagePreference.VietnamesePlus),
+            2 => nameof(OcrLanguagePreference.Auto),
+            _ => nameof(OcrLanguagePreference.EnglishPlus),
         };
         s.HotkeyFullscreen = _hkFullscreen.Combo;
         s.HotkeyArea = _hkArea.Combo;

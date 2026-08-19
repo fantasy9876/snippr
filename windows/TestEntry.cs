@@ -361,6 +361,31 @@ static class TestEntry
                 if (stillUp)
                     throw new InvalidOperationException("HideNow left the hint up");
             });
+            Step("review-rail-carries-its-actions", () =>
+            {
+                // The rail is tools THEN backdrop/color/undo/redo, like
+                // macOS. The parity gate pins the catalog's split; this is
+                // the other half — that the toolbar actually built it that
+                // way, because the layout is told how many to place.
+                var counts = review.ChromeCountsForTesting;
+                if (counts.Rail != ToolCatalog.RailCount
+                    || counts.Strip != ToolCatalog.StripCount)
+                    throw new InvalidOperationException(
+                        $"toolbar rail/strip {counts.Rail}/{counts.Strip}, "
+                        + $"catalog {ToolCatalog.RailCount}/{ToolCatalog.StripCount}");
+
+                // Backdrop's hint says (D), so D has to do something. A hint
+                // naming a key nobody routes is a promise the app breaks the
+                // first time someone believes it.
+                var menu = review.BackdropMenuForTesting;
+                if (!review.PressKeyForTesting(Keys.D))
+                    throw new InvalidOperationException("D was not routed");
+                Application.DoEvents();
+                if (!menu.Visible)
+                    throw new InvalidOperationException("D did not open the backdrop menu");
+                menu.Close();
+                Application.DoEvents();
+            });
             Step("review-backdrop-menu-labels", () =>
             {
                 // The menu showed five swatches and no words: AutoSize was
@@ -371,6 +396,8 @@ static class TestEntry
                 menu.RaiseOpeningForTesting();
                 foreach (ToolStripItem item in menu.Items)
                 {
+                    // Separators have no label and keep their own thin box.
+                    if (item is ToolStripSeparator) continue;
                     int text = TextRenderer.MeasureText(item.Text, menu.Font).Width;
                     int need = text + menu.ImageScalingSize.Width;
                     if (item.Width < need)
@@ -403,9 +430,18 @@ static class TestEntry
                 menu.RaiseOpeningForTesting();
                 if (!rows.First(i => (BackdropCornerStyle)i.Tag! == BackdropCornerStyle.Large).Checked)
                     throw new InvalidOperationException("Large row is not ticked");
-                // Leave the machine as we found it.
+                // Leave the machine AND the surface as we found them: the
+                // later shot steps photograph this session, and a corner
+                // style left behind changes what they capture.
                 AppSettings.Current.BackdropCorners = before.ToString();
                 AppSettings.Current.Save();
+                var restore = menu.Items.OfType<ToolStripMenuItem>().First(
+                    i => i.Tag is BackdropCornerStyle st && st == before);
+                restore.PerformClick();
+                Application.DoEvents();
+                if (review.CornersForTesting != before)
+                    throw new InvalidOperationException(
+                        $"session corners left at {review.CornersForTesting}, want {before}");
             });
             Step("review-preset-ocean", () =>
             {

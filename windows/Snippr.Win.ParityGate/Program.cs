@@ -96,7 +96,7 @@ static class Program
     {
         var f = new List<string>(
             OverlayToolbarLayout.GateFixtures(
-                ToolCatalog.OverlayTools.Count(), ToolCatalog.OverlayActions.Count()));
+                ToolCatalog.RailCount, ToolCatalog.StripCount));
         // The layout is asked about the catalog's real sizes above; this makes
         // the dependency explicit, so a silent default cannot stand in for it.
         if (ToolCatalog.OverlayTools.Count() != 12) f.Add("overlay tool count moved");
@@ -116,7 +116,7 @@ static class Program
         var metrics = OverlayToolbarLayout.Metrics.Standard;
         var area = OverlayToolbarLayout.Compute(
             selection, screen,
-            ToolCatalog.OverlayTools.Count(), ToolCatalog.OverlayActions.Count(),
+            ToolCatalog.RailCount, ToolCatalog.StripCount,
             18f, metrics);
         if (area is not { } placed) { f.Add("no layout for the fixture"); return f; }
 
@@ -544,11 +544,11 @@ static class Program
             var screen = new RectangleF(0, 0, 1920, 1080);
             var selection = new RectangleF(920, 520, 80, 40);
             var area = OverlayToolbarLayout.Compute(
-                selection, screen, ToolCatalog.OverlayTools.Count(),
-                ToolCatalog.OverlayActions.Count(), 18 * scale, metrics);
+                selection, screen, ToolCatalog.RailCount,
+                ToolCatalog.StripCount, 18 * scale, metrics);
             if (area is not { } placed) { f.Add($"{dpi}dpi: overlay layout null"); continue; }
-            if (placed.ToolButtonFrames.Length != ToolCatalog.OverlayTools.Count()
-                || placed.ActionButtonFrames.Length != ToolCatalog.OverlayActions.Count())
+            if (placed.ToolButtonFrames.Length != ToolCatalog.RailCount
+                || placed.ActionButtonFrames.Length != ToolCatalog.StripCount)
                 f.Add($"{dpi}dpi: overlay dropped buttons");
             foreach (var b in placed.ToolButtonFrames.Concat(placed.ActionButtonFrames))
                 if (b.Width < 1 || b.Height < 1)
@@ -617,6 +617,41 @@ static class Program
         if (ToolCatalog.OverlayOrderForTesting.Distinct().Count()
             != ToolCatalog.OverlayOrderForTesting.Count())
             f.Add("duplicate tool in overlay order");
+
+        // The rail is not just the tools. macOS puts Backdrop, Color, Undo
+        // and Redo at the END of it and keeps the strip for what ends the
+        // session; Windows had all eleven actions on the strip, so the two
+        // surfaces did not have the same shape at all.
+        string[] rail =
+        [
+            .. mac,
+            "backdrop", "color", "undo", "redo",
+        ];
+        var winRail = ToolCatalog.OverlayTools.Select(e => e.IconKey)
+            .Concat(ToolCatalog.RailActions.Select(a => a.IconKey)).ToArray();
+        if (!winRail.SequenceEqual(rail))
+            f.Add($"rail [{string.Join(",", winRail)}] want [{string.Join(",", rail)}]");
+
+        string[] strip = ["copy", "save", "pin", "ocr", "translate", "editor", "close"];
+        var winStrip = ToolCatalog.StripActions.Select(a => a.IconKey).ToArray();
+        if (!winStrip.SequenceEqual(strip))
+            f.Add($"strip [{string.Join(",", winStrip)}] want [{string.Join(",", strip)}]");
+
+        // What the layout is asked to place has to match what the toolbar
+        // will actually hand it; these are two readings of one split.
+        if (ToolCatalog.RailCount != winRail.Length)
+            f.Add($"RailCount {ToolCatalog.RailCount} vs rail {winRail.Length}");
+        if (ToolCatalog.StripCount != winStrip.Length)
+            f.Add($"StripCount {ToolCatalog.StripCount} vs strip {winStrip.Length}");
+        if (ToolCatalog.RailActions.Count() + ToolCatalog.StripActions.Count()
+            != ToolCatalog.OverlayActions.Count())
+            f.Add("rail + strip is not the whole overlay action set");
+
+        // Backdrop advertises D, so the surface must route D. A hint naming a
+        // key nobody routes is a promise the app breaks the first time it is
+        // believed.
+        if (ToolCatalog.Entry(OverlayAction.Backdrop)?.KeyLabel != "D")
+            f.Add("Backdrop does not advertise D");
         return f;
     }
 

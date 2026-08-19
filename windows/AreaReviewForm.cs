@@ -64,6 +64,17 @@ sealed class AreaReviewForm : Form
     /// together, so they agree while the window is short.
     internal Rectangle RequestedBoundsForTesting => _virtualBounds;
 
+    /// Drives the real key router, so a gate can prove a key the toolbar
+    /// ADVERTISES is a key the surface routes.
+    internal bool PressKeyForTesting(Keys key)
+    {
+        var msg = new Message();
+        return ProcessCmdKey(ref msg, key);
+    }
+
+    internal (int Rail, int Strip) ChromeCountsForTesting =>
+        (_toolbar.RailCount, _toolbar.StripCount);
+
     /// Smoke parks this form off-screen (`Reveal` at -32000), so it cannot
     /// place the machine cursor and still round-trip through `PointToClient`.
     /// Production always reads `Cursor.Position`; tests set this instead.
@@ -141,7 +152,9 @@ sealed class AreaReviewForm : Form
     void BindToolbar()
     {
         _toolbar.SetTools(ToolCatalog.OverlayTools.Select(e => (e.IconKey, e.HintText)));
-        _toolbar.SetActions(ToolCatalog.OverlayActions.Select(a => (a.IconKey, a.HintText)));
+        _toolbar.SetActions(
+            ToolCatalog.RailActions.Select(a => (a.IconKey, a.HintText)),
+            ToolCatalog.StripActions.Select(a => (a.IconKey, a.HintText)));
         _toolbar.SetColor(_color);
         _toolbar.ToolSelected += (_, key) =>
         {
@@ -206,7 +219,7 @@ sealed class AreaReviewForm : Form
         var metrics = OverlayToolbarLayout.Metrics.Standard.Scaled(DeviceDpi / 96f);
         var area = OverlayToolbarLayout.Compute(
             _session.Selection, ClientRectangle,
-            ToolCatalog.OverlayTools.Count(), ToolCatalog.OverlayActions.Count(),
+            ToolCatalog.RailCount, ToolCatalog.StripCount,
             Theme.HandleHit * DeviceDpi / 96f, metrics);
         return area is { } placed
             ? (placed.ToolFrame, placed.ActionFrame)
@@ -659,6 +672,14 @@ sealed class AreaReviewForm : Form
         // Tool keys, host-scoped: a letter that names a tool this surface does
         // not show must do nothing rather than select an invisible tool.
         var label = keyData.ToString();
+        // D opens the backdrop menu, as it does on macOS. It is checked
+        // before the tool map because Backdrop is an ACTION: choosing a
+        // preset must not displace the tool the user is drawing with.
+        if (string.Equals(label, "D", StringComparison.OrdinalIgnoreCase))
+        {
+            _toolbar.OpenBackdropMenu();
+            return true;
+        }
         if (label.Length == 1
             && ToolCatalog.ToolForKey(label, inOverlay: true) is Tool tool)
         {

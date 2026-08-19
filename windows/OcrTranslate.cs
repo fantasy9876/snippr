@@ -31,6 +31,8 @@ static class OcrService
         _ => [],
     };
 
+    static readonly HashSet<string> _warnedLanguages = new();
+
     static OcrEngine? EngineFor(string tag) =>
         OcrEngine.AvailableRecognizerLanguages.Any(
             l => string.Equals(l.LanguageTag, tag, StringComparison.OrdinalIgnoreCase))
@@ -73,7 +75,13 @@ static class OcrService
         if (wanted.Length > 0
             && !string.Equals(used, wanted[0], StringComparison.OrdinalIgnoreCase))
         {
-            warning = $"Không có bộ nhận dạng {wanted[0]} — đang đọc bằng {used}";
+            warning = pref == OcrLanguagePreference.VietnamesePlus
+                ? $"Windows không có gói OCR tiếng Việt — đang đọc bằng {used}"
+                : $"Không có bộ nhận dạng {wanted[0]} — đang đọc bằng {used}";
+            // Once per run. The same recognizer answers every capture, so
+            // repeating it turns a useful sentence into noise the user learns
+            // to dismiss without reading.
+            if (!_warnedLanguages.Add(warning)) warning = null;
         }
 
         var result = await engine.RecognizeAsync(soft);
