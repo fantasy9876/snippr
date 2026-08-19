@@ -354,28 +354,67 @@ final class MagnifierAnnotation: Annotation {
 
     override func hitTest(_ p: CGPoint) -> Bool { calloutRect.contains(p) }
 
-    /// Where the callout for `source` sits: beside it, `gap` pixels to the
-    /// right, bottom edges aligned (bottom-left pixel space, as before). When `bounds` is given (the crop or the
-    /// document) the callout is kept INSIDE it — flipped to the left when the
-    /// right side has no room, then clamped — so a magnifier drawn near an
-    /// edge is never exported cut off or, in the review overlay, clipped away.
-    /// Same rule as Windows `AreaReviewSession.MakeMagnifier`.
+    /// Where the callout for `source` sits. Without `bounds`: beside it, `gap`
+    /// pixels to the right, bottom edges aligned (legacy, unclamped).
+    ///
+    /// With `bounds` (the crop or the document) the callout must be INSIDE
+    /// them and must NOT cover the source — a callout parked on top of the
+    /// pixels it enlarges reads as two stray rectangles, which is what the
+    /// owner saw on 1.2.11 when a large source was flipped left and clamped
+    /// back over itself. So: pick the side of the source (right, left, below,
+    /// above — in that order of preference) with the most room, and scale the
+    /// callout DOWN from `zoom` until it fits that strip, never below 1×. Only
+    /// when no side has room for even 1× does it fall back to the largest
+    /// side at 1×, clamped into bounds, overlapping as little as it can.
     static func calloutRect(
         for source: CGRect, gap: CGFloat, zoom: CGFloat = zoom,
         within bounds: CGRect? = nil
     ) -> CGRect {
         let src = source.standardized
-        let size = CGSize(width: src.width * zoom, height: src.height * zoom)
-        var origin = CGPoint(x: src.maxX + gap, y: src.minY)
-        if let bounds, bounds.width > 0, bounds.height > 0 {
-            if origin.x + size.width > bounds.maxX {
-                origin.x = max(bounds.minX, src.minX - gap - size.width)
-            }
-            origin.x = min(max(origin.x, bounds.minX),
-                           max(bounds.minX, bounds.maxX - size.width))
-            origin.y = min(max(origin.y, bounds.minY),
-                           max(bounds.minY, bounds.maxY - size.height))
+        guard let bounds, bounds.width > 0, bounds.height > 0,
+              src.width > 0, src.height > 0
+        else {
+            return CGRect(
+                x: src.maxX + gap, y: src.minY,
+                width: src.width * zoom, height: src.height * zoom)
         }
+        // Free strip beside each side, and the scale (≤ zoom) that fits it.
+        struct Side { let scale: CGFloat; let place: (CGSize) -> CGPoint }
+        let minX = bounds.minX, minY = bounds.minY
+        func clampX(_ x: CGFloat, _ w: CGFloat) -> CGFloat {
+            min(max(x, minX), max(minX, bounds.maxX - w))
+        }
+        func clampY(_ y: CGFloat, _ h: CGFloat) -> CGFloat {
+            min(max(y, minY), max(minY, bounds.maxY - h))
+        }
+        let right = Side(
+            scale: min(zoom, (bounds.maxX - src.maxX - gap) / src.width,
+                       bounds.height / src.height),
+            place: { CGPoint(x: src.maxX + gap, y: clampY(src.minY, $0.height)) })
+        let left = Side(
+            scale: min(zoom, (src.minX - gap - minX) / src.width,
+                       bounds.height / src.height),
+            place: { CGPoint(x: src.minX - gap - $0.width,
+                             y: clampY(src.minY, $0.height)) })
+        let below = Side(
+            scale: min(zoom, (src.minY - gap - minY) / src.height,
+                       bounds.width / src.width),
+            place: { CGPoint(x: clampX(src.minX, $0.width),
+                             y: src.minY - gap - $0.height) })
+        let above = Side(
+            scale: min(zoom, (bounds.maxY - src.maxY - gap) / src.height,
+                       bounds.width / src.width),
+            place: { CGPoint(x: clampX(src.minX, $0.width), y: src.maxY + gap) })
+        let sides = [right, left, below, above]
+        // First side (in preference order) that holds the full zoom; else the
+        // side with the most room, as long as that is at least 1×.
+        let best = sides.first(where: { $0.scale >= zoom })
+            ?? sides.max(by: { $0.scale < $1.scale })!
+        let scale = best.scale >= 1 ? best.scale : 1
+        let size = CGSize(width: src.width * scale, height: src.height * scale)
+        var origin = best.place(size)
+        origin.x = clampX(origin.x, size.width)
+        origin.y = clampY(origin.y, size.height)
         return CGRect(origin: origin, size: size)
     }
 

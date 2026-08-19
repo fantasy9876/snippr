@@ -10909,6 +10909,43 @@ enum SelfTest {
                     if legacy.minX != 206 || legacy.minY != 20 {
                         clampFailures.append("legacy \(legacy)")
                     }
+                    // A LARGE source (owner's 1.2.11 report): 2× does not fit
+                    // on the right, and flipping left would land on top of
+                    // the source. The callout must stay off the source,
+                    // inside the document, and still at least 1×.
+                    let big = CGRect(x: 150, y: 500, width: 400, height: 230)
+                    let bigDoc = CGRect(x: 0, y: 0, width: 1280, height: 1121)
+                    let bigOut = MagnifierAnnotation.calloutRect(
+                        for: big, gap: 16, within: bigDoc)
+                    if bigOut.intersects(big) {
+                        clampFailures.append("large source covered \(bigOut)")
+                    }
+                    if !bigDoc.contains(bigOut) {
+                        clampFailures.append("large callout outside \(bigOut)")
+                    }
+                    if bigOut.width < big.width - 0.5 {
+                        clampFailures.append("large callout below 1x \(bigOut)")
+                    }
+                    if abs(bigOut.width / big.width - bigOut.height / big.height) > 0.01 {
+                        clampFailures.append("large callout aspect \(bigOut)")
+                    }
+                    // Room only BELOW: the callout goes there instead of
+                    // covering the source.
+                    let wide = CGRect(x: 10, y: 120, width: 180, height: 30)
+                    let wideOut = MagnifierAnnotation.calloutRect(
+                        for: wide, gap: 16, within: doc)
+                    if wideOut.intersects(wide) || !doc.contains(wideOut)
+                        || wideOut.maxY > wide.minY {
+                        clampFailures.append("wide source \(wideOut)")
+                    }
+                    // No room anywhere: 1×, inside the document, overlap
+                    // accepted because nothing else is possible.
+                    let huge = CGRect(x: 10, y: 10, width: 180, height: 180)
+                    let hugeOut = MagnifierAnnotation.calloutRect(
+                        for: huge, gap: 16, within: doc)
+                    if !doc.contains(hugeOut) || hugeOut.width != 180 {
+                        clampFailures.append("huge source \(hugeOut)")
+                    }
                     // And the surface uses the host's bounds during the drag.
                     let clamped = AnnotationSurface(pixelScale: 1)
                     clamped.tool = .magnifier
