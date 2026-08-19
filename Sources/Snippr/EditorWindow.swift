@@ -1056,6 +1056,9 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
                 cancelCropSelection()
             }
             window?.invalidateCursorRects(for: self)
+            if pointerInsideView, let vp = lastMouseView {
+                applyCursor(canvasCursor(atView: vp))
+            }
             needsDisplay = true
         }
     }
@@ -1638,9 +1641,15 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
 
     private func updatePointer(from event: NSEvent) {
         let vp = convert(event.locationInWindow, from: nil)
+        lastMouseView = vp
         lastMousePixel = toPixel(vp)
         pointerInsideView = true
     }
+
+    /// Kept alongside `lastMousePixel` so a tool switch can re-derive the
+    /// pointer where it already is, instead of leaving the previous tool's
+    /// cursor up until the mouse next moves.
+    private var lastMouseView: CGPoint?
 
     func invalidatePointerAfterScroll() {
         lastMousePixel = nil
@@ -1715,6 +1724,7 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
             let mag = MagnifierAnnotation(uiScale: pxScale)
             mag.sourceRect = CGRect(origin: pp, size: .zero)
             mag.calloutRect = CGRect(origin: pp, size: .zero)
+            mag.isDrafting = true
             drafting = mag
         case .backdrop:
             // A canvas-level style, not a drag, and CHOOSING the tool changes
@@ -1729,10 +1739,10 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
                         at: vp, in: crop, tolerance: 9 * cropChromeScale
                       ) {
                 cropDrag = .resizing(handle: handle, original: crop)
-                handle.cursor.set()
+                applyCursor(.resize(handle))
             } else if let crop = cropRect, crop.contains(vp) {
                 cropDrag = .moving(start: vp, original: crop)
-                NSCursor.closedHand.set()
+                applyCursor(.closedHand)
             } else {
                 let anchor = EditableSelectionGeometry.clampedPoint(vp, to: bounds)
                 cropRect = CGRect(origin: anchor, size: .zero)
@@ -1768,6 +1778,7 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
 
     override func mouseMoved(with event: NSEvent) {
         updatePointer(from: event)
+        applyCursor(canvasCursor(atView: convert(event.locationInWindow, from: nil)))
         refreshTransient()
     }
 
@@ -1830,12 +1841,18 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
                     x: min(dragStartPoint.x, pp.x), y: min(dragStartPoint.y, pp.y),
                     width: abs(pp.x - dragStartPoint.x),
                     height: abs(pp.y - dragStartPoint.y))
+                let sourceBefore = mag.sourceRect
                 mag.sourceRect = source
-                // Callout sits beside the source at 2x while dragging.
-                mag.calloutRect = CGRect(
-                    x: source.maxX + 8 * pxScale, y: source.minY,
-                    width: source.width * 2, height: source.height * 2)
-                invalidate(pixelRect: before.union(mag.calloutRect).union(source))
+                // Callout sits beside the source at 2x while dragging, kept
+                // inside the image so it cannot end up off the document.
+                mag.calloutRect = MagnifierAnnotation.calloutRect(
+                    for: source, gap: 8 * pxScale,
+                    within: CGRect(
+                        x: 0, y: 0,
+                        width: image.cgImage.width, height: image.cgImage.height))
+                invalidate(pixelRect: before.union(mag.calloutRect)
+                    .union(source).union(sourceBefore)
+                    .insetBy(dx: -2 * pxScale, dy: -2 * pxScale))
             }
         case .backdrop:
             break
@@ -1879,6 +1896,7 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
                     annotations.append(draft)
                 }
                 if let mag = draft as? MagnifierAnnotation {
+                    mag.isDrafting = false
                     // Sample the SANITIZED layer so the callout can never
                     // resurrect pixels a redaction covers.
                     mag.snapshot = SliceBCompositor.magnifierSnapshot(
@@ -2858,7 +2876,11 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
 
     override func resetCursorRects() {
         switch currentTool {
-        case .select: addCursorRect(bounds, cursor: .arrow)
+        // Select gets the plain arrow as the FLOOR; `mouseMoved` raises it to
+        // the open hand over an annotation, which is the only place a click
+        // grabs anything. Backdrop is a canvas style whose click drafts
+        // nothing, so promising a draw with a crosshair would be a lie.
+        case .select, .backdrop: addCursorRect(bounds, cursor: .arrow)
         case .text: addCursorRect(bounds, cursor: .iBeam)
         case .crop:
             addCursorRect(bounds, cursor: .crosshair)
@@ -2872,6 +2894,42 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
         default: addCursorRect(bounds, cursor: .crosshair)
         }
     }
+
+    /// The editor's pointer, derived from (tool, hit) in the same order
+    /// `mouseDown` branches — the crop tool re-uses the overlay's handle
+    /// geometry and tolerance, so what the pointer promises is what the
+    /// click performs.
+    func canvasCursor(atView vp: CGPoint) -> AppCursor {
+        switch currentTool {
+        case .select:
+            if isMovingSelection { return .closedHand }
+            let pp = toPixel(vp)
+            return annotations.contains(where: { $0.hitTest(pp) })
+                ? .openHand : .arrow
+        case .text: return .iBeam
+        case .backdrop: return .arrow
+        case .crop:
+            guard let crop = cropRect else { return .crosshair }
+            if case .moving = cropDrag { return .closedHand }
+            if let handle = EditableSelectionGeometry.handle(
+                at: vp, in: crop, tolerance: 9 * cropChromeScale
+            ) {
+                return .resize(handle)
+            }
+            return crop.contains(vp) ? .openHand : .crosshair
+        default: return .crosshair
+        }
+    }
+
+    /// The only place this view sets a cursor, so what the gate reads back is
+    /// what the pointer became.
+    private func applyCursor(_ cursor: AppCursor) {
+        currentCursor = cursor
+        cursor.cursor.set()
+    }
+
+    private var currentCursor: AppCursor?
+    var currentCursorForTesting: AppCursor? { currentCursor }
 }
 
 /// Floating sample: a line stroked at the actual width & color, plus the number.

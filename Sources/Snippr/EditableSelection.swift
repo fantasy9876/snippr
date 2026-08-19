@@ -27,7 +27,29 @@ enum SelectionHandle: CaseIterable {
         switch self {
         case .left, .right: return .resizeLeftRight
         case .bottom, .top: return .resizeUpDown
-        case .bottomLeft, .bottomRight, .topLeft, .topRight: return .crosshair
+        case .bottomLeft, .bottomRight, .topLeft, .topRight:
+            // AppKit has no public diagonal cursor before macOS 15 and the
+            // deployment target is 14, so the crosshair stays as the floor
+            // rather than a private cursor that can vanish under us.
+            if #available(macOS 15.0, *) {
+                return NSCursor.frameResize(
+                    position: frameResizePosition, directions: .all)
+            }
+            return .crosshair
+        }
+    }
+
+    @available(macOS 15.0, *)
+    private var frameResizePosition: NSCursor.FrameResizePosition {
+        switch self {
+        case .bottomLeft: return .bottomLeft
+        case .bottom: return .bottom
+        case .bottomRight: return .bottomRight
+        case .left: return .left
+        case .right: return .right
+        case .topLeft: return .topLeft
+        case .top: return .top
+        case .topRight: return .topRight
         }
     }
 

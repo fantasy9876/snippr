@@ -5883,6 +5883,169 @@ enum SelfTest {
                   wireFails.isEmpty,
                   wireFails.joined(separator: " | "))
 
+            // The pointer must answer to the TOOL, not to geometry alone.
+            // Before this, every point inside the crop was an open hand while
+            // the very same click drew with the pen — the cursor promised a
+            // move the app never performed. Real mouseMoved events go in and
+            // the cursor production actually set comes back out, so reverting
+            // to the unconditional openHand turns this red.
+            let (cursorOverlay, cursorView) = reviewView()
+            _ = cursorOverlay
+            let cursorSel = CGRect(
+                x: 60, y: 60,
+                width: max(220, b.width - 200),
+                height: max(160, b.height - 200))
+            cursorView.selectForTesting(rect: cursorSel)
+            var cursorFails: [String] = []
+            if !cursorView.isReviewingForTesting {
+                cursorFails.append("not reviewing")
+            }
+            let cursorLive = cursorView.areaSelectionForTesting ?? cursorSel
+            let cursorCentre = CGPoint(x: cursorLive.midX, y: cursorLive.midY)
+            let cursorOutside = CGPoint(x: 20, y: 20)
+            let cursorRightHandle = SelectionHandle.right.point(in: cursorLive)
+            if cursorLive.contains(cursorOutside) {
+                cursorFails.append("outside probe is inside the crop")
+            }
+            if cursorLive.contains(cursorRightHandle) {
+                // maxX is outside CGRect.contains, so mouseDown falls through
+                // to the handle branch there — the premise the "a drawing
+                // tool does not swallow the frame" case rests on.
+                cursorFails.append("edge handle probe counts as inside")
+            }
+            @MainActor func moveCursor(to point: CGPoint) {
+                guard let move = liveMouse(.mouseMoved, point) else {
+                    cursorFails.append("no mouseMoved event")
+                    return
+                }
+                cursorView.mouseMoved(with: move)
+            }
+            @MainActor func expectCursor(
+                _ tool: OverlayAnnotationTool, at point: CGPoint,
+                _ want: AppCursor, _ label: String
+            ) {
+                cursorView.clickReviewToolbarButtonForTesting(
+                    tag: tool.toolbarTag)
+                moveCursor(to: point)
+                let got = cursorView.currentCursorForTesting
+                if got != want {
+                    cursorFails.append(
+                        "\(label): got \(String(describing: got)) want \(want)")
+                }
+            }
+            expectCursor(.select, at: cursorCentre, .openHand, "select inside")
+            expectCursor(.pen, at: cursorCentre, .crosshair, "pen inside")
+            expectCursor(
+                .highlight, at: cursorCentre, .crosshair, "highlight inside")
+            expectCursor(.magnifier, at: cursorCentre, .crosshair, "magnifier inside")
+            expectCursor(.text, at: cursorCentre, .iBeam, "text inside")
+            expectCursor(
+                .select, at: cursorRightHandle, .resize(.right),
+                "select edge handle")
+            // A drawing tool does not swallow the frame: the handle square
+            // straddles the edge and a mouseDown out there still resizes.
+            expectCursor(
+                .pen, at: cursorRightHandle, .resize(.right), "pen edge handle")
+            expectCursor(.pen, at: cursorOutside, .crosshair, "pen outside")
+            // Switching tools re-derives where the pointer already is — no
+            // mouse movement in between, which is the state a keyboard tool
+            // switch leaves the app in.
+            expectCursor(.pen, at: cursorCentre, .crosshair, "pen before switch")
+            cursorView.clickReviewToolbarButtonForTesting(
+                tag: OverlayAnnotationTool.select.toolbarTag)
+            if cursorView.currentCursorForTesting != .openHand {
+                cursorFails.append(
+                    "tool switch did not re-derive: \(String(describing: cursorView.currentCursorForTesting))")
+            }
+            check("overlay-cursor-follows-tool", cursorFails.isEmpty,
+                  cursorFails.joined(separator: " | "))
+
+            // Editor: select is the one tool whose cursor depends on what is
+            // under the pointer, so it is read over a real annotation and
+            // over empty canvas, with the annotation's own hitTest asserting
+            // both premises first.
+            var editorCursorFails: [String] = []
+            let cursorEditorImage = CapturedImage(
+                cgImage: makeNoiseImage(width: 200, height: 160), scale: 1)
+            let cursorWC = EditorWindowController.open(
+                with: cursorEditorImage, forceFitForTesting: true)
+            let cursorCanvas = cursorWC.canvasForTesting
+            let cursorMark = BlurAnnotation(uiScale: 1)
+            cursorMark.rect = CGRect(x: 40, y: 40, width: 60, height: 40)
+            cursorCanvas.annotations = [cursorMark]
+            let overMark = CGPoint(x: cursorMark.rect.midX, y: cursorMark.rect.midY)
+            let overEmpty = CGPoint(x: 170, y: 140)
+            if !cursorMark.hitTest(overMark) {
+                editorCursorFails.append("probe is not on the annotation")
+            }
+            if cursorMark.hitTest(overEmpty) {
+                editorCursorFails.append("empty probe is on the annotation")
+            }
+            @MainActor func expectEditorCursor(
+                _ tool: EditorTool, at point: CGPoint,
+                _ want: AppCursor, _ label: String
+            ) {
+                cursorCanvas.currentTool = tool
+                guard let move = NSEvent.mouseEvent(
+                    with: .mouseMoved,
+                    location: cursorCanvas.convert(point, to: nil),
+                    modifierFlags: [], timestamp: 0,
+                    windowNumber: cursorCanvas.window?.windowNumber ?? 0,
+                    context: nil, eventNumber: 0, clickCount: 1, pressure: 1)
+                else {
+                    editorCursorFails.append("no mouseMoved event")
+                    return
+                }
+                cursorCanvas.mouseMoved(with: move)
+                let got = cursorCanvas.currentCursorForTesting
+                if got != want {
+                    editorCursorFails.append(
+                        "\(label): got \(String(describing: got)) want \(want)")
+                }
+            }
+            expectEditorCursor(.select, at: overMark, .openHand, "select over mark")
+            expectEditorCursor(.select, at: overEmpty, .arrow, "select over empty")
+            expectEditorCursor(.pen, at: overMark, .crosshair, "pen over mark")
+            expectEditorCursor(.text, at: overEmpty, .iBeam, "text")
+            expectEditorCursor(.magnifier, at: overEmpty, .crosshair, "magnifier")
+            cursorWC.window?.close()
+            check("editor-cursor-follows-tool", editorCursorFails.isEmpty,
+                  editorCursorFails.joined(separator: " | "))
+
+            // Panel: no selection geometry, so the tool alone decides — and
+            // the toolbar has to tell the host, or AppKit keeps serving the
+            // previous tool's cached rects.
+            var panelCursorFails: [String] = []
+            let cursorPanel = ScrollResultPanel.show(
+                image: CapturedImage(
+                    cgImage: makeNoiseImage(width: 180, height: 140), scale: 1),
+                inputs: OverlaySessionInputs(
+                    afterShow: true, afterCopy: false, afterSave: false),
+                screen: screen, dependencies: noopDeps())
+            if let panelHost = cursorPanel.annotationHostForTesting {
+                let panelCases: [(OverlayAnnotationTool, AppCursor)] = [
+                    (.select, .arrow), (.pen, .crosshair),
+                    (.highlight, .crosshair), (.text, .iBeam),
+                    (.spotlight, .crosshair),
+                ]
+                for (tool, want) in panelCases {
+                    cursorPanel.clickToolbarButtonForTesting(tag: tool.toolbarTag)
+                    if panelHost.cursorForTool != want {
+                        panelCursorFails.append(
+                            "\(tool): \(panelHost.cursorForTool) want \(want)")
+                    }
+                    if panelHost.cursorToolForTesting != tool {
+                        panelCursorFails.append(
+                            "\(tool): host never told, saw \(String(describing: panelHost.cursorToolForTesting))")
+                    }
+                }
+            } else {
+                panelCursorFails.append("no annotation host")
+            }
+            cursorPanel.dismissForTesting()
+            check("panel-cursor-follows-tool", panelCursorFails.isEmpty,
+                  panelCursorFails.joined(separator: " | "))
+
             // S5 fail-first: Translate is a real shared toolbar action and
             // both terminal hosts claim it BEFORE the dependency can
             // synchronously re-enter. The dependency observes teardown,
@@ -10637,6 +10800,136 @@ enum SelfTest {
                     && !SliceBCompositor.needsRebuild(
                         source: magSource, redactions: [faraway]),
                   "overlap \(SliceBCompositor.needsRebuild(source: magSource, redactions: [overlapping])) far \(SliceBCompositor.needsRebuild(source: magSource, redactions: [faraway]))")
+
+            // 6b. A magnifier drag is VISIBLE while it runs: the source frame
+            //     and the outline of the callout it will make. Nothing is
+            //     sampled until release, so no pixel can leak. After release
+            //     the frame stays around the source next to the callout.
+            do {
+                let w = 200, h = 200
+                let gray = makeSolidImage(
+                    width: w, height: h,
+                    color: CGColor(gray: 0.5, alpha: 1))
+                func render(_ surface: AnnotationSurface) -> [UInt8] {
+                    let c = ctx(w, h)
+                    c.draw(gray, in: CGRect(x: 0, y: 0, width: w, height: h))
+                    _ = surface.drawForPreview(in: c, base: gray)
+                    return rgbaBytes(c.makeImage()!)
+                }
+                func lum(_ b: [UInt8], _ x: Int, _ yBL: Int) -> Int {
+                    let i = ((h - 1 - yBL) * w + x) * 4
+                    return (Int(b[i]) + Int(b[i + 1]) + Int(b[i + 2])) / 3
+                }
+                let baseLum = lum(rgbaBytes(gray), 100, 100)
+                var dragFailures: [String] = []
+                var frameFailures: [String] = []
+                var clampFailures: [String] = []
+                MainActor.assumeIsolated {
+                    let surface = AnnotationSurface(pixelScale: 1)
+                    surface.tool = .magnifier
+                    _ = surface.beginDrag(atPixel: CGPoint(x: 20, y: 20))
+                    surface.continueDrag(toPixel: CGPoint(x: 60, y: 50))
+                    guard let mag = surface.annotations.last
+                        as? MagnifierAnnotation
+                    else { dragFailures.append("no draft"); return }
+                    if mag.snapshot != nil {
+                        dragFailures.append("sampled during drag")
+                    }
+                    let mid = render(surface)
+                    // Source (20,20)-(60,50): white hairline just inside,
+                    // dark hairline just outside, interior untouched.
+                    if lum(mid, 20, 35) < 200 {
+                        dragFailures.append("left edge not white \(lum(mid, 20, 35))")
+                    }
+                    if lum(mid, 19, 35) > baseLum - 30 {
+                        dragFailures.append("left outer not dark \(lum(mid, 19, 35))")
+                    }
+                    if lum(mid, 40, 49) < 200 {
+                        dragFailures.append("top edge not white \(lum(mid, 40, 49))")
+                    }
+                    if abs(lum(mid, 40, 35) - baseLum) > 2 {
+                        dragFailures.append("interior touched \(lum(mid, 40, 35))")
+                    }
+                    // Callout outline (dashed) along its left edge.
+                    let out = mag.calloutRect
+                    if out.width < 79 || out.minX < 60 {
+                        dragFailures.append("callout \(out)")
+                    } else {
+                        let x = Int(out.minX)
+                        var inked = 0
+                        for y in Int(out.minY + 1)..<Int(out.maxY - 1)
+                        where abs(lum(mid, x, y) - baseLum) > 40 { inked += 1 }
+                        if inked < 20 {
+                            dragFailures.append("callout outline inked \(inked)")
+                        }
+                    }
+                    // Released but not yet sampled: fail closed, draw nothing.
+                    surface.endDrag()
+                    let released = render(surface)
+                    if lum(released, 20, 35) >= 200 || lum(released, 19, 35) < baseLum - 30 {
+                        frameFailures.append("frame drawn without snapshot")
+                    }
+                    if !surface.fillPendingMagnifier(base: gray) {
+                        frameFailures.append("no pending magnifier")
+                    }
+                    let filled = render(surface)
+                    if lum(filled, 20, 35) < 200 {
+                        frameFailures.append("source frame missing after fill \(lum(filled, 20, 35))")
+                    }
+                    if lum(filled, 19, 35) > baseLum - 30 {
+                        frameFailures.append("source outer missing after fill \(lum(filled, 19, 35))")
+                    }
+                    if abs(lum(filled, 40, 35) - baseLum) > 2 {
+                        frameFailures.append("interior touched after fill")
+                    }
+                    let ring = lum(filled, Int(out.minX), Int(out.midY))
+                    if ring < 200 { frameFailures.append("callout ring \(ring)") }
+
+                    // Clamp: a source near the right edge flips the callout
+                    // to the left of it, and one near the top is pulled down.
+                    let doc = CGRect(x: 0, y: 0, width: 200, height: 200)
+                    let right = MagnifierAnnotation.calloutRect(
+                        for: CGRect(x: 150, y: 20, width: 40, height: 30),
+                        gap: 16, within: doc)
+                    if right.maxX > 200 || right.minX < 0 || right.width != 80 {
+                        clampFailures.append("right \(right)")
+                    }
+                    if right.maxX > 150 - 16 + 0.5 {
+                        clampFailures.append("did not flip left \(right)")
+                    }
+                    let top = MagnifierAnnotation.calloutRect(
+                        for: CGRect(x: 20, y: 170, width: 40, height: 30),
+                        gap: 16, within: doc)
+                    if top.maxY > 200 || top.minY < 0 {
+                        clampFailures.append("top \(top)")
+                    }
+                    let legacy = MagnifierAnnotation.calloutRect(
+                        for: CGRect(x: 150, y: 20, width: 40, height: 30),
+                        gap: 16, within: nil)
+                    if legacy.minX != 206 || legacy.minY != 20 {
+                        clampFailures.append("legacy \(legacy)")
+                    }
+                    // And the surface uses the host's bounds during the drag.
+                    let clamped = AnnotationSurface(pixelScale: 1)
+                    clamped.tool = .magnifier
+                    clamped.magnifierBounds = { doc }
+                    _ = clamped.beginDrag(atPixel: CGPoint(x: 150, y: 20))
+                    clamped.continueDrag(toPixel: CGPoint(x: 190, y: 50))
+                    if let live = clamped.annotations.last as? MagnifierAnnotation,
+                       live.calloutRect.maxX > 200 {
+                        clampFailures.append("surface unclamped \(live.calloutRect)")
+                    } else if !(clamped.annotations.last is MagnifierAnnotation) {
+                        clampFailures.append("no clamped draft")
+                    }
+                    clamped.abandonDrag()
+                }
+                check("sliceB-magnifier-drag-frame", dragFailures.isEmpty,
+                      dragFailures.joined(separator: "; "))
+                check("sliceB-magnifier-source-frame", frameFailures.isEmpty,
+                      frameFailures.joined(separator: "; "))
+                check("sliceB-magnifier-callout-clamped", clampFailures.isEmpty,
+                      clampFailures.joined(separator: "; "))
+            }
 
             // 7. Backdrop keeps inner coordinates and P3/alpha on `.none`
             let mapped = SliceBBackdrop.sourcePoint(

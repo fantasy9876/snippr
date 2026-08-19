@@ -293,6 +293,8 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
     /// False after exit / screen change so Tab cannot reuse .zero or a
     /// pixel from a previous visit. Updated on enter/move/down/drag/up.
     private var pointerInside = false
+    /// Last cursor this view set, written only by `applyCursor`.
+    private var currentCursor: AppCursor?
     private var hoverWindow: WindowInfo?
 
     nonisolated(unsafe) static var frozenBlitCountForTesting = 0
@@ -423,6 +425,11 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
         if case .resizing(let handle, _) = areaDrag { return handle }
         return nil
     }
+    /// The cursor production last put on screen — not a re-derivation. The
+    /// gate drives real mouse events and reads this, so it fails if the
+    /// (tool, hit) table stops being wired into the event handlers even
+    /// though the table itself is still right.
+    var currentCursorForTesting: AppCursor? { currentCursor }
     var isAnnotationDraggingForTesting: Bool { annotationDragging }
     var isReviewingForTesting: Bool { isReviewing }
     var reviewToolbarFrameForTesting: CGRect? {
@@ -676,6 +683,11 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
                 button.tag == tool.toolbarTag ? .controlAccentColor : .white
         }
         if tool != .text { endTextEntry(commit: true) }
+        // The pointer answers to the tool, so it changes with the tool —
+        // waiting for the next mouseMoved leaves the OLD tool's cursor on
+        // screen over a canvas that now does something else.
+        window?.invalidateCursorRects(for: self)
+        if pointerInside { updateAreaCursor(at: mousePos) }
     }
 
     // MARK: Backdrop
@@ -1403,12 +1415,12 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
             cornerRadius: reviewCornerRadius(for: selection)
            ) {
             areaDrag = .resizing(handle: handle, original: selection)
-            handle.cursor.set()
+            applyCursor(.resize(handle))
             return
         }
         if let selection = areaSelection, selection.contains(p) {
             areaDrag = .moving(start: p, original: selection)
-            NSCursor.closedHand.set()
+            applyCursor(.closedHand)
             return
         }
         if isReviewing {
@@ -1777,35 +1789,69 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
     private lazy var textFieldDelegate = OverlayTextFieldDelegate(
         onEnd: { [weak self] in self?.endTextEntry(commit: true) })
 
-    override func resetCursorRects() {
-        guard mode == .area else {
-            addCursorRect(bounds, cursor: .crosshair)
-            return
+    /// The ONE cursor table for area mode, listed in the order `mouseDown`
+    /// consults its branches — later entries win an overlap, which is also
+    /// how a window resolves overlapping cursor rects.
+    ///
+    /// So: an active drawing tool owns the INSIDE of the crop, handles
+    /// included, because `mouseDown` checks `tool != .select` before it
+    /// checks the handles and a drag there draws. The handle squares still
+    /// straddle the edge, and the part of them outside the crop keeps its
+    /// resize cursor — which is exactly where `mouseDown` does resize.
+    /// Corners come after the mid-edges for the same reason
+    /// `EditableSelectionGeometry.handle(at:)` gives them priority.
+    private func areaCursorRects() -> [(rect: CGRect, cursor: AppCursor)] {
+        guard mode == .area else { return [(bounds, .crosshair)] }
+        var rects: [(rect: CGRect, cursor: AppCursor)] = [(bounds, .crosshair)]
+        guard let selection = areaSelection else { return rects }
+        let tool = annotationSurface?.tool ?? .select
+        let drawing = isReviewing && !textEditingActive && tool != .select
+        if !drawing { rects.append((selection, .openHand)) }
+        let handleRects = EditableSelectionGeometry.handleRects(
+            for: selection, size: 18,
+            cornerRadius: reviewCornerRadius(for: selection))
+        let handleOrder: [SelectionHandle] = [
+            .bottom, .top, .left, .right,
+            .bottomLeft, .bottomRight, .topLeft, .topRight,
+        ]
+        for handle in handleOrder {
+            guard let entry = handleRects.first(where: { $0.0 == handle })
+            else { continue }
+            rects.append((entry.1, .resize(handle)))
         }
-        addCursorRect(bounds, cursor: .crosshair)
-        if let selection = areaSelection {
-            addCursorRect(selection, cursor: .openHand)
-            let radius = reviewCornerRadius(for: selection)
-            for (handle, rect) in EditableSelectionGeometry.handleRects(
-                for: selection, size: 18, cornerRadius: radius
-            ) {
-                addCursorRect(rect, cursor: handle.cursor)
-            }
+        if drawing { rects.append((selection, AppCursor.drawing(tool))) }
+        return rects
+    }
+
+    /// Point lookup over that same table, last match first. Two readers of
+    /// one table instead of two implementations: `resetCursorRects` and the
+    /// `mouseMoved` path cannot drift apart and disagree about what the
+    /// pointer means.
+    func areaCursor(at point: CGPoint) -> AppCursor {
+        if case .moving = areaDrag { return .closedHand }
+        for entry in areaCursorRects().reversed()
+        where entry.rect.contains(point) {
+            return entry.cursor
+        }
+        return .crosshair
+    }
+
+    override func resetCursorRects() {
+        for (rect, cursor) in areaCursorRects() {
+            addCursorRect(rect, cursor: cursor.cursor)
         }
     }
 
     private func updateAreaCursor(at point: CGPoint) {
-        if let selection = areaSelection,
-                  let handle = EditableSelectionGeometry.handle(
-                    at: point, in: selection,
-                    cornerRadius: reviewCornerRadius(for: selection)
-                  ) {
-            handle.cursor.set()
-        } else if let selection = areaSelection, selection.contains(point) {
-            NSCursor.openHand.set()
-        } else {
-            NSCursor.crosshair.set()
-        }
+        applyCursor(areaCursor(at: point))
+    }
+
+    /// The only place this view sets a cursor. Recording and setting in one
+    /// step is what makes `currentCursorForTesting` evidence rather than a
+    /// second opinion.
+    private func applyCursor(_ cursor: AppCursor) {
+        currentCursor = cursor
+        cursor.cursor.set()
     }
 
     /// Mouse-up commit, by purpose: scroll/OCR hand the rect over exactly
@@ -1853,6 +1899,17 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
                 // the base image at that moment, not at the moment the host
                 // happens to be running.
                 surface.redactionBaseImage = frozen.cgImage
+                // A magnifier callout stays inside the crop the export makes
+                // (bottom-left image pixels; the session rect is top-left).
+                surface.magnifierBounds = { [weak self] in
+                    guard let self, let owner = self.owner else { return nil }
+                    let px = owner.session.pixelRect
+                    guard px.width >= 1, px.height >= 1 else { return nil }
+                    return CGRect(
+                        x: px.minX,
+                        y: CGFloat(frozen.cgImage.height) - px.maxY,
+                        width: px.width, height: px.height)
+                }
                 annotationSurface = surface
                 owner.reviewDidBegin(in: self)
                 layoutReviewToolbar()

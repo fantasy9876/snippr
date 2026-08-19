@@ -326,6 +326,7 @@ final class AnnotationSurface: RedactionHost, RedactionJobObserver {
             let magnifier = MagnifierAnnotation(uiScale: pixelScale)
             magnifier.sourceRect = CGRect(origin: p, size: .zero)
             magnifier.calloutRect = CGRect(origin: p, size: .zero)
+            magnifier.isDrafting = true
             activeMagnifier = magnifier
             activeMagnifierAnchor = p
             annotations.append(magnifier)
@@ -425,10 +426,10 @@ final class AnnotationSurface: RedactionHost, RedactionJobObserver {
             magnifier.sourceRect = source
             // The callout sits beside the source at the editor's default
             // magnification, so a drag produces something visible without a
-            // second gesture.
-            magnifier.calloutRect = CGRect(
-                x: source.maxX + 16, y: source.minY,
-                width: source.width * 2, height: source.height * 2)
+            // second gesture — and inside the crop, so it is neither clipped
+            // by the review preview nor cut off in the export.
+            magnifier.calloutRect = MagnifierAnnotation.calloutRect(
+                for: source, gap: 16, within: magnifierBounds?())
         }
     }
 
@@ -496,6 +497,7 @@ final class AnnotationSurface: RedactionHost, RedactionJobObserver {
         // it from the REDACTED document — the surface must never hand back raw
         // pixels a redaction was meant to cover.
         if let magnifier = activeMagnifier, annotations.last === magnifier {
+            magnifier.isDrafting = false
             if magnifier.sourceRect.width <= 1
                 || magnifier.sourceRect.height <= 1 {
                 annotations.removeLast()
@@ -660,6 +662,11 @@ final class AnnotationSurface: RedactionHost, RedactionJobObserver {
     /// Full SOURCE pixel bounds; hosts set this so a spotlight dims the whole
     /// image, not just the selection or the view.
     var redactionBaseBounds: CGRect = .zero
+
+    /// The pixels a magnifier callout must stay inside (bottom-left image
+    /// pixels): the live crop in the review overlay, the whole image where
+    /// there is no crop. Nil = unclamped (legacy placement).
+    var magnifierBounds: (() -> CGRect?)?
 
     /// The frame the document currently wears: the LAST preset chosen, read
     /// straight out of history so undo and redo need no separate bookkeeping.
