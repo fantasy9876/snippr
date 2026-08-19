@@ -310,25 +310,102 @@ sealed class MagnifierAnnotation : Annotation
 
     public override Rectangle Bounds => CalloutRect;
 
+    /// Where the callout for `source` sits: to the right and below by 16 px
+    /// when that fits inside `bounds`, otherwise flipped the other way and
+    /// clamped. Same arithmetic `MakeMagnifier` and the editor used to inline,
+    /// so a live drag preview cannot park somewhere the committed loupe will
+    /// not.
+    public static Rectangle PlaceCallout(
+        Rectangle source, Rectangle bounds, float zoom = 2.5f)
+    {
+        var size = new Size(
+            (int)(source.Width * zoom), (int)(source.Height * zoom));
+        var x = source.Right + 16 + size.Width <= bounds.Right
+            ? source.Right + 16
+            : Math.Max(bounds.Left, source.Left - 16 - size.Width);
+        var y = source.Bottom + 16 + size.Height <= bounds.Bottom
+            ? source.Bottom + 16
+            : Math.Max(bounds.Top, source.Top - 16 - size.Height);
+        return new Rectangle(x, y, size.Width, size.Height);
+    }
+
     public override void Draw(Graphics g, Bitmap? pixelated)
     {
-        if (Snapshot == null || CalloutRect.Width <= 1 || CalloutRect.Height <= 1) return;
         var state = g.Save();
-        g.InterpolationMode = InterpolationMode.NearestNeighbor;
-        g.PixelOffsetMode = PixelOffsetMode.Half;
-        // A soft drop shadow, then the patch, then the ring — the same order
-        // the macOS callout uses, so the two look like one feature.
-        using (var shadow = new SolidBrush(Color.FromArgb(70, Color.Black)))
+        g.SmoothingMode = SmoothingMode.None;
+        g.PixelOffsetMode = PixelOffsetMode.None;
+        if (Snapshot != null && CalloutRect.Width > 1 && CalloutRect.Height > 1)
         {
-            var below = CalloutRect;
-            below.Offset(0, 2);
-            below.Inflate(2, 2);
-            g.FillRectangle(shadow, below);
+            g.InterpolationMode = InterpolationMode.NearestNeighbor;
+            g.PixelOffsetMode = PixelOffsetMode.Half;
+            // A soft drop shadow, then the patch, then the ring — the same
+            // order the macOS callout uses, so the two look like one feature.
+            using (var shadow = new SolidBrush(Color.FromArgb(70, Color.Black)))
+            {
+                var below = CalloutRect;
+                below.Offset(0, 2);
+                below.Inflate(2, 2);
+                g.FillRectangle(shadow, below);
+            }
+            g.DrawImage(Snapshot, CalloutRect);
+            using var pen = new Pen(Color.White, 2);
+            g.DrawRectangle(pen, CalloutRect);
+            DrawSourceFrame(g, SourceRect);
         }
-        g.DrawImage(Snapshot, CalloutRect);
-        using var pen = new Pen(Color.White, 2);
-        g.DrawRectangle(pen, CalloutRect);
+        else if (Snapshot == null)
+        {
+            // Nothing sampled yet, so nothing can leak: show the geometry
+            // only. The dashed outline is where the callout will land.
+            if (CalloutRect.Width > 1 && CalloutRect.Height > 1)
+                DrawCalloutOutline(g, CalloutRect);
+            DrawSourceFrame(g, SourceRect);
+        }
         g.Restore(state);
+    }
+
+    /// 1 px dark line outside, 1 px white line inside: visible on light and
+    /// dark pixels alike, and never covering the source pixels themselves.
+    static void DrawSourceFrame(Graphics g, Rectangle src)
+    {
+        if (src.Width <= 1 || src.Height <= 1) return;
+        var dark = Color.FromArgb(140, 0, 0, 0);
+        StrokeRect(g, Rectangle.Inflate(src, 1, 1), dark, dashed: false);
+        StrokeRect(g, src, Color.White, dashed: false);
+    }
+
+    static void DrawCalloutOutline(Graphics g, Rectangle callout)
+    {
+        var dark = Color.FromArgb(140, 0, 0, 0);
+        StrokeRect(g, Rectangle.Inflate(callout, 1, 1), dark, dashed: true);
+        StrokeRect(g, callout, Color.White, dashed: true);
+    }
+
+    static void StrokeRect(Graphics g, Rectangle r, Color color, bool dashed)
+    {
+        if (r.Width <= 0 || r.Height <= 0) return;
+        using var brush = new SolidBrush(color);
+        void Dash(int x, int y, int w, int h, bool horizontal)
+        {
+            if (!dashed)
+            {
+                g.FillRectangle(brush, x, y, w, h);
+                return;
+            }
+            const int on = 4, off = 3;
+            int span = horizontal ? w : h;
+            int pos = 0;
+            while (pos < span)
+            {
+                int n = Math.Min(on, span - pos);
+                if (horizontal) g.FillRectangle(brush, x + pos, y, n, h);
+                else g.FillRectangle(brush, x, y + pos, w, n);
+                pos += on + off;
+            }
+        }
+        Dash(r.X, r.Y, r.Width, 1, horizontal: true);
+        Dash(r.X, r.Bottom - 1, r.Width, 1, horizontal: true);
+        Dash(r.X, r.Y, 1, r.Height, horizontal: false);
+        Dash(r.Right - 1, r.Y, 1, r.Height, horizontal: false);
     }
 
     public override bool HitTest(Point p) => CalloutRect.Contains(p);

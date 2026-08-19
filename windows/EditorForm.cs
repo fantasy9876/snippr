@@ -866,10 +866,12 @@ sealed class EditorForm : Form
                 if (_draft is MagnifierAnnotation mag)
                 {
                     mag.SourceRect = RectFrom(_dragStartPx, px);
-                    // While the drag is live the callout tracks the source at
-                    // 1:1, so the user is shown the region they are choosing
-                    // rather than a loupe of a rect that does not exist yet.
-                    mag.CalloutRect = mag.SourceRect;
+                    // While the drag is live the callout is only an outline,
+                    // parked where it will land — not a 1:1 box on the source.
+                    mag.CalloutRect = MagnifierAnnotation.PlaceCallout(
+                        mag.SourceRect,
+                        new Rectangle(0, 0, _image.Width, _image.Height),
+                        MagnifierZoom);
                     _canvas.Invalidate();
                 }
                 break;
@@ -934,17 +936,10 @@ sealed class EditorForm : Form
             _image, source, _annotations.OfType<BlurAnnotation>());
         if (mag.Snapshot == null) { _canvas.Invalidate(); return; }
 
-        var size = new Size(
-            (int)(source.Width * MagnifierZoom), (int)(source.Height * MagnifierZoom));
         // Below and to the right if there is room, otherwise the other way —
         // a callout parked off the document could never be dragged back.
-        var x = source.Right + 16 + size.Width <= _image.Width
-            ? source.Right + 16
-            : Math.Max(0, source.Left - 16 - size.Width);
-        var y = source.Bottom + 16 + size.Height <= _image.Height
-            ? source.Bottom + 16
-            : Math.Max(0, source.Top - 16 - size.Height);
-        mag.CalloutRect = new Rectangle(x, y, size.Width, size.Height);
+        mag.CalloutRect = MagnifierAnnotation.PlaceCallout(
+            source, new Rectangle(0, 0, _image.Width, _image.Height), MagnifierZoom);
         PushUndo();
         _annotations.Add(mag);
         _canvas.Invalidate();

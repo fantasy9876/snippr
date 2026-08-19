@@ -168,8 +168,33 @@ static class TestEntry
                 review.Refresh();
             });
             Step("review-shot", () => Capture(review, Path.Combine(dir, "review.png")));
-            Step("review-tool-magnifier", () => review.PressToolForTesting("magnifier"));
-            Step("review-tool-select", () => review.PressToolForTesting("select"));
+            Step("review-tool-magnifier", () =>
+            {
+                // A leftover SizeAll is the bug: SelectTool must reset it.
+                review.CursorForTesting = Cursors.SizeAll;
+                review.PressToolForTesting("magnifier");
+                if (review.CursorForTesting != Cursors.Cross)
+                    throw new InvalidOperationException(
+                        $"magnifier cursor is {review.CursorForTesting} want Cross");
+            });
+            Step("review-magnifier-drag", () =>
+            {
+                var crop = review.SelectionForTesting;
+                review.DragMagnifierForTesting(
+                    new Point(crop.X + 24, crop.Y + 24),
+                    new Point(crop.X + 88, crop.Y + 64));
+                review.Refresh();
+                Application.DoEvents();
+            });
+            Step("review-shot-magnifier-drag",
+                () => Capture(review, Path.Combine(dir, "review-magnifier-drag.png")));
+            Step("review-tool-select", () =>
+            {
+                review.PressToolForTesting("select");
+                if (review.CursorForTesting != Cursors.Cross)
+                    throw new InvalidOperationException(
+                        $"select cursor is {review.CursorForTesting} want Cross");
+            });
             Step("review-preset-ocean", () =>
             {
                 review.ApplyPresetForTesting("ocean");
