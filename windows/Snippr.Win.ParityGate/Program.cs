@@ -26,6 +26,7 @@ static class Program
         failed += Check("win-overlay-toolbar-layout", OverlayToolbarLayoutGate());
         failed += Check("win-area-review-chrome-hit-test", ChromeHitTest());
         failed += Check("win-area-review-crop-drag", CropDrag());
+        failed += Check("win-area-review-handle-inset", HandleInset());
         failed += Check("win-editor-actions-match-catalog", EditorActionsMatchCatalog());
         failed += Check("win-backdrop-corner-radius-table", CornerRadiusTable());
         failed += Check("win-chrome-fits-at-every-dpi", ChromeFitsAtEveryDpi());
@@ -229,6 +230,109 @@ static class Program
         var twice = AreaReviewCrop.Drag(CropGrip.Inside, crop, new Point(0, 0), new Point(40, 30));
         if (once != twice) f.Add("drag is not a pure function of its endpoints");
         return f;
+    }
+
+    /// Corner handles sit on the 45° point of the plate arc so the square
+    /// does not cover the cut. Radius 0 is the eight centres CropDrag already
+    /// uses. Mid-edge handles never move. Hit size stays 18; shrink is the
+    /// drawn square only.
+    static List<string> HandleInset()
+    {
+        var f = new List<string>();
+        var crop = new Rectangle(100, 80, 200, 150);
+
+        var baseline = OverlayToolbarLayout.HandleRects(crop, 18f);
+        var explicitZero = OverlayToolbarLayout.HandleRects(crop, 18f, 0);
+        if (baseline.Length != 8) f.Add($"expected 8 handles, got {baseline.Length}");
+        for (int i = 0; i < baseline.Length; i++)
+            if (baseline[i] != explicitZero[i])
+                f.Add($"radius 0 moved handle {i}: {explicitZero[i]} vs {baseline[i]}");
+
+        for (int i = 0; i < baseline.Length; i++)
+        {
+            var c = Centre(baseline[i]);
+            var centre = new Point((int)MathF.Round(c.X), (int)MathF.Round(c.Y));
+            if (AreaReviewCrop.GripAt(centre, crop, 18f) != (CropGrip)i)
+                f.Add($"radius 0 handle {i} no longer grabs itself");
+        }
+
+        const float radius = 37f;
+        float d = radius * (1f - 1f / MathF.Sqrt(2f));
+        var inset = OverlayToolbarLayout.HandleRects(crop, 18f, radius);
+        int[] corners = [0, 2, 5, 7];
+        int[] edges = [1, 3, 4, 6];
+        foreach (int i in edges)
+        {
+            if (Dist(Centre(inset[i]), Centre(baseline[i])) > 0.01f)
+                f.Add($"mid-edge {i} moved");
+            if (Math.Abs(inset[i].Width - 18f) > 0.01f)
+                f.Add($"hit handle {i} shrank to {inset[i].Width}");
+        }
+        (float Dx, float Dy)[] want =
+        [
+            (d, d), (-d, d), (d, -d), (-d, -d),
+        ];
+        for (int n = 0; n < corners.Length; n++)
+        {
+            int i = corners[n];
+            var got = Centre(inset[i]);
+            var expect = new PointF(
+                Centre(baseline[i]).X + want[n].Dx,
+                Centre(baseline[i]).Y + want[n].Dy);
+            if (Dist(got, expect) > 0.01f)
+                f.Add($"corner {i}: {got} want {expect}");
+            if (Math.Abs(inset[i].Width - 18f) > 0.01f)
+                f.Add($"hit corner {i} shrank to {inset[i].Width}");
+            var gripPt = new Point((int)MathF.Round(got.X), (int)MathF.Round(got.Y));
+            if (AreaReviewCrop.GripAt(gripPt, crop, 18f, radius) != (CropGrip)i)
+                f.Add($"inset corner {i} does not grab itself");
+            // The geometric corner is no longer the handle — it is Inside.
+            var geometric = Centre(baseline[i]);
+            var oldPt = new Point(
+                (int)MathF.Round(geometric.X), (int)MathF.Round(geometric.Y));
+            var oldGrip = AreaReviewCrop.GripAt(oldPt, crop, 18f, radius);
+            if (oldGrip == (CropGrip)i)
+                f.Add($"geometric corner {i} still grabs the handle");
+        }
+
+        // Drawn 8 px square on a small crop (floor 12 → d ≈ 3.51): shrink
+        // so half the side does not cover the cut. Centres stay on the arc.
+        const float floorR = 12f;
+        float floorD = floorR * (1f - 1f / MathF.Sqrt(2f));
+        var drawn = OverlayToolbarLayout.HandleRects(crop, 8f, floorR, shrinkToArc: true);
+        float wantSize = MathF.Max(5f, 2f * floorD);
+        foreach (int i in corners)
+        {
+            if (Math.Abs(drawn[i].Width - wantSize) > 0.01f)
+                f.Add($"visual corner {i} size {drawn[i].Width} want {wantSize}");
+            var expect = new PointF(
+                Centre(baseline[i]).X + (i is 0 or 5 ? floorD : -floorD),
+                Centre(baseline[i]).Y + (i is 0 or 2 ? floorD : -floorD));
+            if (Dist(Centre(drawn[i]), expect) > 0.01f)
+                f.Add($"visual corner {i} centre {Centre(drawn[i])} want {expect}");
+        }
+        foreach (int i in edges)
+            if (Math.Abs(drawn[i].Width - 8f) > 0.01f)
+                f.Add($"visual mid-edge {i} shrank to {drawn[i].Width}");
+
+        // Owner-sized crop, Medium 37 px: 8/2 < d, so the square stays 8.
+        var ownerCrop = new Rectangle(0, 0, 2400, 1523);
+        var owner = OverlayToolbarLayout.HandleRects(
+            ownerCrop, 8f, radius, shrinkToArc: true);
+        foreach (int i in corners)
+            if (Math.Abs(owner[i].Width - 8f) > 0.01f)
+                f.Add($"owner visual {i} size {owner[i].Width} want 8");
+
+        return f;
+    }
+
+    static PointF Centre(RectangleF r) =>
+        new(r.X + r.Width / 2f, r.Y + r.Height / 2f);
+
+    static float Dist(PointF a, PointF b)
+    {
+        float dx = a.X - b.X, dy = a.Y - b.Y;
+        return MathF.Sqrt(dx * dx + dy * dy);
     }
 
     /// Everything the catalog offers the editor, the editor does — and

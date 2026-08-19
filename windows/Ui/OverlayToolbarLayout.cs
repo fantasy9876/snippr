@@ -332,23 +332,47 @@ static class OverlayToolbarLayout
         return failures;
     }
 
-    public static RectangleF[] HandleRects(RectangleF selection, float size)
+    /// Eight crop handles: four corners, four edge midpoints, same order as
+    /// <c>CropGrip</c>. <paramref name="cornerRadius"/> 0 (preset none, or
+    /// style None) is bit-identical to the geometric corners. A positive
+    /// radius moves only the corner centres onto the 45° point of the plate
+    /// arc — <c>d = R × (1 − 1/√2)</c> — so a square handle does not sit on
+    /// the cut and read as a square corner. Mid-edge handles stay put.
+    ///
+    /// <paramref name="shrinkToArc"/> is the drawn corner square only: if
+    /// half its side would still cover the geometric corner, that square
+    /// shrinks to <c>2d</c> (floor 5). Mid-edge squares stay at
+    /// <paramref name="size"/>. Hit-testing keeps the 18 DIP size at the
+    /// same centres — pass <c>false</c> (the default) there. Overlay
+    /// <see cref="Compute"/> does not pass a radius: the rail still avoids
+    /// the geometric corners.
+    public static RectangleF[] HandleRects(
+        RectangleF selection, float size, float cornerRadius = 0, bool shrinkToArc = false)
     {
-        float hx = size / 2f;
-        (float X, float Y)[] pts =
+        float d = cornerRadius > 0
+            ? cornerRadius * (1f - 1f / MathF.Sqrt(2f))
+            : 0f;
+        float cornerSize = size;
+        if (shrinkToArc && d > 0 && size / 2f > d)
+            cornerSize = MathF.Max(5f, 2f * d);
+        (float X, float Y, float Size)[] pts =
         [
-            (selection.Left, selection.Top),
-            (selection.Left + selection.Width / 2f, selection.Top),
-            (selection.Right, selection.Top),
-            (selection.Left, selection.Top + selection.Height / 2f),
-            (selection.Right, selection.Top + selection.Height / 2f),
-            (selection.Left, selection.Bottom),
-            (selection.Left + selection.Width / 2f, selection.Bottom),
-            (selection.Right, selection.Bottom),
+            (selection.Left + d, selection.Top + d, cornerSize),
+            (selection.Left + selection.Width / 2f, selection.Top, size),
+            (selection.Right - d, selection.Top + d, cornerSize),
+            (selection.Left, selection.Top + selection.Height / 2f, size),
+            (selection.Right, selection.Top + selection.Height / 2f, size),
+            (selection.Left + d, selection.Bottom - d, cornerSize),
+            (selection.Left + selection.Width / 2f, selection.Bottom, size),
+            (selection.Right - d, selection.Bottom - d, cornerSize),
         ];
         var rects = new RectangleF[pts.Length];
         for (int i = 0; i < pts.Length; i++)
-            rects[i] = new RectangleF(pts[i].X - hx, pts[i].Y - hx, size, size);
+        {
+            float s = pts[i].Size;
+            float hx = s / 2f;
+            rects[i] = new RectangleF(pts[i].X - hx, pts[i].Y - hx, s, s);
+        }
         return rects;
     }
 

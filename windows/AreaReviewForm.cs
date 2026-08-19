@@ -210,10 +210,13 @@ sealed class AreaReviewForm : Form
         using (var pen = new Pen(Color.DeepSkyBlue, 1.6f))
             g.DrawRectangle(pen, crop);
         // The handles are drawn from the same helper the hit test reads, so
-        // what the user grabs is what they can see.
+        // what the user grabs is what they can see. On a rounded plate the
+        // corner centres sit on the arc; shrinkToArc keeps the 8 px square
+        // from covering the cut on a small crop.
         using (var fill = new SolidBrush(Color.White))
         using (var edge = new Pen(Color.DeepSkyBlue, 1.2f))
-            foreach (var handle in OverlayToolbarLayout.HandleRects(crop, 8f))
+            foreach (var handle in OverlayToolbarLayout.HandleRects(
+                crop, 8f, ReviewCornerRadius, shrinkToArc: true))
             {
                 g.FillRectangle(fill, handle);
                 g.DrawRectangle(
@@ -287,7 +290,8 @@ sealed class AreaReviewForm : Form
                 // grabs. Adjusting it is not an edit of the document — the
                 // marks stay where they were put, and what changes is how much
                 // of them the picture contains.
-                _grip = AreaReviewCrop.GripAt(px, _session.PixelRect, HandleSize);
+                _grip = AreaReviewCrop.GripAt(
+                    px, _session.PixelRect, HandleSize, ReviewCornerRadius);
                 _gripOriginal = _session.PixelRect;
                 break;
             case Tool.Arrow or Tool.Line or Tool.Rect or Tool.Oval or Tool.Highlight:
@@ -351,6 +355,14 @@ sealed class AreaReviewForm : Form
 
     float HandleSize => Theme.HandleHit * DeviceDpi / 96f;
 
+    /// Radius the plate actually draws. No plate (or style None) keeps the
+    /// handles on the geometric corners — same as the overlay, which has no
+    /// preset.
+    float ReviewCornerRadius =>
+        _session.Backdrop == BackdropPreset.None
+            ? 0
+            : BackdropSpec.CornerRadius(_session.PixelRect.Size, _session.Corners);
+
     /// The pointer shape that matches the grip, so the crop advertises what a
     /// drag there will do before the user commits to it. It lives here rather
     /// than beside the arithmetic because `Cursor` is WinForms, and the
@@ -379,7 +391,8 @@ sealed class AreaReviewForm : Form
         }
         if (_tool == Tool.Select && e.Button == MouseButtons.None)
             Cursor = CursorFor(
-                AreaReviewCrop.GripAt(px, _session.PixelRect, HandleSize));
+                AreaReviewCrop.GripAt(
+                    px, _session.PixelRect, HandleSize, ReviewCornerRadius));
         if (_movingSelection && _selected != null)
         {
             _selected.Move(px.X - _dragStartPx.X, px.Y - _dragStartPx.Y);
