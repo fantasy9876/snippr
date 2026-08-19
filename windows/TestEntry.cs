@@ -1,4 +1,5 @@
 using System.Drawing.Imaging;
+using System.Runtime.InteropServices;
 
 namespace Snippr;
 
@@ -18,6 +19,33 @@ namespace Snippr;
 ///                                    and exit — no interactive desktop needed
 static class TestEntry
 {
+    [DllImport("user32.dll")]
+    static extern IntPtr WindowFromPoint(Point point);
+
+    [DllImport("user32.dll", CharSet = CharSet.Auto)]
+    static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    static extern bool IsWindowVisible(IntPtr hWnd);
+
+    [DllImport("user32.dll", EntryPoint = "GetWindowLongPtr")]
+    static extern IntPtr GetWindowLongPtr(IntPtr hWnd, int index);
+
+    const int WmMouseMove = 0x0200;
+    const int WmLButtonDown = 0x0201;
+    const int WmLButtonUp = 0x0202;
+    const int GwlExStyle = -20;
+    const long WsExTopmost = 0x00000008;
+
+    /// lParam for a mouse message: y in the high word, x in the low word,
+    /// both as *signed* 16-bit values — the review surface lives at negative
+    /// client coordinates while the smoke keeps it off-screen.
+    static IntPtr MouseLParam(Point p) =>
+        (IntPtr)(((p.Y & 0xFFFF) << 16) | (p.X & 0xFFFF));
+
+    static void SendMouse(Control target, int message, Point clientPoint) =>
+        SendMessage(target.Handle, message, IntPtr.Zero, MouseLParam(clientPoint));
+
     /// True when the arguments asked for a test entry and it has run.
     public static bool Handle(string[] args)
     {
@@ -154,12 +182,22 @@ static class TestEntry
             }
         }
 
-        var bounds = new Rectangle(0, 0, picture.Width, picture.Height);
+        // Production hands the review surface the VIRTUAL SCREEN and a frozen
+        // capture of exactly that, so the smoke does the same. Asking for a
+        // fixture-sized window instead made the runner clamp it — the desktop
+        // there is smaller than the fixture — and sent us hunting a
+        // multi-monitor bug that the clamp's own definition rules out
+        // (MaxWindowTrackSize is the whole desktop, not the primary monitor).
+        var desktop = SystemInformation.VirtualScreen;
+        var bounds = new Rectangle(0, 0, desktop.Width, desktop.Height);
+        using var frozen = new Bitmap(bounds.Width, bounds.Height);
+        using (var g = Graphics.FromImage(frozen))
+            g.DrawImage(picture, 0, 0, bounds.Width, bounds.Height);
         var selection = new Rectangle(
-            picture.Width / 6, picture.Height / 6,
-            picture.Width * 2 / 3, picture.Height * 2 / 3);
+            bounds.Width / 6, bounds.Height / 6,
+            bounds.Width * 2 / 3, bounds.Height * 2 / 3);
         using (var review = AreaReviewForm.CreateForTesting(
-            new Bitmap(picture), bounds, selection))
+            new Bitmap(frozen), bounds, selection))
         {
             Step("review-layout", () =>
             {
@@ -210,6 +248,201 @@ static class TestEntry
                         "select outside crop kept SizeAll");
                 review.PointerClientForTesting = null;
             });
+            Step("review-covers-requested-bounds", () =>
+            {
+                // Against the rectangle the surface was ASKED for, not against
+                // its own bounds. Windows clamps the window and its client
+                // area TOGETHER, so client-vs-bounds agrees while the window
+                // is short — this check passed on a run whose log showed the
+                // clamp happening (asked 1280x800, client 1044x788). The
+                // runner's screen is smaller than the picture, so this is the
+                // The surface must cover the desktop it asked for. Size only:
+                // where the window sits is the caller's business, and the
+                // smoke parks this one off-screen on purpose.
+                var want = review.RequestedBoundsForTesting.Size;
+                if (review.Size != want)
+                    throw new InvalidOperationException(
+                        $"window {review.Size} != requested {want}");
+                if (review.ClientSize != want)
+                    throw new InvalidOperationException(
+                        $"client {review.ClientSize} != requested {want}");
+            });
+            Step("review-canvas-click-reaches-tool", () =>
+            {
+                // Two halves, and they prove different things.
+                //
+                // First: who does WINDOWS say owns a point over the picture?
+                // The chrome is docked over the whole surface and forwards
+                // what lands on it; when it answered HTTRANSPARENT the press
+                // fell to a form with no mouse handlers and nothing drew.
+                // Posting a message cannot catch that — posting skips hit
+                // testing entirely — so ask the OS with the form on-screen.
+                var home = review.Location;
+                review.Location = Point.Empty;
+                Application.DoEvents();
+                var crop = review.SelectionForTesting;
+                var centre = new Point(
+                    crop.X + crop.Width / 2, crop.Y + crop.Height / 2);
+                var owner = WindowFromPoint(review.PointToScreen(centre));
+                var chrome = review.ChromeForTesting;
+                if (owner != chrome.Handle)
+                    throw new InvalidOperationException(
+                        $"point in the crop belongs to {owner}, not the chrome {chrome.Handle}");
+                review.Location = home;
+                Application.DoEvents();
+
+                // Second: the forwarding itself. An Arrow dragged across the
+                // crop has to leave exactly one mark behind.
+                review.PressToolForTesting("arrow");
+                int before = review.AnnotationCountForTesting;
+                var from = new Point(crop.X + 40, crop.Y + 40);
+                var to = new Point(crop.X + 160, crop.Y + 120);
+                SendMouse(chrome, WmLButtonDown, from);
+                SendMouse(chrome, WmMouseMove, to);
+                SendMouse(chrome, WmLButtonUp, to);
+                Application.DoEvents();
+                int after = review.AnnotationCountForTesting;
+                if (after != before + 1)
+                    throw new InvalidOperationException(
+                        $"arrow drag left {after - before} marks, want 1");
+                review.PressToolForTesting("select");
+            });
+            Step("review-hint-visible-and-topmost", () =>
+            {
+                // The hint was created with CreateHandle + SWP_SHOWWINDOW, so
+                // WinForms never knew it was visible (HideNow was a no-op) and
+                // it sat in the normal band UNDER its own TopMost host — the
+                // overlay could not show a hint at all.
+                // On screen first. The hint clamps itself to the display its
+                // anchor is on, intersected with the host's client rect — and
+                // the smoke parks this form at -32000, where that intersection
+                // is empty and the hint correctly refuses to appear. Hovering
+                // off-screen tested the parking, not the hint.
+                var home = review.Location;
+                review.Location = Point.Empty;
+                Application.DoEvents();
+                var chrome = review.ChromeForTesting;
+                var hint = review.HintForTesting;
+                var button = FirstLeaf(chrome);
+                var centre = new Point(button.Width / 2, button.Height / 2);
+                // Put the REAL cursor on the button first. A posted
+                // WM_MOUSEMOVE makes WinForms start tracking, and the moment
+                // the physical pointer is found elsewhere a WM_MOUSELEAVE
+                // arrives and clears the pending hint before its 450 ms timer
+                // can fire — the hint is then working exactly as designed and
+                // the gate is testing where the runner's mouse happens to be.
+                Cursor.Position = button.PointToScreen(centre);
+                SendMouse(button, WmMouseMove, centre);
+                var deadline = DateTime.UtcNow.AddSeconds(3);
+                while (DateTime.UtcNow < deadline && !hint.IsHandleCreated)
+                {
+                    Application.DoEvents();
+                    Thread.Sleep(30);
+                }
+                while (DateTime.UtcNow < deadline
+                    && !IsWindowVisible(hint.Handle))
+                {
+                    Application.DoEvents();
+                    Thread.Sleep(30);
+                }
+                if (!IsWindowVisible(hint.Handle))
+                    throw new InvalidOperationException(
+                        "hint never became visible — "
+                        + hint.LastPlacementForTesting);
+                long ex = (long)GetWindowLongPtr(hint.Handle, GwlExStyle);
+                if ((ex & WsExTopmost) == 0)
+                    throw new InvalidOperationException(
+                        $"hint is not WS_EX_TOPMOST (exstyle 0x{ex:X})");
+                hint.HideNow();
+                Application.DoEvents();
+                bool stillUp = IsWindowVisible(hint.Handle);
+                review.Location = home;
+                Application.DoEvents();
+                if (stillUp)
+                    throw new InvalidOperationException("HideNow left the hint up");
+            });
+            Step("review-rail-carries-its-actions", () =>
+            {
+                // The rail is tools THEN backdrop/color/undo/redo, like
+                // macOS. The parity gate pins the catalog's split; this is
+                // the other half — that the toolbar actually built it that
+                // way, because the layout is told how many to place.
+                var counts = review.ChromeCountsForTesting;
+                if (counts.Rail != ToolCatalog.RailCount
+                    || counts.Strip != ToolCatalog.StripCount)
+                    throw new InvalidOperationException(
+                        $"toolbar rail/strip {counts.Rail}/{counts.Strip}, "
+                        + $"catalog {ToolCatalog.RailCount}/{ToolCatalog.StripCount}");
+
+                // Backdrop's hint says (D), so D has to do something. A hint
+                // naming a key nobody routes is a promise the app breaks the
+                // first time someone believes it.
+                var menu = review.BackdropMenuForTesting;
+                if (!review.PressKeyForTesting(Keys.D))
+                    throw new InvalidOperationException("D was not routed");
+                Application.DoEvents();
+                if (!menu.Visible)
+                    throw new InvalidOperationException("D did not open the backdrop menu");
+                menu.Close();
+                Application.DoEvents();
+            });
+            Step("review-backdrop-menu-labels", () =>
+            {
+                // The menu showed five swatches and no words: AutoSize was
+                // off with only a height set, so every row kept the default
+                // width and the label had nowhere to draw. Opening is what
+                // sizes them, so open it the way the button does.
+                var menu = review.BackdropMenuForTesting;
+                menu.RaiseOpeningForTesting();
+                foreach (ToolStripItem item in menu.Items)
+                {
+                    // Separators have no label and keep their own thin box.
+                    if (item is ToolStripSeparator) continue;
+                    int text = TextRenderer.MeasureText(item.Text, menu.Font).Width;
+                    int need = text + menu.ImageScalingSize.Width;
+                    if (item.Width < need)
+                        throw new InvalidOperationException(
+                            $"backdrop row '{item.Text}' is {item.Width}px, "
+                            + $"needs {need}px for its label");
+                }
+            });
+            Step("review-backdrop-corner-rows", () =>
+            {
+                // The corner setting existed on Windows since 1.2.11 with no
+                // way to reach it. Clicking the row has to move the LIVE
+                // session, not only the stored setting: the session took its
+                // copy when the surface opened.
+                var menu = review.BackdropMenuForTesting;
+                menu.RaiseOpeningForTesting();
+                var rows = menu.Items.OfType<ToolStripMenuItem>()
+                    .Where(i => i.Tag is BackdropCornerStyle).ToList();
+                if (rows.Count != 4)
+                    throw new InvalidOperationException(
+                        $"{rows.Count} corner rows, want 4");
+                var before = review.CornersForTesting;
+                var target = rows.First(
+                    i => (BackdropCornerStyle)i.Tag! == BackdropCornerStyle.Large);
+                target.PerformClick();
+                Application.DoEvents();
+                if (review.CornersForTesting != BackdropCornerStyle.Large)
+                    throw new InvalidOperationException(
+                        $"session corners {review.CornersForTesting}, want Large");
+                menu.RaiseOpeningForTesting();
+                if (!rows.First(i => (BackdropCornerStyle)i.Tag! == BackdropCornerStyle.Large).Checked)
+                    throw new InvalidOperationException("Large row is not ticked");
+                // Leave the machine AND the surface as we found them: the
+                // later shot steps photograph this session, and a corner
+                // style left behind changes what they capture.
+                AppSettings.Current.BackdropCorners = before.ToString();
+                AppSettings.Current.Save();
+                var restore = menu.Items.OfType<ToolStripMenuItem>().First(
+                    i => i.Tag is BackdropCornerStyle st && st == before);
+                restore.PerformClick();
+                Application.DoEvents();
+                if (review.CornersForTesting != before)
+                    throw new InvalidOperationException(
+                        $"session corners left at {review.CornersForTesting}, want {before}");
+            });
             Step("review-preset-ocean", () =>
             {
                 review.ApplyPresetForTesting("ocean");
@@ -249,6 +482,15 @@ static class TestEntry
     /// out and paints. `DrawToBitmap` on a form that was never shown gives
     /// back an empty rectangle: the first smoke run's `editor.png` was a slab
     /// of background with no toolbar in it, which says nothing about anything.
+    /// The deepest child of <paramref name="root"/> — an overlay toolbar
+    /// button, for a hint that only fires over one.
+    static Control FirstLeaf(Control root)
+    {
+        var c = root;
+        while (c.Controls.Count > 0) c = c.Controls[0];
+        return c;
+    }
+
     static void Reveal(Form form)
     {
         form.StartPosition = FormStartPosition.Manual;

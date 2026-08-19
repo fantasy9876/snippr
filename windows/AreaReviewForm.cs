@@ -50,6 +50,31 @@ sealed class AreaReviewForm : Form
 
     internal Rectangle SelectionForTesting => _session.PixelRect;
 
+    internal BackdropMenu BackdropMenuForTesting => _toolbar.Menu;
+
+    /// The chrome control itself. The smoke asks Windows who owns a point and
+    /// what a real message does with it, which is the half of the input path
+    /// no direct-invoke hook can stand in for.
+    internal Control ChromeForTesting => _toolbar;
+    internal HoverHint HintForTesting => _toolbar.Hint;
+    internal int AnnotationCountForTesting => _session.Annotations.Count;
+    internal BackdropCornerStyle CornersForTesting => _session.Corners;
+    /// The rectangle the surface was ASKED to cover. Comparing the client
+    /// area with the form's own bounds proves nothing: Windows clamps both
+    /// together, so they agree while the window is short.
+    internal Rectangle RequestedBoundsForTesting => _virtualBounds;
+
+    /// Drives the real key router, so a gate can prove a key the toolbar
+    /// ADVERTISES is a key the surface routes.
+    internal bool PressKeyForTesting(Keys key)
+    {
+        var msg = new Message();
+        return ProcessCmdKey(ref msg, key);
+    }
+
+    internal (int Rail, int Strip) ChromeCountsForTesting =>
+        (_toolbar.RailCount, _toolbar.StripCount);
+
     /// Smoke parks this form off-screen (`Reveal` at -32000), so it cannot
     /// place the machine cursor and still round-trip through `PointToClient`.
     /// Production always reads `Cursor.Position`; tests set this instead.
@@ -93,6 +118,11 @@ sealed class AreaReviewForm : Form
         _virtualBounds = bounds;
         FormBorderStyle = FormBorderStyle.None;
         StartPosition = FormStartPosition.Manual;
+        // WinForms clamps Form.Size to SystemInformation.MaxWindowTrackSize.
+        // That metric is the whole desktop, so asking for the virtual screen
+        // is within it; the ceiling is set anyway, before the bounds, so the
+        // window is never the thing that trims itself.
+        MaximumSize = bounds.Size;
         Bounds = bounds;
         TopMost = true;
         ShowInTaskbar = false;
@@ -122,7 +152,9 @@ sealed class AreaReviewForm : Form
     void BindToolbar()
     {
         _toolbar.SetTools(ToolCatalog.OverlayTools.Select(e => (e.IconKey, e.HintText)));
-        _toolbar.SetActions(ToolCatalog.OverlayActions.Select(a => (a.IconKey, a.HintText)));
+        _toolbar.SetActions(
+            ToolCatalog.RailActions.Select(a => (a.IconKey, a.HintText)),
+            ToolCatalog.StripActions.Select(a => (a.IconKey, a.HintText)));
         _toolbar.SetColor(_color);
         _toolbar.ToolSelected += (_, key) =>
         {
@@ -132,6 +164,16 @@ sealed class AreaReviewForm : Form
             // button does nothing".
             Diag.Click("review", $"tool key={key} matched={entry.IconKey == key}");
             if (entry.IconKey == key) SelectTool(entry.Tool);
+        };
+        _toolbar.CornerChosen += (_, style) =>
+        {
+            // The session snapshotted the setting when it opened, so both have
+            // to move or the next repaint puts the old radius back.
+            _session.Corners = style;
+            AppSettings.Current.BackdropCorners = style.ToString();
+            AppSettings.Current.Save();
+            Diag.Click("review", $"corners={style}");
+            RefreshSurface(all: true);
         };
         _toolbar.ActionInvoked += (_, key) =>
         {
@@ -158,7 +200,17 @@ sealed class AreaReviewForm : Form
         _toolbar.SetUndoRedo(_session.CanUndo, _session.CanRedo);
     }
 
-    void PlaceToolbar() => _toolbar.Place(_session.Selection, ClientRectangle);
+    void PlaceToolbar()
+    {
+        _toolbar.Place(_session.Selection, ClientRectangle);
+        // Where the chrome ended up, so "the buttons do nothing" can be told
+        // apart from "the buttons are not where the hit test thinks".
+        var (tool, action) = ChromeFrames();
+        Diag.Click(
+            "review",
+            $"toolbar rail={Rectangle.Round(tool)} strip={Rectangle.Round(action)} "
+            + $"client={ClientRectangle} selection={_session.Selection}");
+    }
 
     /// The rail and the strip, in this form's coordinates — the only parts of
     /// the toolbar that are not the picture.
@@ -167,7 +219,7 @@ sealed class AreaReviewForm : Form
         var metrics = OverlayToolbarLayout.Metrics.Standard.Scaled(DeviceDpi / 96f);
         var area = OverlayToolbarLayout.Compute(
             _session.Selection, ClientRectangle,
-            ToolCatalog.OverlayTools.Count(), ToolCatalog.OverlayActions.Count(),
+            ToolCatalog.RailCount, ToolCatalog.StripCount,
             Theme.HandleHit * DeviceDpi / 96f, metrics);
         return area is { } placed
             ? (placed.ToolFrame, placed.ActionFrame)
@@ -296,6 +348,23 @@ sealed class AreaReviewForm : Form
 
     Point CurrentPointerClient() =>
         PointerClientForTesting ?? PointToClient(Cursor.Position);
+
+    /// What the window asked for and what it got. `MaxWindowTrackSize` is the
+    /// whole DESKTOP, not the primary monitor, so a window asking for the
+    /// virtual screen is not trimmed — but that is a claim about someone
+    /// else's machine, and this line is how it gets checked on theirs.
+    ///
+    /// Measured at Shown, not at handle creation: the borderless style is not
+    /// applied yet at creation, so the client area reads short there and the
+    /// one line someone sends us to settle this would start the argument
+    /// again.
+    protected override void OnShown(EventArgs e)
+    {
+        base.OnShown(e);
+        Diag.Click(
+            "review",
+            $"window asked={_virtualBounds.Size} got={Size} client={ClientSize}");
+    }
 
     void CanvasMouseDown(MouseEventArgs e)
     {
@@ -608,6 +677,14 @@ sealed class AreaReviewForm : Form
         // Tool keys, host-scoped: a letter that names a tool this surface does
         // not show must do nothing rather than select an invisible tool.
         var label = keyData.ToString();
+        // D opens the backdrop menu, as it does on macOS. It is checked
+        // before the tool map because Backdrop is an ACTION: choosing a
+        // preset must not displace the tool the user is drawing with.
+        if (string.Equals(label, "D", StringComparison.OrdinalIgnoreCase))
+        {
+            _toolbar.OpenBackdropMenu();
+            return true;
+        }
         if (label.Length == 1
             && ToolCatalog.ToolForKey(label, inOverlay: true) is Tool tool)
         {

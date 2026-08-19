@@ -257,9 +257,11 @@ static class Program
         if (Math.Abs(Lum(bmp, 40, 35) - gray) > 2)
             f.Add($"interior touched {Lum(bmp, 40, 35)}");
 
-        // 40×30 @ 2.5× → 100×75, parked at (60+16, 50+16).
-        if (callout != new Rectangle(76, 66, 100, 75))
-            f.Add($"callout {callout} want 76,66,100x75");
+        // 40×30 @ 2.5× → 100×75. Right still holds full zoom, so the callout
+        // sits to the right, bottoms-aligned then clamped (y=0), not the old
+        // independent-axis park at (76, 66).
+        if (callout != new Rectangle(76, 0, 100, 75))
+            f.Add($"callout {callout} want 76,0,100x75");
         else
         {
             int inked = 0;
@@ -268,12 +270,15 @@ static class Program
             if (inked < 20) f.Add($"callout outline inked {inked}");
         }
 
-        // Near the right edge the callout must flip left and stay inside.
-        var flipped = MagnifierAnnotation.PlaceCallout(
-            new Rectangle(150, 20, 40, 30), bounds);
+        // Near the right edge the callout must flip left, stay inside, and
+        // not cover the source — the last is what the old clamp missed.
+        var rightSrc = new Rectangle(150, 20, 40, 30);
+        var flipped = MagnifierAnnotation.PlaceCallout(rightSrc, bounds);
         if (flipped.Right > 200 || flipped.X < 0)
             f.Add($"right-edge unclamped {flipped}");
         if (flipped.X >= 150) f.Add($"did not flip left {flipped}");
+        if (flipped.IntersectsWith(rightSrc))
+            f.Add($"right-edge covered {flipped}");
         return f;
     }
 

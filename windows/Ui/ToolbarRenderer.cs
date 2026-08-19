@@ -67,6 +67,19 @@ sealed class ToolbarRenderer : ToolStripProfessionalRenderer
         Icons.Draw(e.Graphics, icon.Key, dest, color);
     }
 
+    /// Menu rows get the same dark hover the toolbar buttons do. Without
+    /// this, `ToolStripProfessionalRenderer` paints its own pale highlight and
+    /// the forced light text lands on it as grey on near-white — the row you
+    /// are pointing at becomes the one you cannot read.
+    protected override void OnRenderMenuItemBackground(
+        ToolStripItemRenderEventArgs e)
+    {
+        var r = new Rectangle(Point.Empty, e.Item.Size);
+        using var bg = new SolidBrush(
+            e.Item.Selected || e.Item.Pressed ? Theme.Hover : Theme.Chrome);
+        e.Graphics.FillRectangle(bg, r);
+    }
+
     protected override void OnRenderItemText(ToolStripItemTextRenderEventArgs e)
     {
         e.TextColor = e.Item.ForeColor == Theme.IconMuted ? Theme.IconMuted : Theme.Icon;
@@ -96,5 +109,14 @@ sealed class ToolbarRenderer : ToolStripProfessionalRenderer
         public override Color ImageMarginGradientEnd => Theme.Chrome;
         public override Color SeparatorDark => Theme.Hairline;
         public override Color SeparatorLight => Theme.Hairline;
+        public override Color MenuItemSelected => Theme.Hover;
+        public override Color MenuItemSelectedGradientBegin => Theme.Hover;
+        public override Color MenuItemSelectedGradientEnd => Theme.Hover;
+        public override Color MenuItemPressedGradientBegin => Theme.Pressed;
+        public override Color MenuItemPressedGradientMiddle => Theme.Pressed;
+        public override Color MenuItemPressedGradientEnd => Theme.Pressed;
+        public override Color MenuItemBorder => Theme.Hairline;
+        public override Color MenuBorder => Theme.Hairline;
+        public override Color ToolStripDropDownBackground => Theme.Chrome;
     }
 }

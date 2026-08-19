@@ -27,6 +27,7 @@
          to them is checked in the raster gate, where GDI+ lives. -->
     <Compile Include="..\Timeline.cs" Link="Timeline.cs" />
     <Compile Include="..\CropGeometry.cs" Link="CropGeometry.cs" />
+    <Compile Include="..\CalloutPlacement.cs" Link="CalloutPlacement.cs" />
     <!-- The overlay toolbar's geometry, from the UI lane. Pure arithmetic, so
          it belongs on this side of the gate rather than the raster one. -->
     <Compile Include="..\Ui\OverlayToolbarLayout.cs" Link="OverlayToolbarLayout.cs" />

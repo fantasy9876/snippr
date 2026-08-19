@@ -73,6 +73,11 @@ sealed class OverlayForm : Form
         _virtualBounds = virtualBounds;
         FormBorderStyle = FormBorderStyle.None;
         StartPosition = FormStartPosition.Manual;
+        // WinForms clamps Form.Size to SystemInformation.MaxWindowTrackSize.
+        // That metric is the whole desktop, so asking for the virtual screen
+        // is within it; the ceiling is set anyway, before the bounds, so the
+        // window is never the thing that trims itself.
+        MaximumSize = virtualBounds.Size;
         Bounds = virtualBounds;
         TopMost = true;
         ShowInTaskbar = false;
@@ -82,6 +87,24 @@ sealed class OverlayForm : Form
         SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint
             | ControlStyles.OptimizedDoubleBuffer, true);
     }
+
+    /// What the window asked for and what it got. `MaxWindowTrackSize` is the
+    /// whole DESKTOP, not the primary monitor, so a window asking for the
+    /// virtual screen is not trimmed — but that is a claim about someone
+    /// else's machine, and this line is how it gets checked on theirs.
+    ///
+    /// Measured at Shown, not at handle creation: the borderless style is not
+    /// applied yet at creation, so the client area reads short there and the
+    /// one line someone sends us to settle this would start the argument
+    /// again.
+    protected override void OnShown(EventArgs e)
+    {
+        base.OnShown(e);
+        Diag.Click(
+            "overlay",
+            $"window asked={_virtualBounds.Size} got={Size} client={ClientSize}");
+    }
+
 
     Rectangle? SelectionLocal
     {

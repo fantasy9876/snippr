@@ -7,11 +7,39 @@ using Windows.Media.Ocr;
 
 namespace Snippr;
 
+/// Which recognizer the user wants, mirroring macOS's `OCRLanguage`. Stored
+/// by name; see AppSettings.OcrLanguage.
+enum OcrLanguagePreference { EnglishPlus, VietnamesePlus, Auto }
+
 // ---------- OCR (Windows.Media.Ocr — offline, uses installed language packs) ----------
 
 static class OcrService
 {
-    public static async Task<string> RecognizeAsync(Bitmap bmp)
+    /// Recognition outcome: the text, plus what to say when the engine that
+    /// answered is not the one that was asked for. Silence is what made
+    /// Vietnamese look like a font bug — English recognizing Vietnamese
+    /// returns confident nonsense, not an error.
+    public readonly record struct OcrResult(string Text, string? LanguageWarning);
+
+    /// The recognizer this build would like, in order of preference, mirroring
+    /// macOS's OCRLanguage. `Auto` asks Windows for the user's own profile
+    /// languages and accepts whatever that gives.
+    static string[] PreferredTags(OcrLanguagePreference pref) => pref switch
+    {
+        OcrLanguagePreference.EnglishPlus => ["en-US", "vi-VN"],
+        OcrLanguagePreference.VietnamesePlus => ["vi-VN", "en-US"],
+        _ => [],
+    };
+
+    static readonly HashSet<string> _warnedLanguages = new();
+
+    static OcrEngine? EngineFor(string tag) =>
+        OcrEngine.AvailableRecognizerLanguages.Any(
+            l => string.Equals(l.LanguageTag, tag, StringComparison.OrdinalIgnoreCase))
+            ? OcrEngine.TryCreateFromLanguage(new Windows.Globalization.Language(tag))
+            : null;
+
+    public static async Task<OcrResult> RecognizeAsync(Bitmap bmp)
     {
         using var ms = new MemoryStream();
         bmp.Save(ms, ImageFormat.Png);
@@ -19,12 +47,46 @@ static class OcrService
         var decoder = await BitmapDecoder.CreateAsync(ms.AsRandomAccessStream());
         using var soft = await decoder.GetSoftwareBitmapAsync();
 
-        var engine = OcrEngine.TryCreateFromUserProfileLanguages()
+        var pref = AppSettings.Current.OcrPreference;
+        var wanted = PreferredTags(pref);
+        OcrEngine? engine = null;
+        foreach (var tag in wanted)
+        {
+            engine = EngineFor(tag);
+            if (engine != null) break;
+        }
+        engine ??= OcrEngine.TryCreateFromUserProfileLanguages()
             ?? OcrEngine.TryCreateFromLanguage(new Windows.Globalization.Language("en-US"));
-        if (engine == null) return "";
+
+        var used = engine?.RecognizerLanguage.LanguageTag ?? "none";
+        // Which language answered is the whole diagnosis when the text comes
+        // back wrong: Windows ships no Vietnamese recognizer, so asking for
+        // one lands on English, and English reading Vietnamese returns
+        // confident nonsense rather than an error anyone can see.
+        Diag.Click(
+            "ocr",
+            $"pref={pref} wanted={string.Join("|", wanted)} used={used} available="
+            + string.Join(
+                "|",
+                OcrEngine.AvailableRecognizerLanguages.Select(l => l.LanguageTag)));
+        if (engine == null) return new OcrResult("", "No text recognizer is installed");
+
+        string? warning = null;
+        if (wanted.Length > 0
+            && !string.Equals(used, wanted[0], StringComparison.OrdinalIgnoreCase))
+        {
+            warning = pref == OcrLanguagePreference.VietnamesePlus
+                ? $"Windows không có gói OCR tiếng Việt — đang đọc bằng {used}"
+                : $"Không có bộ nhận dạng {wanted[0]} — đang đọc bằng {used}";
+            // Once per run. The same recognizer answers every capture, so
+            // repeating it turns a useful sentence into noise the user learns
+            // to dismiss without reading.
+            if (!_warnedLanguages.Add(warning)) warning = null;
+        }
 
         var result = await engine.RecognizeAsync(soft);
-        return string.Join("\n", result.Lines.Select(l => l.Text));
+        return new OcrResult(
+            string.Join("\n", result.Lines.Select(l => l.Text)), warning);
     }
 }
 
@@ -75,9 +137,12 @@ sealed class TextResultForm : Form
     public static async void RunOcrFlow(Bitmap image, bool autoTranslate = false)
     {
         string text;
+        string? languageWarning = null;
         try
         {
-            text = await OcrService.RecognizeAsync(image);
+            var recognized = await OcrService.RecognizeAsync(image);
+            text = recognized.Text;
+            languageWarning = recognized.LanguageWarning;
         }
         catch
         {
@@ -92,7 +157,12 @@ sealed class TextResultForm : Form
             ToastForm.Show("No text found");
             return;
         }
-        try { Clipboard.SetText(text); } catch { }
+        // UnicodeText by name: the default already is Unicode, but an ANSI
+        // round trip is exactly how accented text turns into the "font bug"
+        // this flow was reported for, so the format is stated rather than
+        // assumed.
+        try { Clipboard.SetText(text, TextDataFormat.UnicodeText); } catch { }
+        if (languageWarning != null) ToastForm.Show(languageWarning);
         var f = new TextResultForm(text);
         f.Show();
         f.Activate();

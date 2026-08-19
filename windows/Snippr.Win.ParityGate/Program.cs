@@ -18,6 +18,7 @@ static class Program
     {
         int failed = 0;
         failed += Check("win-tooltip-catalog-parity", CatalogParity());
+        failed += Check("win-overlay-tool-order-matches-mac", OverlayToolOrder());
         failed += Check("win-backdrop-presets-match-spec", PresetsMatchSpec());
         failed += Check("win-backdrop-compose-geometry", ComposeGeometry());
         failed += Check("win-backdrop-undo-timeline", UndoTimeline());
@@ -31,6 +32,7 @@ static class Program
         failed += Check("win-editor-actions-match-catalog", EditorActionsMatchCatalog());
         failed += Check("win-backdrop-corner-radius-table", CornerRadiusTable());
         failed += Check("win-chrome-fits-at-every-dpi", ChromeFitsAtEveryDpi());
+        failed += Check("win-magnifier-callout-clamped", MagnifierCalloutClamped());
         if (pending > 0)
             Console.WriteLine($"{pending} PARITY GATE(S) PENDING — not a pass");
         Console.WriteLine(failed == 0
@@ -95,7 +97,7 @@ static class Program
     {
         var f = new List<string>(
             OverlayToolbarLayout.GateFixtures(
-                ToolCatalog.OverlayTools.Count(), ToolCatalog.OverlayActions.Count()));
+                ToolCatalog.RailCount, ToolCatalog.StripCount));
         // The layout is asked about the catalog's real sizes above; this makes
         // the dependency explicit, so a silent default cannot stand in for it.
         if (ToolCatalog.OverlayTools.Count() != 12) f.Add("overlay tool count moved");
@@ -115,7 +117,7 @@ static class Program
         var metrics = OverlayToolbarLayout.Metrics.Standard;
         var area = OverlayToolbarLayout.Compute(
             selection, screen,
-            ToolCatalog.OverlayTools.Count(), ToolCatalog.OverlayActions.Count(),
+            ToolCatalog.RailCount, ToolCatalog.StripCount,
             18f, metrics);
         if (area is not { } placed) { f.Add("no layout for the fixture"); return f; }
 
@@ -543,11 +545,11 @@ static class Program
             var screen = new RectangleF(0, 0, 1920, 1080);
             var selection = new RectangleF(920, 520, 80, 40);
             var area = OverlayToolbarLayout.Compute(
-                selection, screen, ToolCatalog.OverlayTools.Count(),
-                ToolCatalog.OverlayActions.Count(), 18 * scale, metrics);
+                selection, screen, ToolCatalog.RailCount,
+                ToolCatalog.StripCount, 18 * scale, metrics);
             if (area is not { } placed) { f.Add($"{dpi}dpi: overlay layout null"); continue; }
-            if (placed.ToolButtonFrames.Length != ToolCatalog.OverlayTools.Count()
-                || placed.ActionButtonFrames.Length != ToolCatalog.OverlayActions.Count())
+            if (placed.ToolButtonFrames.Length != ToolCatalog.RailCount
+                || placed.ActionButtonFrames.Length != ToolCatalog.StripCount)
                 f.Add($"{dpi}dpi: overlay dropped buttons");
             foreach (var b in placed.ToolButtonFrames.Concat(placed.ActionButtonFrames))
                 if (b.Width < 1 || b.Height < 1)
@@ -561,6 +563,60 @@ static class Program
             f.Add(
                 "the 200% case now fits 1366px — check that overflow is still " +
                 "needed, or tighten this expectation");
+        return f;
+    }
+
+    /// Counterpart of Mac `sliceB-magnifier-callout-clamped` (f6f475c). The
+    /// old independent X/Y flip parks a 2.5× loupe on top of a large source —
+    /// that is the overlap the owner photographed on 1.2.11. These three
+    /// cases are the ones that gate was rewritten to catch.
+    static List<string> MagnifierCalloutClamped()
+    {
+        var f = new List<string>();
+        const float zoom = CalloutPlacement.DefaultZoom;
+
+        // Owner's 1.2.11 report: 400×230 in 1280×1121. 2.5× does not fit
+        // beside it; flipping left used to land on the source. The callout
+        // must stay off the source, inside the document, and at least 1×.
+        var big = new Rectangle(150, 500, 400, 230);
+        var bigDoc = new Rectangle(0, 0, 1280, 1121);
+        var bigOut = CalloutPlacement.Place(big, bigDoc, zoom);
+        if (bigOut.IntersectsWith(big))
+            f.Add($"large source covered {bigOut}");
+        if (!bigDoc.Contains(bigOut))
+            f.Add($"large callout outside {bigOut}");
+        if (bigOut.Width < big.Width)
+            f.Add($"large callout below 1x {bigOut}");
+        var aspectX = bigOut.Width / (double)big.Width;
+        var aspectY = bigOut.Height / (double)big.Height;
+        if (Math.Abs(aspectX - aspectY) > 0.01)
+            f.Add($"large callout aspect {bigOut}");
+
+        // Room only BELOW (visual bottom of the picture — Mac's `below` with
+        // Y flipped). A source hugging the top has no strip left or right.
+        var wide = new Rectangle(10, 10, 180, 30);
+        var doc = new Rectangle(0, 0, 200, 200);
+        var wideOut = CalloutPlacement.Place(wide, doc, zoom);
+        if (wideOut.IntersectsWith(wide) || !doc.Contains(wideOut)
+            || wideOut.Y < wide.Bottom)
+            f.Add($"wide source {wideOut}");
+
+        // No room anywhere: 1×, inside the document, overlap accepted
+        // because nothing else is possible.
+        var huge = new Rectangle(10, 10, 180, 180);
+        var hugeOut = CalloutPlacement.Place(huge, doc, zoom);
+        if (!doc.Contains(hugeOut) || hugeOut.Width != 180)
+            f.Add($"huge source {hugeOut}");
+
+        // And the small source that used to pin right-and-below at 2.5× now
+        // prefers right (full zoom fits). Independent X/Y would still pass
+        // this; the large case above is what turns red if the old law returns.
+        var small = new Rectangle(20, 20, 40, 30);
+        var smallOut = CalloutPlacement.Place(small, doc, zoom);
+        if (smallOut != new Rectangle(76, 0, 100, 75))
+            f.Add($"small {smallOut} want 76,0,100x75");
+        if (smallOut.IntersectsWith(small))
+            f.Add($"small covered {smallOut}");
         return f;
     }
 
@@ -583,6 +639,76 @@ static class Program
     }
 
     // ---------- catalog ----------
+
+    /// The review rail must read left-to-right the same as macOS's
+    /// `OverlayAnnotationTool.areaReviewTools`. The owner asked for one
+    /// muscle memory across platforms, and "they look the same today" is not
+    /// a property any code holds — this sequence is.
+    ///
+    /// macOS lists `pixelateText` between blur and magnifier. Windows has no
+    /// such tool, so it is absent here BY NAME: the day one is added, this
+    /// gate is where the order gets decided rather than discovered.
+    static List<string> OverlayToolOrder()
+    {
+        var f = new List<string>();
+        string[] mac =
+        [
+            "select", "pen", "arrow", "rect", "text", "line",
+            "oval", "highlight", "counter", "pixelate", "spotlight",
+            "magnifier",
+        ];
+        var win = ToolCatalog.OverlayTools.Select(e => e.IconKey).ToArray();
+        if (!win.SequenceEqual(mac))
+            f.Add($"order [{string.Join(",", win)}] want [{string.Join(",", mac)}]");
+
+        // The order list and the InOverlay flags are two statements about the
+        // same thing; if they disagree a tool either never reaches the rail
+        // or is looked up and is not there.
+        var flagged = ToolCatalog.Entries.Where(e => e.InOverlay)
+            .Select(e => e.Tool).OrderBy(t => t).ToArray();
+        var ordered = ToolCatalog.OverlayOrderForTesting.OrderBy(t => t).ToArray();
+        if (!flagged.SequenceEqual(ordered))
+            f.Add($"order set [{string.Join(",", ordered)}] vs InOverlay [{string.Join(",", flagged)}]");
+        if (ToolCatalog.OverlayOrderForTesting.Distinct().Count()
+            != ToolCatalog.OverlayOrderForTesting.Count())
+            f.Add("duplicate tool in overlay order");
+
+        // The rail is not just the tools. macOS puts Backdrop, Color, Undo
+        // and Redo at the END of it and keeps the strip for what ends the
+        // session; Windows had all eleven actions on the strip, so the two
+        // surfaces did not have the same shape at all.
+        string[] rail =
+        [
+            .. mac,
+            "backdrop", "color", "undo", "redo",
+        ];
+        var winRail = ToolCatalog.OverlayTools.Select(e => e.IconKey)
+            .Concat(ToolCatalog.RailActions.Select(a => a.IconKey)).ToArray();
+        if (!winRail.SequenceEqual(rail))
+            f.Add($"rail [{string.Join(",", winRail)}] want [{string.Join(",", rail)}]");
+
+        string[] strip = ["copy", "save", "pin", "ocr", "translate", "editor", "close"];
+        var winStrip = ToolCatalog.StripActions.Select(a => a.IconKey).ToArray();
+        if (!winStrip.SequenceEqual(strip))
+            f.Add($"strip [{string.Join(",", winStrip)}] want [{string.Join(",", strip)}]");
+
+        // What the layout is asked to place has to match what the toolbar
+        // will actually hand it; these are two readings of one split.
+        if (ToolCatalog.RailCount != winRail.Length)
+            f.Add($"RailCount {ToolCatalog.RailCount} vs rail {winRail.Length}");
+        if (ToolCatalog.StripCount != winStrip.Length)
+            f.Add($"StripCount {ToolCatalog.StripCount} vs strip {winStrip.Length}");
+        if (ToolCatalog.RailActions.Count() + ToolCatalog.StripActions.Count()
+            != ToolCatalog.OverlayActions.Count())
+            f.Add("rail + strip is not the whole overlay action set");
+
+        // Backdrop advertises D, so the surface must route D. A hint naming a
+        // key nobody routes is a promise the app breaks the first time it is
+        // believed.
+        if (ToolCatalog.Entry(OverlayAction.Backdrop)?.KeyLabel != "D")
+            f.Add("Backdrop does not advertise D");
+        return f;
+    }
 
     static List<string> CatalogParity()
     {

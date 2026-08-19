@@ -3,18 +3,35 @@ using System.Drawing.Drawing2D;
 namespace Snippr;
 
 /// Floating overlay chrome. Raises IconKey strings only — no OverlayAction
-/// enum (that lives in Honey's ToolCatalog). Honey binds the catalog on rebase:
-/// <c>SetTools(ToolCatalog.OverlayTools.Select(e => (e.IconKey, e.HintText)))</c>
-/// and maps the raised key back to the catalog row.
+/// enum (that lives in ToolCatalog).
+///
+/// This control deliberately does NOT answer WM_NCHITTEST with HTTRANSPARENT
+/// outside its rail and strip. It used to, from the days when it was a shell
+/// with no host; `AreaReviewForm` then docked it Fill over the whole surface
+/// and routed the picture's mouse events THROUGH it, and the two rules were
+/// never reconciled. Click-through won, so every press on the picture fell to
+/// a form that has no mouse handlers: no drawing, no crop drag, no cursor —
+/// which is what "none of the buttons work" turned out to be.
 sealed class OverlayToolbar : Control
 {
     public event EventHandler<string>? ToolSelected;
     public event EventHandler<string>? ActionInvoked;
+    /// The plate's corner rounding, chosen from the backdrop menu. Not an
+    /// action id: it carries a style, and it does not displace the tool.
+    public event EventHandler<BackdropCornerStyle>? CornerChosen;
 
     readonly ChromePanel _rail = new();
     readonly ChromePanel _strip = new();
     readonly List<OverlayButton> _toolButtons = new();
     readonly List<OverlayButton> _actionButtons = new();
+    /// Rail order: the tools, then the four actions that live with them.
+    /// Kept separately from `_toolButtons` because those four are NOT tools —
+    /// they must never be ticked as the active one — and separately from the
+    /// strip because the layout places the rail as a single run of buttons.
+    readonly List<OverlayButton> _railButtons = new();
+    readonly List<(string Key, string Hint)> _toolSpecs = new();
+    readonly List<(string Key, string Hint)> _railActionSpecs = new();
+    readonly List<(string Key, string Hint)> _stripActionSpecs = new();
     readonly HoverHint _hint;
     readonly BackdropMenu _menu = new();
     Color _color = Theme.Accent;
@@ -37,12 +54,16 @@ sealed class OverlayToolbar : Control
         ("pixelate", "Pixelate (B)"),
     ];
 
-    static readonly (string Key, string Hint)[] DefaultActions =
+    static readonly (string Key, string Hint)[] DefaultRailActions =
     [
-        ("backdrop", "Backdrop"),
+        ("backdrop", "Backdrop (D)"),
         ("color", "Annotation color"),
         ("undo", "Undo (Ctrl+Z)"),
         ("redo", "Redo (Ctrl+Y)"),
+    ];
+
+    static readonly (string Key, string Hint)[] DefaultActions =
+    [
         ("copy", "Copy to clipboard (Ctrl+C)"),
         ("save", "Save as… (Ctrl+S)"),
         ("pin", "Pin to screen (Ctrl+P)"),
@@ -60,11 +81,12 @@ sealed class OverlayToolbar : Control
         Controls.Add(_rail);
         Controls.Add(_strip);
         SetTools(DefaultTools);
-        SetActions(DefaultActions);
+        SetActions(DefaultRailActions, DefaultActions);
         _hint = HoverHint.Attach(this, HintAt);
         // Honey binds Menu.PresetChosen for compose. Forward the same id so a
         // single ActionInvoked listener can see "none|ocean|sunset|mint|graphite".
         _menu.PresetChosen += (_, id) => ActionInvoked?.Invoke(this, id);
+        _menu.CornerChosen += (_, style) => CornerChosen?.Invoke(this, style);
     }
 
     /// Raises exactly what a click on that button raises. The headless smoke
@@ -80,15 +102,29 @@ sealed class OverlayToolbar : Control
 
     public void SetTools(IEnumerable<(string IconKey, string Hint)> tools)
     {
-        Rebuild(_rail, _toolButtons, tools, isTool: true);
-        if (_havePlace) Place(_lastSelection, _lastScreen);
+        _toolSpecs.Clear();
+        _toolSpecs.AddRange(tools.Select(t => (t.IconKey, t.Hint)));
+        Rebuild();
     }
 
-    public void SetActions(IEnumerable<(string IconKey, string Hint)> actions)
+    /// Two lists, because the rail and the strip are two different places and
+    /// the rail's own contents are tools THEN actions. Rebuilding both at once
+    /// is what keeps that order true: filling one panel at a time meant
+    /// clearing the rail's tools to add an action to it.
+    public void SetActions(
+        IEnumerable<(string IconKey, string Hint)> railActions,
+        IEnumerable<(string IconKey, string Hint)> stripActions)
     {
-        Rebuild(_strip, _actionButtons, actions, isTool: false);
-        if (_havePlace) Place(_lastSelection, _lastScreen);
+        _railActionSpecs.Clear();
+        _railActionSpecs.AddRange(railActions.Select(a => (a.IconKey, a.Hint)));
+        _stripActionSpecs.Clear();
+        _stripActionSpecs.AddRange(stripActions.Select(a => (a.IconKey, a.Hint)));
+        Rebuild();
     }
+
+    /// What the layout has to place on each side.
+    public int RailCount => _railButtons.Count;
+    public int StripCount => _stripActionSpecs.Count;
 
     public void SetActive(string? iconKey)
     {
@@ -122,7 +158,7 @@ sealed class OverlayToolbar : Control
         _havePlace = true;
         var metrics = OverlayToolbarLayout.Metrics.Standard.Scaled(DeviceDpi / 96f);
         var area = OverlayToolbarLayout.Compute(
-            selection, screen, _toolButtons.Count, _actionButtons.Count,
+            selection, screen, RailCount, StripCount,
             Theme.HandleHit * DeviceDpi / 96f, metrics);
         if (area is not { } placed)
         {
@@ -134,13 +170,15 @@ sealed class OverlayToolbar : Control
         _strip.Visible = true;
         _rail.Bounds = Rectangle.Round(placed.ToolFrame);
         _strip.Bounds = Rectangle.Round(placed.ActionFrame);
-        PlaceButtons(_toolButtons, placed.ToolButtonFramesLocal);
-        PlaceButtons(_actionButtons, placed.ActionButtonFramesLocal);
+        PlaceButtons(_railButtons, placed.ToolButtonFramesLocal);
+        PlaceButtons(
+            _actionButtons.Skip(_railActionSpecs.Count).ToList(),
+            placed.ActionButtonFramesLocal);
     }
 
     string? HintAt(Point pt)
     {
-        foreach (var b in _toolButtons.Concat(_actionButtons))
+        foreach (var b in _railButtons.Concat(_actionButtons))
         {
             var screen = b.RectangleToScreen(b.ClientRectangle);
             var local = RectangleToClient(screen);
@@ -149,24 +187,56 @@ sealed class OverlayToolbar : Control
         return null;
     }
 
-    void Rebuild(
-        ChromePanel panel,
-        List<OverlayButton> list,
-        IEnumerable<(string IconKey, string Hint)> items,
-        bool isTool)
+    void Rebuild()
     {
-        foreach (var b in list) b.Dispose();
-        list.Clear();
-        panel.Controls.Clear();
-        foreach (var (key, hint) in items)
+        foreach (var b in _railButtons.Concat(_actionButtons)) b.Dispose();
+        _toolButtons.Clear();
+        _actionButtons.Clear();
+        _railButtons.Clear();
+        _rail.Controls.Clear();
+        _strip.Controls.Clear();
+
+        foreach (var (key, hint) in _toolSpecs)
         {
-            var btn = new OverlayButton(key, hint);
-            if (key == "color") btn.Tint = _color;
-            btn.Click += (_, _) => OnButton(btn, isTool);
-            panel.Controls.Add(btn);
-            list.Add(btn);
+            var btn = Make(key, hint, isTool: true);
+            _rail.Controls.Add(btn);
+            _toolButtons.Add(btn);
+            _railButtons.Add(btn);
         }
-        if (isTool) SetActive(_active);
+        foreach (var (key, hint) in _railActionSpecs)
+        {
+            var btn = Make(key, hint, isTool: false);
+            _rail.Controls.Add(btn);
+            _actionButtons.Add(btn);
+            _railButtons.Add(btn);
+        }
+        foreach (var (key, hint) in _stripActionSpecs)
+        {
+            var btn = Make(key, hint, isTool: false);
+            _strip.Controls.Add(btn);
+            _actionButtons.Add(btn);
+        }
+        SetActive(_active);
+        if (_havePlace) Place(_lastSelection, _lastScreen);
+    }
+
+    OverlayButton Make(string key, string hint, bool isTool)
+    {
+        var btn = new OverlayButton(key, hint);
+        if (key == "color") btn.Tint = _color;
+        btn.Click += (_, _) => OnButton(btn, isTool);
+        return btn;
+    }
+
+    /// Opens the preset menu from the Backdrop button, as a click would.
+    /// The D key routes here rather than synthesising a click, so the menu
+    /// appears under the button either way.
+    public void OpenBackdropMenu()
+    {
+        var btn = _actionButtons.FirstOrDefault(b => b.IconKey == "backdrop");
+        if (btn == null) return;
+        _hint.HideNow();
+        _menu.Show(btn.PointToScreen(new Point(0, btn.Height)));
     }
 
     void OnButton(OverlayButton btn, bool isTool)
@@ -192,22 +262,6 @@ sealed class OverlayToolbar : Control
         int n = Math.Min(buttons.Count, local.Length);
         for (int i = 0; i < n; i++)
             buttons[i].Bounds = Rectangle.Round(local[i]);
-    }
-
-    protected override void WndProc(ref Message m)
-    {
-        const int WmNcHitTest = 0x0084;
-        const int HtTransparent = -1;
-        if (m.Msg == WmNcHitTest)
-        {
-            var pt = PointToClient(Control.MousePosition);
-            if (!_rail.Bounds.Contains(pt) && !_strip.Bounds.Contains(pt))
-            {
-                m.Result = HtTransparent;
-                return;
-            }
-        }
-        base.WndProc(ref m);
     }
 
     protected override void Dispose(bool disposing)

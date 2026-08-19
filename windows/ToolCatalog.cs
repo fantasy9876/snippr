@@ -88,7 +88,7 @@ static class ToolCatalog
 
     public static readonly IReadOnlyList<ActionEntry> Actions = new[]
     {
-        new ActionEntry(OverlayAction.Backdrop, "Backdrop", "", "backdrop", true, true),
+        new ActionEntry(OverlayAction.Backdrop, "Backdrop", "D", "backdrop", true, true),
         new ActionEntry(OverlayAction.Color, "Annotation color", "", "color", true, true),
         new ActionEntry(OverlayAction.Undo, "Undo", "Ctrl+Z", "undo", true, true),
         new ActionEntry(OverlayAction.Redo, "Redo", "Ctrl+Y", "redo", true, true),
@@ -105,14 +105,60 @@ static class ToolCatalog
     public static IEnumerable<ToolEntry> EditorTools =>
         Entries.Where(e => e.InEditor);
 
+    /// The review rail is ordered like macOS's `OverlayAnnotationTool`, which
+    /// is deliberately NOT the editor's order: the overlay leads with the two
+    /// tools a screenshot is annotated with most (pen, arrow) while the editor
+    /// leads with its shape family. Keeping the order here rather than in the
+    /// `Tool` enum leaves stroke-width keys (`nameof(Tool.X)`) and the editor
+    /// rail untouched — the parity gate pins this sequence against the macOS
+    /// one so the two rails cannot drift again.
+    ///
+    /// macOS also offers `pixelateText` here, which this build has no tool
+    /// for; that is a missing FEATURE, not an ordering difference.
+    static readonly Tool[] OverlayOrder =
+    [
+        Tool.Select, Tool.Pen, Tool.Arrow, Tool.Rect, Tool.Text, Tool.Line,
+        Tool.Oval, Tool.Highlight, Tool.Counter, Tool.Blur, Tool.Spotlight,
+        Tool.Magnifier,
+    ];
+
     public static IEnumerable<ToolEntry> OverlayTools =>
-        Entries.Where(e => e.InOverlay);
+        OverlayOrder.Select(t => Entry(t)).OfType<ToolEntry>();
+
+    /// The overlay order, as a set, must stay exactly the rows marked
+    /// `InOverlay` — otherwise a tool added to the catalog would silently
+    /// never reach the rail, or one removed would throw at startup.
+    internal static IEnumerable<Tool> OverlayOrderForTesting => OverlayOrder;
 
     public static IEnumerable<ActionEntry> EditorActions =>
         Actions.Where(a => a.InEditor);
 
     public static IEnumerable<ActionEntry> OverlayActions =>
         Actions.Where(a => a.InOverlay);
+
+    /// The four actions macOS keeps on the TOOL rail, in its order, rather
+    /// than on the action strip: Backdrop is a document style, Color and
+    /// Undo/Redo belong with the drawing you are doing, and the strip is for
+    /// what ENDS the session. Windows had all eleven on the strip, so the two
+    /// surfaces did not even have the same shape.
+    static readonly OverlayAction[] RailActionOrder =
+    [
+        OverlayAction.Backdrop, OverlayAction.Color,
+        OverlayAction.Undo, OverlayAction.Redo,
+    ];
+
+    public static IEnumerable<ActionEntry> RailActions =>
+        RailActionOrder.Select(a => Entry(a)).OfType<ActionEntry>();
+
+    public static IEnumerable<ActionEntry> StripActions =>
+        Actions.Where(a => a.InOverlay && !RailActionOrder.Contains(a.Action));
+
+    /// What the LAYOUT counts, as opposed to what the catalog counts: the
+    /// rail carries the tools plus those four, the strip carries the rest.
+    /// Production and the gates both read these, so a split that moves
+    /// cannot move in one of them only.
+    public static int RailCount => OverlayTools.Count() + RailActionOrder.Length;
+    public static int StripCount => StripActions.Count();
 
     public static ToolEntry? Entry(Tool tool)
     {
