@@ -99,6 +99,15 @@ sealed class OverlayForm : Form
         base.WndProc(ref m);
     }
 
+    protected override void OnHandleCreated(EventArgs e)
+    {
+        base.OnHandleCreated(e);
+        Native.ForceClientSize(Handle, _virtualBounds.Size);
+        Diag.Click(
+            "overlay",
+            $"window asked={_virtualBounds.Size} got={Size} client={ClientSize}");
+    }
+
 
     Rectangle? SelectionLocal
     {

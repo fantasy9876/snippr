@@ -347,6 +347,15 @@ sealed class AreaReviewForm : Form
         base.WndProc(ref m);
     }
 
+    protected override void OnHandleCreated(EventArgs e)
+    {
+        base.OnHandleCreated(e);
+        Native.ForceClientSize(Handle, _virtualBounds.Size);
+        Diag.Click(
+            "review",
+            $"window asked={_virtualBounds.Size} got={Size} client={ClientSize}");
+    }
+
     void CanvasMouseDown(MouseEventArgs e)
     {
         CommitText();

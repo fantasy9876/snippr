@@ -110,6 +110,9 @@ sealed class HoverHint : Form
         return placed;
     }
 
+    /// Why the last hint did or did not appear, for the gate to quote.
+    internal string LastPlacementForTesting { get; private set; } = "none";
+
     protected override bool ShowWithoutActivation => true;
 
     protected override CreateParams CreateParams
@@ -221,6 +224,13 @@ sealed class HoverHint : Form
         var size = Measure(_shown);
         var allowed = AllowedRect();
         var placed = Place(size, _anchor, allowed, HostDpi);
+        // A hint that DECLINES to appear looks exactly like one that is
+        // broken. The anchor and the allowed rect are the whole story, so
+        // keep the last decision readable — this file is compiled into the
+        // raster gate too, which has no logger.
+        LastPlacementForTesting =
+            $"text=\"{_shown}\" anchor={_anchor} allowed={allowed} "
+            + $"size={size} placed={(placed is null ? "none" : placed.ToString())}";
         if (placed is null)
         {
             HideNow();

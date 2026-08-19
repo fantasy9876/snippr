@@ -247,13 +247,15 @@ static class TestEntry
                 // clamp happening (asked 1280x800, client 1044x788). The
                 // runner's screen is smaller than the picture, so this is the
                 // real test of the WM_GETMINMAXINFO answer.
-                var want = review.RequestedBoundsForTesting;
-                if (review.Bounds != want)
+                // SIZE only: where the window sits is the caller's business,
+                // and the smoke parks this one off-screen on purpose.
+                var want = review.RequestedBoundsForTesting.Size;
+                if (review.Size != want)
                     throw new InvalidOperationException(
-                        $"bounds {review.Bounds} != requested {want}");
-                if (review.ClientSize != want.Size)
+                        $"window {review.Size} != requested {want}");
+                if (review.ClientSize != want)
                     throw new InvalidOperationException(
-                        $"client {review.ClientSize} != requested {want.Size}");
+                        $"client {review.ClientSize} != requested {want}");
             });
             Step("review-canvas-click-reaches-tool", () =>
             {
@@ -327,7 +329,9 @@ static class TestEntry
                     Thread.Sleep(30);
                 }
                 if (!IsWindowVisible(hint.Handle))
-                    throw new InvalidOperationException("hint never became visible");
+                    throw new InvalidOperationException(
+                        "hint never became visible — "
+                        + hint.LastPlacementForTesting);
                 long ex = (long)GetWindowLongPtr(hint.Handle, GwlExStyle);
                 if ((ex & WsExTopmost) == 0)
                     throw new InvalidOperationException(

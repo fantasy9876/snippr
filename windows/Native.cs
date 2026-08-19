@@ -25,6 +25,29 @@ static class Native
 
     public const int WM_GETMINMAXINFO = 0x0024;
 
+    const uint SwpNomove = 0x0002;
+    const uint SwpNozorder = 0x0004;
+    const uint SwpNoactivate = 0x0010;
+
+    [DllImport("user32.dll", SetLastError = true)]
+    static extern bool SetWindowPos(
+        IntPtr hWnd, IntPtr after, int x, int y, int cx, int cy, uint flags);
+
+    /// Resize the window past what WinForms was willing to store.
+    ///
+    /// `Form.Size` is clamped to the primary monitor's track size when it is
+    /// SET, before any handle exists, so answering WM_GETMINMAXINFO only
+    /// raises the ceiling — it cannot grow a window that was already trimmed
+    /// on the way in. Position is left alone (SWP_NOMOVE) so a caller that
+    /// parked the window somewhere keeps it there.
+    public static void ForceClientSize(IntPtr handle, Size size)
+    {
+        if (handle == IntPtr.Zero) return;
+        SetWindowPos(
+            handle, IntPtr.Zero, 0, 0, size.Width, size.Height,
+            SwpNomove | SwpNozorder | SwpNoactivate);
+    }
+
     [StructLayout(LayoutKind.Sequential)]
     public struct POINT
     {
