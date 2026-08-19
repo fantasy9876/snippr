@@ -63,3 +63,36 @@ static class AreaReviewCrop
             Math.Max(left, right), Math.Max(top, bottom));
     }
 }
+
+/// Pointer shape for the review surface, as a table the parity gate can
+/// read. The WinForms `Cursor` mapping lives next to the form; this is the
+/// (tool, hit) answer both `SelectTool` and `CanvasMouseMove` must use, so a
+/// tool switch cannot leave a leftover grip cursor.
+enum ReviewCursorKind
+{
+    Cross,
+    IBeam,
+    SizeAll,
+    SizeWE,
+    SizeNS,
+    SizeNWSE,
+    SizeNESW,
+}
+
+static class AreaReviewCursor
+{
+    public static ReviewCursorKind For(Tool tool, CropGrip grip)
+    {
+        if (tool == Tool.Text) return ReviewCursorKind.IBeam;
+        if (tool != Tool.Select) return ReviewCursorKind.Cross;
+        return grip switch
+        {
+            CropGrip.TopLeft or CropGrip.BottomRight => ReviewCursorKind.SizeNWSE,
+            CropGrip.TopRight or CropGrip.BottomLeft => ReviewCursorKind.SizeNESW,
+            CropGrip.Top or CropGrip.Bottom => ReviewCursorKind.SizeNS,
+            CropGrip.Left or CropGrip.Right => ReviewCursorKind.SizeWE,
+            CropGrip.Inside => ReviewCursorKind.SizeAll,
+            _ => ReviewCursorKind.Cross,
+        };
+    }
+}

@@ -19,6 +19,8 @@ static class Program
         failed += Check("win-backdrop-compose-pixels", ComposePixels());
         failed += Check("win-backdrop-grain-deterministic", GrainDeterministic());
         failed += Check("win-magnifier-crop-privacy", MagnifierPrivacy());
+        failed += Check("win-magnifier-drag-frame", MagnifierDragFrame());
+        failed += Check("win-magnifier-source-frame", MagnifierSourceFrame());
         failed += Check("win-spotlight-dim", SpotlightDim());
         failed += Check("win-backdrop-export-routes", ExportRoutes());
         failed += Check("win-area-review-payloads", AreaReviewPayloads());
@@ -216,6 +218,97 @@ static class Program
         }
         if (levels.Count < 3) f.Add($"grain flat ({levels.Count} levels)");
         if (worst > 8) f.Add($"grain is not a dither (jump {worst})");
+        return f;
+    }
+
+    // ---------- magnifier drag / source frames ----------
+
+    static int Lum(Bitmap b, int x, int y)
+    {
+        var c = At(b, x, y);
+        return (c.R + c.G + c.B) / 3;
+    }
+
+    /// While the drag is live (no snapshot) the source has a 1 px white inner
+    /// hairline and a 1 px dark outer, the interior is untouched, and the
+    /// would-be callout is a dashed outline — not a 1:1 box on the source.
+    static List<string> MagnifierDragFrame()
+    {
+        var f = new List<string>();
+        const int gray = 140;
+        using var bmp = new Bitmap(200, 200, PixelFormat.Format32bppArgb);
+        using (var g = Graphics.FromImage(bmp))
+        using (var fill = new SolidBrush(Color.FromArgb(255, gray, gray, gray)))
+            g.FillRectangle(fill, 0, 0, 200, 200);
+
+        var source = new Rectangle(20, 20, 40, 30);
+        var bounds = new Rectangle(0, 0, 200, 200);
+        var callout = MagnifierAnnotation.PlaceCallout(source, bounds);
+        var mag = new MagnifierAnnotation
+        {
+            SourceRect = source, CalloutRect = callout, Snapshot = null,
+        };
+        using (var g = Graphics.FromImage(bmp))
+            AnnotationCompositor.Draw([mag], g, bmp, bounds, null);
+
+        if (Lum(bmp, 20, 35) < 200) f.Add($"left edge not white {Lum(bmp, 20, 35)}");
+        if (Lum(bmp, 19, 35) > gray - 30) f.Add($"left outer not dark {Lum(bmp, 19, 35)}");
+        if (Lum(bmp, 40, 20) < 200) f.Add($"top edge not white {Lum(bmp, 40, 20)}");
+        if (Math.Abs(Lum(bmp, 40, 35) - gray) > 2)
+            f.Add($"interior touched {Lum(bmp, 40, 35)}");
+
+        // 40×30 @ 2.5× → 100×75, parked at (60+16, 50+16).
+        if (callout != new Rectangle(76, 66, 100, 75))
+            f.Add($"callout {callout} want 76,66,100x75");
+        else
+        {
+            int inked = 0;
+            for (int y = callout.Y + 1; y < callout.Bottom - 1; y++)
+                if (Math.Abs(Lum(bmp, callout.X, y) - gray) > 40) inked++;
+            if (inked < 20) f.Add($"callout outline inked {inked}");
+        }
+
+        // Near the right edge the callout must flip left and stay inside.
+        var flipped = MagnifierAnnotation.PlaceCallout(
+            new Rectangle(150, 20, 40, 30), bounds);
+        if (flipped.Right > 200 || flipped.X < 0)
+            f.Add($"right-edge unclamped {flipped}");
+        if (flipped.X >= 150) f.Add($"did not flip left {flipped}");
+        return f;
+    }
+
+    /// After release the source frame stays, and the callout is the solid
+    /// ring it always was. Drawing a frame with no snapshot is the drag path
+    /// above; this one is the committed annotation.
+    static List<string> MagnifierSourceFrame()
+    {
+        var f = new List<string>();
+        const int gray = 140;
+        using var bmp = new Bitmap(200, 200, PixelFormat.Format32bppArgb);
+        using (var g = Graphics.FromImage(bmp))
+        using (var fill = new SolidBrush(Color.FromArgb(255, gray, gray, gray)))
+            g.FillRectangle(fill, 0, 0, 200, 200);
+
+        var source = new Rectangle(20, 20, 40, 30);
+        var bounds = new Rectangle(0, 0, 200, 200);
+        var callout = MagnifierAnnotation.PlaceCallout(source, bounds);
+        using var snapshot = AnnotationCompositor.MagnifierSnapshot(bmp, source, []);
+        if (snapshot == null) { f.Add("no snapshot"); return f; }
+        var mag = new MagnifierAnnotation
+        {
+            SourceRect = source, CalloutRect = callout, Snapshot = snapshot,
+        };
+        using (var g = Graphics.FromImage(bmp))
+            AnnotationCompositor.Draw([mag], g, bmp, bounds, null);
+
+        if (Lum(bmp, 20, 35) < 200)
+            f.Add($"source frame missing {Lum(bmp, 20, 35)}");
+        if (Lum(bmp, 19, 35) > gray - 30)
+            f.Add($"source outer missing {Lum(bmp, 19, 35)}");
+        if (Math.Abs(Lum(bmp, 40, 35) - gray) > 2)
+            f.Add($"interior touched after fill {Lum(bmp, 40, 35)}");
+        var ring = Lum(bmp, callout.X, callout.Y + callout.Height / 2);
+        if (ring < 200) f.Add($"callout ring {ring}");
         return f;
     }
 

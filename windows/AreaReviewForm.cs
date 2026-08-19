@@ -42,6 +42,28 @@ sealed class AreaReviewForm : Form
     internal void PressToolForTesting(string iconKey) =>
         _toolbar.RaiseToolForTesting(iconKey);
 
+    internal Cursor CursorForTesting
+    {
+        get => Cursor;
+        set => Cursor = value;
+    }
+
+    internal Rectangle SelectionForTesting => _session.PixelRect;
+
+    /// Smoke parks this form off-screen (`Reveal` at -32000), so it cannot
+    /// place the machine cursor and still round-trip through `PointToClient`.
+    /// Production always reads `Cursor.Position`; tests set this instead.
+    internal Point? PointerClientForTesting { get; set; }
+
+    /// Presses Magnifier and leaves the drag live, so smoke can photograph
+    /// the source frame and the dashed callout before a snapshot exists.
+    internal void DragMagnifierForTesting(Point from, Point to)
+    {
+        SelectTool(Tool.Magnifier);
+        CanvasMouseDown(new MouseEventArgs(MouseButtons.Left, 1, from.X, from.Y, 0));
+        CanvasMouseMove(new MouseEventArgs(MouseButtons.Left, 1, to.X, to.Y, 0));
+    }
+
     internal void PressActionForTesting(string iconKey) =>
         _toolbar.RaiseActionForTesting(iconKey);
 
@@ -266,7 +288,14 @@ sealed class AreaReviewForm : Form
         _tool = tool;
         _toolbar.Hint.HideNow();
         UpdateToolbarState();
+        // Re-evaluate immediately at the pointer: switching back to Select
+        // while the pointer is inside the crop must be SizeAll, not Cross
+        // until the next move. Drawing tools stay Cross regardless of hit.
+        ApplyCursor(CurrentPointerClient());
     }
+
+    Point CurrentPointerClient() =>
+        PointerClientForTesting ?? PointToClient(Cursor.Position);
 
     void CanvasMouseDown(MouseEventArgs e)
     {
@@ -363,19 +392,27 @@ sealed class AreaReviewForm : Form
             ? 0
             : BackdropSpec.CornerRadius(_session.PixelRect.Size, _session.Corners);
 
-    /// The pointer shape that matches the grip, so the crop advertises what a
-    /// drag there will do before the user commits to it. It lives here rather
-    /// than beside the arithmetic because `Cursor` is WinForms, and the
-    /// arithmetic has to compile into a gate that has no windows at all.
-    static Cursor CursorFor(CropGrip grip) => grip switch
+    /// The pointer shape that matches (tool, hit). The table lives in
+    /// `AreaReviewCursor` so the parity gate can read it; this is only the
+    /// WinForms mapping.
+    static Cursor CursorFor(Tool tool, CropGrip grip) => AreaReviewCursor.For(tool, grip) switch
     {
-        CropGrip.TopLeft or CropGrip.BottomRight => Cursors.SizeNWSE,
-        CropGrip.TopRight or CropGrip.BottomLeft => Cursors.SizeNESW,
-        CropGrip.Top or CropGrip.Bottom => Cursors.SizeNS,
-        CropGrip.Left or CropGrip.Right => Cursors.SizeWE,
-        CropGrip.Inside => Cursors.SizeAll,
+        ReviewCursorKind.IBeam => Cursors.IBeam,
+        ReviewCursorKind.SizeNWSE => Cursors.SizeNWSE,
+        ReviewCursorKind.SizeNESW => Cursors.SizeNESW,
+        ReviewCursorKind.SizeNS => Cursors.SizeNS,
+        ReviewCursorKind.SizeWE => Cursors.SizeWE,
+        ReviewCursorKind.SizeAll => Cursors.SizeAll,
         _ => Cursors.Cross,
     };
+
+    void ApplyCursor(Point px)
+    {
+        var grip = _tool == Tool.Select
+            ? AreaReviewCrop.GripAt(px, _session.PixelRect, HandleSize, ReviewCornerRadius)
+            : CropGrip.None;
+        Cursor = CursorFor(_tool, grip);
+    }
 
     void CanvasMouseMove(MouseEventArgs e)
     {
@@ -389,10 +426,8 @@ sealed class AreaReviewForm : Form
             RefreshSurface(all: true);
             return;
         }
-        if (_tool == Tool.Select && e.Button == MouseButtons.None)
-            Cursor = CursorFor(
-                AreaReviewCrop.GripAt(
-                    px, _session.PixelRect, HandleSize, ReviewCornerRadius));
+        if (e.Button == MouseButtons.None)
+            ApplyCursor(px);
         if (_movingSelection && _selected != null)
         {
             _selected.Move(px.X - _dragStartPx.X, px.Y - _dragStartPx.Y);
@@ -408,7 +443,13 @@ sealed class AreaReviewForm : Form
             case SpotlightAnnotation spot: spot.Rect = RectFrom(_dragStartPx, px); break;
             case MagnifierAnnotation mag:
                 mag.SourceRect = RectFrom(_dragStartPx, px);
-                mag.CalloutRect = mag.SourceRect;
+                // Same region MakeMagnifier will commit: a drag that leaves
+                // the crop must not park the dashed outline somewhere the
+                // loupe will not land.
+                mag.CalloutRect = MagnifierAnnotation.PlaceCallout(
+                    Rectangle.Intersect(mag.SourceRect, _session.PixelRect),
+                    _session.PixelRect,
+                    MagnifierAnnotation.DefaultZoom);
                 break;
             default: return;
         }

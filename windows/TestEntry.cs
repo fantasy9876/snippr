@@ -168,8 +168,48 @@ static class TestEntry
                 review.Refresh();
             });
             Step("review-shot", () => Capture(review, Path.Combine(dir, "review.png")));
-            Step("review-tool-magnifier", () => review.PressToolForTesting("magnifier"));
-            Step("review-tool-select", () => review.PressToolForTesting("select"));
+            Step("review-tool-magnifier", () =>
+            {
+                // A leftover SizeAll is the bug: SelectTool must reset it.
+                review.CursorForTesting = Cursors.SizeAll;
+                review.PressToolForTesting("magnifier");
+                if (review.CursorForTesting != Cursors.Cross)
+                    throw new InvalidOperationException(
+                        $"magnifier cursor is {review.CursorForTesting} want Cross");
+            });
+            Step("review-magnifier-drag", () =>
+            {
+                var crop = review.SelectionForTesting;
+                review.DragMagnifierForTesting(
+                    new Point(crop.X + 24, crop.Y + 24),
+                    new Point(crop.X + 88, crop.Y + 64));
+                review.Refresh();
+                Application.DoEvents();
+            });
+            Step("review-shot-magnifier-drag",
+                () => Capture(review, Path.Combine(dir, "review-magnifier-drag.png")));
+            Step("review-tool-select", () =>
+            {
+                var crop = review.SelectionForTesting;
+                // Two directions, both premises set by the test: inside the
+                // crop must become SizeAll (CropGrip.None would still pass a
+                // one-way "not SizeAll outside"), and outside must not keep
+                // the leftover SizeAll. The form is parked at -32000, so the
+                // machine cursor cannot be the premise.
+                review.PointerClientForTesting = new Point(crop.X + 24, crop.Y + 24);
+                review.PressToolForTesting("select");
+                if (review.CursorForTesting != Cursors.SizeAll)
+                    throw new InvalidOperationException(
+                        $"select inside crop is {review.CursorForTesting} want SizeAll");
+
+                review.PointerClientForTesting = new Point(crop.X - 24, crop.Y - 24);
+                review.PressToolForTesting("magnifier");
+                review.PressToolForTesting("select");
+                if (review.CursorForTesting == Cursors.SizeAll)
+                    throw new InvalidOperationException(
+                        "select outside crop kept SizeAll");
+                review.PointerClientForTesting = null;
+            });
             Step("review-preset-ocean", () =>
             {
                 review.ApplyPresetForTesting("ocean");

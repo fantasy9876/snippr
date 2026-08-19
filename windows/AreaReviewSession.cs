@@ -153,26 +153,20 @@ sealed class AreaReviewSession
     /// Samples a callout's source once, after the redactions — the same rule
     /// the editor uses, kept here so the review surface cannot acquire a
     /// weaker one.
-    public MagnifierAnnotation? MakeMagnifier(Rectangle source, float zoom = 2.5f)
+    public MagnifierAnnotation? MakeMagnifier(
+        Rectangle source, float zoom = MagnifierAnnotation.DefaultZoom)
     {
         var region = Rectangle.Intersect(source, PixelRect);
         if (region.Width <= 4 || region.Height <= 4) return null;
         var snapshot = AnnotationCompositor.MagnifierSnapshot(
             Frozen, region, Annotations.OfType<BlurAnnotation>());
         if (snapshot == null) return null;
-        var size = new Size((int)(region.Width * zoom), (int)(region.Height * zoom));
         // Parked inside the CROP, not merely inside the desktop: a callout
         // outside the crop is one the export drops and the user cannot reach.
-        var x = region.Right + 16 + size.Width <= PixelRect.Right
-            ? region.Right + 16
-            : Math.Max(PixelRect.Left, region.Left - 16 - size.Width);
-        var y = region.Bottom + 16 + size.Height <= PixelRect.Bottom
-            ? region.Bottom + 16
-            : Math.Max(PixelRect.Top, region.Top - 16 - size.Height);
         return new MagnifierAnnotation
         {
             SourceRect = region,
-            CalloutRect = new Rectangle(x, y, size.Width, size.Height),
+            CalloutRect = MagnifierAnnotation.PlaceCallout(region, PixelRect, zoom),
             Snapshot = snapshot,
         };
     }

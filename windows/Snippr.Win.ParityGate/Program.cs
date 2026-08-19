@@ -27,6 +27,7 @@ static class Program
         failed += Check("win-area-review-chrome-hit-test", ChromeHitTest());
         failed += Check("win-area-review-crop-drag", CropDrag());
         failed += Check("win-area-review-handle-inset", HandleInset());
+        failed += Check("win-area-review-cursor-follows-tool", CursorFollowsTool());
         failed += Check("win-editor-actions-match-catalog", EditorActionsMatchCatalog());
         failed += Check("win-backdrop-corner-radius-table", CornerRadiusTable());
         failed += Check("win-chrome-fits-at-every-dpi", ChromeFitsAtEveryDpi());
@@ -323,6 +324,60 @@ static class Program
             if (Math.Abs(owner[i].Width - 8f) > 0.01f)
                 f.Add($"owner visual {i} size {owner[i].Width} want 8");
 
+        return f;
+    }
+
+    /// Cursor is a function of (tool, hit). Drawing tools are always Cross,
+    /// text is IBeam, Select uses the grip table. Reverting SelectTool to
+    /// "never set the cursor" is a smoke concern; reverting this table to
+    /// "Select is SizeAll for every hit" (or drawing tools inheriting grips)
+    /// is what this gate is for.
+    static List<string> CursorFollowsTool()
+    {
+        var f = new List<string>();
+        foreach (var entry in ToolCatalog.OverlayTools)
+        {
+            if (entry.Tool == Tool.Select || entry.Tool == Tool.Text) continue;
+            foreach (var grip in Enum.GetValues<CropGrip>())
+            {
+                var got = AreaReviewCursor.For(entry.Tool, grip);
+                if (got != ReviewCursorKind.Cross)
+                    f.Add($"{entry.Tool} {grip} -> {got} want Cross");
+            }
+        }
+
+        if (AreaReviewCursor.For(Tool.Text, CropGrip.Inside) != ReviewCursorKind.IBeam)
+            f.Add("text inside is not IBeam");
+        if (AreaReviewCursor.For(Tool.Text, CropGrip.TopLeft) != ReviewCursorKind.IBeam)
+            f.Add("text handle is not IBeam");
+        if (AreaReviewCursor.For(Tool.Text, CropGrip.None) != ReviewCursorKind.IBeam)
+            f.Add("text outside is not IBeam");
+
+        var select = new (CropGrip Grip, ReviewCursorKind Want)[]
+        {
+            (CropGrip.None, ReviewCursorKind.Cross),
+            (CropGrip.Inside, ReviewCursorKind.SizeAll),
+            (CropGrip.Left, ReviewCursorKind.SizeWE),
+            (CropGrip.Right, ReviewCursorKind.SizeWE),
+            (CropGrip.Top, ReviewCursorKind.SizeNS),
+            (CropGrip.Bottom, ReviewCursorKind.SizeNS),
+            (CropGrip.TopLeft, ReviewCursorKind.SizeNWSE),
+            (CropGrip.BottomRight, ReviewCursorKind.SizeNWSE),
+            (CropGrip.TopRight, ReviewCursorKind.SizeNESW),
+            (CropGrip.BottomLeft, ReviewCursorKind.SizeNESW),
+        };
+        foreach (var (grip, want) in select)
+        {
+            var got = AreaReviewCursor.For(Tool.Select, grip);
+            if (got != want) f.Add($"select {grip} -> {got} want {want}");
+        }
+
+        // Drawing tools ignore the hit: a leftover Select grip cannot stick
+        // after the switch, whether the pointer is inside the crop or not.
+        if (AreaReviewCursor.For(Tool.Magnifier, CropGrip.None) != ReviewCursorKind.Cross)
+            f.Add("magnifier after switch is not Cross");
+        if (AreaReviewCursor.For(Tool.Pen, CropGrip.Inside) != ReviewCursorKind.Cross)
+            f.Add("pen over the crop is not Cross");
         return f;
     }
 
