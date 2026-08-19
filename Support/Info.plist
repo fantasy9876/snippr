@@ -13,9 +13,9 @@
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.2.11</string>
+    <string>1.2.12</string>
     <key>CFBundleVersion</key>
-    <string>28</string>
+    <string>29</string>
     <key>SnipprReleaseSignerSHA1</key>
     <string>946c43e6456970f5ec11544b3244c192aae949d6</string>
     <key>LSMinimumSystemVersion</key>
