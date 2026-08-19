@@ -206,6 +206,77 @@ static class TestEntry
                 review.Refresh();
             });
             Step("review-shot", () => Capture(review, Path.Combine(dir, "review.png")));
+            Step("review-chrome-is-themed-not-system", () =>
+            {
+                // The rail, the strip and every button were WinForms Controls
+                // with no BackColor of their own under a Color.Transparent
+                // parent, and WinForms answers that with SystemColors.Control
+                // — so the whole overlay chrome was a near-white slab of
+                // whatever the Windows theme said. Nothing in the app could
+                // see it, because the colour did not come from the app.
+                var (rail, strip) = review.ChromeRectsForTesting;
+                if (rail.Width <= 0 || strip.Width <= 0)
+                    throw new InvalidOperationException(
+                        $"no chrome placed: rail={rail} strip={strip}");
+                using var shot = new Bitmap(review.Width, review.Height);
+                review.DrawToBitmap(shot, new Rectangle(0, 0, shot.Width, shot.Height));
+                var system = SystemColors.Control;
+                var plate = OverlayChrome.Plate;
+                int systemPixels = 0, platePixels = 0;
+                string first = "";
+                foreach (var frame in new[] { rail, strip })
+                    for (int y = Math.Max(0, frame.Top); y < Math.Min(shot.Height, frame.Bottom); y++)
+                        for (int x = Math.Max(0, frame.Left); x < Math.Min(shot.Width, frame.Right); x++)
+                        {
+                            var c = shot.GetPixel(x, y);
+                            if (Math.Abs(c.R - system.R) <= 6
+                                && Math.Abs(c.G - system.G) <= 6
+                                && Math.Abs(c.B - system.B) <= 6)
+                            {
+                                systemPixels++;
+                                if (first.Length == 0) first = $" first@{x},{y}={c.R},{c.G},{c.B}";
+                            }
+                            if (c.R == plate.R && c.G == plate.G && c.B == plate.B)
+                                platePixels++;
+                        }
+                Diag.Click(
+                    "test",
+                    $"chrome rail={rail} strip={strip} plate={platePixels}px "
+                    + $"system={systemPixels}px");
+                if (systemPixels > 0)
+                    throw new InvalidOperationException(
+                        $"{systemPixels}px of SystemColors.Control in the chrome{first}");
+                if (platePixels == 0)
+                    throw new InvalidOperationException(
+                        "the chrome never painted its own plate colour");
+            });
+            Step("review-repaint-is-stable", () =>
+            {
+                // Twice running, the same pixels. A surface that renders
+                // differently each time it is asked is a surface that flickers
+                // — and this one used to render itself twice per frame, once
+                // for a form nobody can see under a child that covers it and
+                // again through WinForms' transparency emulation.
+                using var before = new Bitmap(review.Width, review.Height);
+                using var after = new Bitmap(review.Width, review.Height);
+                var whole = new Rectangle(0, 0, before.Width, before.Height);
+                review.DrawToBitmap(before, whole);
+                review.Refresh();
+                Application.DoEvents();
+                review.DrawToBitmap(after, whole);
+                int differing = 0;
+                string first = "";
+                for (int y = 0; y < before.Height; y += 2)
+                    for (int x = 0; x < before.Width; x += 2)
+                        if (before.GetPixel(x, y).ToArgb() != after.GetPixel(x, y).ToArgb())
+                        {
+                            differing++;
+                            if (first.Length == 0) first = $" first@{x},{y}";
+                        }
+                if (differing > 0)
+                    throw new InvalidOperationException(
+                        $"the surface renders differently twice running: {differing}px{first}");
+            });
             Step("review-tool-magnifier", () =>
             {
                 // A leftover SizeAll is the bug: SelectTool must reset it.

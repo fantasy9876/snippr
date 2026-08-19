@@ -75,6 +75,17 @@ sealed class AreaReviewForm : Form
     internal (int Rail, int Strip) ChromeCountsForTesting =>
         (_toolbar.RailCount, _toolbar.StripCount);
 
+    /// Where the rail and the strip ended up, so the smoke can look at the
+    /// pixels inside them rather than at the whole desktop.
+    internal (Rectangle Rail, Rectangle Strip) ChromeRectsForTesting
+    {
+        get
+        {
+            var (rail, strip) = _toolbar.ChromeFrames;
+            return (Rectangle.Round(rail), Rectangle.Round(strip));
+        }
+    }
+
     /// Smoke parks this form off-screen (`Reveal` at -32000), so it cannot
     /// place the machine cursor and still round-trip through `PointToClient`.
     /// Production always reads `Cursor.Position`; tests set this instead.
@@ -133,6 +144,12 @@ sealed class AreaReviewForm : Form
                 | ControlStyles.OptimizedDoubleBuffer, true);
 
         _toolbar.Dock = DockStyle.Fill;
+        // The toolbar covers every pixel of this form, so it — not this form —
+        // is what the user sees. Handing it the surface painter is what makes
+        // ONE render per frame: it used to fake transparency, which re-ran this
+        // form's paint inside its own, unbuffered, on top of the invisible
+        // render the form had just done for nobody.
+        _toolbar.PaintSurface = PaintSurface;
         BindToolbar();
         Controls.Add(_toolbar);
         // The toolbar covers the whole surface, so its own mouse events ARE
@@ -200,31 +217,35 @@ sealed class AreaReviewForm : Form
         _toolbar.SetUndoRedo(_session.CanUndo, _session.CanRedo);
     }
 
+    string _lastChromeLog = "";
+
     void PlaceToolbar()
     {
         _toolbar.Place(_session.Selection, ClientRectangle);
         // Where the chrome ended up, so "the buttons do nothing" can be told
         // apart from "the buttons are not where the hit test thinks".
+        //
+        // Said only when it CHANGES. A crop drag re-places the toolbar on
+        // every mouse move, and every one of these was a directory create, a
+        // size check and a file append on the UI thread — the drag stutter
+        // that got blamed on the drawing.
         var (tool, action) = ChromeFrames();
-        Diag.Click(
-            "review",
+        var line =
             $"toolbar rail={Rectangle.Round(tool)} strip={Rectangle.Round(action)} "
-            + $"client={ClientRectangle} selection={_session.Selection}");
+            + $"client={ClientRectangle} selection={_session.Selection}";
+        if (line == _lastChromeLog) return;
+        _lastChromeLog = line;
+        Diag.Click("review", line);
     }
 
     /// The rail and the strip, in this form's coordinates — the only parts of
     /// the toolbar that are not the picture.
-    (RectangleF Tool, RectangleF Action) ChromeFrames()
-    {
-        var metrics = OverlayToolbarLayout.Metrics.Standard.Scaled(DeviceDpi / 96f);
-        var area = OverlayToolbarLayout.Compute(
-            _session.Selection, ClientRectangle,
-            ToolCatalog.RailCount, ToolCatalog.StripCount,
-            Theme.HandleHit * DeviceDpi / 96f, metrics);
-        return area is { } placed
-            ? (placed.ToolFrame, placed.ActionFrame)
-            : (RectangleF.Empty, RectangleF.Empty);
-    }
+    ///
+    /// Read from the toolbar rather than recomputed. `Compute` searches four
+    /// placements against seven alignments on each side and eight forbidden
+    /// handle rects; the hit test asks this question on EVERY mouse event, and
+    /// the answer cannot have changed since the last Place.
+    (RectangleF Tool, RectangleF Action) ChromeFrames() => _toolbar.ChromeFrames;
 
     /// A gesture is under way: a crop being dragged, a mark being drawn, or a
     /// mark being moved.
@@ -238,15 +259,23 @@ sealed class AreaReviewForm : Form
         if (always
             || AreaReviewHitTest.IsCanvas(
                 e.Location, tool, action,
-                chromeVisible: true, dragInProgress: DragInProgress))
+                chromeVisible: _toolbar.ChromeVisible,
+                dragInProgress: DragInProgress))
             handler(e);
     }
 
     // ---------- painting ----------
 
-    protected override void OnPaint(PaintEventArgs e)
+    protected override void OnPaint(PaintEventArgs e) =>
+        PaintSurface(e.Graphics, Rectangle.Intersect(e.ClipRectangle, ClientRectangle));
+
+    /// The whole surface, into whatever is asking and clipped to
+    /// <paramref name="clip"/>. The toolbar calls this from its own paint —
+    /// see the note where it is wired up — and this form's OnPaint calls it
+    /// too, so `DrawToBitmap` and the smoke's captures see the same picture.
+    void PaintSurface(Graphics g, Rectangle clip)
     {
-        var g = e.Graphics;
+        if (clip.Width <= 0 || clip.Height <= 0) return;
         g.DrawImageUnscaled(_session.Frozen, 0, 0);
         var crop = _session.PixelRect;
 
@@ -262,7 +291,10 @@ sealed class AreaReviewForm : Form
         // is part of what survives, so the hole is the outer rect.
         using (var dim = new SolidBrush(Color.FromArgb(105, Color.Black)))
         {
-            var region = new Region(ClientRectangle);
+            // Built from the clip, not the whole surface: a partial repaint
+            // asks GDI+ to fill a region the size of the desktop otherwise,
+            // and then throws all but the damaged part of it away.
+            var region = new Region(clip);
             region.Exclude(VisibleOuterRect());
             g.FillRegion(dim, region);
             region.Dispose();
@@ -324,13 +356,39 @@ sealed class AreaReviewForm : Form
     {
         if (all) PlaceToolbar();
         UpdateToolbarState();
-        // The toolbar is a CHILD covering the entire surface, and a child is
-        // not repainted when its parent is invalidated — the picture under it
-        // would keep showing what it showed before the mark was made. It is
-        // transparent, so invalidating it is what renders this form's drawing
-        // again underneath it.
-        Invalidate(true);
+        InvalidateSurface(null);
     }
+
+    /// Repaints the picture — which means repainting the TOOLBAR, because it
+    /// covers this form and draws the surface inside its own paint.
+    ///
+    /// Never `Invalidate(true)` on the form. That invalidated this form (whose
+    /// paint nothing can see under a child covering every pixel), the toolbar,
+    /// and recursively all twenty-one buttons — so a single undo repainted the
+    /// whole desktop twice and every button once, which is the flicker.
+    /// <paramref name="area"/> null means the whole surface.
+    void InvalidateSurface(Rectangle? area)
+    {
+        if (!_toolbar.IsHandleCreated) { Invalidate(); return; }
+        if (area is not Rectangle rect) { _toolbar.Invalidate(); return; }
+        rect.Intersect(_toolbar.ClientRectangle);
+        if (rect.Width > 0 && rect.Height > 0) _toolbar.Invalidate(rect);
+    }
+
+    /// Room around a live mark for its stroke, its arrow head and the
+    /// antialiasing, so a damage-limited repaint cannot clip what it redraws.
+    int DirtyMargin => Theme.Px(32f, DeviceDpi);
+
+    /// What a mark that moved can have changed. Spotlight dims everything
+    /// outside itself and the magnifier parks its callout anywhere in the
+    /// picture, so neither is bounded by its own rectangle — those two ask for
+    /// the crop. An empty rectangle means "no idea", and asks for it too.
+    Rectangle Dirty(Annotation mark, Rectangle before, Rectangle after) =>
+        mark is SpotlightAnnotation or MagnifierAnnotation
+            || before.IsEmpty || after.IsEmpty
+            ? Rectangle.Inflate(_session.PixelRect, DirtyMargin, DirtyMargin)
+            : Rectangle.Inflate(
+                Rectangle.Union(before, after), DirtyMargin, DirtyMargin);
 
     // ---------- tools ----------
 
@@ -497,14 +555,17 @@ sealed class AreaReviewForm : Form
         }
         if (e.Button == MouseButtons.None)
             ApplyCursor(px);
-        if (_movingSelection && _selected != null)
+        if (_movingSelection && _selected is { } mark)
         {
-            _selected.Move(px.X - _dragStartPx.X, px.Y - _dragStartPx.Y);
+            var moved = mark.Bounds;
+            mark.Move(px.X - _dragStartPx.X, px.Y - _dragStartPx.Y);
             _dragStartPx = px;
-            Invalidate(true);
+            InvalidateSurface(Dirty(mark, moved, mark.Bounds));
             return;
         }
-        switch (_draft)
+        if (_draft is not { } draft) return;
+        var was = draft.Bounds;
+        switch (draft)
         {
             case ShapeAnnotation s: s.End = px; break;
             case PenAnnotation p: p.Points.Add(px); break;
@@ -522,7 +583,9 @@ sealed class AreaReviewForm : Form
                 break;
             default: return;
         }
-        Invalidate(true);
+        // Only what the mark touched. Repainting the whole virtual desktop per
+        // mouse move is what made drawing feel like it was catching up.
+        InvalidateSurface(Dirty(draft, was, draft.Bounds));
     }
 
     void CanvasMouseUp(MouseEventArgs e)

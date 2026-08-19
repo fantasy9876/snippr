@@ -28,6 +28,7 @@ static class Program
         failed += Check("win-backdrop-corner-radius-pixels", CornerRadiusPixels());
         failed += Check("win-area-review-preview-shows-document", ReviewPreviewShowsDocument());
         failed += Check("win-hover-hint-clamped", HoverHintClamped());
+        failed += Check("win-overlay-chrome-paints-its-own-colours", OverlayChromePixels());
         if (pending > 0)
             Console.WriteLine($"{pending} RASTER GATE(S) PENDING — not a pass");
         Console.WriteLine(failed == 0
@@ -853,6 +854,124 @@ static class Program
                 f.Add($"{preset}: crop corner is square in the preview");
         }
         return f;
+    }
+
+    // ---------- the chrome paints its own colours ----------
+
+    /// Every pixel of the overlay chrome is one this app named.
+    ///
+    /// The rail, the strip and all twenty-one buttons were WinForms `Control`s
+    /// that set no background colour of their own, under a parent whose
+    /// BackColor was `Color.Transparent`. A child does NOT inherit that unless
+    /// it supports transparency itself — WinForms hands it
+    /// `SystemColors.Control` instead. So every overlay button was a #F0F0F0
+    /// slab of whatever the Windows theme said, with an icon drawn on it, and
+    /// nothing inside the app could notice: the colour came from outside it.
+    ///
+    /// This paints the chrome over a sentinel and asks two things of every
+    /// pixel — that the chrome covered it, and that what it put there came
+    /// from `Theme` and not from the desktop.
+    static List<string> OverlayChromePixels()
+    {
+        var f = new List<string>();
+        // Magenta: nothing in the chrome's palette is anywhere near it, so a
+        // surviving sentinel pixel means nobody painted that pixel.
+        var sentinel = Color.FromArgb(255, 255, 0, 255);
+        var system = SystemColors.Control;
+
+        foreach (int dpi in new[] { 96, 120, 144, 192 })
+        {
+            var button = new Rectangle(
+                20, 20, Theme.Px(Theme.OverlayBtnW, dpi), Theme.Px(Theme.OverlayBtnH, dpi));
+            (string Name, bool Hover, bool Press, bool Ticked, bool Enabled)[] states =
+            [
+                ("normal", false, false, false, true),
+                ("hover", true, false, false, true),
+                ("pressed", false, true, false, true),
+                ("checked", false, false, true, true),
+                ("disabled", false, false, false, false),
+            ];
+            var probes = new Dictionary<string, Color>();
+            foreach (var (name, hover, press, ticked, enabled) in states)
+            {
+                using var bmp = Sentinel(button.Right + 40, button.Bottom + 40, sentinel);
+                using (var g = Graphics.FromImage(bmp))
+                    OverlayChrome.PaintButton(
+                        g, button, "rect", dpi,
+                        hover: hover, pressed: press, isChecked: ticked,
+                        enabled: enabled, tint: null);
+
+                int bare = 0, systemColoured = 0;
+                string first = "";
+                for (int y = button.Top; y < button.Bottom; y++)
+                    for (int x = button.Left; x < button.Right; x++)
+                    {
+                        var c = At(bmp, x, y);
+                        if (c.ToArgb() == sentinel.ToArgb())
+                        {
+                            bare++;
+                            if (first.Length == 0) first = $" first@{x},{y}";
+                        }
+                        if (Near(c, system, 6)) systemColoured++;
+                    }
+                if (bare > 0) f.Add($"{dpi}dpi {name}: {bare}px unpainted{first}");
+                if (systemColoured > 0)
+                    f.Add($"{dpi}dpi {name}: {systemColoured}px of SystemColors.Control");
+                // …and nothing outside the button's own box is painted, or a
+                // button would smear over the plate it sits on.
+                if (At(bmp, button.Right + 2, button.Top + 2).ToArgb() != sentinel.ToArgb())
+                    f.Add($"{dpi}dpi {name}: painted outside its bounds");
+                // Inside the state pill, clear of the icon: the icon starts a
+                // quarter of the way in at every DPI.
+                probes[name] = At(bmp, button.Left + 3, button.Top + button.Height / 2);
+            }
+
+            // A resting button IS the plate, so the rail reads as one object
+            // rather than as tiles laid on one.
+            var resting = probes["normal"];
+            if (!Near(resting, OverlayChrome.Plate, 0))
+                f.Add($"{dpi}dpi: resting button is {resting}, not the plate");
+            // And every state the user can put it in looks different from
+            // resting. On the white background these all but vanished, which
+            // is the other half of "the buttons feel wrong".
+            foreach (var name in new[] { "hover", "pressed", "checked" })
+                if (Near(probes[name], resting, 2))
+                    f.Add($"{dpi}dpi: {name} is indistinguishable from normal");
+            if (Near(probes["hover"], probes["pressed"], 2))
+                f.Add($"{dpi}dpi: pressed is indistinguishable from hover");
+        }
+
+        foreach (int dpi in new[] { 96, 144 })
+        {
+            var frame = new Rectangle(10, 10, 200, 140);
+            using var bmp = Sentinel(240, 180, sentinel);
+            using (var g = Graphics.FromImage(bmp))
+                OverlayChrome.PaintPlate(g, frame, dpi);
+            var middle = At(bmp, frame.Left + frame.Width / 2, frame.Top + frame.Height / 2);
+            if (!Near(middle, OverlayChrome.Plate, 0))
+                f.Add($"{dpi}dpi plate: centre is {middle}, not the plate colour");
+            if (Near(middle, system, 6))
+                f.Add($"{dpi}dpi plate: centre is SystemColors.Control");
+            if (At(bmp, frame.Right + 4, frame.Top + 4).ToArgb() != sentinel.ToArgb())
+                f.Add($"{dpi}dpi plate: painted outside its frame");
+            // The corner is cut, and cut no further than its radius: the
+            // extreme corner is untouched, a pixel a radius in is solid plate.
+            if (Near(At(bmp, frame.Left, frame.Top), OverlayChrome.Plate, 8))
+                f.Add($"{dpi}dpi plate: corner is square");
+            int r = Theme.Px(Theme.RadiusChrome, dpi);
+            if (!Near(At(bmp, frame.Left + r + 2, frame.Top + r + 2), OverlayChrome.Plate, 0))
+                f.Add($"{dpi}dpi plate: cut further in than its own radius");
+        }
+        return f;
+    }
+
+    static Bitmap Sentinel(int width, int height, Color colour)
+    {
+        var bmp = new Bitmap(width, height, PixelFormat.Format32bppArgb);
+        using var g = Graphics.FromImage(bmp);
+        using var brush = new SolidBrush(colour);
+        g.FillRectangle(brush, 0, 0, width, height);
+        return bmp;
     }
 
     // ---------- still RED ----------

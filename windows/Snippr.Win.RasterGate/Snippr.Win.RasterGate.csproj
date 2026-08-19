@@ -29,6 +29,12 @@
     <Compile Include="..\CalloutPlacement.cs" Link="CalloutPlacement.cs" />
     <Compile Include="..\Ui\ThemeMetrics.cs" Link="ThemeMetrics.cs" />
     <Compile Include="..\Ui\Theme.cs" Link="Theme.cs" />
+    <!-- The overlay chrome's pixels. It is a static painter over a Graphics
+         precisely so this gate can point it at a bitmap: the bug it exists to
+         prevent — a button wearing SystemColors.Control because WinForms chose
+         its background — is only visible as pixels. -->
+    <Compile Include="..\Ui\OverlayChrome.cs" Link="OverlayChrome.cs" />
+    <Compile Include="..\Ui\Icons.cs" Link="Icons.cs" />
     <Compile Include="..\Ui\AreaReviewPreview.cs" Link="AreaReviewPreview.cs" />
     <Compile Include="..\Ui\HoverHint.cs" Link="HoverHint.cs" />
     <Compile Include="..\AreaReviewSession.cs" Link="AreaReviewSession.cs" />
