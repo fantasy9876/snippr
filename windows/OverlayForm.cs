@@ -92,9 +92,14 @@ sealed class OverlayForm : Form
     /// whole DESKTOP, not the primary monitor, so a window asking for the
     /// virtual screen is not trimmed — but that is a claim about someone
     /// else's machine, and this line is how it gets checked on theirs.
-    protected override void OnHandleCreated(EventArgs e)
+    ///
+    /// Measured at Shown, not at handle creation: the borderless style is not
+    /// applied yet at creation, so the client area reads short there and the
+    /// one line someone sends us to settle this would start the argument
+    /// again.
+    protected override void OnShown(EventArgs e)
     {
-        base.OnHandleCreated(e);
+        base.OnShown(e);
         Diag.Click(
             "overlay",
             $"window asked={_virtualBounds.Size} got={Size} client={ClientSize}");
