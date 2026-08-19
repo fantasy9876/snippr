@@ -5647,6 +5647,24 @@ enum SelfTest {
             }
             check("overlay5-setting-matrix", matrixHeadlessOK, "see mismatches above")
 
+            // The review rail's left-to-right order, pinned. Windows keeps a
+            // copy of this sequence in `win-overlay-tool-order-matches-mac`
+            // (its icon keys differ in two names: `blur` is `pixelate` there,
+            // and it has no `pixelateText` tool at all). Without a gate on
+            // THIS side, appending a case to the enum would quietly land the
+            // new tool at the end of the macOS rail and leave the Windows
+            // copy stale with nothing red on either platform — which is how
+            // the two rails drifted apart in the first place.
+            let wantRailOrder = [
+                "select", "pen", "arrow", "rect", "text", "line",
+                "oval", "highlight", "counter", "blur", "spotlight",
+                "pixelateText", "magnifier",
+            ]
+            let liveRailOrder = OverlayAnnotationTool.areaReviewTools
+                .map(\.rawValue)
+            check("overlay-tool-order", liveRailOrder == wantRailOrder,
+                  "rail \(liveRailOrder) want \(wantRailOrder)")
+
             guard let screen = NSScreen.main ?? NSScreen.screens.first else {
                 print("SKIP overlay5-environment — no display attached; MUST re-run on an unlocked session")
                 return
