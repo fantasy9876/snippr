@@ -1,0 +1,122 @@
+name: Windows CI
+
+# The installer workflow is `workflow_dispatch` only, and rightly so: it signs
+# binaries and publishes releases. This one only CHECKS, so it can run itself.
+#
+# It exists because the Windows build is written on machines that cannot run
+# it. Every Windows-only question so far has cost a round trip through a
+# dispatch someone had to remember to fire; a fix pushed to a working branch
+# should be built, gated and smoked on Windows without anyone asking.
+on:
+  push:
+    branches:
+      - 'claude/**'
+      - 'feat/**'
+      - 'fix/**'
+    paths:
+      - 'windows/**'
+      - '.github/workflows/windows-ci.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Build every project, warnings included
+        shell: pwsh
+        run: |
+          # `windows/check-all.sh`'s rule, on the runner. Every project, because
+          # the RasterGate once broke in CI when only the app and one gate were
+          # built before pushing — and warnings fail, because a `-v quiet` build
+          # once reported clean while the compiler had already complained.
+          $projects = @(
+            'windows/Snippr.Win.csproj',
+            'windows/Snippr.Win.StitcherGate/Snippr.Win.StitcherGate.csproj',
+            'windows/Snippr.Win.ParityGate/Snippr.Win.ParityGate.csproj',
+            'windows/Snippr.Win.RasterGate/Snippr.Win.RasterGate.csproj'
+          )
+          $log = @()
+          foreach ($p in $projects) {
+            Write-Host "== $p"
+            $out = & dotnet build $p -c Release --nologo 2>&1
+            $out | ForEach-Object { Write-Host $_ }
+            if ($LASTEXITCODE -ne 0) { throw "build failed: $p ($LASTEXITCODE)" }
+            $log += $out
+          }
+          $bad = @($log | Select-String -Pattern ': (warning|error) [A-Z]+[0-9]+' |
+            ForEach-Object { $_.Line } | Sort-Object -Unique)
+          if ($bad.Count -gt 0) {
+            Write-Host '== build warnings/errors — treated as failure'
+            $bad | ForEach-Object { Write-Host $_ }
+            throw "build produced $($bad.Count) warning/error line(s)"
+          }
+
+      - name: StitcherGate (animated-band + majority fail-closed)
+        run: >
+          dotnet run --project windows/Snippr.Win.StitcherGate/Snippr.Win.StitcherGate.csproj
+          -c Release --no-launch-profile
+
+      - name: ParityGate (catalog / literals / geometry)
+        run: >
+          dotnet run --project windows/Snippr.Win.ParityGate/Snippr.Win.ParityGate.csproj
+          -c Release -f net8.0 --no-launch-profile
+
+      - name: RasterGate (GDI+ pixels)
+        run: >
+          dotnet run --project windows/Snippr.Win.RasterGate/Snippr.Win.RasterGate.csproj
+          -c Release --no-launch-profile
+
+      - name: Headless UI smoke (--test-shot)
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem -Recurse -Path windows/bin/Release -Filter Snippr.exe |
+            Where-Object { $_.FullName -notlike '*publish*' } | Select-Object -First 1
+          if (-not $exe) { throw 'built Snippr.exe not found' }
+          $out = Join-Path $pwd 'smoke-out'
+          New-Item -ItemType Directory -Force $out | Out-Null
+          Write-Host "running $($exe.FullName) --test-shot $out"
+          # Snippr is a WinExe: `& exe` returns before the process exits and
+          # leaves $LASTEXITCODE empty, so the job would judge a run that had
+          # not happened yet. Start-Process -Wait is what reads its code.
+          $p = Start-Process -FilePath $exe.FullName `
+            -ArgumentList @('--test-shot', $out) `
+            -Wait -PassThru -NoNewWindow
+          $code = $p.ExitCode
+          Write-Host "test-shot exit=$code"
+          Get-ChildItem $out | Format-Table Name, Length
+          # The log IS the report: the smoke names every step it ran and why a
+          # failing one failed, and reading it here beats downloading an
+          # artifact to find out.
+          foreach ($name in @('click.log', 'crash.log')) {
+            $path = Join-Path $out $name
+            if (Test-Path $path) {
+              Write-Host "===== $name ====="
+              Get-Content $path | Select-Object -Last 300 | ForEach-Object { Write-Host $_ }
+            }
+          }
+          if ($null -eq $code) { throw '--test-shot produced no exit code' }
+          if ($code -ne 0) { throw "--test-shot failed $code step(s)" }
+
+      - name: Upload smoke shots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-ci-smoke
+          if-no-files-found: warn
+          path: smoke-out/
