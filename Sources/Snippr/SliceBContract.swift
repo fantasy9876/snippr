@@ -342,25 +342,92 @@ final class MagnifierAnnotation: Annotation {
     var sourceRect: CGRect = .zero
     var calloutRect: CGRect = .zero
     var snapshot: CGImage?
+    /// True while the placing drag is still running. The snapshot does not
+    /// exist yet, so the draw shows WHERE the drag is — the source frame and
+    /// the outline of the callout it will produce — instead of nothing.
+    var isDrafting = false
+
+    /// Magnification the callout uses on this platform (Windows uses 2.5).
+    static let zoom: CGFloat = 2
 
     override var bounds: CGRect { calloutRect }
 
     override func hitTest(_ p: CGPoint) -> Bool { calloutRect.contains(p) }
 
+    /// Where the callout for `source` sits: beside it, `gap` pixels to the
+    /// right, bottom edges aligned (bottom-left pixel space, as before). When `bounds` is given (the crop or the
+    /// document) the callout is kept INSIDE it — flipped to the left when the
+    /// right side has no room, then clamped — so a magnifier drawn near an
+    /// edge is never exported cut off or, in the review overlay, clipped away.
+    /// Same rule as Windows `AreaReviewSession.MakeMagnifier`.
+    static func calloutRect(
+        for source: CGRect, gap: CGFloat, zoom: CGFloat = zoom,
+        within bounds: CGRect? = nil
+    ) -> CGRect {
+        let src = source.standardized
+        let size = CGSize(width: src.width * zoom, height: src.height * zoom)
+        var origin = CGPoint(x: src.maxX + gap, y: src.minY)
+        if let bounds, bounds.width > 0, bounds.height > 0 {
+            if origin.x + size.width > bounds.maxX {
+                origin.x = max(bounds.minX, src.minX - gap - size.width)
+            }
+            origin.x = min(max(origin.x, bounds.minX),
+                           max(bounds.minX, bounds.maxX - size.width))
+            origin.y = min(max(origin.y, bounds.minY),
+                           max(bounds.minY, bounds.maxY - size.height))
+        }
+        return CGRect(origin: origin, size: size)
+    }
+
     override func draw(in ctx: CGContext, pixellated: CGImage?) {
-        guard let snapshot, calloutRect.width > 1, calloutRect.height > 1
-        else { return }
+        let src = sourceRect.standardized
+        if let snapshot, calloutRect.width > 1, calloutRect.height > 1 {
+            ctx.saveGState()
+            ctx.setShadow(
+                offset: CGSize(width: 0, height: -2 * uiScale), blur: 6 * uiScale,
+                color: NSColor.black.withAlphaComponent(0.45).cgColor)
+            ctx.interpolationQuality = .none
+            ctx.draw(snapshot, in: calloutRect)
+            ctx.setShadow(offset: .zero, blur: 0, color: nil)
+            ctx.setStrokeColor(NSColor.white.cgColor)
+            ctx.setLineWidth(max(1, 2 * uiScale))
+            ctx.stroke(calloutRect)
+            ctx.restoreGState()
+            // The mark stays readable: a thin frame says which pixels the
+            // callout enlarges.
+            drawSourceFrame(src, in: ctx)
+        } else if isDrafting {
+            // Nothing sampled yet, so nothing can leak: show the geometry
+            // only. The dashed outline is where the callout will land.
+            let hair = max(1, uiScale)
+            if calloutRect.width > 1, calloutRect.height > 1 {
+                ctx.saveGState()
+                ctx.setStrokeColor(NSColor.black.withAlphaComponent(0.55).cgColor)
+                ctx.setLineWidth(hair)
+                ctx.setLineDash(phase: 0, lengths: [4 * hair, 3 * hair])
+                ctx.stroke(calloutRect.insetBy(dx: -hair / 2, dy: -hair / 2))
+                ctx.setStrokeColor(NSColor.white.cgColor)
+                ctx.stroke(calloutRect.insetBy(dx: hair / 2, dy: hair / 2))
+                ctx.restoreGState()
+            }
+            drawSourceFrame(src, in: ctx)
+        }
+    }
+
+    /// 1 px dark line outside, 1 px white line inside: visible on light and
+    /// dark pixels alike, and NEVER covering the source pixels themselves —
+    /// both lines sit on the rect's edge, half in, half out.
+    private func drawSourceFrame(_ src: CGRect, in ctx: CGContext) {
+        guard src.width > 1, src.height > 1 else { return }
+        let hair = max(1, uiScale)
         ctx.saveGState()
         defer { ctx.restoreGState() }
-        ctx.setShadow(
-            offset: CGSize(width: 0, height: -2 * uiScale), blur: 6 * uiScale,
-            color: NSColor.black.withAlphaComponent(0.45).cgColor)
-        ctx.interpolationQuality = .none
-        ctx.draw(snapshot, in: calloutRect)
-        ctx.setShadow(offset: .zero, blur: 0, color: nil)
+        ctx.setLineDash(phase: 0, lengths: [])
+        ctx.setLineWidth(hair)
+        ctx.setStrokeColor(NSColor.black.withAlphaComponent(0.55).cgColor)
+        ctx.stroke(src.insetBy(dx: -hair / 2, dy: -hair / 2))
         ctx.setStrokeColor(NSColor.white.cgColor)
-        ctx.setLineWidth(max(1, 2 * uiScale))
-        ctx.stroke(calloutRect)
+        ctx.stroke(src.insetBy(dx: hair / 2, dy: hair / 2))
     }
 
     /// Dragging moves the callout only — it never re-aims the source, so the

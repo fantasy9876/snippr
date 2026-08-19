@@ -1715,6 +1715,7 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
             let mag = MagnifierAnnotation(uiScale: pxScale)
             mag.sourceRect = CGRect(origin: pp, size: .zero)
             mag.calloutRect = CGRect(origin: pp, size: .zero)
+            mag.isDrafting = true
             drafting = mag
         case .backdrop:
             // A canvas-level style, not a drag, and CHOOSING the tool changes
@@ -1830,12 +1831,18 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
                     x: min(dragStartPoint.x, pp.x), y: min(dragStartPoint.y, pp.y),
                     width: abs(pp.x - dragStartPoint.x),
                     height: abs(pp.y - dragStartPoint.y))
+                let sourceBefore = mag.sourceRect
                 mag.sourceRect = source
-                // Callout sits beside the source at 2x while dragging.
-                mag.calloutRect = CGRect(
-                    x: source.maxX + 8 * pxScale, y: source.minY,
-                    width: source.width * 2, height: source.height * 2)
-                invalidate(pixelRect: before.union(mag.calloutRect).union(source))
+                // Callout sits beside the source at 2x while dragging, kept
+                // inside the image so it cannot end up off the document.
+                mag.calloutRect = MagnifierAnnotation.calloutRect(
+                    for: source, gap: 8 * pxScale,
+                    within: CGRect(
+                        x: 0, y: 0,
+                        width: image.cgImage.width, height: image.cgImage.height))
+                invalidate(pixelRect: before.union(mag.calloutRect)
+                    .union(source).union(sourceBefore)
+                    .insetBy(dx: -2 * pxScale, dy: -2 * pxScale))
             }
         case .backdrop:
             break
@@ -1879,6 +1886,7 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
                     annotations.append(draft)
                 }
                 if let mag = draft as? MagnifierAnnotation {
+                    mag.isDrafting = false
                     // Sample the SANITIZED layer so the callout can never
                     // resurrect pixels a redaction covers.
                     mag.snapshot = SliceBCompositor.magnifierSnapshot(

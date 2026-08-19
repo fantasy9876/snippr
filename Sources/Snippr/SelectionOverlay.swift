@@ -1853,6 +1853,17 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
                 // the base image at that moment, not at the moment the host
                 // happens to be running.
                 surface.redactionBaseImage = frozen.cgImage
+                // A magnifier callout stays inside the crop the export makes
+                // (bottom-left image pixels; the session rect is top-left).
+                surface.magnifierBounds = { [weak self] in
+                    guard let self, let owner = self.owner else { return nil }
+                    let px = owner.session.pixelRect
+                    guard px.width >= 1, px.height >= 1 else { return nil }
+                    return CGRect(
+                        x: px.minX,
+                        y: CGFloat(frozen.cgImage.height) - px.maxY,
+                        width: px.width, height: px.height)
+                }
                 annotationSurface = surface
                 owner.reviewDidBegin(in: self)
                 layoutReviewToolbar()
