@@ -32,6 +32,7 @@ static class Program
         failed += Check("win-editor-actions-match-catalog", EditorActionsMatchCatalog());
         failed += Check("win-backdrop-corner-radius-table", CornerRadiusTable());
         failed += Check("win-chrome-fits-at-every-dpi", ChromeFitsAtEveryDpi());
+        failed += Check("win-magnifier-callout-clamped", MagnifierCalloutClamped());
         if (pending > 0)
             Console.WriteLine($"{pending} PARITY GATE(S) PENDING — not a pass");
         Console.WriteLine(failed == 0
@@ -562,6 +563,60 @@ static class Program
             f.Add(
                 "the 200% case now fits 1366px — check that overflow is still " +
                 "needed, or tighten this expectation");
+        return f;
+    }
+
+    /// Counterpart of Mac `sliceB-magnifier-callout-clamped` (f6f475c). The
+    /// old independent X/Y flip parks a 2.5× loupe on top of a large source —
+    /// that is the overlap the owner photographed on 1.2.11. These three
+    /// cases are the ones that gate was rewritten to catch.
+    static List<string> MagnifierCalloutClamped()
+    {
+        var f = new List<string>();
+        const float zoom = CalloutPlacement.DefaultZoom;
+
+        // Owner's 1.2.11 report: 400×230 in 1280×1121. 2.5× does not fit
+        // beside it; flipping left used to land on the source. The callout
+        // must stay off the source, inside the document, and at least 1×.
+        var big = new Rectangle(150, 500, 400, 230);
+        var bigDoc = new Rectangle(0, 0, 1280, 1121);
+        var bigOut = CalloutPlacement.Place(big, bigDoc, zoom);
+        if (bigOut.IntersectsWith(big))
+            f.Add($"large source covered {bigOut}");
+        if (!bigDoc.Contains(bigOut))
+            f.Add($"large callout outside {bigOut}");
+        if (bigOut.Width < big.Width)
+            f.Add($"large callout below 1x {bigOut}");
+        var aspectX = bigOut.Width / (double)big.Width;
+        var aspectY = bigOut.Height / (double)big.Height;
+        if (Math.Abs(aspectX - aspectY) > 0.01)
+            f.Add($"large callout aspect {bigOut}");
+
+        // Room only BELOW (visual bottom of the picture — Mac's `below` with
+        // Y flipped). A source hugging the top has no strip left or right.
+        var wide = new Rectangle(10, 10, 180, 30);
+        var doc = new Rectangle(0, 0, 200, 200);
+        var wideOut = CalloutPlacement.Place(wide, doc, zoom);
+        if (wideOut.IntersectsWith(wide) || !doc.Contains(wideOut)
+            || wideOut.Y < wide.Bottom)
+            f.Add($"wide source {wideOut}");
+
+        // No room anywhere: 1×, inside the document, overlap accepted
+        // because nothing else is possible.
+        var huge = new Rectangle(10, 10, 180, 180);
+        var hugeOut = CalloutPlacement.Place(huge, doc, zoom);
+        if (!doc.Contains(hugeOut) || hugeOut.Width != 180)
+            f.Add($"huge source {hugeOut}");
+
+        // And the small source that used to pin right-and-below at 2.5× now
+        // prefers right (full zoom fits). Independent X/Y would still pass
+        // this; the large case above is what turns red if the old law returns.
+        var small = new Rectangle(20, 20, 40, 30);
+        var smallOut = CalloutPlacement.Place(small, doc, zoom);
+        if (smallOut != new Rectangle(76, 0, 100, 75))
+            f.Add($"small {smallOut} want 76,0,100x75");
+        if (smallOut.IntersectsWith(small))
+            f.Add($"small covered {smallOut}");
         return f;
     }
 

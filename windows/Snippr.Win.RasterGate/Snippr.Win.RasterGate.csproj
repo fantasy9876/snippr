@@ -26,6 +26,7 @@
     <Compile Include="..\AnnotationCompositor.cs" Link="AnnotationCompositor.cs" />
     <Compile Include="..\Timeline.cs" Link="Timeline.cs" />
     <Compile Include="..\CropGeometry.cs" Link="CropGeometry.cs" />
+    <Compile Include="..\CalloutPlacement.cs" Link="CalloutPlacement.cs" />
     <Compile Include="..\Ui\ThemeMetrics.cs" Link="ThemeMetrics.cs" />
     <Compile Include="..\Ui\Theme.cs" Link="Theme.cs" />
     <Compile Include="..\Ui\AreaReviewPreview.cs" Link="AreaReviewPreview.cs" />

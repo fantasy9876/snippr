@@ -312,26 +312,19 @@ sealed class MagnifierAnnotation : Annotation
 
     /// Review and editor share this so a live preview cannot be sized from a
     /// different default than the committed loupe.
-    public const float DefaultZoom = 2.5f;
+    public const float DefaultZoom = CalloutPlacement.DefaultZoom;
 
-    /// Where the callout for `source` sits: to the right and below by 16 px
-    /// when that fits inside `bounds`, otherwise flipped the other way and
-    /// clamped. Same arithmetic `MakeMagnifier` and the editor used to inline,
-    /// so a live drag preview cannot park somewhere the committed loupe will
+    /// Where the callout for `source` sits. Same law as Mac
+    /// `MagnifierAnnotation.calloutRect` (f6f475c): right, left, below,
+    /// above — first side that holds `zoom`, else the roomiest, never below
+    /// 1×, overlap only when the document cannot hold a 1× loupe beside the
+    /// source. The arithmetic lives in `CalloutPlacement` so the parity gate
+    /// can run it without GDI+; this is still the one function every caller
+    /// uses, so a live drag cannot park somewhere the committed loupe will
     /// not.
     public static Rectangle PlaceCallout(
         Rectangle source, Rectangle bounds, float zoom = DefaultZoom)
-    {
-        var size = new Size(
-            (int)(source.Width * zoom), (int)(source.Height * zoom));
-        var x = source.Right + 16 + size.Width <= bounds.Right
-            ? source.Right + 16
-            : Math.Max(bounds.Left, source.Left - 16 - size.Width);
-        var y = source.Bottom + 16 + size.Height <= bounds.Bottom
-            ? source.Bottom + 16
-            : Math.Max(bounds.Top, source.Top - 16 - size.Height);
-        return new Rectangle(x, y, size.Width, size.Height);
-    }
+        => CalloutPlacement.Place(source, bounds, zoom);
 
     public override void Draw(Graphics g, Bitmap? pixelated)
     {
