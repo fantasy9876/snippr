@@ -210,6 +210,24 @@ static class TestEntry
                         "select outside crop kept SizeAll");
                 review.PointerClientForTesting = null;
             });
+            Step("review-backdrop-menu-labels", () =>
+            {
+                // The menu showed five swatches and no words: AutoSize was
+                // off with only a height set, so every row kept the default
+                // width and the label had nowhere to draw. Opening is what
+                // sizes them, so open it the way the button does.
+                var menu = review.BackdropMenuForTesting;
+                menu.RaiseOpeningForTesting();
+                foreach (ToolStripItem item in menu.Items)
+                {
+                    int text = TextRenderer.MeasureText(item.Text, menu.Font).Width;
+                    int need = text + menu.ImageScalingSize.Width;
+                    if (item.Width < need)
+                        throw new InvalidOperationException(
+                            $"backdrop row '{item.Text}' is {item.Width}px, "
+                            + $"needs {need}px for its label");
+                }
+            });
             Step("review-preset-ocean", () =>
             {
                 review.ApplyPresetForTesting("ocean");

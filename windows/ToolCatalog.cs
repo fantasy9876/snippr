@@ -105,8 +105,30 @@ static class ToolCatalog
     public static IEnumerable<ToolEntry> EditorTools =>
         Entries.Where(e => e.InEditor);
 
+    /// The review rail is ordered like macOS's `OverlayAnnotationTool`, which
+    /// is deliberately NOT the editor's order: the overlay leads with the two
+    /// tools a screenshot is annotated with most (pen, arrow) while the editor
+    /// leads with its shape family. Keeping the order here rather than in the
+    /// `Tool` enum leaves stroke-width keys (`nameof(Tool.X)`) and the editor
+    /// rail untouched — the parity gate pins this sequence against the macOS
+    /// one so the two rails cannot drift again.
+    ///
+    /// macOS also offers `pixelateText` here, which this build has no tool
+    /// for; that is a missing FEATURE, not an ordering difference.
+    static readonly Tool[] OverlayOrder =
+    [
+        Tool.Select, Tool.Pen, Tool.Arrow, Tool.Rect, Tool.Text, Tool.Line,
+        Tool.Oval, Tool.Highlight, Tool.Counter, Tool.Blur, Tool.Spotlight,
+        Tool.Magnifier,
+    ];
+
     public static IEnumerable<ToolEntry> OverlayTools =>
-        Entries.Where(e => e.InOverlay);
+        OverlayOrder.Select(t => Entry(t)).OfType<ToolEntry>();
+
+    /// The overlay order, as a set, must stay exactly the rows marked
+    /// `InOverlay` — otherwise a tool added to the catalog would silently
+    /// never reach the rail, or one removed would throw at startup.
+    internal static IEnumerable<Tool> OverlayOrderForTesting => OverlayOrder;
 
     public static IEnumerable<ActionEntry> EditorActions =>
         Actions.Where(a => a.InEditor);

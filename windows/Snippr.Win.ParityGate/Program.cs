@@ -18,6 +18,7 @@ static class Program
     {
         int failed = 0;
         failed += Check("win-tooltip-catalog-parity", CatalogParity());
+        failed += Check("win-overlay-tool-order-matches-mac", OverlayToolOrder());
         failed += Check("win-backdrop-presets-match-spec", PresetsMatchSpec());
         failed += Check("win-backdrop-compose-geometry", ComposeGeometry());
         failed += Check("win-backdrop-undo-timeline", UndoTimeline());
@@ -583,6 +584,41 @@ static class Program
     }
 
     // ---------- catalog ----------
+
+    /// The review rail must read left-to-right the same as macOS's
+    /// `OverlayAnnotationTool.areaReviewTools`. The owner asked for one
+    /// muscle memory across platforms, and "they look the same today" is not
+    /// a property any code holds — this sequence is.
+    ///
+    /// macOS lists `pixelateText` between blur and magnifier. Windows has no
+    /// such tool, so it is absent here BY NAME: the day one is added, this
+    /// gate is where the order gets decided rather than discovered.
+    static List<string> OverlayToolOrder()
+    {
+        var f = new List<string>();
+        string[] mac =
+        [
+            "select", "pen", "arrow", "rect", "text", "line",
+            "oval", "highlight", "counter", "pixelate", "spotlight",
+            "magnifier",
+        ];
+        var win = ToolCatalog.OverlayTools.Select(e => e.IconKey).ToArray();
+        if (!win.SequenceEqual(mac))
+            f.Add($"order [{string.Join(",", win)}] want [{string.Join(",", mac)}]");
+
+        // The order list and the InOverlay flags are two statements about the
+        // same thing; if they disagree a tool either never reaches the rail
+        // or is looked up and is not there.
+        var flagged = ToolCatalog.Entries.Where(e => e.InOverlay)
+            .Select(e => e.Tool).OrderBy(t => t).ToArray();
+        var ordered = ToolCatalog.OverlayOrderForTesting.OrderBy(t => t).ToArray();
+        if (!flagged.SequenceEqual(ordered))
+            f.Add($"order set [{string.Join(",", ordered)}] vs InOverlay [{string.Join(",", flagged)}]");
+        if (ToolCatalog.OverlayOrderForTesting.Distinct().Count()
+            != ToolCatalog.OverlayOrderForTesting.Count())
+            f.Add("duplicate tool in overlay order");
+        return f;
+    }
 
     static List<string> CatalogParity()
     {

@@ -21,6 +21,17 @@ static class OcrService
 
         var engine = OcrEngine.TryCreateFromUserProfileLanguages()
             ?? OcrEngine.TryCreateFromLanguage(new Windows.Globalization.Language("en-US"));
+        // Which language answered is the whole diagnosis when the text comes
+        // back wrong: a profile without a Vietnamese OCR pack silently falls
+        // through to en-US, and en-US on Vietnamese reads as mangled glyphs
+        // rather than as an error anyone can see.
+        Diag.Click(
+            "ocr",
+            $"engine={engine?.RecognizerLanguage.LanguageTag ?? "none"} "
+            + "available="
+            + string.Join(
+                "|",
+                OcrEngine.AvailableRecognizerLanguages.Select(l => l.LanguageTag)));
         if (engine == null) return "";
 
         var result = await engine.RecognizeAsync(soft);

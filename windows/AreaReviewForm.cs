@@ -50,6 +50,8 @@ sealed class AreaReviewForm : Form
 
     internal Rectangle SelectionForTesting => _session.PixelRect;
 
+    internal BackdropMenu BackdropMenuForTesting => _toolbar.Menu;
+
     /// Smoke parks this form off-screen (`Reveal` at -32000), so it cannot
     /// place the machine cursor and still round-trip through `PointToClient`.
     /// Production always reads `Cursor.Position`; tests set this instead.
@@ -158,7 +160,17 @@ sealed class AreaReviewForm : Form
         _toolbar.SetUndoRedo(_session.CanUndo, _session.CanRedo);
     }
 
-    void PlaceToolbar() => _toolbar.Place(_session.Selection, ClientRectangle);
+    void PlaceToolbar()
+    {
+        _toolbar.Place(_session.Selection, ClientRectangle);
+        // Where the chrome ended up, so "the buttons do nothing" can be told
+        // apart from "the buttons are not where the hit test thinks".
+        var (tool, action) = ChromeFrames();
+        Diag.Click(
+            "review",
+            $"toolbar rail={Rectangle.Round(tool)} strip={Rectangle.Round(action)} "
+            + $"client={ClientRectangle} selection={_session.Selection}");
+    }
 
     /// The rail and the strip, in this form's coordinates — the only parts of
     /// the toolbar that are not the picture.

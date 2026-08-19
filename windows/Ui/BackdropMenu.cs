@@ -33,8 +33,6 @@ sealed class BackdropMenu : ContextMenuStrip
             var item = new ToolStripMenuItem(label)
             {
                 Tag = id,
-                AutoSize = false,
-                Height = 28,
                 Image = SwatchBitmap(id, swatch),
             };
             item.Click += (_, _) =>
@@ -44,8 +42,39 @@ sealed class BackdropMenu : ContextMenuStrip
             };
             Items.Add(item);
         }
-        Opening += (_, _) => HoverHintOf();
+        Opening += (_, _) => { HoverHintOf(); SizeItems(); };
     }
+
+    /// Every row gets the same box: the natural width the label needs, and a
+    /// taller-than-default height so the swatch has room.
+    ///
+    /// The width has to be MEASURED. Fixing `AutoSize = false` with only a
+    /// height left every row at `ToolStripMenuItem`'s default width, and once
+    /// the image margin took its share there was no room left to draw the
+    /// label in — the menu showed five swatches and no words. Measuring on
+    /// `Opening` rather than in the constructor also means the row is right on
+    /// the display the menu actually opens on, not the one the app started on.
+    void SizeItems()
+    {
+        int width = 0;
+        foreach (ToolStripItem item in Items)
+        {
+            item.AutoSize = true;
+            width = Math.Max(width, item.GetPreferredSize(Size.Empty).Width);
+        }
+        int height = Theme.Px(28, DeviceDpi);
+        foreach (ToolStripItem item in Items)
+        {
+            item.AutoSize = false;
+            item.Size = new Size(width, height);
+        }
+    }
+
+    /// Runs the real `Opening` handlers without putting a dropdown on the
+    /// screen, so the smoke can check that opening the menu is what sizes the
+    /// rows — not merely that the sizer works when called directly.
+    internal void RaiseOpeningForTesting() =>
+        OnOpening(new System.ComponentModel.CancelEventArgs());
 
     public void SetActive(string id)
     {
