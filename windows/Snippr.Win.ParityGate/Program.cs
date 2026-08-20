@@ -655,9 +655,12 @@ static class Program
             ("offset area", new Rectangle(7, 5, 40, 30), new Rectangle(20, 15, 6, 6)),
             ("one-pixel gap", new Rectangle(0, 0, 40, 30), new Rectangle(1, 1, 38, 28)),
         };
+        // Hoisted: a stackalloc inside the loop would accumulate a frame per
+        // case until the method returns (CA2014). `Surround` writes the
+        // entries it reports and this only ever reads those.
+        Span<Rectangle> bands = stackalloc Rectangle[4];
         foreach (var (name, area, hole) in cases)
         {
-            Span<Rectangle> bands = stackalloc Rectangle[4];
             int n = CropGeometry.Surround(area, hole, bands);
             var painted = new Dictionary<(int X, int Y), int>();
             for (int i = 0; i < n; i++)
