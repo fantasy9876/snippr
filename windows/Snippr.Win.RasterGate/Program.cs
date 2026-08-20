@@ -29,6 +29,7 @@ static class Program
         failed += Check("win-area-review-preview-shows-document", ReviewPreviewShowsDocument());
         failed += Check("win-hover-hint-clamped", HoverHintClamped());
         failed += Check("win-overlay-chrome-paints-its-own-colours", OverlayChromePixels());
+        failed += Check("win-pixelate-matches-reference", PixelateMatchesReference());
         if (pending > 0)
             Console.WriteLine($"{pending} RASTER GATE(S) PENDING — not a pass");
         Console.WriteLine(failed == 0
@@ -219,6 +220,27 @@ static class Program
         }
         if (levels.Count < 3) f.Add($"grain flat ({levels.Count} levels)");
         if (worst > 8) f.Add($"grain is not a dither (jump {worst})");
+
+        // The tiles are CACHED now — built once per preset instead of once per
+        // paint, which was costing a 64 KB byte[], a Bitmap and 16384 hashed
+        // pixels on every frame of every drag over a backdrop. A cache has one
+        // new way to be wrong that painting afresh did not: handing back the
+        // wrong preset's tile. So interleave. Ocean either side of Sunset must
+        // still be Ocean, and must still not be Sunset.
+        using var oceanFirst = Fill(BackdropPreset.Ocean);
+        using var sunset = Fill(BackdropPreset.Sunset);
+        using var oceanAgain = Fill(BackdropPreset.Ocean);
+        int drifted = 0;
+        bool distinct = false;
+        for (int y = 0; y < 256; y += 3)
+            for (int x = 0; x < 256; x += 3)
+            {
+                if (At(oceanFirst, x, y) != At(oceanAgain, x, y)) drifted++;
+                if (At(oceanFirst, x, y) != At(sunset, x, y)) distinct = true;
+            }
+        if (drifted > 0)
+            f.Add($"{drifted}px of Ocean changed after Sunset was drawn between");
+        if (!distinct) f.Add("Ocean and Sunset render identically — one tile for both");
         return f;
     }
 
@@ -971,6 +993,137 @@ static class Program
         using var g = Graphics.FromImage(bmp);
         using var brush = new SolidBrush(colour);
         g.FillRectangle(brush, 0, 0, width, height);
+        return bmp;
+    }
+
+    // ---------- the redaction still redacts ----------
+
+    /// `Pixelate` stopped staging the picture through two managed byte[]s and
+    /// now reads and writes the locked bits directly — three full-size buffers
+    /// down to one, and no copy of every pixel before any block is averaged.
+    ///
+    /// That is a rewrite of the code that REDACTS, so "it looks about right"
+    /// is not a standard anyone should accept. This runs the implementation
+    /// the app ships beside a transcription of the one it replaced and demands
+    /// they agree on every pixel, at sizes that are not multiples of the block
+    /// (where the partial edge blocks live) and at blocks of 1 and 7 as well
+    /// as the default 14.
+    static List<string> PixelateMatchesReference()
+    {
+        var f = new List<string>();
+        (int W, int H)[] sizes = [(64, 48), (61, 47), (14, 14), (15, 3), (1, 1), (97, 128)];
+        int[] blocks = [14, 1, 7];
+        foreach (var (w, h) in sizes)
+        {
+            foreach (var block in blocks)
+            {
+                using var src = Noise(w, h, (uint)(w * 7919 + h * 104729 + block));
+                using var got = AnnotationRenderer.Pixelate(src, block);
+                using var want = ReferencePixelate(src, block);
+                if (got.Width != want.Width || got.Height != want.Height)
+                {
+                    f.Add($"{w}x{h}/{block}: size {got.Width}x{got.Height}");
+                    continue;
+                }
+                int wrong = 0, changed = 0;
+                string first = "";
+                for (int y = 0; y < h; y++)
+                    for (int x = 0; x < w; x++)
+                    {
+                        var a = At(got, x, y);
+                        var b = At(want, x, y);
+                        if (a.ToArgb() != b.ToArgb())
+                        {
+                            wrong++;
+                            if (first.Length == 0) first = $" first@{x},{y} {a} vs {b}";
+                        }
+                        if (a.ToArgb() != At(src, x, y).ToArgb()) changed++;
+                    }
+                if (wrong > 0) f.Add($"{w}x{h}/{block}: {wrong}px differ{first}");
+                // Positive premise: at a block wider than a pixel the redaction
+                // has to actually move pixels, or this compares two copies of
+                // the source and would pass however broken both were.
+                if (block > 1 && w > 1 && h > 1 && changed == 0)
+                    f.Add($"{w}x{h}/{block}: redaction changed nothing");
+            }
+        }
+        return f;
+    }
+
+    /// The staging implementation `Pixelate` replaced, kept here as the oracle.
+    /// Deliberately a transcription — if it is "tidied" to share code with the
+    /// thing it checks, it stops checking anything.
+    static Bitmap ReferencePixelate(Bitmap src, int block)
+    {
+        block = Math.Max(1, block);
+        int w = src.Width, h = src.Height;
+        var bounds = new Rectangle(0, 0, w, h);
+        var result = new Bitmap(w, h, PixelFormat.Format32bppArgb);
+
+        var srcData = src.LockBits(bounds, ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
+        var pixels = new byte[srcData.Stride * h];
+        System.Runtime.InteropServices.Marshal.Copy(srcData.Scan0, pixels, 0, pixels.Length);
+        src.UnlockBits(srcData);
+
+        var dstData = result.LockBits(bounds, ImageLockMode.WriteOnly, PixelFormat.Format32bppArgb);
+        var outPixels = new byte[dstData.Stride * h];
+        for (int by = 0; by < h; by += block)
+        {
+            int yEnd = Math.Min(by + block, h);
+            for (int bx = 0; bx < w; bx += block)
+            {
+                int xEnd = Math.Min(bx + block, w);
+                long b = 0, g2 = 0, r = 0, a = 0;
+                int count = (xEnd - bx) * (yEnd - by);
+                for (int y = by; y < yEnd; y++)
+                {
+                    int row = y * srcData.Stride;
+                    for (int x = bx; x < xEnd; x++)
+                    {
+                        int i = row + x * 4;
+                        b += pixels[i];
+                        g2 += pixels[i + 1];
+                        r += pixels[i + 2];
+                        a += pixels[i + 3];
+                    }
+                }
+                byte ab = (byte)(b / count), ag = (byte)(g2 / count);
+                byte ar = (byte)(r / count), aa = (byte)(a / count);
+                for (int y = by; y < yEnd; y++)
+                {
+                    int row = y * dstData.Stride;
+                    for (int x = bx; x < xEnd; x++)
+                    {
+                        int i = row + x * 4;
+                        outPixels[i] = ab;
+                        outPixels[i + 1] = ag;
+                        outPixels[i + 2] = ar;
+                        outPixels[i + 3] = aa;
+                    }
+                }
+            }
+        }
+        System.Runtime.InteropServices.Marshal.Copy(outPixels, 0, dstData.Scan0, outPixels.Length);
+        result.UnlockBits(dstData);
+        return result;
+    }
+
+    /// Deterministic noise, so a failure is reproducible and a block average
+    /// is not the same number everywhere.
+    static Bitmap Noise(int w, int h, uint seed)
+    {
+        var bmp = new Bitmap(w, h, PixelFormat.Format32bppArgb);
+        uint state = seed | 1;
+        for (int y = 0; y < h; y++)
+            for (int x = 0; x < w; x++)
+            {
+                state ^= state << 13; state ^= state >> 17; state ^= state << 5;
+                bmp.SetPixel(x, y, Color.FromArgb(
+                    (int)(160 + (state >> 24) % 96),
+                    (int)(state & 0xFF),
+                    (int)((state >> 8) & 0xFF),
+                    (int)((state >> 16) & 0xFF)));
+            }
         return bmp;
     }
 

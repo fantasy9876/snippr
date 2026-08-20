@@ -463,7 +463,15 @@ static class AnnotationRenderer
     /// carrying pure source red through a "pixelated" area. Averaging also
     /// matches what the macOS build produces, so a redaction looks the same on
     /// both platforms.
-    public static Bitmap Pixelate(Bitmap src, int block = 14)
+    /// Straight through the locked bits, both ways.
+    ///
+    /// This used to stage the whole picture twice in managed byte[]s — one
+    /// read out of the source, one built for the destination — so redacting a
+    /// capture of the desktop cost THREE full-size buffers and two copies of
+    /// every pixel before a single block was averaged. On a 4K desktop that is
+    /// about 100 MB in flight to produce a 33 MB answer. The arithmetic below
+    /// is unchanged, byte for byte; only the staging is gone.
+    public static unsafe Bitmap Pixelate(Bitmap src, int block = 14)
     {
         block = Math.Max(1, block);
         int w = src.Width, h = src.Height;
@@ -471,50 +479,53 @@ static class AnnotationRenderer
         var result = new Bitmap(w, h, PixelFormat.Format32bppArgb);
 
         var srcData = src.LockBits(bounds, ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
-        var pixels = new byte[srcData.Stride * h];
-        System.Runtime.InteropServices.Marshal.Copy(srcData.Scan0, pixels, 0, pixels.Length);
-        src.UnlockBits(srcData);
-
-        var dstData = result.LockBits(bounds, ImageLockMode.WriteOnly, PixelFormat.Format32bppArgb);
-        var outPixels = new byte[dstData.Stride * h];
-        for (int by = 0; by < h; by += block)
+        BitmapData? dstData = null;
+        try
         {
-            int yEnd = Math.Min(by + block, h);
-            for (int bx = 0; bx < w; bx += block)
+            dstData = result.LockBits(
+                bounds, ImageLockMode.WriteOnly, PixelFormat.Format32bppArgb);
+            byte* source = (byte*)srcData.Scan0;
+            byte* dest = (byte*)dstData.Scan0;
+            for (int by = 0; by < h; by += block)
             {
-                int xEnd = Math.Min(bx + block, w);
-                long b = 0, g2 = 0, r = 0, a = 0;
-                int count = (xEnd - bx) * (yEnd - by);
-                for (int y = by; y < yEnd; y++)
+                int yEnd = Math.Min(by + block, h);
+                for (int bx = 0; bx < w; bx += block)
                 {
-                    int row = y * srcData.Stride;
-                    for (int x = bx; x < xEnd; x++)
+                    int xEnd = Math.Min(bx + block, w);
+                    long b = 0, g2 = 0, r = 0, a = 0;
+                    int count = (xEnd - bx) * (yEnd - by);
+                    for (int y = by; y < yEnd; y++)
                     {
-                        int i = row + x * 4;
-                        b += pixels[i];
-                        g2 += pixels[i + 1];
-                        r += pixels[i + 2];
-                        a += pixels[i + 3];
+                        byte* row = source + (long)y * srcData.Stride + (long)bx * 4;
+                        for (int x = bx; x < xEnd; x++, row += 4)
+                        {
+                            b += row[0];
+                            g2 += row[1];
+                            r += row[2];
+                            a += row[3];
+                        }
                     }
-                }
-                byte ab = (byte)(b / count), ag = (byte)(g2 / count);
-                byte ar = (byte)(r / count), aa = (byte)(a / count);
-                for (int y = by; y < yEnd; y++)
-                {
-                    int row = y * dstData.Stride;
-                    for (int x = bx; x < xEnd; x++)
+                    byte ab = (byte)(b / count), ag = (byte)(g2 / count);
+                    byte ar = (byte)(r / count), aa = (byte)(a / count);
+                    for (int y = by; y < yEnd; y++)
                     {
-                        int i = row + x * 4;
-                        outPixels[i] = ab;
-                        outPixels[i + 1] = ag;
-                        outPixels[i + 2] = ar;
-                        outPixels[i + 3] = aa;
+                        byte* row = dest + (long)y * dstData.Stride + (long)bx * 4;
+                        for (int x = bx; x < xEnd; x++, row += 4)
+                        {
+                            row[0] = ab;
+                            row[1] = ag;
+                            row[2] = ar;
+                            row[3] = aa;
+                        }
                     }
                 }
             }
         }
-        System.Runtime.InteropServices.Marshal.Copy(outPixels, 0, dstData.Scan0, outPixels.Length);
-        result.UnlockBits(dstData);
+        finally
+        {
+            src.UnlockBits(srcData);
+            if (dstData != null) result.UnlockBits(dstData);
+        }
         return result;
     }
 }

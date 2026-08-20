@@ -151,6 +151,10 @@ sealed class TrayContext : ApplicationContext
         finally
         {
             frozen.Dispose();
+            // The frozen desktop is the single biggest thing this app ever
+            // allocates. Once it is gone the process is idle again, and the
+            // pages should be too.
+            MemoryTrim.Schedule();
         }
     }
 

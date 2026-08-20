@@ -83,10 +83,16 @@ sealed class OverlayForm : Form
         ShowInTaskbar = false;
         Cursor = Cursors.Cross;
         KeyPreview = true;
-        DoubleBuffered = true;
+        // Opaque + a buffer of our own, NOT DoubleBuffered. WinForms buffers a
+        // control by asking for a bitmap the size of its CLIENT rectangle, and
+        // this window is the whole virtual desktop: every crosshair move was
+        // allocating and freeing a full-screen DIB. The picture is identical —
+        // one buffered blit per frame — but the buffer is made once.
         SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint
-            | ControlStyles.OptimizedDoubleBuffer, true);
+            | ControlStyles.Opaque, true);
     }
+
+    readonly PaintBuffer _buffer = new();
 
     /// What the window asked for and what it got. `MaxWindowTrackSize` is the
     /// whole DESKTOP, not the primary monitor, so a window asking for the
@@ -118,43 +124,75 @@ sealed class OverlayForm : Form
         }
     }
 
+    protected override void OnPaintBackground(PaintEventArgs e) { }
+
     protected override void OnPaint(PaintEventArgs e)
     {
-        var g = e.Graphics;
+        var clip = Rectangle.Intersect(e.ClipRectangle, ClientRectangle);
+        if (clip.Width <= 0 || clip.Height <= 0) return;
+        var buffer = _buffer.For(clip.Size);
+        if (buffer is null)
+        {
+            // No buffer to be had: a torn frame beats a blank one.
+            PaintInto(e.Graphics, clip);
+            return;
+        }
+        using (var back = Graphics.FromImage(buffer))
+        {
+            back.TranslateTransform(-clip.X, -clip.Y);
+            // Set AFTER the transform: SetClip takes world coordinates.
+            back.SetClip(clip);
+            PaintInto(back, clip);
+        }
+        e.Graphics.DrawImage(
+            buffer, clip, new Rectangle(Point.Empty, clip.Size), GraphicsUnit.Pixel);
+    }
+
+    void PaintInto(Graphics g, Rectangle clip)
+    {
+        // An opaque ground first. The buffer starts fully transparent and the
+        // screen DC it stands in for has no alpha channel at all, so a frozen
+        // capture whose alpha bytes came back as zero would composite to the
+        // desktop against one and to nothing against the other.
+        g.FillRectangle(Ground, clip);
         g.DrawImageUnscaled(_frozen, 0, 0);
 
-        using var dim = new SolidBrush(Color.FromArgb(105, Color.Black));
         var sel = SelectionLocal;
         if (sel is Rectangle r)
         {
-            var region = new Region(ClientRectangle);
-            region.Exclude(r);
-            g.FillRegion(dim, region);
-            region.Dispose();
+            // Bands, not a Region: same coverage, no GDI object per frame.
+            Span<Rectangle> bands = stackalloc Rectangle[4];
+            int n = CropGeometry.Surround(clip, r, bands);
+            for (int i = 0; i < n; i++) g.FillRectangle(Dim, bands[i]);
 
-            using var pen = new Pen(Color.DeepSkyBlue, 1.6f);
-            g.DrawRectangle(pen, r);
+            g.DrawRectangle(SelectionEdge, r);
 
             string label = $"{r.Width} × {r.Height}";
             DrawBubble(g, label, new Point(r.Right + 8, r.Bottom + 6));
         }
         else
         {
-            g.FillRectangle(dim, ClientRectangle);
-            using var cross = new Pen(Color.FromArgb(170, Color.White), 1f);
-            g.DrawLine(cross, _current.X, 0, _current.X, Height);
-            g.DrawLine(cross, 0, _current.Y, Width, _current.Y);
+            g.FillRectangle(Dim, clip);
+            g.DrawLine(Crosshair, _current.X, 0, _current.X, Height);
+            g.DrawLine(Crosshair, 0, _current.Y, Width, _current.Y);
         }
     }
 
+    /// Made once. These never vary, and building them per paint meant three
+    /// unmanaged GDI+ handles created and destroyed on every mouse move.
+    static readonly SolidBrush Ground = new(Color.Black);
+    static readonly SolidBrush Dim = new(Color.FromArgb(105, Color.Black));
+    static readonly Pen SelectionEdge = new(Color.DeepSkyBlue, 1.6f);
+    static readonly Pen Crosshair = new(Color.FromArgb(170, Color.White), 1f);
+    static readonly Font BubbleFont = new("Segoe UI", 9.5f, FontStyle.Bold);
+    static readonly SolidBrush BubbleBack = new(Color.FromArgb(195, Color.Black));
+
     static void DrawBubble(Graphics g, string text, Point at)
     {
-        using var font = new Font("Segoe UI", 9.5f, FontStyle.Bold);
-        var size = g.MeasureString(text, font);
+        var size = g.MeasureString(text, BubbleFont);
         var rect = new RectangleF(at.X, at.Y, size.Width + 12, size.Height + 6);
-        using var bg = new SolidBrush(Color.FromArgb(195, Color.Black));
-        g.FillRectangle(bg, rect);
-        g.DrawString(text, font, Brushes.White, at.X + 6, at.Y + 3);
+        g.FillRectangle(BubbleBack, rect);
+        g.DrawString(text, BubbleFont, Brushes.White, at.X + 6, at.Y + 3);
     }
 
     protected override void OnMouseDown(MouseEventArgs e)
@@ -205,5 +243,11 @@ sealed class OverlayForm : Form
     protected override void OnKeyDown(KeyEventArgs e)
     {
         if (e.KeyCode == Keys.Escape) Close();
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing) _buffer.Dispose();
+        base.Dispose(disposing);
     }
 }

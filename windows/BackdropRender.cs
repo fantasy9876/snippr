@@ -81,7 +81,7 @@ static class BackdropRender
     static void DrawGrain(
         Graphics g, RectangleF canvas, BackdropPreset preset, float documentPixelsPerUserUnit)
     {
-        using var tile = GrainBitmap(BackdropSpec.GrainSeed(preset));
+        var tile = CachedGrain(BackdropSpec.GrainSeed(preset));
         var side = BackdropSpec.GrainTileSide / Math.Max(0.0001f, documentPixelsPerUserUnit);
         using var brush = new TextureBrush(tile, WrapMode.Tile);
         brush.ScaleTransform(side / BackdropSpec.GrainTileSide, side / BackdropSpec.GrainTileSide);
@@ -89,6 +89,33 @@ static class BackdropRender
         g.PixelOffsetMode = PixelOffsetMode.Half;
         g.FillRectangle(brush, canvas);
         g.Restore(state);
+    }
+
+    /// The grain tiles, kept.
+    ///
+    /// There are at most four of them — one per preset that has a backdrop —
+    /// and each is a fixed 128x128. Building one costs a 64 KB byte[], a
+    /// Bitmap, a LockBits and 16384 hashed pixels, and `DrawGrain` was paying
+    /// that on EVERY paint: once per mouse move while drawing over a preset,
+    /// on a surface the size of the desktop. They never vary — the seed is the
+    /// preset — so the only correct number of times to build one is once.
+    ///
+    /// The lock guards the DICTIONARY, not the tiles: GDI+ reads them as a
+    /// brush source, and every caller here paints on the UI thread. Never
+    /// disposed — four tiles is 256 KB and the process wants them again the
+    /// moment another backdrop is drawn.
+    static readonly Dictionary<uint, Bitmap> GrainCache = new();
+    static readonly object GrainGate = new();
+
+    static Bitmap CachedGrain(uint seed)
+    {
+        lock (GrainGate)
+        {
+            if (GrainCache.TryGetValue(seed, out var cached)) return cached;
+            var made = GrainBitmap(seed);
+            GrainCache[seed] = made;
+            return made;
+        }
     }
 
     /// The spec's tile bytes turned into what GDI+ can composite: a deviation

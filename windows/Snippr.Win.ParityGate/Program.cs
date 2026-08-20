@@ -24,6 +24,7 @@ static class Program
         failed += Check("win-backdrop-undo-timeline", UndoTimeline());
         failed += Check("win-backdrop-route-table", RouteTable());
         failed += Check("win-area-review-crop-authority", CropAuthority());
+        failed += Check("win-dim-bands-cover-exactly", DimBands());
         failed += Check("win-overlay-toolbar-layout", OverlayToolbarLayoutGate());
         failed += Check("win-area-review-chrome-hit-test", ChromeHitTest());
         failed += Check("win-area-review-crop-drag", CropDrag());
@@ -625,6 +626,68 @@ static class Program
         Console.WriteLine($"PEND {name} {reason}");
         pending++;
         return 0;
+    }
+
+    /// The dim around the crop, as bands instead of a GDI region.
+    ///
+    /// The review surface paints this on every mouse move of a drag, so it
+    /// stopped building a `Region` per frame. That is only safe if the bands
+    /// cover EXACTLY what the region did — and "exactly" has three parts, all
+    /// of which show on screen if broken: a missed pixel is a bright notch in
+    /// the dim, a pixel inside the hole is a veil over the picture being
+    /// reviewed, and a pixel painted twice is a dark patch, because the dim is
+    /// translucent.
+    ///
+    /// Checked by walking the pixels rather than by restating the arithmetic:
+    /// an oracle that computes the bands the same way would agree with any bug.
+    static List<string> DimBands()
+    {
+        var f = new List<string>();
+        var cases = new (string Name, Rectangle Area, Rectangle Hole)[]
+        {
+            ("hole inside", new Rectangle(0, 0, 40, 30), new Rectangle(10, 8, 15, 12)),
+            ("hole at origin", new Rectangle(0, 0, 40, 30), new Rectangle(0, 0, 12, 9)),
+            ("hole at far corner", new Rectangle(0, 0, 40, 30), new Rectangle(28, 21, 12, 9)),
+            ("hole fills area", new Rectangle(0, 0, 40, 30), new Rectangle(0, 0, 40, 30)),
+            ("hole hangs off", new Rectangle(0, 0, 40, 30), new Rectangle(-5, -5, 20, 20)),
+            ("hole outside", new Rectangle(0, 0, 40, 30), new Rectangle(80, 80, 10, 10)),
+            ("hole empty", new Rectangle(0, 0, 40, 30), Rectangle.Empty),
+            ("offset area", new Rectangle(7, 5, 40, 30), new Rectangle(20, 15, 6, 6)),
+            ("one-pixel gap", new Rectangle(0, 0, 40, 30), new Rectangle(1, 1, 38, 28)),
+        };
+        foreach (var (name, area, hole) in cases)
+        {
+            Span<Rectangle> bands = stackalloc Rectangle[4];
+            int n = CropGeometry.Surround(area, hole, bands);
+            var painted = new Dictionary<(int X, int Y), int>();
+            for (int i = 0; i < n; i++)
+            {
+                var b = bands[i];
+                if (!area.Contains(b))
+                    f.Add($"{name}: band {b} escapes {area}");
+                for (int y = b.Top; y < b.Bottom; y++)
+                    for (int x = b.Left; x < b.Right; x++)
+                    {
+                        painted.TryGetValue((x, y), out var seen);
+                        painted[(x, y)] = seen + 1;
+                    }
+            }
+            var clipped = Rectangle.Intersect(area, hole);
+            int missed = 0, veiled = 0, twice = 0;
+            for (int y = area.Top; y < area.Bottom; y++)
+                for (int x = area.Left; x < area.Right; x++)
+                {
+                    bool wanted = !clipped.Contains(x, y);
+                    painted.TryGetValue((x, y), out var times);
+                    if (wanted && times == 0) missed++;
+                    if (!wanted && times > 0) veiled++;
+                    if (times > 1) twice++;
+                }
+            if (missed > 0) f.Add($"{name}: {missed}px of the surround left bright");
+            if (veiled > 0) f.Add($"{name}: {veiled}px of the crop dimmed");
+            if (twice > 0) f.Add($"{name}: {twice}px dimmed twice");
+        }
+        return f;
     }
 
     static int Check(string name, List<string> failures)

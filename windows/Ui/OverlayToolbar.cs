@@ -59,10 +59,7 @@ sealed class OverlayToolbar : Control
     Rectangle _railFrame;
     Rectangle _stripFrame;
     bool _chromeVisible;
-    /// One buffer, kept. WinForms' own OptimizedDoubleBuffer allocates for the
-    /// CLIENT rectangle every paint, and this control's client rectangle is the
-    /// whole virtual desktop — a 30-odd MB allocate-and-free per mouse move.
-    Bitmap? _buffer;
+    readonly PaintBuffer _buffer = new();
 
     static readonly (string Key, string Hint)[] DefaultTools =
     [
@@ -338,7 +335,7 @@ sealed class OverlayToolbar : Control
     {
         var clip = Rectangle.Intersect(e.ClipRectangle, ClientRectangle);
         if (clip.Width <= 0 || clip.Height <= 0) return;
-        var buffer = Buffer(clip.Size);
+        var buffer = _buffer.For(clip.Size);
         if (buffer is null)
         {
             // No buffer to be had: a torn frame beats a blank one.
@@ -384,36 +381,13 @@ sealed class OverlayToolbar : Control
             OverlayChrome.PaintPlate(g, _stripFrame, DeviceDpi);
     }
 
-    Bitmap? Buffer(Size need)
-    {
-        if (_buffer is not null
-            && _buffer.Width >= need.Width && _buffer.Height >= need.Height)
-            return _buffer;
-        int width = Math.Max(need.Width, _buffer?.Width ?? 0);
-        int height = Math.Max(need.Height, _buffer?.Height ?? 0);
-        _buffer?.Dispose();
-        _buffer = null;
-        try
-        {
-            // Premultiplied: GDI+ blits PArgb through its fast opaque path,
-            // the same reason the captures use it.
-            _buffer = new Bitmap(width, height, PixelFormat.Format32bppPArgb);
-        }
-        catch (Exception ex)
-        {
-            Diag.Crash("overlay-buffer", ex);
-        }
-        return _buffer;
-    }
-
     protected override void Dispose(bool disposing)
     {
         if (disposing)
         {
             _hint.Dispose();
             _menu.Dispose();
-            _buffer?.Dispose();
-            _buffer = null;
+            _buffer.Dispose();
         }
         base.Dispose(disposing);
     }

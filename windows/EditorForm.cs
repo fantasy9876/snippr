@@ -149,6 +149,10 @@ sealed class EditorForm : Form
         };
         _history.Clear();
         foreach (var bmp in seen) bmp.Dispose();
+        // An editing session holds the shot, the scale cache, the pixelate
+        // cache and every bitmap on the undo stacks. Closing it is the other
+        // moment worth giving the memory back.
+        MemoryTrim.Schedule();
     }
 
     // ---------- toolbar ----------

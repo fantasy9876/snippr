@@ -138,10 +138,13 @@ sealed class AreaReviewForm : Form
         TopMost = true;
         ShowInTaskbar = false;
         KeyPreview = true;
-        DoubleBuffered = true;
+        // NOT DoubleBuffered. The toolbar is docked Fill over every pixel of
+        // this form and buffers itself, so this form's own paint is both
+        // invisible and rare — and WinForms would answer OptimizedDoubleBuffer
+        // by allocating a bitmap the size of the virtual desktop for each of
+        // those paints.
         SetStyle(
-            ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint
-                | ControlStyles.OptimizedDoubleBuffer, true);
+            ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint, true);
 
         _toolbar.Dock = DockStyle.Fill;
         // The toolbar covers every pixel of this form, so it — not this form —
@@ -289,16 +292,12 @@ sealed class AreaReviewForm : Form
 
         // Everything outside the crop is dimmed — with a frame on, the frame
         // is part of what survives, so the hole is the outer rect.
-        using (var dim = new SolidBrush(Color.FromArgb(105, Color.Black)))
-        {
-            // Built from the clip, not the whole surface: a partial repaint
-            // asks GDI+ to fill a region the size of the desktop otherwise,
-            // and then throws all but the damaged part of it away.
-            var region = new Region(clip);
-            region.Exclude(VisibleOuterRect());
-            g.FillRegion(dim, region);
-            region.Dispose();
-        }
+        //
+        // Four rectangles, not a Region. The hole is always a rectangle, so
+        // clip-minus-hole is at most four bands, and this runs on every mouse
+        // move of a drag: a `Region` is a real GDI object to allocate, combine
+        // and destroy each time, and it bought nothing a subtraction cannot do.
+        DimAround(g, clip, VisibleOuterRect());
 
         var marks = g.Save();
         g.SmoothingMode = SmoothingMode.AntiAlias;
@@ -313,26 +312,43 @@ sealed class AreaReviewForm : Form
         if (_session.Backdrop != BackdropPreset.None)
             BackdropRender.DrawPlateHairline(g, crop, 1, _session.Corners);
 
-        using (var pen = new Pen(Color.DeepSkyBlue, 1.6f))
-            g.DrawRectangle(pen, crop);
+        g.DrawRectangle(CropEdge, crop);
         // The handles are drawn from the same helper the hit test reads, so
         // what the user grabs is what they can see. On a rounded plate the
         // corner centres sit on the arc; shrinkToArc keeps the 8 px square
         // from covering the cut on a small crop.
-        using (var fill = new SolidBrush(Color.White))
-        using (var edge = new Pen(Color.DeepSkyBlue, 1.2f))
-            foreach (var handle in OverlayToolbarLayout.HandleRects(
-                crop, 8f, ReviewCornerRadius, shrinkToArc: true))
-            {
-                g.FillRectangle(fill, handle);
-                g.DrawRectangle(
-                    edge, handle.X, handle.Y, handle.Width, handle.Height);
-            }
-        if (_selected != null)
+        foreach (var handle in OverlayToolbarLayout.HandleRects(
+            crop, 8f, ReviewCornerRadius, shrinkToArc: true))
         {
-            using var sel = new Pen(Color.DeepSkyBlue, 1.5f) { DashStyle = DashStyle.Dash };
-            g.DrawRectangle(sel, Rectangle.Inflate(_selected.Bounds, 5, 5));
+            g.FillRectangle(HandleFill, handle);
+            g.DrawRectangle(
+                HandleEdge, handle.X, handle.Y, handle.Width, handle.Height);
         }
+        if (_selected != null)
+            g.DrawRectangle(SelectionEdge, Rectangle.Inflate(_selected.Bounds, 5, 5));
+    }
+
+    /// The chrome this surface paints on every frame, made once.
+    ///
+    /// Pens and brushes are unmanaged GDI+ handles. These four never vary, and
+    /// building and destroying them per paint — which meant per mouse move
+    /// while drawing — was work with no output. Process-lifetime on purpose:
+    /// disposing them would only mean making them again.
+    static readonly SolidBrush Dim = new(Color.FromArgb(105, Color.Black));
+    static readonly Pen CropEdge = new(Color.DeepSkyBlue, 1.6f);
+    static readonly SolidBrush HandleFill = new(Color.White);
+    static readonly Pen HandleEdge = new(Color.DeepSkyBlue, 1.2f);
+    static readonly Pen SelectionEdge =
+        new(Color.DeepSkyBlue, 1.5f) { DashStyle = DashStyle.Dash };
+
+    /// The dim, from `CropGeometry.Surround` — the arithmetic lives there so a
+    /// gate can check it without a screen. Stack-allocated: this is a
+    /// per-frame path and four rectangles are not worth a heap.
+    static void DimAround(Graphics g, Rectangle area, Rectangle hole)
+    {
+        Span<Rectangle> bands = stackalloc Rectangle[4];
+        int n = CropGeometry.Surround(area, hole, bands);
+        for (int i = 0; i < n; i++) g.FillRectangle(Dim, bands[i]);
     }
 
     Rectangle VisibleOuterRect()
