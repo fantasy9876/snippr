@@ -27,7 +27,9 @@ cài** — release thiếu hash sẽ khiến client từ chối auto-update (fai
 3. `shasum -a 256 <staging>/Snippr-<ver>.dmg <staging>/Snippr-<ver>-intel.dmg`
 4. Cập nhật `site/version.json`: `mac`, `macUrlArm`, `macUrlIntel`,
    **`macSha256Arm`, `macSha256Intel`** (bắt buộc — client mới sẽ so khớp).
-5. Cập nhật nút tải trong `site/index.html`.
+   `index.html` đọc các trường này lúc mở trang — **không** sửa nút tải
+   trong HTML. Chạy `scripts/test-site-versions-from-json.sh` trước khi
+   deploy: cứng số phiên bản hiện tại vào `index.html` là đỏ.
 
 Lưu ý: script cập nhật giờ swap an toàn (`Snippr.app.new` → đổi tên sau khi
 copy xong, có rollback) và verify SHA-256 + đúng bundle ID + đúng certificate
@@ -41,6 +43,9 @@ root; một DMG ký bằng cert khác bị từ chối trước khi đụng app 
 3. `sha256sum SnipprSetup-<ver>-win-x64.exe`
 4. Cập nhật `site/version.json`: `win`, `winUrl`, **`winSha256`** (bắt buộc
    nếu installer KHÔNG được ký Authenticode; nên điền luôn kể cả khi đã ký).
+   Link Setup + ZIP portable trên trang chủ lấy từ `winUrl` (portable =
+   cùng thư mục tag, tên `Snippr-portable-win-x64.zip`). Không sửa
+   `index.html`.
 5. ⚠️ Đặt tag GitHub Release theo version Windows hoặc dùng tag chung rõ ràng —
    `winUrl` trỏ nhầm tag cũ là mọi client ăn 404.
 
@@ -53,7 +58,8 @@ hợp lệ → chạy; sha lệch → từ chối; không chữ ký + không sha
   `objects.githubusercontent.com` (sửa `AllowedHosts`/`allowedDownloadHost`
   nếu đổi nơi phát hành).
 - Chạy test trước khi phát hành:
-  - macOS: `Snippr --selftest`, `Snippr --test-scrollstitch`, và
+  - macOS: `Snippr --selftest`, `Snippr --test-scrollstitch`,
     `scripts/test-site-installer-transaction.sh` (bắt buộc trước khi deploy
-    `site/install.sh`)
+    `site/install.sh`), và `scripts/test-site-versions-from-json.sh`
+    (bắt buộc trước khi deploy `site/index.html`)
   - Windows: `dotnet build -c Release` (và test tay scroll capture)
