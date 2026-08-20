@@ -3,32 +3,41 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Snippr — Chụp màn hình cho Mac và Windows</title>
-<meta name="description" content="Snippr là ứng dụng chụp màn hình miễn phí cho Mac và Windows. Chụp vùng chọn, cửa sổ, cuộn trang, chú thích và OCR tiếng Việt. Ảnh ở lại máy bạn.">
-<meta name="theme-color" content="#000000">
-<meta property="og:title" content="Snippr — Chụp màn hình cho Mac và Windows">
-<meta property="og:description" content="Chụp, chú thích, OCR tiếng Việt. Miễn phí, mã nguồn mở, không tài khoản.">
+<title>Snippr — Công cụ chụp màn hình cho Mac và Windows</title>
+<meta name="description" content="Snippr: kéo vùng, duyệt ngay trên ảnh, Backdrop, Spotlight, OCR tiếng Việt offline. Miễn phí, mã nguồn mở, ảnh ở lại máy bạn.">
+<meta name="theme-color" content="#090b0e">
+<meta property="og:title" content="Snippr — Công cụ chụp màn hình cho Mac và Windows">
+<meta property="og:description" content="Kéo vùng, chú thích, Backdrop, OCR tiếng Việt. Không tài khoản, không đám mây.">
 <meta property="og:image" content="https://snippr.pages.dev/icon-1.2.6.png">
 <meta property="og:url" content="https://snippr.pages.dev">
 <link rel="icon" href="icon-1.2.6.png">
 <link rel="apple-touch-icon" href="icon-1.2.6.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Instrument+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
   :root {
-    --ink: #1d1d1f;
-    --muted: #6e6e73;
-    --faint: #86868b;
-    --line: rgba(0,0,0,.08);
-    --bg: #f5f5f7;
-    --card: #ffffff;
-    --blue: #0071e3;
-    --blue-hover: #0077ed;
-    --blue-press: #006edb;
-    --hero: #000;
-    --hero-ink: #f5f5f7;
-    --hero-muted: #a1a1a6;
-    --radius: 18px;
-    --shadow: 0 20px 60px rgba(0,0,0,.18);
-    --max: 1120px;
+    --bg: #090b0e;
+    --bg-2: #10141a;
+    --elev: #161b22;
+    --paper: #efeae0;
+    --paper-2: #e6e0d4;
+    --ink: #14171c;
+    --ink-soft: #2c333c;
+    --muted: #5c6570;
+    --faint: #8b93a0;
+    --fog: #c9cfd8;
+    --line: rgba(255,255,255,.08);
+    --line-ink: rgba(20,23,28,.12);
+    --accent: #2ad4c2;
+    --accent-deep: #14b8a6;
+    --accent-ink: #04221e;
+    --warm: #e4b86a;
+    --danger: #e86868;
+    --max: 1140px;
+    --r: 10px;
+    --sans: "Instrument Sans", "Segoe UI", Helvetica, Arial, sans-serif;
+    --mono: "IBM Plex Mono", ui-monospace, Menlo, monospace;
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   html { scroll-behavior: smooth; }
@@ -38,260 +47,326 @@
   }
   body {
     background: var(--bg);
-    color: var(--ink);
-    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-    font-size: 17px;
-    line-height: 1.47;
+    color: #e8ecef;
+    font-family: var(--sans);
+    font-size: 16px;
+    line-height: 1.55;
     -webkit-font-smoothing: antialiased;
     text-rendering: optimizeLegibility;
   }
-  a { color: var(--blue); text-decoration: none; }
-  a:hover { text-decoration: underline; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; text-underline-offset: 3px; }
   img { max-width: 100%; display: block; }
   .wrap { width: min(var(--max), calc(100% - 48px)); margin: 0 auto; }
 
   nav {
     position: sticky; top: 0; z-index: 40;
-    backdrop-filter: saturate(180%) blur(20px);
-    -webkit-backdrop-filter: saturate(180%) blur(20px);
-    background: rgba(0,0,0,.72);
-    border-bottom: 1px solid rgba(255,255,255,.08);
+    background: rgba(9,11,14,.92);
+    border-bottom: 1px solid var(--line);
   }
   .nav-inner {
     width: min(var(--max), calc(100% - 40px));
     margin: 0 auto;
-    height: 52px;
+    height: 60px;
     display: flex; align-items: center; justify-content: space-between; gap: 16px;
   }
   .brand {
     display: flex; align-items: center; gap: 10px;
     color: #fff; font-weight: 600; letter-spacing: -.02em;
-    text-decoration: none;
+    text-decoration: none; font-size: 16px;
   }
-  .brand:hover { text-decoration: none; opacity: .86; }
+  .brand:hover { text-decoration: none; color: var(--accent); }
   .brand img { width: 28px; height: 28px; border-radius: 7px; }
-  .nav-links { display: flex; align-items: center; gap: 22px; }
+  .nav-links { display: flex; align-items: center; gap: 26px; }
   .nav-links a {
-    color: rgba(255,255,255,.82); font-size: 12px; font-weight: 400;
-    text-decoration: none;
+    color: var(--fog); font-size: 13.5px; font-weight: 500;
+    text-decoration: none; letter-spacing: .01em;
   }
   .nav-links a:hover { color: #fff; text-decoration: none; }
   .nav-cta {
-    background: var(--blue); color: #fff !important;
-    padding: 6px 14px; border-radius: 980px; font-weight: 500 !important;
+    background: var(--accent); color: var(--accent-ink) !important;
+    padding: 8px 14px; border-radius: 8px; font-weight: 600 !important;
   }
-  .nav-cta:hover { background: var(--blue-hover); }
+  .nav-cta:hover { background: #5eead4; }
 
   .hero {
-    background:
-      radial-gradient(900px 420px at 50% -10%, rgba(0,113,227,.28), transparent 60%),
-      var(--hero);
-    color: var(--hero-ink);
-    text-align: center;
-    padding: 88px 0 0;
+    position: relative;
+    overflow: hidden;
+    padding: 84px 0 0;
   }
+  .hero::before {
+    content: "";
+    position: absolute; inset: 0;
+    background:
+      radial-gradient(700px 320px at 18% -8%, rgba(42,212,194,.16), transparent 62%),
+      radial-gradient(640px 280px at 92% 8%, rgba(228,184,106,.08), transparent 58%),
+      linear-gradient(180deg, #0c1016 0%, var(--bg) 100%);
+    pointer-events: none;
+  }
+  .hero::after {
+    content: "";
+    position: absolute; inset: 0;
+    background-image:
+      linear-gradient(rgba(255,255,255,.035) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(255,255,255,.035) 1px, transparent 1px);
+    background-size: 56px 56px;
+    mask-image: linear-gradient(180deg, #000 0%, transparent 78%);
+    pointer-events: none;
+  }
+  .hero .wrap { position: relative; z-index: 1; }
   .eyebrow {
-    color: var(--hero-muted);
-    font-size: 17px; font-weight: 600; letter-spacing: .01em;
-    margin-bottom: 14px;
+    display: inline-flex; align-items: center; gap: 10px;
+    color: var(--accent);
+    font-family: var(--mono);
+    font-size: 12px; font-weight: 500;
+    letter-spacing: .12em; text-transform: uppercase;
+    margin-bottom: 18px;
+  }
+  .eyebrow i {
+    width: 18px; height: 1px; background: var(--accent); display: inline-block;
   }
   h1 {
-    font-size: clamp(44px, 7vw, 80px);
-    line-height: 1.05;
-    letter-spacing: -.035em;
+    font-size: clamp(36px, 6vw, 68px);
+    line-height: 1.04;
+    letter-spacing: -.038em;
     font-weight: 600;
+    max-width: 13ch;
+    color: #f4f6f7;
   }
   .lede {
-    margin: 22px auto 0;
-    max-width: 640px;
-    color: var(--hero-muted);
-    font-size: clamp(19px, 2.4vw, 24px);
-    line-height: 1.4;
+    margin: 22px 0 0;
+    max-width: 560px;
+    color: #9aa3ae;
+    font-size: clamp(17px, 2vw, 20px);
+    line-height: 1.45;
     font-weight: 400;
+    overflow-wrap: normal;
+    word-break: normal;
   }
   .hero-cta {
-    display: flex; justify-content: center; flex-wrap: wrap; gap: 12px;
-    margin: 34px 0 14px;
+    display: flex; flex-wrap: wrap; gap: 10px;
+    margin: 32px 0 16px;
   }
   .btn {
     display: inline-flex; align-items: center; justify-content: center;
-    min-height: 48px; padding: 0 22px;
-    border-radius: 980px; font-size: 17px; font-weight: 500;
+    min-height: 46px; padding: 0 18px;
+    border-radius: 8px; font-size: 15px; font-weight: 600;
     text-decoration: none; border: 0; cursor: pointer;
-    transition: background .15s ease, transform .15s ease;
+    letter-spacing: -.01em;
+    transition: background .15s ease, color .15s ease, border-color .15s ease;
   }
-  .btn:hover { text-decoration: none; transform: scale(1.02); }
-  .btn-primary { background: var(--blue); color: #fff; }
-  .btn-primary:hover { background: var(--blue-hover); }
+  .btn:hover { text-decoration: none; }
+  .btn-primary { background: var(--accent); color: var(--accent-ink); }
+  .btn-primary:hover { background: #5eead4; }
   .btn-ghost {
-    background: transparent; color: #fff;
-    box-shadow: inset 0 0 0 1px rgba(255,255,255,.28);
+    background: transparent; color: #e8ecef;
+    box-shadow: inset 0 0 0 1px rgba(255,255,255,.16);
   }
-  .btn-ghost:hover { background: rgba(255,255,255,.08); }
-  .hero-meta { color: #6e6e73; font-size: 14px; padding: 0 8px; }
-  .hero-meta a { color: #2997ff; }
+  .btn-ghost:hover { background: rgba(255,255,255,.05); }
+  .hero-meta {
+    color: #6d7682; font-size: 13px;
+    font-family: var(--mono);
+  }
+  .hero-meta a { color: var(--accent); }
 
   .hero-frame {
-    margin: 64px auto 0;
-    width: min(980px, calc(100% - 32px));
-    border-radius: 18px 18px 0 0;
+    position: relative; z-index: 1;
+    margin: 44px auto 0;
+    width: min(1040px, calc(100% - 32px));
+    border: 1px solid rgba(255,255,255,.1);
+    border-bottom: 0;
+    border-radius: 12px 12px 0 0;
     overflow: hidden;
-    box-shadow: 0 40px 80px rgba(0,0,0,.45);
-    background: #111;
+    background: #0e1218;
+    box-shadow: 0 30px 80px rgba(0,0,0,.45);
   }
   .hero-frame img { width: 100%; height: auto; }
 
-  section { padding: 96px 0; }
-  .band-dark { background: #000; color: #f5f5f7; }
-  .band-white { background: #fff; }
-  h1, h2, .copy h3 { overflow-wrap: anywhere; }
+  section { padding: 88px 0; }
+  .band-paper { background: var(--paper); color: var(--ink); }
+  .band-ink { background: var(--bg-2); }
+  h1, h2, .copy h3 { overflow-wrap: break-word; }
   h2 {
-    font-size: clamp(32px, 5vw, 56px);
-    letter-spacing: -.03em; line-height: 1.07; font-weight: 600;
+    font-size: clamp(30px, 4.4vw, 48px);
+    letter-spacing: -.03em; line-height: 1.08; font-weight: 600;
   }
   .center { text-align: center; }
   .subhead {
-    margin: 16px auto 0; max-width: 680px;
-    color: var(--muted); font-size: 21px; line-height: 1.4;
+    margin: 14px auto 0; max-width: 640px;
+    color: var(--muted); font-size: 18px; line-height: 1.45;
   }
-  .band-dark .subhead { color: var(--hero-muted); }
+  .band-ink .subhead, .hero .subhead { color: #8b93a0; }
+
+  .new-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 14px;
+    margin-top: 44px;
+  }
+  .new-card {
+    background: var(--elev);
+    border: 1px solid var(--line);
+    border-radius: var(--r);
+    padding: 20px 18px 22px;
+    min-height: 168px;
+  }
+  .new-card .idx {
+    font-family: var(--mono); font-size: 11px; color: var(--accent);
+    letter-spacing: .08em;
+  }
+  .new-card h3 { font-size: 18px; letter-spacing: -.02em; margin: 10px 0 8px; }
+  .new-card p { color: #8b93a0; font-size: 14.5px; }
+
+  .grid-3 {
+    display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px;
+    margin-top: 44px;
+  }
+  .tile {
+    background: #fff;
+    border-radius: var(--r);
+    padding: 24px 22px 22px;
+    border: 1px solid var(--line-ink);
+  }
+  .tile h3 { font-size: 18px; letter-spacing: -.02em; margin-bottom: 8px; }
+  .tile p { color: var(--muted); font-size: 15px; }
 
   .split {
-    display: grid; grid-template-columns: 1fr 1fr; gap: 64px;
+    display: grid; grid-template-columns: 1fr 1.15fr; gap: 56px;
     align-items: center;
   }
   .split.reverse { direction: rtl; }
   .split.reverse > * { direction: ltr; }
-  .kicker { color: var(--blue); font-size: 14px; font-weight: 600; margin-bottom: 10px; }
-  .copy h3 {
-    font-size: clamp(28px, 3.4vw, 40px);
-    letter-spacing: -.03em; line-height: 1.12; font-weight: 600;
+  .kicker {
+    color: var(--accent-deep);
+    font-family: var(--mono);
+    font-size: 12px; font-weight: 500;
+    letter-spacing: .1em; text-transform: uppercase;
+    margin-bottom: 10px;
   }
-  .copy p { margin-top: 14px; color: var(--muted); font-size: 19px; }
+  .band-ink .kicker { color: var(--accent); }
+  .copy h3 {
+    font-size: clamp(26px, 3.2vw, 36px);
+    letter-spacing: -.028em; line-height: 1.12; font-weight: 600;
+  }
+  .copy p { margin-top: 14px; color: var(--muted); font-size: 17px; }
+  .band-ink .copy p { color: #8b93a0; }
   .shot {
-    border-radius: var(--radius);
-    box-shadow: var(--shadow);
-    background: #111;
+    border-radius: var(--r);
+    background: #0e1218;
     overflow: hidden;
     width: 100%;
-  }
-  .shot.light { background: #fff; box-shadow: 0 16px 50px rgba(0,0,0,.1); }
-  .shot.crop-top {
-    height: min(420px, 58vw);
-    object-fit: cover;
-    object-position: top center;
-  }
-
-  .grid-3 {
-    display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px;
-    margin-top: 48px;
-  }
-  .tile {
-    background: var(--card);
-    border-radius: 22px;
-    padding: 28px 26px 26px;
-    box-shadow: 0 4px 24px rgba(0,0,0,.04);
     border: 1px solid var(--line);
   }
-  .tile h3 { font-size: 21px; letter-spacing: -.02em; margin-bottom: 8px; }
-  .tile p { color: var(--muted); font-size: 16px; }
+  .shot.light { background: #fff; border-color: var(--line-ink); }
+  .presets {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 10px;
+  }
+  .presets figure { margin: 0; }
+  .presets figcaption {
+    margin-top: 6px; font-size: 12px; color: var(--faint);
+    font-family: var(--mono); letter-spacing: .04em;
+  }
 
-  .gallery { display: grid; grid-template-columns: 1.3fr .7fr; gap: 16px; margin-top: 48px; }
-  .gallery-side { display: grid; gap: 16px; }
+  .gallery { display: grid; grid-template-columns: 1.25fr .75fr; gap: 14px; margin-top: 44px; }
+  .gallery-side { display: grid; gap: 14px; }
   figure figcaption {
-    margin-top: 10px; color: var(--muted); font-size: 13px; text-align: center;
+    margin-top: 10px; color: var(--muted); font-size: 13px;
   }
 
-  .dl-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin-top: 40px; }
+  .dl-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin-top: 40px; }
   .dl-card {
-    background: var(--card);
-    border-radius: 22px;
-    padding: 28px 24px 24px;
+    background: var(--elev);
+    border: 1px solid var(--line);
+    border-radius: var(--r);
+    padding: 24px 22px 22px;
     display: flex; flex-direction: column; gap: 8px;
-    min-height: 240px;
-    box-shadow: 0 1px 0 var(--line);
-    transition: transform .15s ease, box-shadow .15s ease;
+    min-height: 248px;
   }
-  .dl-card.recommended { box-shadow: 0 0 0 2px var(--blue); }
-  .dl-card h3 { font-size: 24px; letter-spacing: -.02em; }
-  .dl-card .ver { color: var(--faint); font-size: 14px; }
-  .dl-card p { color: var(--muted); font-size: 15px; flex: 1; }
-  .dl-card .btn { width: 100%; margin-top: 12px; }
-  .ink-btn { background: var(--ink); color: #fff; }
-  .ink-btn:hover { background: #333; }
-  .note-mini { font-size: 13px; color: var(--faint); }
+  .dl-card.recommended { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+  .dl-card h3 { font-size: 22px; letter-spacing: -.02em; }
+  .dl-card .ver { color: var(--accent); font-size: 12px; font-family: var(--mono); }
+  .dl-card p { color: #8b93a0; font-size: 14.5px; flex: 1; }
+  .dl-card .btn { width: 100%; margin-top: 10px; }
+  .ink-btn { background: #e8ecef; color: var(--ink); }
+  .ink-btn:hover { background: #fff; }
+  .note-mini { font-size: 12.5px; color: #6d7682 !important; flex: 0 !important; }
+  .note-mini a { color: var(--accent); }
 
   .install-box {
     margin-top: 28px;
-    background: #1d1d1f;
-    color: #f5f5f7;
-    border-radius: 18px;
+    background: #0c1016;
+    color: #e8ecef;
+    border: 1px solid var(--line);
+    border-radius: var(--r);
     padding: 22px 22px 18px;
   }
-  .install-box p { color: #a1a1a6; font-size: 15px; margin-bottom: 12px; }
-  .cmd {
-    display: flex; gap: 10px; align-items: stretch; flex-wrap: wrap;
-  }
+  .install-box p { color: #8b93a0; font-size: 15px; margin-bottom: 12px; }
+  .cmd { display: flex; gap: 10px; align-items: stretch; flex-wrap: wrap; }
   .cmd code {
     flex: 1; min-width: 240px;
-    background: #000; color: #d6f3ff;
-    border-radius: 12px; padding: 14px 16px;
-    font: 13.5px/1.4 ui-monospace, "SF Mono", Menlo, monospace;
+    background: #05070a; color: var(--accent);
+    border: 1px solid var(--line);
+    border-radius: 8px; padding: 14px 16px;
+    font: 13px/1.4 var(--mono);
     overflow-x: auto; user-select: all;
   }
   .cmd button {
-    background: var(--blue); color: #fff; border: 0;
-    border-radius: 12px; padding: 0 16px; font-weight: 600; cursor: pointer;
+    background: var(--accent); color: var(--accent-ink); border: 0;
+    border-radius: 8px; padding: 0 16px; font-weight: 600; cursor: pointer;
+    font-family: var(--sans);
   }
-  .cmd button:hover { background: var(--blue-hover); }
-  details { margin-top: 18px; }
+  .cmd button:hover { background: #5eead4; }
+  details { margin-top: 16px; }
   details summary {
-    cursor: pointer; color: var(--blue); font-weight: 500; list-style: none;
+    cursor: pointer; color: var(--accent-deep); font-weight: 600; list-style: none;
   }
+  .band-ink details summary { color: var(--accent); }
   details summary::-webkit-details-marker { display: none; }
-  details summary::after { content: " ›"; }
-  details[open] summary::after { content: " ˄"; }
+  details summary::after { content: " →"; }
+  details[open] summary::after { content: " ↑"; }
   ol { margin: 14px 0 0 22px; color: var(--muted); }
   ol li { margin: 10px 0; }
   kbd, code.inline {
-    font: 13px/1 ui-monospace, "SF Mono", Menlo, monospace;
-    background: rgba(0,0,0,.05);
-    border: 1px solid var(--line);
-    border-radius: 6px; padding: 2px 6px;
+    font: 12.5px/1 var(--mono);
+    background: rgba(20,23,28,.06);
+    border: 1px solid var(--line-ink);
+    border-radius: 5px; padding: 2px 6px;
   }
 
-  table { width: 100%; border-collapse: collapse; margin-top: 28px; font-size: 16px; }
-  th, td { text-align: left; padding: 14px 12px; border-bottom: 1px solid var(--line); }
-  th { color: var(--faint); font-size: 13px; font-weight: 600; }
-  .faq { margin-top: 28px; display: grid; gap: 10px; }
+  table { width: 100%; border-collapse: collapse; margin-top: 24px; font-size: 15px; }
+  th, td { text-align: left; padding: 13px 10px; border-bottom: 1px solid var(--line-ink); }
+  th { color: var(--muted); font-size: 12px; font-weight: 600; font-family: var(--mono); letter-spacing: .06em; text-transform: uppercase; }
+  .faq { margin-top: 24px; display: grid; gap: 8px; }
   .faq details {
-    margin: 0; background: #fff; border-radius: 16px; padding: 16px 20px;
+    margin: 0; background: #fff; border: 1px solid var(--line-ink);
+    border-radius: 8px; padding: 14px 18px;
   }
   .faq details summary { color: var(--ink); font-weight: 600; }
   .faq details p { margin-top: 10px; color: var(--muted); }
 
   footer {
-    background: #f5f5f7;
+    background: var(--bg);
     border-top: 1px solid var(--line);
-    padding: 40px 0 64px;
-    color: var(--faint); font-size: 13px;
+    padding: 36px 0 56px;
+    color: #6d7682; font-size: 13px;
   }
   footer .foot {
     display: flex; justify-content: space-between; gap: 16px; flex-wrap: wrap;
   }
-  footer a { color: var(--muted); }
+  footer a { color: #9aa3ae; }
 
   @media (max-width: 860px) {
     .nav-links a:not(.nav-cta) { display: none; }
-    .split, .split.reverse, .gallery, .grid-3, .dl-grid { grid-template-columns: 1fr; }
-    section { padding: 64px 0; }
-    .hero { padding-top: 56px; }
-    .wrap { width: min(var(--max), calc(100% - 36px)); }
-    .copy p { font-size: 17px; }
-    .subhead { font-size: 18px; }
-    h1 { font-size: 40px; }
-    h2 { font-size: 30px; }
-    .shot.crop-top { height: 260px; }
+    .split, .split.reverse, .gallery, .grid-3, .dl-grid, .new-grid, .presets {
+      grid-template-columns: 1fr;
+    }
+    section { padding: 60px 0; }
+    .hero { padding-top: 52px; }
+    .wrap { width: min(var(--max), calc(100% - 32px)); }
+    .copy p { font-size: 16px; }
+    .subhead { font-size: 16px; }
+    h1 { font-size: 32px; max-width: none; }
+    h2 { font-size: 28px; }
   }
 </style>
 </head>
@@ -300,46 +375,79 @@
   <div class="nav-inner">
     <a class="brand" href="#top"><img src="icon-1.2.6.png" alt="">Snippr</a>
     <div class="nav-links">
+      <a href="#new">Mới</a>
       <a href="#features">Tính năng</a>
       <a href="#preview">Xem trước</a>
       <a href="#download">Tải về</a>
       <a href="#help">Hỗ trợ</a>
       <a href="https://github.com/fantasy9876/snippr">GitHub</a>
-      <a class="nav-cta" href="#download">Tải Snippr</a>
+      <a class="nav-cta" href="#download">Tải về</a>
     </div>
   </div>
 </nav>
 
 <header class="hero" id="top">
   <div class="wrap">
-    <p class="eyebrow">Cho Mac và Windows</p>
-    <h1>Chụp màn hình.<br>Gọn như ý nghĩ.</h1>
-    <p class="lede">Kéo chọn, chú thích ngay trên ảnh, copy. Cuộn trang dài rồi mở Editor để zoom. OCR tiếng Việt offline — không tài khoản, ảnh không lên mây.</p>
+    <p class="eyebrow"><i></i>macOS · Windows · mã nguồn mở</p>
+    <h1>Chụp. Đánh dấu.<br>Xong việc.</h1>
+    <p class="lede">Kéo vùng — thanh công cụ hiện ngay trên ảnh. Backdrop, Spotlight, crop tại chỗ, OCR tiếng Việt offline. Không tài khoản. Ảnh không lên mây.</p>
     <div class="hero-cta">
       <a class="btn btn-primary" href="#download">Tải miễn phí</a>
-      <a class="btn btn-ghost" href="#features">Xem tính năng</a>
+      <a class="btn btn-ghost" href="#new">Tính năng mới</a>
     </div>
-    <p class="hero-meta">macOS 14+ · Windows 10/11 · MIT<br><a href="https://github.com/fantasy9876/snippr">Mã nguồn mở</a></p>
+    <p class="hero-meta">macOS 14+ · Windows 10/11 · MIT · <a href="https://github.com/fantasy9876/snippr">github.com/fantasy9876/snippr</a></p>
   </div>
   <div class="hero-frame">
-    <img src="shot-editor.png" alt="Editor Snippr 1.2.8 — chú thích trên ảnh vừa chụp">
+    <img src="shot-review.png" alt="Màn duyệt Snippr sau khi kéo vùng — toolbar, 8 handle crop, HUD phím tắt">
   </div>
 </header>
 
-<section id="features">
+<section class="band-ink" id="new">
   <div class="wrap">
     <div class="center">
-      <h2>Xong việc.<br>Quên app đi.</h2>
-      <p class="subhead">Snippr sống trên menu bar hoặc khay hệ thống. Bấm phím tắt, chụp, đánh dấu, copy. Không wizard, không đăng nhập.</p>
+      <p class="kicker" style="margin-bottom:12px">Mới · macOS 1.2.12 · Windows 1.2.15</p>
+      <h2>Làm việc ngay trên vùng vừa chụp.</h2>
+      <p class="subhead">Không cần mở cửa sổ khác nếu chỉ copy, che, hoặc gắn nền. Editor vẫn đó khi cần zoom và chú thích kỹ.</p>
     </div>
-    <div class="grid-3" style="margin-top:56px">
+    <div class="new-grid">
+      <article class="new-card">
+        <div class="idx">01</div>
+        <h3>Màn duyệt</h3>
+        <p>Kéo xong, toolbar bám cạnh vùng. Tám handle để crop. Kéo ngang qua toolbar không đứt thao tác.</p>
+      </article>
+      <article class="new-card">
+        <div class="idx">02</div>
+        <h3>Backdrop</h3>
+        <p>Năm nền: Ocean, Sunset, Mint, Graphite, Contact. Plate có bóng và grain — trong Editor và trên màn duyệt.</p>
+      </article>
+      <article class="new-card">
+        <div class="idx">03</div>
+        <h3>HUD phím tắt</h3>
+        <p>Rê chuột lên nút: tên lệnh + phím tắt. Hiện đúng cả bốn góc màn, không tràn mép.</p>
+      </article>
+      <article class="new-card">
+        <div class="idx">04</div>
+        <h3>Spotlight · Kính lúp</h3>
+        <p>Làm tối xung quanh vùng cần nhìn, hoặc phóng chi tiết. Pixelate 1.2.11 che bằng trung bình ô, không lộ màu gốc.</p>
+      </article>
+    </div>
+  </div>
+</section>
+
+<section class="band-paper" id="features">
+  <div class="wrap">
+    <div class="center">
+      <h2>Đủ việc hằng ngày.<br>Không thêm hệ sinh thái.</h2>
+      <p class="subhead">Snippr nằm trên menu bar hoặc khay hệ thống. Phím tắt, chụp, đánh dấu, copy. Không wizard, không đăng nhập.</p>
+    </div>
+    <div class="grid-3">
       <article class="tile">
         <h3>Chụp đủ kiểu</h3>
-        <p>Toàn màn hình, kéo chọn vùng, cửa sổ, hẹn 3 giây, lặp lại vùng cũ. Sau khi chọn vùng, thanh công cụ hiện ngay trên ảnh — copy, lưu, ghim, OCR, dịch, hoặc mở Editor.</p>
+        <p>Toàn màn hình, kéo vùng, cửa sổ, hẹn 3 giây, lặp lại vùng cũ. Sau khi chọn, copy / lưu / ghim / OCR / dịch / mở Editor ngay trên ảnh.</p>
       </article>
       <article class="tile">
         <h3>Cuộn một trang dài</h3>
-        <p>Bạn cuộn, Snippr ghép. Banner hay vùng chạy trên trang không làm nhân đôi đầu trang. Xong thì mở Editor để zoom và cắt.</p>
+        <p>Bạn cuộn, Snippr ghép. Banner chạy không nhân đôi đầu trang. Xong thì mở Editor để zoom và cắt.</p>
       </article>
       <article class="tile">
         <h3>Chú thích tức thì</h3>
@@ -361,38 +469,77 @@
   </div>
 </section>
 
-<section>
+<section class="band-paper" style="padding-top:0">
   <div class="wrap split">
     <div class="copy">
-      <p class="kicker">Chụp cửa sổ</p>
-      <h3>Một cửa sổ, nền bạn chọn.</h3>
-      <p>Wallpaper, trong suốt, màu đặc, hoặc cắt bóng. Cài đặt 1.2.8 cũng chọn việc sau khi chụp cuộn trang: mở Editor để zoom và cắt.</p>
+      <p class="kicker">Màn duyệt</p>
+      <h3>Kéo vùng xong là làm việc được.</h3>
+      <p>Thanh công cụ bám cạnh vùng vừa chọn. Đổi crop bằng tám handle. Backdrop, Magnifier, Spotlight ngay tại chỗ — không bắt mở Editor nếu chỉ cần copy hoặc che.</p>
     </div>
-    <img class="shot light" src="shot-prefs.png" alt="Cài đặt nền cửa sổ và hành vi sau khi chụp">
+    <img class="shot" src="shot-review.png" alt="Màn duyệt: vùng chọn, handle crop, toolbar tối, HUD Copy">
   </div>
 </section>
 
-<section class="band-white">
+<section class="band-ink">
+  <div class="wrap split reverse">
+    <div class="copy">
+      <p class="kicker">Backdrop</p>
+      <h3>Một cửa sổ, nền bạn chọn.</h3>
+      <p>Năm preset có bóng plate và grain. Dùng khi chụp cửa sổ hoặc gắn nền cho vùng vừa cắt. Cài đặt vẫn chọn wallpaper, trong suốt, màu đặc, hoặc cắt bóng.</p>
+    </div>
+    <div class="presets">
+      <figure>
+        <img class="shot" src="shot-backdrop-ocean.jpg" alt="Backdrop Ocean">
+        <figcaption>Ocean</figcaption>
+      </figure>
+      <figure>
+        <img class="shot" src="shot-backdrop-sunset.jpg" alt="Backdrop Sunset">
+        <figcaption>Sunset</figcaption>
+      </figure>
+      <figure>
+        <img class="shot" src="shot-backdrop-mint.jpg" alt="Backdrop Mint">
+        <figcaption>Mint</figcaption>
+      </figure>
+      <figure>
+        <img class="shot" src="shot-backdrop-graphite.jpg" alt="Backdrop Graphite">
+        <figcaption>Graphite</figcaption>
+      </figure>
+    </div>
+  </div>
+</section>
+
+<section class="band-paper">
+  <div class="wrap split">
+    <div class="copy">
+      <p class="kicker">Editor</p>
+      <h3>Zoom, chú thích, rồi copy.</h3>
+      <p>Hai hàng công cụ, nút Backdrop cạnh màu. Zoom 50% / 200% khung vẫn khớp. Cuộn được tới mép phải và mép dưới của khung.</p>
+    </div>
+    <img class="shot" src="shot-editor.png" alt="Editor Snippr — hai hàng công cụ, Backdrop, chú thích trên ảnh">
+  </div>
+</section>
+
+<section class="band-paper" style="padding-top:0">
   <div class="wrap split reverse">
     <div class="copy">
       <p class="kicker">OCR &amp; dịch</p>
       <h3>Chữ trên màn hình thành chữ trong clipboard.</h3>
       <p>Quét vùng có chữ, copy ngay. Cần dịch thì chọn ngôn ngữ — Việt, Anh, Nhật, Hàn, Trung… Phần còn lại của ảnh không rời máy.</p>
     </div>
-    <img class="shot" src="shot-ocr.png" alt="Vùng chữ vừa quét trong Snippr">
+    <img class="shot" src="shot-ocr.png" alt="Bảng OCR tiếng Việt trong Snippr">
   </div>
 </section>
 
-<section class="band-white" id="preview">
+<section class="band-paper" id="preview" style="padding-top:0">
   <div class="wrap">
     <div class="center">
       <h2>Nhìn gần hơn.</h2>
-      <p class="subhead">Editor 1.2.8, OCR tiếng Việt, và cài đặt nền cửa sổ.</p>
+      <p class="subhead">Màn duyệt, Editor, Backdrop, OCR — đúng những gì vừa lên 1.2.12 / 1.2.15.</p>
     </div>
     <div class="gallery">
       <figure>
         <img class="shot" src="shot-editor.png" alt="Editor chú thích">
-        <figcaption>Editor — copy, lưu, ghim, OCR, dịch, 11 công cụ chú thích.</figcaption>
+        <figcaption>Editor — copy, lưu, ghim, OCR, Backdrop, Spotlight, kính lúp.</figcaption>
       </figure>
       <div class="gallery-side">
         <figure>
@@ -412,13 +559,13 @@
   <div class="wrap">
     <div class="center">
       <h2>Tải Snippr.</h2>
-      <p class="subhead">Miễn phí. Chọn đúng máy của bạn. Không cần tạo tài khoản.</p>
+      <p class="subhead">Miễn phí. Chọn đúng máy. Không cần tạo tài khoản.</p>
     </div>
     <div class="dl-grid">
       <article class="dl-card" data-os="mac-arm">
         <h3>Mac</h3>
         <p class="ver">Apple Silicon · v1.2.12</p>
-        <p>Cho máy M1 trở lên. Kéo vào Applications là xong.</p>
+        <p>Cho máy M1 trở lên. Kéo vào Applications là xong. Có màn duyệt, Backdrop, Spotlight.</p>
         <a class="btn btn-primary" href="Snippr-1.2.12.dmg" download>Tải DMG</a>
       </article>
       <article class="dl-card" data-os="mac-intel">
@@ -430,7 +577,7 @@
       <article class="dl-card" data-os="win">
         <h3>Windows</h3>
         <p class="ver">64-bit · v1.2.15</p>
-        <p>1.2.15 sửa lỗi các nút trên lớp overlay bị trắng theo theme Windows và bị nháy mỗi lần bấm. Vẫn có màn duyệt ngay sau khi kéo vùng (toolbar, Backdrop, Magnifier, Spotlight, chỉnh crop), gợi ý phím tắt khi rê chuột, và che pixel thực sự che. Installer hoặc ZIP portable.</p>
+        <p>Màn duyệt sau khi kéo vùng, HUD phím tắt, Backdrop / Magnifier / Spotlight, pixelate che thật. Installer hoặc ZIP portable.</p>
         <a class="btn ink-btn" href="https://github.com/fantasy9876/snippr/releases/download/v1.2.15/SnipprSetup-1.2.15-win-x64.exe">Tải Setup</a>
         <p class="note-mini">Bản này chưa ký Authenticode. Nếu SmartScreen hỏi, đối chiếu SHA-256 trên GitHub rồi chọn More info → Run anyway. <a href="https://github.com/fantasy9876/snippr/releases/download/v1.2.15/Snippr-portable-win-x64.zip">ZIP portable</a></p>
       </article>
@@ -438,7 +585,7 @@
   </div>
 </section>
 
-<section class="band-white" id="help">
+<section class="band-paper" id="help">
   <div class="wrap">
     <h2>Cài đặt.</h2>
     <p class="subhead" style="margin-left:0;text-align:left">Trên Mac, một lệnh là đủ. Trên Windows, chạy installer.</p>
@@ -471,7 +618,7 @@
       </ol>
     </details>
 
-    <h2 style="margin-top:80px">Phím tắt.</h2>
+    <h2 style="margin-top:72px">Phím tắt.</h2>
     <p class="subhead" style="margin-left:0;text-align:left">Đổi được trong Cài đặt.</p>
     <table>
       <thead>
@@ -481,12 +628,12 @@
         <tr><td>Toàn màn hình</td><td><kbd>⇧⌘1</kbd></td><td><kbd>Ctrl+Shift+1</kbd></td></tr>
         <tr><td>Vùng chọn</td><td><kbd>⇧⌘2</kbd></td><td><kbd>Ctrl+Shift+2</kbd></td></tr>
         <tr><td>Cửa sổ đang mở</td><td>menu bar → More</td><td><kbd>Ctrl+Shift+4</kbd></td></tr>
-        <tr><td>Quét chữ / QR</td><td><kbd>⌃⌥⌘O</kbd> hoặc nút trên ảnh</td><td>Nút OCR trên editor</td></tr>
+        <tr><td>Quét chữ / QR</td><td><kbd>⌃⌥⌘O</kbd> hoặc nút trên ảnh</td><td>Nút OCR trên editor / màn duyệt</td></tr>
       </tbody>
     </table>
     <p style="margin-top:16px;color:var(--muted);font-size:15px">Trong editor: lăn đổi độ dày · <kbd>⌘/Ctrl + lăn</kbd> zoom · <kbd>⌘/Ctrl + C</kbd> copy và đóng · <kbd>⌘/Ctrl + S</kbd> lưu · <kbd>⌘/Ctrl + Z</kbd> hoàn tác · phím <kbd>A</kbd> <kbd>R</kbd> <kbd>T</kbd> <kbd>B</kbd> đổi công cụ.</p>
 
-    <h2 style="margin-top:80px">Câu hỏi thường gặp.</h2>
+    <h2 style="margin-top:72px">Câu hỏi thường gặp.</h2>
     <div class="faq">
       <details>
         <summary>Mac Intel dùng được không?</summary>
@@ -543,7 +690,6 @@
     var ua = navigator.userAgent || "";
     var isWin = /Windows/i.test(ua);
     var isMac = /Mac OS X|Macintosh/i.test(ua);
-    // Chrome still reports "Intel" on Apple Silicon. Default Mac to the Silicon build.
     var key = isWin ? "win" : isMac ? "mac-arm" : "";
     if (key) {
       var card = document.querySelector('[data-os="' + key + '"]');
