@@ -291,6 +291,9 @@
   .ink-btn:hover { background: #fff; }
   .note-mini { font-size: 12.5px; color: #6d7682 !important; flex: 0 !important; }
   .note-mini a { color: var(--accent); }
+  #dl-error { color: var(--danger); margin: 16px 0 0; }
+  #dl-error[hidden] { display: none; }
+  .btn[aria-disabled="true"] { opacity: .45; pointer-events: none; }
 
   .install-box {
     margin-top: 28px;
@@ -405,7 +408,7 @@
 <section class="band-ink" id="new">
   <div class="wrap">
     <div class="center">
-      <p class="kicker" style="margin-bottom:12px">Mới · macOS 1.2.12 · Windows 1.2.15</p>
+      <p class="kicker" style="margin-bottom:12px" data-fill="kicker">Mới · macOS · Windows</p>
       <h2>Làm việc ngay trên vùng vừa chụp.</h2>
       <p class="subhead">Không cần mở cửa sổ khác nếu chỉ copy, che, hoặc gắn nền. Editor vẫn đó khi cần zoom và chú thích kỹ.</p>
     </div>
@@ -534,7 +537,7 @@
   <div class="wrap">
     <div class="center">
       <h2>Nhìn gần hơn.</h2>
-      <p class="subhead">Màn duyệt, Editor, Backdrop, OCR — đúng những gì vừa lên 1.2.12 / 1.2.15.</p>
+      <p class="subhead" data-fill="gallery-ver">Màn duyệt, Editor, Backdrop, OCR — đúng những gì vừa lên.</p>
     </div>
     <div class="gallery">
       <figure>
@@ -561,25 +564,29 @@
       <h2>Tải Snippr.</h2>
       <p class="subhead">Miễn phí. Chọn đúng máy. Không cần tạo tài khoản.</p>
     </div>
+    <p id="dl-error" class="subhead" hidden>Không đọc được version.json — không đưa link tải cũ. Dùng GitHub Releases hoặc thử tải lại trang.</p>
+    <noscript>
+      <p class="subhead">Trang đọc số bản từ version.json. Không có JavaScript thì cài Mac bằng lệnh bên dưới, hoặc vào GitHub Releases.</p>
+    </noscript>
     <div class="dl-grid">
       <article class="dl-card" data-os="mac-arm">
         <h3>Mac</h3>
-        <p class="ver">Apple Silicon · v1.2.12</p>
+        <p class="ver" data-fill="mac-arm-ver">Apple Silicon</p>
         <p>Cho máy M1 trở lên. Kéo vào Applications là xong. Có màn duyệt, Backdrop, Spotlight.</p>
-        <a class="btn btn-primary" href="Snippr-1.2.12.dmg" download>Tải DMG</a>
+        <a class="btn btn-primary" data-fill-href="macUrlArm" href="#">Tải DMG</a>
       </article>
       <article class="dl-card" data-os="mac-intel">
         <h3>Mac Intel</h3>
-        <p class="ver">x86_64 · v1.2.12</p>
+        <p class="ver" data-fill="mac-intel-ver">x86_64</p>
         <p>Cho Mac dùng chip Intel. Cùng tính năng với bản Apple Silicon.</p>
-        <a class="btn ink-btn" href="Snippr-1.2.12-intel.dmg" download>Tải DMG</a>
+        <a class="btn ink-btn" data-fill-href="macUrlIntel" href="#">Tải DMG</a>
       </article>
       <article class="dl-card" data-os="win">
         <h3>Windows</h3>
-        <p class="ver">64-bit · v1.2.15</p>
+        <p class="ver" data-fill="win-ver">64-bit</p>
         <p>Màn duyệt sau khi kéo vùng, HUD phím tắt, Backdrop / Magnifier / Spotlight, pixelate che thật. Installer hoặc ZIP portable.</p>
-        <a class="btn ink-btn" href="https://github.com/fantasy9876/snippr/releases/download/v1.2.15/SnipprSetup-1.2.15-win-x64.exe">Tải Setup</a>
-        <p class="note-mini">Bản này chưa ký Authenticode. Nếu SmartScreen hỏi, đối chiếu SHA-256 trên GitHub rồi chọn More info → Run anyway. <a href="https://github.com/fantasy9876/snippr/releases/download/v1.2.15/Snippr-portable-win-x64.zip">ZIP portable</a></p>
+        <a class="btn ink-btn" data-fill-href="winUrl" href="#">Tải Setup</a>
+        <p class="note-mini">Bản này chưa ký Authenticode. Nếu SmartScreen hỏi, đối chiếu SHA-256 trên GitHub rồi chọn More info → Run anyway. <a data-fill-href="winPortable" href="#">ZIP portable</a></p>
       </article>
     </div>
   </div>
@@ -612,7 +619,7 @@
     <details>
       <summary>Cài Windows</summary>
       <ol>
-        <li>Tải <b>Setup</b>, chạy <code class="inline">SnipprSetup-1.2.15-win-x64.exe</code>.</li>
+        <li>Tải <b>Setup</b>, chạy <code class="inline" data-fill="win-setup-name">SnipprSetup-win-x64.exe</code>.</li>
         <li>Nếu SmartScreen cảnh báo, kiểm SHA-256 trên GitHub rồi <b>More info → Run anyway</b>.</li>
         <li>Chọn thư mục, xong bấm Finish — Snippr chạy ở khay hệ thống.</li>
       </ol>
@@ -641,7 +648,7 @@
       </details>
       <details>
         <summary>Sao hệ điều hành cảnh báo app chưa xác minh?</summary>
-        <p>Bản Mac dùng chữ ký Snippr ổn định để giữ quyền Ghi màn hình khi cập nhật, nhưng chưa notarize với Apple. Bản Windows 1.2.15 chưa ký Authenticode. Mã nguồn và SHA-256 công khai trên GitHub để bạn tự kiểm.</p>
+        <p data-fill="win-faq">Bản Mac dùng chữ ký Snippr ổn định để giữ quyền Ghi màn hình khi cập nhật, nhưng chưa notarize với Apple. Bản Windows chưa ký Authenticode. Mã nguồn và SHA-256 công khai trên GitHub để bạn tự kiểm.</p>
       </details>
       <details>
         <summary>Đổi phím tắt thế nào?</summary>
@@ -662,7 +669,7 @@
 <footer>
   <div class="wrap foot">
     <p>Snippr · MIT · <a href="https://github.com/fantasy9876/snippr">github.com/fantasy9876/snippr</a></p>
-    <p>macOS 1.2.12 · Windows 1.2.15 chưa ký số — hãy đối chiếu SHA-256 trước khi chạy.</p>
+    <p data-fill="footer-ver">macOS · Windows chưa ký số — hãy đối chiếu SHA-256 trước khi chạy.</p>
   </div>
 </footer>
 
@@ -695,6 +702,59 @@
       var card = document.querySelector('[data-os="' + key + '"]');
       if (card) card.classList.add("recommended");
     }
+
+    function fill(name, text) {
+      document.querySelectorAll('[data-fill="' + name + '"]').forEach(function (el) {
+        el.textContent = text;
+      });
+    }
+    function fillHref(name, url) {
+      document.querySelectorAll('[data-fill-href="' + name + '"]').forEach(function (el) {
+        el.setAttribute("href", url);
+        if (/\.dmg(\?|$)/i.test(url)) el.setAttribute("download", "");
+      });
+    }
+    function portableFromWinUrl(winUrl) {
+      var m = String(winUrl).match(/^(.*\/)SnipprSetup-[^/]+-win-x64\.exe$/);
+      return m ? m[1] + "Snippr-portable-win-x64.zip" : "";
+    }
+    function setupName(winUrl, win) {
+      var last = String(winUrl).split("/").pop() || "";
+      return last || ("SnipprSetup-" + win + "-win-x64.exe");
+    }
+    function failVisible() {
+      var err = document.getElementById("dl-error");
+      if (err) err.hidden = false;
+      document.querySelectorAll("[data-fill-href]").forEach(function (el) {
+        el.setAttribute("href", "#");
+        el.setAttribute("aria-disabled", "true");
+        el.removeAttribute("download");
+      });
+    }
+    fetch("version.json", { cache: "no-store" })
+      .then(function (r) {
+        if (!r.ok) throw new Error(String(r.status));
+        return r.json();
+      })
+      .then(function (v) {
+        if (!v.mac || !v.win || !v.macUrlArm || !v.macUrlIntel || !v.winUrl)
+          throw new Error("incomplete");
+        var portable = portableFromWinUrl(v.winUrl);
+        if (!portable) throw new Error("winUrl");
+        fill("kicker", "Mới · macOS " + v.mac + " · Windows " + v.win);
+        fill("gallery-ver", "Màn duyệt, Editor, Backdrop, OCR — đúng những gì vừa lên " + v.mac + " / " + v.win + ".");
+        fill("mac-arm-ver", "Apple Silicon · v" + v.mac);
+        fill("mac-intel-ver", "x86_64 · v" + v.mac);
+        fill("win-ver", "64-bit · v" + v.win);
+        fill("win-setup-name", setupName(v.winUrl, v.win));
+        fill("win-faq", "Bản Mac dùng chữ ký Snippr ổn định để giữ quyền Ghi màn hình khi cập nhật, nhưng chưa notarize với Apple. Bản Windows " + v.win + " chưa ký Authenticode. Mã nguồn và SHA-256 công khai trên GitHub để bạn tự kiểm.");
+        fill("footer-ver", "macOS " + v.mac + " · Windows " + v.win + " chưa ký số — hãy đối chiếu SHA-256 trước khi chạy.");
+        fillHref("macUrlArm", v.macUrlArm);
+        fillHref("macUrlIntel", v.macUrlIntel);
+        fillHref("winUrl", v.winUrl);
+        fillHref("winPortable", portable);
+      })
+      .catch(failVisible);
   })();
 </script>
 </body>
