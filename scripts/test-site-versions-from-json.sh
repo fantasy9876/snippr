@@ -52,5 +52,15 @@ if "failVisible" not in html:
     print("FAIL site-versions-from-json missing fail-visible path")
     sys.exit(1)
 
+# No-JS has no fetch, so the buttons stay href="#". A noscript without a
+# real Releases link leaves those people with nothing to click.
+blocks = re.findall(r"<noscript>(.*?)</noscript>", html, flags=re.S)
+if not any(
+    'href="https://github.com/fantasy9876/snippr/releases"' in b
+    for b in blocks
+):
+    print("FAIL site-versions-from-json noscript must link to GitHub Releases")
+    sys.exit(1)
+
 print("PASS site-versions-from-json")
 PY
