@@ -171,6 +171,28 @@ enum SaveAsOutcome {
     case failed
 }
 
+/// One editor presentation. Overlay "Open in Editor…" and the toolbar
+/// macwindow path both go through this so a spy cannot see an unbaked
+/// crop without also seeing the live annotations (the 1.2.14 hole).
+struct EditorHandoff {
+    var image: CapturedImage
+    var annotations: [Annotation]
+    var backdrop: BackdropStyle?
+    var openPanel: Bool
+
+    init(
+        image: CapturedImage,
+        annotations: [Annotation] = [],
+        backdrop: BackdropStyle? = nil,
+        openPanel: Bool = false
+    ) {
+        self.image = image
+        self.annotations = annotations
+        self.backdrop = backdrop
+        self.openPanel = openPanel
+    }
+}
+
 /// Every user intention is exactly ONE `commit` call with the flattened
 /// snapshot at the FINAL pixel rect. Auto-actions (`afterCopy`/`afterSave`)
 /// run only for the two initial intents — `initialCapture` (area-review
@@ -190,7 +212,7 @@ struct CaptureActionRouter {
         /// One recognition effect for both manual intents. `autoTranslate` is
         /// false for OCR and true only for the explicit Translate action.
         var ocr: @MainActor (CapturedImage, Bool) -> Void
-        var openEditor: @MainActor (CapturedImage) -> Void
+        var openEditor: @MainActor (EditorHandoff) -> Void
         var toast: @MainActor (String) -> Void
         var setLastCapture: @MainActor (CapturedImage) -> Void
         var setLastAreaRect: @MainActor (CGRect) -> Void
@@ -210,7 +232,7 @@ struct CaptureActionRouter {
             ) -> Void,
             pin: @escaping @MainActor (CapturedImage) -> Void,
             ocr: @escaping @MainActor (CapturedImage) -> Void,
-            openEditor: @escaping @MainActor (CapturedImage) -> Void,
+            openEditor: @escaping @MainActor (EditorHandoff) -> Void,
             toast: @escaping @MainActor (String) -> Void,
             setLastCapture: @escaping @MainActor (CapturedImage) -> Void,
             setLastAreaRect: @escaping @MainActor (CGRect) -> Void,
@@ -241,7 +263,7 @@ struct CaptureActionRouter {
             ) -> Void,
             pin: @escaping @MainActor (CapturedImage) -> Void,
             ocrWithMode: @escaping @MainActor (CapturedImage, Bool) -> Void,
-            openEditor: @escaping @MainActor (CapturedImage) -> Void,
+            openEditor: @escaping @MainActor (EditorHandoff) -> Void,
             toast: @escaping @MainActor (String) -> Void,
             setLastCapture: @escaping @MainActor (CapturedImage) -> Void,
             setLastAreaRect: @escaping @MainActor (CGRect) -> Void,
@@ -281,7 +303,12 @@ struct CaptureActionRouter {
                         }
                     }
                 },
-                openEditor: { EditorWindowController.open(with: $0) },
+                openEditor: {
+                    EditorWindowController.open(
+                        with: $0.image, backdrop: $0.backdrop,
+                        openBackdropPanel: $0.openPanel,
+                        annotations: $0.annotations)
+                },
                 toast: { ToastHUD.show($0) },
                 setLastCapture: { AppServices.lastCapture = $0 },
                 setLastAreaRect: { Settings.shared.lastAreaRect = $0 },
@@ -423,7 +450,7 @@ struct CaptureActionRouter {
 
         case .openEditor:
             deps.setLastCapture(remembered)
-            deps.openEditor(snapshot)
+            deps.openEditor(EditorHandoff(image: snapshot))
             recordAreaRect()
             return .completed
         }

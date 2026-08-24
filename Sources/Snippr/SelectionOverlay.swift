@@ -913,18 +913,18 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
         if passStyle?.kind == .none { passStyle = nil }
         let global = globalRect(for: canonical)
         owner.finish(.handled)
-        if let deps = owner.routerDependenciesOverride {
-            deps.setLastCapture(payload.visual)
-            deps.setLastAreaRect(global)
-            deps.openEditor(editorPayload.semantic)
-            return
-        }
-        AppServices.lastCapture = payload.visual
-        Settings.shared.lastAreaRect = global
-        EditorWindowController.open(
-            with: editorPayload.semantic, backdrop: passStyle,
-            openBackdropPanel: true,
-            annotations: handoff)
+        // One payload, both seams: a test spy and production live receive
+        // the same unbaked crop + live holes + backdrop. Splitting this
+        // let the 1.2.14 bake regress under a green gate.
+        let editorHandoff = EditorHandoff(
+            image: editorPayload.semantic,
+            annotations: handoff,
+            backdrop: passStyle,
+            openPanel: true)
+        let deps = owner.routerDependenciesOverride ?? .live
+        deps.setLastCapture(payload.visual)
+        deps.setLastAreaRect(global)
+        deps.openEditor(editorHandoff)
     }
 
     /// Clips the live caption to the crop the export will produce — rounded

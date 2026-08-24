@@ -8704,8 +8704,8 @@ enum SelfTest {
                                 },
                                 openEditor: { [self] in
                                     editors.append(CGSize(
-                                        width: $0.cgImage.width,
-                                        height: $0.cgImage.height))
+                                        width: $0.image.cgImage.width,
+                                        height: $0.image.cgImage.height))
                                 },
                                 toast: { [self] in toasts.append($0) },
                                 setLastCapture: { [self] in
@@ -10386,8 +10386,8 @@ enum SelfTest {
                                 ocrWithMode: { _, _ in },
                                 openEditor: { [self] in
                                     editors.append(CGSize(
-                                        width: $0.cgImage.width,
-                                        height: $0.cgImage.height))
+                                        width: $0.image.cgImage.width,
+                                        height: $0.image.cgImage.height))
                                 },
                                 toast: { _ in },
                                 setLastCapture: { [self] in
@@ -17960,13 +17960,15 @@ enum SelfTest {
                 }
                 wc.window?.close()
 
-                // Call site: Open in Editor hands the spy an unbaked crop.
+                // Call site: Open in Editor hands the spy one EditorHandoff
+                // (unbaked crop + live holes). Reproducing 1.2.14 — baked
+                // payload.semantic and empty annotations — must fail here.
                 if let screen = NSScreen.screens.first {
                     let frozenImage = makeSolidImage(
                         width: Int(screen.frame.width * 2),
                         height: Int(screen.frame.height * 2),
                         color: NSColor.white.cgColor)
-                    var editorImages: [CGImage] = []
+                    var editorHandoffs: [EditorHandoff] = []
                     let overlay = SelectionOverlay(
                         purpose: .areaReview,
                         inputs: OverlaySessionInputs(
@@ -17979,7 +17981,7 @@ enum SelfTest {
                             autoSave: { _, _ in },
                             saveAs: { _, _ in },
                             pin: { _ in }, ocr: { _ in },
-                            openEditor: { editorImages.append($0.cgImage) },
+                            openEditor: { editorHandoffs.append($0) },
                             toast: { _ in },
                             setLastCapture: { _ in },
                             setLastAreaRect: { _ in },
@@ -18010,11 +18012,12 @@ enum SelfTest {
                         handoffFails.append("no-surface")
                     }
                     view.openBackdropEditorForTesting()
-                    if editorImages.count != 1 {
+                    if editorHandoffs.count != 1 {
                         handoffFails.append(
-                            "editor-calls \(editorImages.count)")
+                            "editor-calls \(editorHandoffs.count)")
                     } else {
-                        let handedImage = editorImages[0]
+                        let handed = editorHandoffs[0]
+                        let handedImage = handed.image.cgImage
                         let dimSample = luma(probe2(handedImage, 8, 8))
                         let holeX = min(65, handedImage.width - 2)
                         let holeY = min(60, handedImage.height - 2)
@@ -18026,6 +18029,31 @@ enum SelfTest {
                         if holeSample < 240 {
                             handoffFails.append(
                                 "call-site-hole \(holeSample)")
+                        }
+                        if !handed.openPanel {
+                            handoffFails.append("open-panel")
+                        }
+                        let spots = handed.annotations
+                            .compactMap { $0 as? SpotlightAnnotation }
+                        if spots.count != 1 {
+                            handoffFails.append(
+                                "handoff-count \(spots.count)")
+                        }
+                        if spots.contains(where: {
+                            abs($0.dimFraction - 0.3) > 0.0001
+                        }) {
+                            handoffFails.append(
+                                "handoff-dim \(spots.map { $0.dimFraction })")
+                        }
+                        if let rect = spots.first?.rect {
+                            if abs(rect.minX - 40) > 0.5
+                                || abs(rect.minY - 40) > 0.5
+                                || abs(rect.width - 50) > 0.5
+                                || abs(rect.height - 40) > 0.5 {
+                                handoffFails.append("handoff-rect \(rect)")
+                            }
+                        } else {
+                            handoffFails.append("handoff-rect missing")
                         }
                     }
                     overlay.dismissForTesting()

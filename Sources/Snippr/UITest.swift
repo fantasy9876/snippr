@@ -115,10 +115,12 @@ enum UITest {
                 autoSave: { _, _ in },
                 saveAs: { _, _ in },
                 pin: { _ in }, ocr: { _ in },
-                openEditor: { image in
+                openEditor: { handoff in
                     editorPresents += 1
-                    lastEditorImage = image
-                    EditorWindowController.open(with: image)
+                    lastEditorImage = handoff.image
+                    EditorWindowController.open(
+                        with: handoff.image,
+                        annotations: handoff.annotations)
                 },
                 toast: { _ in },
                 setLastCapture: { _ in },
@@ -249,9 +251,11 @@ enum UITest {
                     }
                 },
                 pin: { _ in }, ocr: { _ in },
-                openEditor: { image in
+                openEditor: { handoff in
                     panelEditorPresents += 1
-                    EditorWindowController.open(with: image)
+                    EditorWindowController.open(
+                        with: handoff.image,
+                        annotations: handoff.annotations)
                 },
                 toast: { _ in panelDepsToastCounter() },
                 setLastCapture: { _ in },
@@ -483,7 +487,7 @@ enum UITest {
                         done(.cancelled)
                     },
                     pin: { routed = $0 }, ocr: { routed = $0 },
-                    openEditor: { routed = $0 },
+                    openEditor: { routed = $0.image },
                     toast: { _ in },
                     setLastCapture: { _ in },
                     setLastAreaRect: { _ in }, logEvent: { _ in })
