@@ -396,4 +396,128 @@ enum OverlayToolbarLayout {
             rows: grid.rows,
             columns: grid.columns)
     }
+
+    enum PopoverPlacement: Equatable {
+        case right, left, above, below
+    }
+
+    struct Popover {
+        let frame: CGRect
+        let placement: PopoverPlacement
+    }
+
+    /// Places a fixed-size panel next to `anchor` (the Backdrop button)
+    /// without covering `avoid` (the crop) when any such frame fits.
+    ///
+    /// Same collision language as `area`: stay inside the overlay's padded
+    /// bounds, skip the resize handles, and prefer the side of the button
+    /// that still leaves the shot visible. Covering the crop is a last
+    /// resort, scored by overlap area, never a preference.
+    ///
+    /// Intended mutation: drop the `avoidPenalty` term →
+    /// `sliceB-backdrop-overlay-mini covering-selection`.
+    static func popover(
+        size: CGSize,
+        anchor rawAnchor: CGRect,
+        avoid rawAvoid: CGRect,
+        bounds rawBounds: CGRect,
+        occupied: [CGRect] = [],
+        handleHitSize: CGFloat = 18,
+        metrics: Metrics = .standard
+    ) -> Popover? {
+        let bounds = rawBounds.standardized
+        let avoid = rawAvoid.standardized.intersection(bounds)
+        let anchor = rawAnchor.standardized
+        guard size.width > 0, size.height > 0,
+              bounds.width > metrics.gap * 2,
+              bounds.height > metrics.gap * 2,
+              size.width <= bounds.width - metrics.gap * 2,
+              size.height <= bounds.height - metrics.gap * 2
+        else { return nil }
+
+        let safe = bounds.insetBy(dx: metrics.gap, dy: metrics.gap)
+        func clamp(_ value: CGFloat, low: CGFloat, high: CGFloat) -> CGFloat {
+            min(high, max(low, value))
+        }
+        let xLow = safe.minX
+        let xHigh = safe.maxX - size.width
+        let yLow = safe.minY
+        let yHigh = safe.maxY - size.height
+        guard xHigh >= xLow, yHigh >= yLow else { return nil }
+
+        func frameAt(x: CGFloat, y: CGFloat) -> CGRect {
+            CGRect(
+                origin: CGPoint(
+                    x: clamp(x, low: xLow, high: xHigh),
+                    y: clamp(y, low: yLow, high: yHigh)),
+                size: size)
+        }
+
+        let alignedY = anchor.midY - size.height / 2
+        let alignedX = anchor.midX - size.width / 2
+        let avoidAlignedY = avoid.isNull
+            ? alignedY : avoid.midY - size.height / 2
+        let avoidAlignedX = avoid.isNull
+            ? alignedX : avoid.midX - size.width / 2
+
+        let candidates: [(CGRect, PopoverPlacement, Int)] = [
+            (frameAt(x: anchor.maxX + metrics.gap, y: alignedY),
+             .right, 0),
+            (frameAt(x: anchor.minX - metrics.gap - size.width, y: alignedY),
+             .left, 1),
+            (frameAt(x: alignedX, y: anchor.maxY + metrics.gap),
+             .above, 2),
+            (frameAt(x: alignedX, y: anchor.minY - metrics.gap - size.height),
+             .below, 3),
+            (frameAt(x: avoid.maxX + metrics.gap, y: avoidAlignedY),
+             .right, 8),
+            (frameAt(x: avoid.minX - metrics.gap - size.width, y: avoidAlignedY),
+             .left, 9),
+            (frameAt(x: avoidAlignedX, y: avoid.maxY + metrics.gap),
+             .above, 10),
+            (frameAt(x: avoidAlignedX, y: avoid.minY - metrics.gap - size.height),
+             .below, 11),
+        ]
+
+        let handles = avoid.isNull
+            ? []
+            : EditableSelectionGeometry.handleRects(
+                for: avoid, size: handleHitSize).map { $0.1 }
+
+        func overlapArea(_ a: CGRect, _ b: CGRect) -> CGFloat {
+            let i = a.intersection(b)
+            guard !i.isNull, i.width > 0, i.height > 0 else { return 0 }
+            return i.width * i.height
+        }
+        func avoidPenalty(_ frame: CGRect) -> CGFloat {
+            guard !avoid.isNull else { return 0 }
+            return overlapArea(frame, avoid)
+        }
+
+        var best: (Popover, CGFloat)?
+        for (index, candidate) in candidates.enumerated() {
+            let frame = candidate.0
+            guard safe.contains(frame) else { continue }
+            let crop = avoidPenalty(frame)
+            // Covering the shot is never a preference: 1e6 × area puts any
+            // overlap above every side/chrome cost. Drop this term and the
+            // button-adjacent candidate that sits on the crop wins.
+            var score = crop * 1_000_000
+            score += CGFloat(candidate.2)
+            for chrome in occupied {
+                score += overlapArea(frame, chrome) * 10
+            }
+            for handle in handles {
+                score += overlapArea(frame, handle) * 100
+            }
+            let dx = frame.midX - anchor.midX
+            let dy = frame.midY - anchor.midY
+            score += (dx * dx + dy * dy).squareRoot() / 1000
+            score += CGFloat(index) * 0.001
+            if best == nil || score < best!.1 {
+                best = (Popover(frame: frame, placement: candidate.1), score)
+            }
+        }
+        return best?.0
+    }
 }

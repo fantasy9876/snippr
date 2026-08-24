@@ -10263,6 +10263,253 @@ enum SelfTest {
                       routeFailures.prefix(8).joined(separator: " | "))
             }
 
+            // 1a-6. Overlay mini (WP4b). Smaller than the WP4a mockup, ten
+            //       thumbs plus None, padding S/M/L, and a placement solver
+            //       that will not sit on the crop when any other frame fits.
+            //
+            // Intended mutation: OverlayToolbarLayout.popover, drop the
+            // `avoidPenalty * 1_000_000` term → covering-selection.
+            do {
+                var miniFails: [String] = []
+                let spec = OverlayQuickBackdrop.self
+                if spec.size.width >= spec.mockupSize.width {
+                    miniFails.append("not-narrower \(spec.size.width)")
+                }
+                if spec.size.height >= spec.mockupSize.height {
+                    miniFails.append("not-shorter \(spec.size.height)")
+                }
+                if spec.chipSize.width >= spec.mockupChipSize.width
+                    || spec.chipSize.height >= spec.mockupChipSize.height {
+                    miniFails.append("chip \(spec.chipSize)")
+                }
+                if spec.gradientIds.count != 10 {
+                    miniFails.append("thumbs \(spec.gradientIds.count)")
+                }
+                if spec.gradientIds.contains("ember")
+                    || spec.gradientIds.contains("meadow") {
+                    miniFails.append("full-catalog-on-overlay")
+                }
+                let wantIds = [
+                    "ocean", "sunset", "mint", "graphite",
+                    "lavender", "rose", "lagoon", "midnight",
+                    "paper", "fog",
+                ]
+                if spec.gradientIds != wantIds {
+                    miniFails.append("ids \(spec.gradientIds)")
+                }
+                let pads = spec.paddingTicks.map(\.fraction)
+                if pads != [0.04, 0.06, 0.10] {
+                    miniFails.append("padding \(pads)")
+                }
+
+                // Pure geometry: a centre crop with the button on its right
+                // must place the mini to the right of the button, not on the
+                // shot. A crop against the right edge must flip.
+                let bounds = CGRect(x: 0, y: 0, width: 1200, height: 800)
+                let centre = CGRect(x: 400, y: 250, width: 320, height: 240)
+                let rightAnchor = CGRect(
+                    x: centre.maxX + 10, y: centre.midY - 15,
+                    width: 34, height: 30)
+                if let placed = OverlayToolbarLayout.popover(
+                    size: spec.size, anchor: rightAnchor, avoid: centre,
+                    bounds: bounds)
+                {
+                    if placed.frame.intersects(centre) {
+                        miniFails.append("covering-selection \(placed.frame)")
+                    }
+                    if !bounds.insetBy(dx: 10, dy: 10).contains(placed.frame) {
+                        miniFails.append("outside-bounds \(placed.frame)")
+                    }
+                } else {
+                    miniFails.append("no-centre-placement")
+                }
+
+                let edge = CGRect(
+                    x: bounds.maxX - 220, y: 300, width: 200, height: 180)
+                let edgeAnchor = CGRect(
+                    x: edge.minX - 44, y: edge.midY - 15,
+                    width: 34, height: 30)
+                if let placed = OverlayToolbarLayout.popover(
+                    size: spec.size, anchor: edgeAnchor, avoid: edge,
+                    bounds: bounds)
+                {
+                    if placed.frame.intersects(edge) {
+                        miniFails.append("edge-covering \(placed.frame)")
+                    }
+                    if placed.placement == .right
+                        && placed.frame.minX >= edgeAnchor.midX {
+                        miniFails.append("did-not-flip \(placed.placement)")
+                    }
+                } else {
+                    miniFails.append("no-edge-placement")
+                }
+
+                if let screen = NSScreen.main ?? NSScreen.screens.first {
+                    @MainActor final class MiniSpy {
+                        var editors: [CGSize] = []
+                        var lastCaptures: [CGSize] = []
+                        func dependencies() -> CaptureActionRouter.Dependencies {
+                            CaptureActionRouter.Dependencies(
+                                copyToClipboard: { _ in },
+                                autoSave: { _, _ in }, saveAs: { _, _ in },
+                                pin: { _ in },
+                                ocrWithMode: { _, _ in },
+                                openEditor: { [self] in
+                                    editors.append(CGSize(
+                                        width: $0.cgImage.width,
+                                        height: $0.cgImage.height))
+                                },
+                                toast: { _ in },
+                                setLastCapture: { [self] in
+                                    lastCaptures.append(CGSize(
+                                        width: $0.cgImage.width,
+                                        height: $0.cgImage.height))
+                                },
+                                setLastAreaRect: { _ in },
+                                logEvent: { _ in })
+                        }
+                    }
+                    let spy = MiniSpy()
+                    let overlay = SelectionOverlay(
+                        purpose: .areaReview,
+                        inputs: OverlaySessionInputs(
+                            afterShow: true, afterCopy: false,
+                            afterSave: false),
+                        completion: { _ in })
+                    overlay.routerDependenciesOverride = spy.dependencies()
+                    let view = SelectionOverlayView(
+                        mode: .area, screen: screen,
+                        frozen: CapturedImage(
+                            cgImage: makeStripePattern(
+                                width: Int(screen.frame.width),
+                                height: Int(screen.frame.height),
+                                seed: 0x0824_2026),
+                            scale: 1),
+                        windowList: [], owner: overlay)
+                    // Long edge must beat the 40 px padding floor or S/M/L
+                    // all render as the same outer size (320 × 0.06 rounds
+                    // to 19 and is lifted to 40, same as 0.10).
+                    let selection = CGRect(
+                        x: 80, y: 80, width: 720, height: 480)
+                    view.selectForTesting(rect: selection)
+                    view.showBackdropMiniForTesting()
+                    if !view.backdropMiniIsShownForTesting {
+                        miniFails.append("mini-not-shown")
+                    }
+                    if let frame = view.backdropMiniFrameForTesting {
+                        if frame.intersects(selection) {
+                            miniFails.append("host-covering \(frame)")
+                        }
+                        if abs(frame.width - spec.size.width) > 0.5
+                            || abs(frame.height - spec.size.height) > 0.5 {
+                            miniFails.append("host-size \(frame.size)")
+                        }
+                    } else {
+                        miniFails.append("no-host-frame")
+                    }
+                    for id in spec.gradientIds {
+                        if view.backdropMiniControlForTesting(
+                            OverlayBackdropMiniIdentifier.gradient(id)) == nil {
+                            miniFails.append("missing-\(id)")
+                        }
+                    }
+                    if view.backdropMiniControlForTesting(
+                        OverlayBackdropMiniIdentifier.gradient("ember")) != nil
+                        || view.backdropMiniControlForTesting(
+                            OverlayBackdropMiniIdentifier.gradient("meadow")) != nil {
+                        miniFails.append("ember-or-meadow-present")
+                    }
+                    if view.backdropMiniControlForTesting(
+                        OverlayBackdropMiniIdentifier.none) == nil {
+                        miniFails.append("missing-none")
+                    }
+
+                    // Drive the REAL chip, not applyBackdropStyle: the
+                    // identifier is the wiring the user clicks.
+                    view.backdropMiniControlForTesting(
+                        OverlayBackdropMiniIdentifier.gradient("lavender"))
+                        .map { $0.performClick(nil) }
+                    let afterLav = view.annotationSurface?.backdropStyle
+                    if afterLav?.kind != .gradient
+                        || afterLav?.gradientId != "lavender" {
+                        miniFails.append(
+                            "lavender \(String(describing: afterLav?.gradientId))")
+                    }
+                    // v0 view must NOT pretend lavender is Ocean.
+                    if view.annotationSurface?.backdropPreset != BackdropPreset.none {
+                        miniFails.append(
+                            "lavender-as-preset \(String(describing: view.annotationSurface?.backdropPreset))")
+                    }
+                    let inner = overlay.session.pixelRect.size
+                    let lavLayout = BackdropLayout(
+                        innerPixels: inner, pixelScale: 1,
+                        style: afterLav ?? .none)
+                    if let outer = view.backdropPreviewOuterRectForTesting {
+                        if abs(outer.width - lavLayout.outerPointSize.width) > 0.5
+                            || abs(outer.height
+                                - lavLayout.outerPointSize.height) > 0.5 {
+                            miniFails.append(
+                                "preview \(outer.size) vs \(lavLayout.outerPointSize)")
+                        }
+                    } else {
+                        miniFails.append("no-lavender-preview")
+                    }
+
+                    view.backdropMiniControlForTesting(
+                        OverlayBackdropMiniIdentifier.paddingL)
+                        .map { $0.performClick(nil) }
+                    let afterPad = view.annotationSurface?.backdropStyle
+                    if abs((afterPad?.paddingFraction ?? 0) - 0.10) > 0.0001 {
+                        miniFails.append(
+                            "padding \(String(describing: afterPad?.paddingFraction))")
+                    }
+                    if afterPad?.gradientId != "lavender" {
+                        miniFails.append("padding-dropped-fill")
+                    }
+                    let padLayout = BackdropLayout(
+                        innerPixels: inner, pixelScale: 1,
+                        style: afterPad ?? .none)
+                    let padM = SliceBBackdrop.padding(
+                        forLongEdge: 2000, pixelScale: 1,
+                        style: afterLav ?? .none)
+                    let padL = SliceBBackdrop.padding(
+                        forLongEdge: 2000, pixelScale: 1,
+                        style: afterPad ?? .none)
+                    if padL <= padM {
+                        miniFails.append("padding-did-nothing \(padM)/\(padL)")
+                    }
+
+                    // Same chip again is not an edit.
+                    let countBefore = view.annotationSurface?.annotations.count
+                    view.backdropMiniControlForTesting(
+                        OverlayBackdropMiniIdentifier.paddingL)
+                        .map { $0.performClick(nil) }
+                    if view.annotationSurface?.annotations.count != countBefore {
+                        miniFails.append("same-padding-forked")
+                    }
+
+                    view.openBackdropEditorForTesting()
+                    if spy.editors.count != 1 {
+                        miniFails.append("editor-calls \(spy.editors.count)")
+                    }
+                    if spy.editors.last != inner {
+                        miniFails.append(
+                            "editor-baked \(String(describing: spy.editors.last))")
+                    }
+                    if spy.lastCaptures.last != padLayout.outerPointSize {
+                        miniFails.append(
+                            "lastCapture \(String(describing: spy.lastCaptures.last)) want \(padLayout.outerPointSize)")
+                    }
+                    overlay.dismissForTesting()
+                } else {
+                    miniFails.append("no-screen")
+                }
+
+                check("sliceB-backdrop-overlay-mini",
+                      miniFails.isEmpty,
+                      miniFails.prefix(8).joined(separator: " | "))
+            }
+
             // 1b-2. The fill paints INSIDE the canvas and nowhere else.
             //
             // Every primitive the fill uses covers the current clip rather

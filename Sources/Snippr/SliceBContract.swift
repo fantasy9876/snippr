@@ -306,20 +306,30 @@ final class SpotlightAnnotation: Annotation {
     }
 }
 
-/// The document's backdrop preset, carried as an annotation.
+/// The document's backdrop, carried as an annotation.
 ///
 /// The frame is not a mark — it draws nothing here and covers no pixels — but
 /// choosing one IS an edit, and the overlay's history is a single array of
-/// annotations. Modelling the preset as an entry in that array is what makes
-/// mark → preset → mark undo in exactly that order: a parallel stack could
-/// record the presets but not where they sat between the marks. The editor
+/// annotations. Modelling the style as an entry in that array is what makes
+/// mark → frame → mark undo in exactly that order: a parallel stack could
+/// record the frames but not where they sat between the marks. The editor
 /// keeps its own snapshot-based undo and does not use this.
+///
+/// WP4b stores the full `BackdropStyle` (ten overlay thumbs + padding), not
+/// the v0 five-case preset. `preset` is the v0 view so existing gates that
+/// still switch on ocean/sunset/mint/graphite keep compiling; non-v0 fills
+/// read as `.none` there and must go through `style`.
 final class BackdropAnnotation: Annotation {
-    let preset: BackdropPreset
+    let style: BackdropStyle
+    var preset: BackdropPreset { style.legacyPreset ?? .none }
 
-    init(preset: BackdropPreset, uiScale: CGFloat) {
-        self.preset = preset
+    init(style: BackdropStyle, uiScale: CGFloat) {
+        self.style = style.clamped()
         super.init(uiScale: uiScale)
+    }
+
+    convenience init(preset: BackdropPreset, uiScale: CGFloat) {
+        self.init(style: .from(preset: preset), uiScale: uiScale)
     }
 
     /// Nothing to hit and nothing to move: Select must never pick this up, and
@@ -333,7 +343,7 @@ final class BackdropAnnotation: Annotation {
     override func draw(in ctx: CGContext, pixellated: CGImage?) {}
 
     override func copyAnnotation() -> Annotation {
-        BackdropAnnotation(preset: preset, uiScale: uiScale)
+        BackdropAnnotation(style: style, uiScale: uiScale)
     }
 }
 
