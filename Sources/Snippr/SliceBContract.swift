@@ -962,13 +962,23 @@ enum BackdropCornerStyle: String, CaseIterable {
 struct BackdropLayout: Equatable {
     let style: BackdropStyle
     let pixelScale: CGFloat
-    /// Padding on every edge, in pixels and in points.
+    /// Nominal per-edge pad from `padding(forLongEdge:)`. Alignment
+    /// redistributes extra space; this number stays the v0 symmetric amount.
     let padPixels: CGFloat
     let padPoints: CGFloat
+    /// Actual insets in PIXELS, y-up (bottom is minY).
+    let padLeftPixels: CGFloat
+    let padRightPixels: CGFloat
+    let padBottomPixels: CGFloat
+    let padTopPixels: CGFloat
+    /// Uniform source crop on every edge, in pixels. 0 for v0.
+    let insetPixels: CGFloat
     let innerPixelSize: CGSize
     let outerPixelSize: CGSize
     let innerPointSize: CGSize
     let outerPointSize: CGSize
+    /// Visible screenshot in the outer frame, PIXEL space, origin bottom-left.
+    let platePixelRect: CGRect
 
     /// v0 five-case view of `style`. Non-v0 fills are not a preset; callers
     /// that still switch on this must also check `style.kind`.
@@ -979,23 +989,49 @@ struct BackdropLayout: Equatable {
         let inner = CGSize(
             width: max(0, innerPixels.width), height: max(0, innerPixels.height))
         let clamped = style.clamped()
-        let pad: CGFloat = clamped.kind == .none
-            ? 0
-            : SliceBBackdrop.padding(
-                forLongEdge: max(inner.width, inner.height),
-                pixelScale: scale, style: clamped)
         self.style = clamped
         self.pixelScale = scale
-        self.padPixels = pad
-        self.padPoints = pad / scale
         self.innerPixelSize = inner
-        self.outerPixelSize = CGSize(
-            width: inner.width + pad * 2, height: inner.height + pad * 2)
         self.innerPointSize = CGSize(
             width: inner.width / scale, height: inner.height / scale)
+
+        let iw = Int(inner.width.rounded(.towardZero))
+        let ih = Int(inner.height.rounded(.towardZero))
+        guard let geo = SliceBBackdrop.pixelGeometry(
+            innerWidth: max(0, iw), innerHeight: max(0, ih),
+            pixelScale: scale, style: clamped)
+        else {
+            // Overflow: collapse to the inner size so callers that still
+            // construct a layout (preview) do not invent a frame they cannot
+            // export. `outerDimensions` returns nil on the same inputs.
+            self.padPixels = 0
+            self.padPoints = 0
+            self.padLeftPixels = 0
+            self.padRightPixels = 0
+            self.padBottomPixels = 0
+            self.padTopPixels = 0
+            self.insetPixels = 0
+            self.outerPixelSize = inner
+            self.outerPointSize = self.innerPointSize
+            self.platePixelRect = CGRect(origin: .zero, size: inner)
+            return
+        }
+
+        self.padPixels = CGFloat(geo.pad)
+        self.padPoints = CGFloat(geo.pad) / scale
+        self.padLeftPixels = CGFloat(geo.left)
+        self.padRightPixels = CGFloat(geo.right)
+        self.padBottomPixels = CGFloat(geo.bottom)
+        self.padTopPixels = CGFloat(geo.top)
+        self.insetPixels = CGFloat(geo.inset)
+        self.outerPixelSize = CGSize(
+            width: CGFloat(geo.outerW), height: CGFloat(geo.outerH))
         self.outerPointSize = CGSize(
-            width: (inner.width + pad * 2) / scale,
-            height: (inner.height + pad * 2) / scale)
+            width: CGFloat(geo.outerW) / scale,
+            height: CGFloat(geo.outerH) / scale)
+        self.platePixelRect = CGRect(
+            x: CGFloat(geo.left), y: CGFloat(geo.bottom),
+            width: CGFloat(geo.contentW), height: CGFloat(geo.contentH))
     }
 
     init(innerPixels: CGSize, pixelScale: CGFloat, preset: BackdropPreset) {
@@ -1004,14 +1040,30 @@ struct BackdropLayout: Equatable {
             style: .from(preset: preset))
     }
 
-    /// Where the untouched document sits inside the frame, in points. The
-    /// canvas keeps its own coordinates: nothing is translated or baked, so a
-    /// mark, a crop, a guide and an OCR box all stay source-local.
+    /// Where the document canvas sits inside the frame, in points. The canvas
+    /// keeps source coordinates: a mark, a crop, a guide and an OCR box all
+    /// stay source-local. With inset the canvas is larger than the plate and
+    /// origin is plate − inset.
     var innerPointRect: CGRect {
         CGRect(
-            origin: CGPoint(x: padPoints, y: padPoints),
+            origin: CGPoint(
+                x: (platePixelRect.minX - insetPixels) / pixelScale,
+                y: (platePixelRect.minY - insetPixels) / pixelScale),
             size: innerPointSize)
     }
+
+    /// Visible screenshot (after inset), in points. `drawFrame` and hit-testing
+    /// read this, not `innerPointRect`, so a cropped plate cannot swallow
+    /// clicks in the inset band.
+    var platePointRect: CGRect {
+        CGRect(
+            x: platePixelRect.minX / pixelScale,
+            y: platePixelRect.minY / pixelScale,
+            width: platePixelRect.width / pixelScale,
+            height: platePixelRect.height / pixelScale)
+    }
+
+    var insetPoints: CGFloat { insetPixels / pixelScale }
 
     /// `.none` collapses: the frame is not a thin border, it is absent.
     var isCollapsed: Bool { style.kind == .none || padPixels == 0 }
@@ -1071,6 +1123,84 @@ enum SliceBBackdrop {
         return min(cap, max(floor, (edge * style.paddingFraction).rounded()))
     }
 
+    /// Integer geometry for one framed document. Preview, reserve, fingerprint
+    /// and export all go through here so they cannot disagree about size or
+    /// where the plate sits. Nil on overflow: fail closed, do not wrap.
+    static func pixelGeometry(
+        innerWidth: Int, innerHeight: Int, pixelScale: CGFloat, style: BackdropStyle
+    ) -> (
+        pad: Int, inset: Int, left: Int, right: Int, bottom: Int, top: Int,
+        contentW: Int, contentH: Int, outerW: Int, outerH: Int
+    )? {
+        guard innerWidth > 0, innerHeight > 0 else { return nil }
+        let clamped = style.clamped()
+        if clamped.kind == .none {
+            return (
+                pad: 0, inset: 0, left: 0, right: 0, bottom: 0, top: 0,
+                contentW: innerWidth, contentH: innerHeight,
+                outerW: innerWidth, outerH: innerHeight)
+        }
+        let pad = Int(padding(
+            forLongEdge: CGFloat(max(innerWidth, innerHeight)),
+            pixelScale: pixelScale, style: clamped))
+        let (twice, tOverflow) = pad.multipliedReportingOverflow(by: 2)
+        guard !tOverflow else { return nil }
+        let (minW, wOverflow) = innerWidth.addingReportingOverflow(twice)
+        let (minH, hOverflow) = innerHeight.addingReportingOverflow(twice)
+        guard !wOverflow, !hOverflow else { return nil }
+
+        var outerW = minW
+        var outerH = minH
+        if let r = clamped.ratio.widthOverHeight, outerH > 0 {
+            let aspect = Double(outerW) / Double(outerH)
+            let target = Double(r)
+            if aspect < target {
+                let want = (Double(outerH) * target).rounded()
+                guard want.isFinite, want <= Double(Int.max) else { return nil }
+                outerW = max(outerW, Int(want))
+            } else if aspect > target {
+                let want = (Double(outerW) / target).rounded()
+                guard want.isFinite, want <= Double(Int.max) else { return nil }
+                outerH = max(outerH, Int(want))
+            }
+        }
+
+        let short = min(innerWidth, innerHeight)
+        var inset = Int((clamped.insetFraction * CGFloat(short)).rounded())
+        inset = max(0, min(inset, (short - 1) / 2))
+        let contentW = innerWidth - inset * 2
+        let contentH = innerHeight - inset * 2
+        let extraW = outerW - contentW
+        let extraH = outerH - contentH
+        let metrics = clamped.shadowMetrics()
+        let floor = Int(shadowExtent(
+            pixelScale: pixelScale, offsetPt: metrics.offsetPt,
+            blurPt: metrics.blurPt))
+
+        func split(
+            _ extra: Int, toward: Int, autoBalance: Bool
+        ) -> (Int, Int) {
+            let tight = min(max(0, floor), extra)
+            if autoBalance || toward == 0 {
+                return (extra / 2, extra - extra / 2)
+            }
+            if toward < 0 { return (tight, extra - tight) }
+            return (extra - tight, tight)
+        }
+
+        let (left, right) = split(
+            extraW, toward: clamped.alignment.horizontal,
+            autoBalance: clamped.autoBalance)
+        let (bottom, top) = split(
+            extraH, toward: clamped.alignment.vertical,
+            autoBalance: clamped.autoBalance)
+        return (
+            pad: pad, inset: inset, left: left, right: right,
+            bottom: bottom, top: top,
+            contentW: contentW, contentH: contentH,
+            outerW: outerW, outerH: outerH)
+    }
+
     /// Outer canvas size for an inner image of these dimensions. Preview,
     /// reserve, fingerprint and export all read the frame's size from HERE, so
     /// none of them can disagree about how big the composed result is.
@@ -1087,17 +1217,14 @@ enum SliceBBackdrop {
         innerWidth: Int, innerHeight: Int, style: BackdropStyle,
         pixelScale: CGFloat = 1
     ) -> (width: Int, height: Int)? {
-        guard innerWidth > 0, innerHeight > 0 else { return nil }
-        guard style.kind != .none else { return (innerWidth, innerHeight) }
-        let pad = Int(padding(
-            forLongEdge: CGFloat(max(innerWidth, innerHeight)),
-            pixelScale: pixelScale, style: style))
-        let (twice, tOverflow) = pad.multipliedReportingOverflow(by: 2)
-        guard !tOverflow else { return nil }
-        let (w, wOverflow) = innerWidth.addingReportingOverflow(twice)
-        let (h, hOverflow) = innerHeight.addingReportingOverflow(twice)
-        guard !wOverflow, !hOverflow else { return nil }
-        return (w, h)
+        guard let geo = pixelGeometry(
+            innerWidth: innerWidth, innerHeight: innerHeight,
+            pixelScale: pixelScale, style: style)
+        else { return nil }
+        if style.clamped().kind == .none {
+            return (innerWidth, innerHeight)
+        }
+        return (geo.outerW, geo.outerH)
     }
 
     /// Backdrop is an OUTER frame: a click at `padded` must resolve to the
@@ -1106,6 +1233,14 @@ enum SliceBBackdrop {
         fromPadded point: CGPoint, padding: CGFloat
     ) -> CGPoint {
         CGPoint(x: point.x - padding, y: point.y - padding)
+    }
+
+    /// Asymmetric / inset-aware map from the wrapper into source coordinates.
+    static func sourcePoint(
+        fromPadded point: CGPoint, layout: BackdropLayout
+    ) -> CGPoint {
+        let origin = layout.innerPointRect.origin
+        return CGPoint(x: point.x - origin.x, y: point.y - origin.y)
     }
 
     /// Extra dest-sized buffers a raster fill keeps alive during compose.
@@ -1921,8 +2056,9 @@ enum SliceBBackdrop {
     ) -> CGImage? {
         guard style.kind != .none else { return image }
         guard !ForcedOuterComposeFailure.isActive else { return nil }
-        let pad = padding(
-            forLongEdge: CGFloat(max(image.width, image.height)),
+        let layout = BackdropLayout(
+            innerPixels: CGSize(
+                width: CGFloat(image.width), height: CGFloat(image.height)),
             pixelScale: pixelScale, style: style)
         guard let outer = outerDimensions(
             innerWidth: image.width, innerHeight: image.height, style: style,
@@ -1944,9 +2080,7 @@ enum SliceBBackdrop {
             space: CGColorSpace(name: CGColorSpace.sRGB)!,
             bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
         else { return nil }
-        let target = CGRect(
-            x: pad, y: pad,
-            width: CGFloat(image.width), height: CGFloat(image.height))
+        let target = layout.platePixelRect
         // The SAME frame the preview draws. A gradient that cannot be built
         // fails the whole compose: carrying on would return a non-nil frame
         // with no background, which terminal callers would treat as success.
@@ -1968,7 +2102,13 @@ enum SliceBBackdrop {
             roundedRect: target, cornerWidth: radius, cornerHeight: radius,
             transform: nil))
         ctx.clip()
-        ctx.draw(image, in: target)
+        // Full source, offset so the inset crop lands in the plate. The clip
+        // above is what throws the cropped edges away — the canvas keeps them.
+        let imageRect = CGRect(
+            x: target.minX - layout.insetPixels,
+            y: target.minY - layout.insetPixels,
+            width: CGFloat(image.width), height: CGFloat(image.height))
+        ctx.draw(image, in: imageRect)
         // Inside the same clip and ON TOP of the screenshot: it softens the
         // clipped edge, which is the "jagged frame" the report was about.
         drawPlateHairline(

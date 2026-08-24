@@ -967,11 +967,17 @@ final class BackdropDocumentView: NSView {
         // frame edge the report was about, and it made the preview disagree
         // with an export that antialiases correctly. The live text field, the
         // one subview that needed the layer mask, carries its own clip now.
+        let plate = layout.isCollapsed
+            ? CGRect(origin: .zero, size: layout.innerPointSize)
+            : CGRect(
+                origin: CGPoint(x: layout.insetPoints, y: layout.insetPoints),
+                size: layout.platePointRect.size)
         let radius = layout.isCollapsed
             ? 0
             : SliceBBackdrop.cornerRadius(
-                documentPoints: layout.innerPointSize,
+                documentPoints: layout.platePointRect.size,
                 style: layout.style.cornerStyle)
+        canvas.documentVisibleRect = plate
         canvas.documentCornerRadius = radius
         canvas.layer?.cornerRadius = 0
         canvas.layer?.masksToBounds = false
@@ -986,7 +992,7 @@ final class BackdropDocumentView: NSView {
         // export because every metric it uses is scaled by the caller.
         SliceBBackdrop.drawFrame(
             in: ctx, size: layout.outerPointSize,
-            target: layout.innerPointRect, style: layout.style,
+            target: layout.platePointRect, style: layout.style,
             // Radius and shadow are POINT metrics and this context is in
             // points, so their scale is 1. The grain is not: its period is
             // fixed in DOCUMENT pixels, so at @2x a 128px tile has to be drawn
@@ -1006,14 +1012,14 @@ final class BackdropDocumentView: NSView {
         let hit = super.hitTest(point)
         guard hit !== self else { return nil }
         if !layout.isCollapsed, hit === canvas || hit?.isDescendant(of: canvas) == true {
-            let inner = layout.innerPointRect
+            let plate = layout.platePointRect
             // The hit shape follows the DRAWN shape: a corner that looks cut
             // but still swallows clicks is a worse lie than a square one.
             let radius = SliceBBackdrop.cornerRadius(
-                documentPoints: layout.innerPointSize,
+                documentPoints: plate.size,
                 style: layout.style.cornerStyle)
             let rounded = CGPath(
-                roundedRect: inner, cornerWidth: radius, cornerHeight: radius,
+                roundedRect: plate, cornerWidth: radius, cornerHeight: radius,
                 transform: nil)
             if !rounded.contains(point) { return nil }
         }
@@ -1452,16 +1458,36 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
         }
     }
 
+    /// Visible plate in canvas coordinates. Equals `bounds` when inset is 0;
+    /// inset crops the source so the plate is smaller than the canvas and the
+    /// overflow must not paint into the padding.
+    var documentVisibleRect: CGRect = .zero {
+        didSet {
+            guard documentVisibleRect != oldValue else { return }
+            needsDisplay = true
+        }
+    }
+
+    private var plateRect: CGRect {
+        documentVisibleRect.width > 0 && documentVisibleRect.height > 0
+            ? documentVisibleRect : bounds
+    }
+
     override func draw(_ dirtyRect: NSRect) {
         guard let ctx = NSGraphicsContext.current?.cgContext else { return }
+        let plate = plateRect
         if documentCornerRadius > 0 {
             ctx.saveGState()
             ctx.addPath(CGPath(
-                roundedRect: bounds, cornerWidth: documentCornerRadius,
+                roundedRect: plate, cornerWidth: documentCornerRadius,
                 cornerHeight: documentCornerRadius, transform: nil))
             ctx.clip()
+        } else if plate != bounds {
+            ctx.saveGState()
+            ctx.clip(to: plate)
         }
-        defer { if documentCornerRadius > 0 { ctx.restoreGState() } }
+        let clipped = documentCornerRadius > 0 || plate != bounds
+        defer { if clipped { ctx.restoreGState() } }
         ctx.interpolationQuality = .high
         ctx.draw(image.cgImage, in: bounds)
 
@@ -1492,7 +1518,7 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
         // the line has to go under them, not over them.
         if documentCornerRadius > 0 {
             SliceBBackdrop.drawPlateHairline(
-                in: ctx, rect: bounds, pixelScale: 1)
+                in: ctx, rect: plateRect, pixelScale: 1)
         }
 
         ctx.saveGState()
@@ -2829,7 +2855,7 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
         let magnification = enclosingScrollView?.magnification ?? 1
         let scale = (window?.backingScaleFactor ?? 2) * max(0.01, magnification)
         let rounded = CGPath(
-            roundedRect: convert(bounds, to: field),
+            roundedRect: convert(plateRect, to: field),
             cornerWidth: documentCornerRadius,
             cornerHeight: documentCornerRadius, transform: nil)
         let mask = (field.layer?.mask as? CAShapeLayer) ?? CAShapeLayer()

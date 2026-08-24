@@ -9495,6 +9495,200 @@ enum SelfTest {
                       fillFailures.prefix(8).joined(separator: " | "))
             }
 
+            // WP3: alignment / ratio / inset / auto-balance. v0 geometry
+            // (auto + cc + autoBalance + inset 0) must be byte-identical to
+            // inner+2*pad; everything else redistributes extra space without
+            // dropping an edge below the shadow floor.
+            do {
+                var geoFailures: [String] = []
+                let ocean = BackdropStyle.from(preset: .ocean)
+                // Long edge 1000 → pad 60, shadow floor 40, so alignment has
+                // room to hug an edge. 200×100 would clamp pad to the floor
+                // and make tl/br a no-op.
+                let innerW = 1000, innerH = 500
+                let scale: CGFloat = 1
+                let pad = Int(SliceBBackdrop.padding(
+                    forLongEdge: CGFloat(max(innerW, innerH)),
+                    pixelScale: scale, style: ocean))
+                let floor = Int(SliceBBackdrop.shadowExtent(
+                    pixelScale: scale, offsetPt: ocean.shadowMetrics().offsetPt,
+                    blurPt: ocean.shadowMetrics().blurPt))
+                let v0 = BackdropLayout(
+                    innerPixels: CGSize(width: CGFloat(innerW), height: CGFloat(innerH)),
+                    pixelScale: scale, style: ocean)
+                if Int(v0.outerPixelSize.width) != innerW + 2 * pad
+                    || Int(v0.outerPixelSize.height) != innerH + 2 * pad
+                    || Int(v0.padLeftPixels) != pad || Int(v0.padRightPixels) != pad
+                    || Int(v0.padBottomPixels) != pad || Int(v0.padTopPixels) != pad
+                    || Int(v0.insetPixels) != 0
+                    || Int(v0.platePixelRect.minX) != pad
+                    || Int(v0.platePixelRect.width) != innerW {
+                    geoFailures.append(
+                        "v0 \(Int(v0.outerPixelSize.width))x\(Int(v0.outerPixelSize.height)) "
+                            + "pad \(Int(v0.padLeftPixels))")
+                }
+                let viaOuter = SliceBBackdrop.outerDimensions(
+                    innerWidth: innerW, innerHeight: innerH, style: ocean,
+                    pixelScale: scale)
+                if viaOuter?.width != Int(v0.outerPixelSize.width)
+                    || viaOuter?.height != Int(v0.outerPixelSize.height) {
+                    geoFailures.append("outerDimensions drifted from layout")
+                }
+
+                func layout(_ mutate: (inout BackdropStyle) -> Void) -> BackdropLayout {
+                    var s = ocean
+                    mutate(&s)
+                    return BackdropLayout(
+                        innerPixels: CGSize(
+                            width: CGFloat(innerW), height: CGFloat(innerH)),
+                        pixelScale: scale, style: s)
+                }
+
+                let centered = layout { $0.autoBalance = true; $0.alignment = .tl }
+                let alsoCentered = layout { $0.autoBalance = true; $0.alignment = .br }
+                if centered.platePixelRect != alsoCentered.platePixelRect
+                    || centered.platePixelRect != v0.platePixelRect {
+                    geoFailures.append("autoBalance did not centre")
+                }
+
+                let hugTL = layout { $0.autoBalance = false; $0.alignment = .tl }
+                let hugBR = layout { $0.autoBalance = false; $0.alignment = .br }
+                if hugTL.platePixelRect.minX != CGFloat(floor)
+                    || hugTL.padTopPixels != CGFloat(floor)
+                    || hugBR.padRightPixels != CGFloat(floor)
+                    || hugBR.padBottomPixels != CGFloat(floor)
+                    || hugTL.outerPixelSize != v0.outerPixelSize
+                    || hugTL.platePixelRect.origin == hugBR.platePixelRect.origin {
+                    geoFailures.append(
+                        "alignment tl \(hugTL.platePixelRect.origin) "
+                            + "br \(hugBR.platePixelRect.origin)")
+                }
+
+                let square = layout { $0.ratio = .oneOne }
+                if Int(square.outerPixelSize.width) != Int(square.outerPixelSize.height)
+                    || Int(square.outerPixelSize.width) < innerW + 2 * pad {
+                    geoFailures.append(
+                        "1:1 \(Int(square.outerPixelSize.width))x"
+                            + "\(Int(square.outerPixelSize.height))")
+                }
+
+                for ratio in BackdropRatio.allCases {
+                    for align in BackdropAlignment.allCases {
+                        for balanced in [true, false] {
+                            let L = layout {
+                                $0.ratio = ratio
+                                $0.alignment = align
+                                $0.autoBalance = balanced
+                            }
+                            let left = Int(L.padLeftPixels)
+                            let right = Int(L.padRightPixels)
+                            let bottom = Int(L.padBottomPixels)
+                            let top = Int(L.padTopPixels)
+                            let cW = Int(L.platePixelRect.width)
+                            let cH = Int(L.platePixelRect.height)
+                            let oW = Int(L.outerPixelSize.width)
+                            let oH = Int(L.outerPixelSize.height)
+                            if left < floor || right < floor
+                                || bottom < floor || top < floor {
+                                geoFailures.append(
+                                    "floor \(ratio.rawValue)/\(align.rawValue)/b\(balanced)")
+                            }
+                            if left + cW + right != oW
+                                || bottom + cH + top != oH
+                                || cW != innerW || cH != innerH {
+                                geoFailures.append(
+                                    "sum \(ratio.rawValue)/\(align.rawValue)")
+                            }
+                            if let r = ratio.widthOverHeight, oH > 0 {
+                                let got = Double(oW) / Double(oH)
+                                if abs(got - Double(r)) > 0.02 {
+                                    geoFailures.append(
+                                        "ratio \(ratio.rawValue) \(got)")
+                                }
+                            }
+                            if geoFailures.count > 12 { break }
+                        }
+                        if geoFailures.count > 12 { break }
+                    }
+                    if geoFailures.count > 12 { break }
+                }
+
+                var insetStyle = ocean
+                insetStyle.insetFraction = 0.10
+                let insetL = BackdropLayout(
+                    innerPixels: CGSize(
+                        width: CGFloat(innerW), height: CGFloat(innerH)),
+                    pixelScale: scale, style: insetStyle)
+                let wantInset = Int((0.10 * CGFloat(innerH)).rounded())
+                if Int(insetL.insetPixels) != wantInset
+                    || Int(insetL.platePixelRect.width) != innerW - 2 * wantInset
+                    || Int(insetL.outerPixelSize.width) != innerW + 2 * pad {
+                    geoFailures.append(
+                        "inset \(Int(insetL.insetPixels)) "
+                            + "plate \(Int(insetL.platePixelRect.width)) "
+                            + "outer \(Int(insetL.outerPixelSize.width))")
+                }
+
+                // Source crop: a red strip on the left edge must not survive
+                // in the plate after inset. The canvas keeps those pixels.
+                if let strip = CGContext(
+                    data: nil, width: innerW, height: innerH,
+                    bitsPerComponent: 8, bytesPerRow: 0,
+                    space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                    bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+                {
+                    strip.setFillColor(CGColor(srgbRed: 1, green: 1, blue: 1, alpha: 1))
+                    strip.fill(CGRect(x: 0, y: 0, width: innerW, height: innerH))
+                    strip.setFillColor(CGColor(srgbRed: 1, green: 0, blue: 0, alpha: 1))
+                    strip.fill(CGRect(x: 0, y: 0, width: CGFloat(wantInset), height: CGFloat(innerH)))
+                    if let src = strip.makeImage(),
+                       let framed = SliceBBackdrop.compose(
+                            image: src, style: insetStyle,
+                            budgetBytes: SliceBExport.defaultBudgetBytes)
+                    {
+                        let plate = insetL.platePixelRect
+                        var bytes = [UInt8](
+                            repeating: 0, count: framed.width * framed.height * 4)
+                        if let c = CGContext(
+                            data: &bytes, width: framed.width, height: framed.height,
+                            bitsPerComponent: 8, bytesPerRow: framed.width * 4,
+                            space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+                        {
+                            c.interpolationQuality = .none
+                            c.draw(framed, in: CGRect(
+                                x: 0, y: 0, width: framed.width, height: framed.height))
+                            // CGImage origin is top-left; plate is y-up.
+                            let x = Int(plate.minX) + 1
+                            let yTop = framed.height - (Int(plate.minY) + 1) - 1
+                            let i = (yTop * framed.width + x) * 4
+                            if bytes[i] > 200 && bytes[i + 1] < 40 && bytes[i + 2] < 40 {
+                                geoFailures.append("inset leaked source edge")
+                            }
+                            if framed.width != Int(insetL.outerPixelSize.width) {
+                                geoFailures.append(
+                                    "compose outer \(framed.width) layout "
+                                        + "\(Int(insetL.outerPixelSize.width))")
+                            }
+                        }
+                    } else {
+                        geoFailures.append("inset compose nil")
+                    }
+                }
+
+                let mapped = SliceBBackdrop.sourcePoint(
+                    fromPadded: CGPoint(x: 90, y: 70), layout: v0)
+                let expected = SliceBBackdrop.sourcePoint(
+                    fromPadded: CGPoint(x: 90, y: 70), padding: v0.padPoints)
+                if mapped != expected {
+                    geoFailures.append("sourcePoint \(mapped) vs \(expected)")
+                }
+
+                check("sliceB-backdrop-geometry-wp3",
+                      geoFailures.isEmpty,
+                      geoFailures.prefix(8).joined(separator: " | "))
+            }
+
             // 1b-2. The fill paints INSIDE the canvas and nowhere else.
             //
             // Every primitive the fill uses covers the current clip rather
