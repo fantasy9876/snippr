@@ -260,6 +260,12 @@ sealed class BlurAnnotation : Annotation
 /// Lights one rectangle by dimming everything around it. The hole IS the
 /// object: clicking the lit area selects the spotlight, clicking the dimmed
 /// surround does not.
+///
+/// WP8 parity (macOS 1.2.14): preference `multipleSpotlight` (default ON)
+/// allows several holes. Each Draw() still paints a full-canvas dim, so two
+/// calls stack darkness and overlapping Alternate-fill flips the intersection
+/// back to dim. Port must union holes in AnnotationCompositor (one dim layer,
+/// punch with CompositingMode.SourceCopy/Color.Transparent — not even-odd).
 sealed class SpotlightAnnotation : Annotation
 {
     public Rectangle Rect;

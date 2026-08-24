@@ -66,6 +66,27 @@ enum SelfTest {
         // Headless tests may run from the installed bundle and therefore share
         // its preferences domain. Never mutate real user settings here.
         Settings.registerDefaults(applyMigrations: false)
+        // Gates below write last-used / multiple-spotlight. Restore the
+        // operator's real defaults when we leave, and start from a clean
+        // slate so a leftover last-used cannot preselect a panel that a
+        // gate expects to show None.
+        let defaults = UserDefaults.standard
+        let savedLastStyle = defaults.data(forKey: Settings.Keys.backdropLastStyle)
+        let savedMultiple = defaults.object(forKey: Settings.Keys.multipleSpotlight)
+        defaults.removeObject(forKey: Settings.Keys.backdropLastStyle)
+        defer {
+            if let savedLastStyle {
+                defaults.set(savedLastStyle, forKey: Settings.Keys.backdropLastStyle)
+            } else {
+                defaults.removeObject(forKey: Settings.Keys.backdropLastStyle)
+            }
+            if let savedMultiple {
+                defaults.set(savedMultiple, forKey: Settings.Keys.multipleSpotlight)
+            } else {
+                defaults.removeObject(forKey: Settings.Keys.multipleSpotlight)
+            }
+            SliceBCompositor.multipleSpotlightOverrideForTesting = nil
+        }
         try? FileManager.default.createDirectory(atPath: outputDir, withIntermediateDirectories: true)
         var failures = 0
 
@@ -9901,6 +9922,15 @@ enum SelfTest {
                 if !BackdropPanelFeature.geometryEnabled {
                     panelFailures.append("geometry-hidden-after-wp3")
                 }
+                // 1.2.13 was 236pt — 24pt short of four chips — and ate the
+                // first letter of Inset/Alignment/Ratio. Slack must stay
+                // positive so a couple of points of safe-area cannot clip.
+                if BackdropPanelView.width < 260
+                    || BackdropPanelView.layoutSlack < 2 {
+                    panelFailures.append(
+                        "clip-risk w=\(BackdropPanelView.width) "
+                            + "slack=\(BackdropPanelView.layoutSlack)")
+                }
                 check("sliceB-backdrop-panel-contract",
                       panelFailures.isEmpty,
                       panelFailures.prefix(8).joined(separator: " | "))
@@ -10488,6 +10518,23 @@ enum SelfTest {
                         miniFails.append("same-padding-forked")
                     }
 
+                    if let mini = view.backdropMiniViewForTesting {
+                        let rect = view.convert(
+                            mini.openEditorButtonFrame, from: mini)
+                        let p = CGPoint(x: rect.midX, y: rect.midY)
+                        if view.areaCursor(at: p) != .pointingHand {
+                            miniFails.append(
+                                "open-editor-cursor \(String(describing: view.areaCursor(at: p)))")
+                        }
+                    } else {
+                        miniFails.append("mini-view-missing")
+                    }
+                    let remembered = Settings.shared.backdropLastStyle
+                    if remembered?.gradientId != "lavender"
+                        || abs((remembered?.paddingFraction ?? 0) - 0.10) > 0.0001 {
+                        miniFails.append(
+                            "last-used \(String(describing: remembered?.gradientId))")
+                    }
                     view.openBackdropEditorForTesting()
                     if spy.editors.count != 1 {
                         miniFails.append("editor-calls \(spy.editors.count)")
@@ -10508,6 +10555,48 @@ enum SelfTest {
                 check("sliceB-backdrop-overlay-mini",
                       miniFails.isEmpty,
                       miniFails.prefix(8).joined(separator: " | "))
+            }
+
+            // Last-used is a VIEW of the default, not a frame. Opening the
+            // editor with the sidebar already open (overlay "Open in Editor…")
+            // must show it AND still require a click to apply.
+            do {
+                var lastFails: [String] = []
+                var last = BackdropStyle.gradient("mint")
+                last.paddingFraction = 0.08
+                Settings.shared.rememberBackdropStyle(last)
+                let wc = EditorWindowController.open(
+                    with: CapturedImage(
+                        cgImage: makeSolidImage(
+                            width: 160, height: 120,
+                            color: NSColor.gray.cgColor),
+                        scale: 1),
+                    forceFitForTesting: true,
+                    openBackdropPanel: true)
+                if !wc.isBackdropPanelOpen {
+                    lastFails.append("panel-closed")
+                }
+                if wc.canvasForTesting.backdropStyleForTesting.kind != .none {
+                    lastFails.append("document-framed")
+                }
+                let panel = wc.backdropPanelModel
+                if panel?.style.gradientId != "mint"
+                    || panel?.isPreselected != true {
+                    lastFails.append(
+                        "preselect \(String(describing: panel?.style.gradientId)) "
+                            + "pre \(String(describing: panel?.isPreselected))")
+                }
+                panel?.choose(gradientId: "mint")
+                if wc.canvasForTesting.backdropStyleForTesting.gradientId != "mint"
+                    || panel?.isPreselected != false {
+                    lastFails.append("click-did-not-apply")
+                }
+                wc.close()
+                UserDefaults.standard.removeObject(
+                    forKey: Settings.Keys.backdropLastStyle)
+                check("sliceB-backdrop-last-used-preselect",
+                      lastFails.isEmpty,
+                      lastFails.joined(separator: " | "))
             }
 
             // 1b-2. The fill paints INSIDE the canvas and nowhere else.
@@ -11744,6 +11833,38 @@ enum SelfTest {
                   orderIndependent && dimOverBlur && brightInside,
                   "orderIndep \(orderIndependent) dimOverBlur \(dimOverBlur) brightInside \(brightInside)")
 
+            // 7b. Two overlapping holes: intersection stays bright (even-odd
+            //     would flip it back to dim) and the surround is dimmed once.
+            do {
+                let white = makeSolidImage(
+                    width: 100, height: 80, color: NSColor.white.cgColor)
+                let a = SpotlightAnnotation(uiScale: 1)
+                a.rect = CGRect(x: 10, y: 10, width: 40, height: 40)
+                a.baseBounds = CGRect(x: 0, y: 0, width: 100, height: 80)
+                a.dimFraction = 0.5
+                let b = SpotlightAnnotation(uiScale: 1)
+                b.rect = CGRect(x: 30, y: 10, width: 40, height: 40)
+                b.baseBounds = a.baseBounds
+                b.dimFraction = 0.5
+                let both = AnnotationRenderer.render(
+                    base: white, annotations: [a, b], pixellated: nil)
+                let onlyA = AnnotationRenderer.render(
+                    base: white, annotations: [a], pixellated: nil)
+                let none = AnnotationRenderer.render(
+                    base: white, annotations: [], pixellated: nil)
+                let baseL = luma(probe(none, 15, 30))
+                let holeA = luma(probe(both, 15, 30))
+                let overlap = luma(probe(both, 35, 30))
+                let holeB = luma(probe(both, 55, 30))
+                let outside = luma(probe(both, 5, 5))
+                let outsideA = luma(probe(onlyA, 5, 5))
+                check("sliceB-spotlight-union-holes",
+                      holeA == baseL && overlap == baseL && holeB == baseL
+                        && outside < baseL && abs(outside - outsideA) <= 2,
+                      "A \(holeA) overlap \(overlap) B \(holeB) "
+                        + "out \(outside)/\(outsideA) base \(baseL)")
+            }
+
             // 8. A magnifier must sample the SANITIZED layer.
             let magCtx = ctx(60, 40)
             magCtx.setFillColor(NSColor.white.cgColor)
@@ -12515,13 +12636,17 @@ enum SelfTest {
                   "mapped \(mapped) p3 \(p3Kept) \(p3Detail) "
                     + "stops \(stopsDetail)")
 
-            // 8. Spotlight stays a singleton and is hit by its hole
+            // 8. Spotlight stays a singleton (preference OFF) and is hit by
+            //    its hole. Surface gates below assume replace; pin OFF so a
+            //    machine whose defaults already have multiple ON cannot
+            //    flip them.
+            SliceBCompositor.multipleSpotlightOverrideForTesting = false
             let spot1 = SpotlightAnnotation(uiScale: 1)
             spot1.rect = CGRect(x: 10, y: 10, width: 40, height: 40)
             let spot2 = SpotlightAnnotation(uiScale: 1)
             spot2.rect = CGRect(x: 60, y: 60, width: 20, height: 20)
             let afterSecond = SliceBCompositor.applySpotlight(
-                existing: [spot1], new: spot2)
+                existing: [spot1], new: spot2, multiple: false)
             // E. Spotlight replacement is one transaction, and it puts the
             //    previous one back WHERE it was.
             var spotFailures: [String] = []
@@ -17583,6 +17708,60 @@ enum SelfTest {
                     && !spot2.hitTest(CGPoint(x: 5, y: 5)),
                   "count \(afterSecond.count) hitHole \(spot2.hitTest(CGPoint(x: 70, y: 70))) hitOutside \(spot2.hitTest(CGPoint(x: 5, y: 5)))")
 
+            // 8b. Preference ON: append, inherit dim, undo is a plain pop.
+            do {
+                SliceBCompositor.multipleSpotlightOverrideForTesting = true
+                let kept = SliceBCompositor.applySpotlight(
+                    existing: [spot1], new: spot2, multiple: true)
+                var multiFails: [String] = []
+                if kept.count != 2 || kept[0] !== spot1 || kept[1] !== spot2 {
+                    multiFails.append("apply \(kept.count)")
+                }
+                let surface = AnnotationSurface(pixelScale: 1)
+                surface.redactionBaseBounds = CGRect(
+                    x: 0, y: 0, width: 200, height: 200)
+                let first = SpotlightAnnotation(uiScale: 1)
+                first.rect = CGRect(x: 10, y: 10, width: 40, height: 30)
+                first.dimFraction = 0.3
+                surface.addAnnotationForTesting(first)
+                surface.tool = .spotlight
+                _ = surface.beginDrag(atPixel: CGPoint(x: 80, y: 80))
+                surface.continueDrag(toPixel: CGPoint(x: 140, y: 130))
+                surface.endDrag()
+                let live = surface.annotations
+                    .compactMap { $0 as? SpotlightAnnotation }
+                if live.count != 2 || live[0] !== first {
+                    multiFails.append("live \(live.count)")
+                }
+                if abs((live.last?.dimFraction ?? 0) - 0.3) > 0.0001 {
+                    multiFails.append(
+                        "inherit \(live.last?.dimFraction ?? -1)")
+                }
+                if !surface.setSpotlightDim(0.8) {
+                    multiFails.append("dim-refused")
+                }
+                let afterDim = surface.annotations
+                    .compactMap { $0 as? SpotlightAnnotation }
+                if afterDim.contains(where: {
+                    abs($0.dimFraction - 0.8) > 0.0001
+                }) {
+                    multiFails.append("shared-dim")
+                }
+                _ = surface.undo()
+                if abs(first.dimFraction - 0.3) > 0.0001 {
+                    multiFails.append("dim-undo \(first.dimFraction)")
+                }
+                _ = surface.undo()
+                if surface.annotations.count != 1
+                    || surface.annotations.first !== first {
+                    multiFails.append("pop \(surface.annotations.count)")
+                }
+                check("sliceB-spotlight-multiple",
+                      multiFails.isEmpty,
+                      multiFails.joined(separator: " | "))
+                SliceBCompositor.multipleSpotlightOverrideForTesting = false
+            }
+
             // 9. Real key routing + real toolbar + symbol fallback
             let uiWC = EditorWindowController.open(
                 with: CapturedImage(
@@ -19100,6 +19279,8 @@ enum SelfTest {
                 canvas.undoManager?.beginUndoGrouping()
                 canvas.registerUndoSnapshot()
                 canvas.undoManager?.endUndoGrouping()
+                UserDefaults.standard.removeObject(
+                    forKey: Settings.Keys.backdropLastStyle)
                 let toolBefore = canvas.currentTool
                 let historyBefore = canvas.historyMutationCountForTesting
                 let fingerprintBefore = canvas.documentFingerprintForTesting

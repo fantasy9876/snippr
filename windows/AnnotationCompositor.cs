@@ -15,6 +15,10 @@ enum AnnotationPhase { Redaction = 0, Spotlight = 1, Foreground = 2 }
 /// magnifier the export had already dropped.
 ///
 /// Counterpart: `SliceBCompositor.draw` in `Sources/Snippr/SliceBContract.swift`.
+///
+/// WP8 parity: when multiple SpotlightAnnotations are live, do not call
+/// each Draw() independently. Mirror `SliceBCompositor.drawSpotlights`:
+/// one dim fill, union of holes. Until then Windows stays singleton.
 static class AnnotationCompositor
 {
     public static AnnotationPhase PhaseOf(Annotation a) => a switch

@@ -728,6 +728,14 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
         mini.onOpenEditor = { [weak self] in
             self?.openBackdropEditor()
         }
+        mini.onOpenEditorHover = { [weak self] hovered in
+            guard let self else { return }
+            if hovered {
+                self.applyCursor(.pointingHand)
+            } else {
+                self.applyCursor(self.areaCursor(at: self.mousePos))
+            }
+        }
         return mini
     }
 
@@ -751,7 +759,12 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
             hideBackdropMini()
             return
         }
-        mini.sync(style: backdropStyle)
+        if backdropStyle.kind == .none,
+           let last = Settings.shared.backdropLastStyle, last.kind != .none {
+            mini.sync(style: last)
+        } else {
+            mini.sync(style: backdropStyle)
+        }
         mini.isHidden = false
         layoutBackdropMini()
     }
@@ -803,6 +816,11 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
         backdropMini?.control(identifier: identifier)
     }
 
+    var backdropMiniViewForTesting: OverlayBackdropMiniView? {
+        guard let mini = backdropMini, !mini.isHidden else { return nil }
+        return mini
+    }
+
     func openBackdropEditorForTesting() { openBackdropEditor() }
 
     @discardableResult
@@ -819,6 +837,7 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
             return false
         }
         guard surface.applyBackdropStyle(next) else { return false }
+        Settings.shared.rememberBackdropStyle(next)
         refreshBackdropButton()
         backdropMini?.sync(style: surface.backdropStyle)
         updateTextEntryClip()
@@ -892,7 +911,8 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
         AppServices.lastCapture = payload.visual
         Settings.shared.lastAreaRect = global
         EditorWindowController.open(
-            with: payload.semantic, backdrop: passStyle)
+            with: payload.semantic, backdrop: passStyle,
+            openBackdropPanel: true)
     }
 
     /// Clips the live caption to the crop the export will produce — rounded
@@ -1913,6 +1933,10 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
             rects.append((entry.1, .resize(handle)))
         }
         if drawing { rects.append((selection, AppCursor.drawing(tool))) }
+        if let mini = backdropMini, !mini.isHidden {
+            let editor = convert(mini.openEditorButtonFrame, from: mini)
+            rects.append((editor, .pointingHand))
+        }
         return rects
     }
 

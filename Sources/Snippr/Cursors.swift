@@ -14,6 +14,7 @@ enum AppCursor: Equatable {
     case openHand
     case closedHand
     case iBeam
+    case pointingHand
     case resize(SelectionHandle)
 
     var cursor: NSCursor {
@@ -23,6 +24,7 @@ enum AppCursor: Equatable {
         case .openHand: return .openHand
         case .closedHand: return .closedHand
         case .iBeam: return .iBeam
+        case .pointingHand: return .pointingHand
         case .resize(let handle): return handle.cursor
         }
     }

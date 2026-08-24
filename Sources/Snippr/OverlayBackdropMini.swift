@@ -22,7 +22,7 @@ enum OverlayQuickBackdrop {
     static let contentInset: CGFloat = 8
     static let headerHeight: CGFloat = 16
     static let paddingRowHeight: CGFloat = 24
-    static let footerHeight: CGFloat = 18
+    static let footerHeight: CGFloat = 22
     static let sectionGap: CGFloat = 6
     static let cornerRadius: CGFloat = 10
 
@@ -87,15 +87,29 @@ enum OverlayBackdropMiniIdentifier {
 final class OverlayBackdropMiniView: NSView {
     var onChoose: ((BackdropStyle) -> Void)?
     var onOpenEditor: (() -> Void)?
+    /// Overlay cursor table reads this so hover/click share one meaning.
+    var onOpenEditorHover: ((Bool) -> Void)?
 
     private(set) var style: BackdropStyle = .none
     private(set) var hintButtons: [NSButton] = []
+    private(set) var isOpenEditorHovered = false
 
     private var noneButton: NSButton!
     private var gradientButtons: [String: NSButton] = [:]
     private var paddingButtons: [String: NSButton] = [:]
     private var openEditorButton: NSButton!
     private var titleLabel: NSTextField!
+    private var openEditorTracking: NSTrackingArea?
+
+    /// Rest / hover SF Symbols for the footer link. Exposed so a gate can
+    /// name the icon it expects instead of matching a bitmap.
+    static let openEditorSymbol = "arrow.up.right.square"
+    static let openEditorHoverSymbol = "arrow.up.right.square.fill"
+
+    var openEditorButtonFrame: CGRect { openEditorButton.frame }
+    var openEditorSymbolNameForTesting: String {
+        isOpenEditorHovered ? Self.openEditorHoverSymbol : Self.openEditorSymbol
+    }
 
     override var isFlipped: Bool { true }
 
@@ -206,17 +220,18 @@ final class OverlayBackdropMiniView: NSView {
         openEditorButton.isBordered = false
         openEditorButton.title = "Open in Editor…"
         openEditorButton.font = .systemFont(ofSize: 11, weight: .medium)
-        openEditorButton.contentTintColor = NSColor(
-            srgbRed: 0.49, green: 0.69, blue: 1, alpha: 1)
+        openEditorButton.imagePosition = .imageLeading
+        openEditorButton.imageHugsTitle = true
         openEditorButton.alignment = .right
         openEditorButton.setAccessibilityLabel("Open in Editor…")
-        openEditorButton.toolTip = "Open in Editor…"
+        openEditorButton.toolTip = "Open this shot in the editor with Backdrop"
         openEditorButton.identifier = NSUserInterfaceItemIdentifier(
             OverlayBackdropMiniIdentifier.openEditor)
         openEditorButton.setAccessibilityIdentifier(
             OverlayBackdropMiniIdentifier.openEditor)
         openEditorButton.target = self
         openEditorButton.action = #selector(openEditorClicked)
+        applyOpenEditorAppearance(hovered: false)
         addSubview(openEditorButton)
 
         var hints: [NSButton] = [noneButton]
@@ -225,6 +240,53 @@ final class OverlayBackdropMiniView: NSView {
         hints.append(openEditorButton)
         hintButtons = hints
         refreshSelection()
+        resetCursorRects()
+    }
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        addCursorRect(openEditorButton.frame, cursor: .pointingHand)
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let openEditorTracking { removeTrackingArea(openEditorTracking) }
+        let area = NSTrackingArea(
+            rect: openEditorButton.frame,
+            options: [.mouseEnteredAndExited, .activeAlways],
+            owner: self, userInfo: nil)
+        addTrackingArea(area)
+        openEditorTracking = area
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        guard event.trackingArea === openEditorTracking else {
+            super.mouseEntered(with: event)
+            return
+        }
+        applyOpenEditorAppearance(hovered: true)
+        onOpenEditorHover?(true)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        guard event.trackingArea === openEditorTracking else {
+            super.mouseExited(with: event)
+            return
+        }
+        applyOpenEditorAppearance(hovered: false)
+        onOpenEditorHover?(false)
+    }
+
+    private func applyOpenEditorAppearance(hovered: Bool) {
+        isOpenEditorHovered = hovered
+        let name = hovered ? Self.openEditorHoverSymbol : Self.openEditorSymbol
+        let image = NSImage(
+            systemSymbolName: name, accessibilityDescription: "Open in Editor")
+        image?.isTemplate = true
+        openEditorButton.image = image
+        openEditorButton.contentTintColor = hovered
+            ? NSColor(srgbRed: 0.70, green: 0.84, blue: 1, alpha: 1)
+            : NSColor(srgbRed: 0.49, green: 0.69, blue: 1, alpha: 1)
     }
 
     private func chipFrame(index: Int, originY: CGFloat) -> CGRect {

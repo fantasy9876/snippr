@@ -51,7 +51,8 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
     @discardableResult
     static func open(
         with image: CapturedImage, backdrop: BackdropStyle? = nil,
-        forceFitForTesting: Bool = false
+        forceFitForTesting: Bool = false,
+        openBackdropPanel: Bool = false
     ) -> EditorWindowController {
         let wc = EditorWindowController(
             image: image, backdrop: backdrop,
@@ -66,6 +67,7 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
         wc.window?.orderFrontRegardless()
         AppActivation.activateNow()
         wc.window?.makeKeyAndOrderFront(nil)
+        if openBackdropPanel { wc.setBackdropPanelOpen(true) }
         return wc
     }
 
@@ -724,6 +726,7 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
             BackdropSwatch.resetCache()
         }
         backdropPanelModel?.syncFromCanvas(canvas.backdropStyle)
+        if open { backdropPanelModel?.preselectLastUsed() }
         backdropButton?.contentTintColor = open ? .controlAccentColor : .lightGray
         window?.contentView?.layoutSubtreeIfNeeded()
         // The viewport just changed width, so a fitted document is no longer
@@ -1336,6 +1339,7 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
         }
         registerBackdropUndo(from: backdropStyle)
         backdropStyle = next
+        Settings.shared.rememberBackdropStyle(next)
         needsDisplay = true
         onStateChange?()
         return true
@@ -2005,10 +2009,16 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
             if big {
                 registerUndoSnapshot()
                 if let spot = draft as? SpotlightAnnotation {
-                    // v1 is a singleton: darkness never stacks. Select the new
-                    // one, or the digit keys would target a detached object.
+                    let multiple = SliceBCompositor.allowsMultipleSpotlights
+                    if multiple,
+                       let existing = annotations
+                        .compactMap({ $0 as? SpotlightAnnotation }).last {
+                        spot.dimFraction = existing.dimFraction
+                    }
+                    // Preference OFF: replace so darkness never stacks as two
+                    // independent layers. ON: append; compositor unions holes.
                     annotations = SliceBCompositor.applySpotlight(
-                        existing: annotations, new: spot)
+                        existing: annotations, new: spot, multiple: multiple)
                     selected = spot
                 } else {
                     annotations.append(draft)
@@ -2749,17 +2759,27 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
                 .selectTool(.pixelateText)
             return
         }
-        // 1-9 set the selected spotlight's darkness, through undo.
-        if flags.isEmpty, let digit = Int(chars), (1...9).contains(digit),
-           let selectedSpot = selected as? SpotlightAnnotation,
-           // Only a spotlight still in the document may be adjusted; a
-           // replaced one is detached and mutating it would do nothing visible.
-           let spot = annotations.compactMap({ $0 as? SpotlightAnnotation })
-               .first(where: { $0 === selectedSpot }) {
-            registerUndoSnapshot()
-            spot.dimFraction = CGFloat(digit) / 10
-            needsDisplay = true
-            return
+        // 1-9 set spotlight darkness, through undo. Multiple mode writes
+        // the whole group (one dim layer); singleton still needs a selection
+        // so a detached replacement cannot be mutated.
+        if flags.isEmpty, let digit = Int(chars), (1...9).contains(digit) {
+            let live = annotations.compactMap { $0 as? SpotlightAnnotation }
+            let targets: [SpotlightAnnotation]
+            if SliceBCompositor.allowsMultipleSpotlights {
+                targets = live
+            } else if let selectedSpot = selected as? SpotlightAnnotation,
+                      let spot = live.first(where: { $0 === selectedSpot }) {
+                targets = [spot]
+            } else {
+                targets = []
+            }
+            if !targets.isEmpty {
+                registerUndoSnapshot()
+                let value = CGFloat(digit) / 10
+                for spot in targets { spot.dimFraction = value }
+                needsDisplay = true
+                return
+            }
         }
         if flags.isEmpty, let tool = SliceAHotkeys.editorToolKeys[chars] {
             let controller = window?.windowController as? EditorWindowController

@@ -211,25 +211,50 @@ final class BackdropPanelModel: ObservableObject {
 
     private var isDragging = false
     private var groupIsOpen = false
+    /// True when `style` is last-used shown as a default, not what the
+    /// document is wearing. A click must still apply — `apply` would
+    /// otherwise treat the already-visible chip as a no-op.
+    private(set) var isPreselected = false
 
     init(style: BackdropStyle) { self.style = style }
 
     /// The canvas is the source of truth; the panel follows it so that undo,
     /// a preset applied from elsewhere and the panel never disagree.
+    ///
+    /// Exception: a last-used preselection on a bare document is a VIEW of
+    /// the default, not of the canvas. Refreshing layout must not wipe it
+    /// back to None while the document is still None.
     func syncFromCanvas(_ style: BackdropStyle) {
+        if isPreselected && style.kind == .none { return }
+        isPreselected = false
         guard style != self.style else { return }
         self.style = style
     }
 
+    /// Show last-used on a bare document without applying it. Opening the
+    /// sidebar is still not an edit.
+    func preselectLastUsed() {
+        guard style.kind == .none,
+              let last = Settings.shared.backdropLastStyle,
+              last.kind != .none
+        else { return }
+        style = last
+        isPreselected = true
+    }
+
     func apply(_ next: BackdropStyle) {
         let clamped = next.clamped()
-        guard clamped != style else { return }
+        if !isPreselected {
+            guard clamped != style else { return }
+        }
         if isDragging && !groupIsOpen {
             groupIsOpen = true
             onBeginContinuousEdit?()
         }
         if onApply?(clamped) == true {
             style = clamped
+            isPreselected = false
+            Settings.shared.rememberBackdropStyle(clamped)
         }
     }
 
@@ -284,11 +309,13 @@ final class BackdropPanelModel: ObservableObject {
     }
 
     func setCornerStyle(_ corner: BackdropCornerStyle) {
-        guard corner != style.cornerStyle else { return }
+        guard corner != style.cornerStyle || isPreselected else { return }
         onCornerStyle?(corner)
         var next = style
         next.cornerStyle = corner
         style = next
+        isPreselected = false
+        Settings.shared.rememberBackdropStyle(style)
     }
 
     var isNone: Bool { style.kind == .none }
@@ -354,15 +381,32 @@ struct BackdropPanelView: View {
     @State private var isNamingPreset = false
     @State private var draftPresetName = ""
 
-    static let width: CGFloat = 236
+    /// Wide enough for four 52pt chips + 8pt gutters + this padding. The
+    /// 236pt frame in 1.2.13 was 24pt short of that, so a vertical
+    /// ScrollView clipped/centred the overflow and ate the first letter of
+    /// every geometry label ("Inset" → "nset").
+    static let horizontalPadding: CGFloat = 16
+    static let chipSpacing: CGFloat = 8
+    static let width: CGFloat = 268
+
+    static var chipGridWidth: CGFloat {
+        4 * BackdropSwatch.size.width + 3 * chipSpacing
+    }
+
+    /// Positive slack means labels cannot clip at the leading edge even if
+    /// the hosting view reports a couple of points of safe-area inset.
+    static var layoutSlack: CGFloat {
+        width - (chipGridWidth + horizontalPadding * 2)
+    }
 
     private let gradientColumns = Array(
-        repeating: GridItem(.fixed(BackdropSwatch.size.width), spacing: 8),
+        repeating: GridItem(
+            .fixed(BackdropSwatch.size.width), spacing: chipSpacing),
         count: 4)
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 14) {
+            VStack(alignment: .leading, spacing: 18) {
                 if BackdropPanelFeature.presetsEnabled { presetRow }
                 noneButton
                 gradients
@@ -370,10 +414,12 @@ struct BackdropPanelView: View {
                 sliders
                 if BackdropPanelFeature.geometryEnabled { geometry }
             }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 16)
+            .padding(.horizontal, Self.horizontalPadding)
+            .padding(.vertical, 18)
+            .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
         }
         .frame(width: Self.width)
+        .ignoresSafeArea()
         .background(Color(nsColor: NSColor(white: 0.11, alpha: 1)))
     }
 
@@ -529,7 +575,7 @@ struct BackdropPanelView: View {
     }
 
     private var sliders: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 14) {
             labelledSlider(
                 "Padding",
                 value: Binding(
@@ -579,7 +625,7 @@ struct BackdropPanelView: View {
     /// WP3 owns the geometry these write to. Hidden until it lands so the
     /// panel never offers a control the compositor ignores.
     private var geometry: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 14) {
             labelledSlider(
                 "Inset",
                 value: Binding(
@@ -620,9 +666,9 @@ struct BackdropPanelView: View {
     }
 
     private var alignmentGrid: some View {
-        VStack(spacing: 4) {
+        VStack(spacing: 6) {
             ForEach(0..<3, id: \.self) { row in
-                HStack(spacing: 4) {
+                HStack(spacing: 6) {
                     ForEach(0..<3, id: \.self) { col in
                         let anchor = BackdropAlignment.allCases[row * 3 + col]
                         // With auto-balance on the compositor divides the
@@ -634,11 +680,11 @@ struct BackdropPanelView: View {
                         Button {
                             model.choose(alignment: anchor)
                         } label: {
-                            RoundedRectangle(cornerRadius: 3)
+                            RoundedRectangle(cornerRadius: 4)
                                 .fill(selected
                                     ? Color.accentColor
                                     : Color.white.opacity(0.14))
-                                .frame(width: 20, height: 16)
+                                .frame(width: 26, height: 20)
                         }
                         .buttonStyle(.plain)
                         .accessibilityIdentifier(
@@ -689,11 +735,13 @@ struct BackdropPanelView: View {
         _ title: String, value: Binding<CGFloat>,
         range: ClosedRange<CGFloat>, identifier: String
     ) -> some View {
-        HStack(spacing: 8) {
+        HStack(spacing: 10) {
             Text(title)
                 .font(.system(size: 11))
                 .foregroundStyle(.secondary)
-                .frame(width: 56, alignment: .leading)
+                .lineLimit(1)
+                .fixedSize()
+                .frame(minWidth: 52, alignment: .leading)
             Slider(
                 value: Binding(
                     get: { Double(value.wrappedValue) },

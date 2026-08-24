@@ -255,7 +255,11 @@ enum SliceBOCR {
 
 // MARK: - New annotation types
 
-/// Dim everything outside `rect`. v1 is a singleton: darkness never stacks.
+/// Dim everything outside `rect`. A single annotation still knows how to
+/// paint its own hole (tests, stray callers). Production preview/export go
+/// through `SliceBCompositor.drawSpotlights`, which unions every live hole
+/// into one dim layer — two `draw` calls would stack darkness and even-odd
+/// would flip an overlapping intersection back to dim.
 /// `baseBounds` is captured at creation so a cropped export dims the same
 /// region the preview showed.
 final class SpotlightAnnotation: Annotation {
@@ -533,6 +537,14 @@ enum SliceBPhase: Int, Comparable {
 }
 
 enum SliceBCompositor {
+    /// Tests pin singleton vs multiple without touching live Settings.
+    /// Production reads `Settings.multipleSpotlight` (default ON).
+    nonisolated(unsafe) static var multipleSpotlightOverrideForTesting: Bool?
+
+    static var allowsMultipleSpotlights: Bool {
+        multipleSpotlightOverrideForTesting ?? Settings.shared.multipleSpotlight
+    }
+
     static func phase(of annotation: Annotation) -> SliceBPhase {
         if annotation is BlurAnnotation { return .redaction }
         if annotation is SpotlightAnnotation { return .spotlight }
@@ -569,30 +581,10 @@ enum SliceBCompositor {
         let baseBounds = CGRect(
             x: 0, y: 0, width: base.width, height: base.height)
         var renderedAll = true
+        let ordered = phaseOrder(annotations)
 
-        for annotation in phaseOrder(annotations) {
-            guard let blur = annotation as? BlurAnnotation else {
-                // A magnifier TRANSPORTS pixels: whatever its source covers is
-                // reproduced, enlarged, wherever the callout sits. So the crop
-                // is a privacy boundary for it, and the boundary is enforced
-                // HERE rather than at the drag — a source that was legitimate
-                // when the callout was made can be moved outside the crop
-                // afterwards by a crop move or resize, and this check catches
-                // that the instant it happens, with no resampling and without
-                // the snapshot losing its identity.
-                //
-                // CONTAINS, not intersects: a partially outside source still
-                // shows the part that is outside. The crop is rectangular, so
-                // the rounded frame plays no part in it — that is decoration,
-                // not a boundary.
-                if let magnifier = annotation as? MagnifierAnnotation,
-                   !visiblePixels.contains(
-                       magnifier.sourceRect.standardized.integral) {
-                    continue
-                }
-                annotation.draw(in: ctx, pixellated: nil)
-                continue
-            }
+        for annotation in ordered {
+            guard let blur = annotation as? BlurAnnotation else { continue }
             // A redaction whose own rect is not finite and positive tells us
             // nothing about WHERE to cover, so cover everything visible rather
             // than skip it and claim success.
@@ -633,7 +625,60 @@ enum SliceBCompositor {
             }
             if !failed.isEmpty { drawFailedRedaction(failed, in: ctx) }
         }
+
+        // One dim layer for every live hole. Individual `SpotlightAnnotation.draw`
+        // would stack darkness and even-odd-flip overlapping intersections.
+        drawSpotlights(
+            ordered.compactMap { $0 as? SpotlightAnnotation }, in: ctx)
+
+        for annotation in ordered {
+            if annotation is BlurAnnotation { continue }
+            if annotation is SpotlightAnnotation { continue }
+            // A magnifier TRANSPORTS pixels: whatever its source covers is
+            // reproduced, enlarged, wherever the callout sits. So the crop
+            // is a privacy boundary for it, and the boundary is enforced
+            // HERE rather than at the drag — a source that was legitimate
+            // when the callout was made can be moved outside the crop
+            // afterwards by a crop move or resize, and this check catches
+            // that the instant it happens, with no resampling and without
+            // the snapshot losing its identity.
+            //
+            // CONTAINS, not intersects: a partially outside source still
+            // shows the part that is outside. The crop is rectangular, so
+            // the rounded frame plays no part in it — that is decoration,
+            // not a boundary.
+            if let magnifier = annotation as? MagnifierAnnotation,
+               !visiblePixels.contains(
+                   magnifier.sourceRect.standardized.integral) {
+                continue
+            }
+            annotation.draw(in: ctx, pixellated: nil)
+        }
         return renderedAll
+    }
+
+    /// Shared darkness, union of holes. `.clear` inside a transparency layer
+    /// punches the overlay only — destination (base + redactions) shows
+    /// through — so overlapping holes stay bright instead of flipping dim.
+    static func drawSpotlights(
+        _ spots: [SpotlightAnnotation], in ctx: CGContext
+    ) {
+        guard !spots.isEmpty else { return }
+        let dim = max(0.1, min(0.9, spots.last?.dimFraction ?? 0.6))
+        let canvas = spots.first(where: { !$0.baseBounds.isEmpty })?.baseBounds
+            ?? spots[0].rect
+        guard canvas.width > 0, canvas.height > 0 else { return }
+        ctx.saveGState()
+        defer { ctx.restoreGState() }
+        ctx.clip(to: canvas)
+        ctx.beginTransparencyLayer(auxiliaryInfo: nil)
+        ctx.setFillColor(NSColor.black.withAlphaComponent(dim).cgColor)
+        ctx.fill(canvas)
+        ctx.setBlendMode(.clear)
+        for spot in spots where spot.rect.width > 0 && spot.rect.height > 0 {
+            ctx.fill(spot.rect)
+        }
+        ctx.endTransparencyLayer()
     }
 
     /// Source pixels for a magnifier callout, taken AFTER redactions so the
@@ -702,12 +747,14 @@ enum SliceBCompositor {
         }
     }
 
-    /// Spotlight v1 is a singleton: adding a second one replaces the first so
-    /// darkness never stacks.
+    /// Preference OFF (1.2.13): replace so darkness never stacks as two
+    /// independent layers. Preference ON: append; the compositor still paints
+    /// a single dim, so stacking is a render concern, not an array concern.
     static func applySpotlight(
-        existing: [Annotation], new: SpotlightAnnotation
+        existing: [Annotation], new: SpotlightAnnotation, multiple: Bool
     ) -> [Annotation] {
-        existing.filter { !($0 is SpotlightAnnotation) } + [new]
+        if multiple { return existing + [new] }
+        return existing.filter { !($0 is SpotlightAnnotation) } + [new]
     }
 }
 

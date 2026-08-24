@@ -227,6 +227,11 @@ final class Settings {
         static let backdropPresets = "backdropPresets_v1"
         static let backdropAutoApply = "backdropAutoApply"
         static let backdropAutoApplyPreset = "backdropAutoApplyPreset"
+        /// Last BackdropStyle the user actually chose (mini or sidebar).
+        /// Preselection only — never auto-applies a frame by itself.
+        static let backdropLastStyle = "backdropLastStyle"
+        /// Multiple Spotlight holes. Default ON; OFF restores 1.2.13 replace.
+        static let multipleSpotlight = "multipleSpotlight"
         static let escSave = "escSave"
         static let confirmationStyle = "confirmationStyle"
         static let urlSchemeEnabled = "urlSchemeEnabled"
@@ -286,6 +291,7 @@ final class Settings {
             Keys.urlSchemeEnabled: false,
             Keys.diagnostics: true,
             Keys.uploadProvider: "disabled",
+            Keys.multipleSpotlight: true,
         ])
         // Older releases defaulted to 100%, leaving larger/near-edge images
         // behind macOS scrollbars. Move every existing install to Fit once;
@@ -421,6 +427,41 @@ final class Settings {
     var backdropAutoApplyPreset: String? {
         get { d.string(forKey: Keys.backdropAutoApplyPreset) }
         set { d.set(newValue, forKey: Keys.backdropAutoApplyPreset) }
+    }
+
+    /// Last style the user picked in the mini or the sidebar. Overlay and
+    /// editor preselect this when the document is still `.none`. It is NOT
+    /// a capture default: auto-apply (a named preset, off unless asked)
+    /// is the only path that frames a shot the user has not clicked on.
+    var backdropLastStyle: BackdropStyle? {
+        get {
+            guard let data = d.data(forKey: Keys.backdropLastStyle),
+                  let style = try? JSONDecoder().decode(
+                    BackdropStyle.self, from: data)
+            else { return nil }
+            return style.clamped()
+        }
+        set {
+            if let style = newValue,
+               let data = try? JSONEncoder().encode(style.clamped()) {
+                d.set(data, forKey: Keys.backdropLastStyle)
+            } else {
+                d.removeObject(forKey: Keys.backdropLastStyle)
+            }
+        }
+    }
+
+    /// Remember an explicit user choice. `.none` is a choice too — they
+    /// picked None — so the next mini opens on None rather than a stale fill.
+    func rememberBackdropStyle(_ style: BackdropStyle) {
+        backdropLastStyle = style.clamped()
+    }
+
+    /// Multiple Spotlight holes. Default ON via `registerDefaults`. OFF
+    /// restores the 1.2.13 singleton (drawing a new hole replaces the last).
+    var multipleSpotlight: Bool {
+        get { d.bool(forKey: Keys.multipleSpotlight) }
+        set { d.set(newValue, forKey: Keys.multipleSpotlight) }
     }
 
     var escCopy: Bool {

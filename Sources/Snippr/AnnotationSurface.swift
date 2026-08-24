@@ -205,6 +205,9 @@ final class AnnotationSurface: RedactionHost, RedactionJobObserver {
         let new: SpotlightAnnotation
         let prior: SpotlightAnnotation
         let priorIndex: Int
+        /// Other live holes whose dim was written in the same transaction
+        /// (multiple mode). Empty when preference is OFF.
+        let groupDimPriors: [(spot: SpotlightAnnotation, dim: CGFloat)]
     }
     private var spotlightReplacements: [SpotlightReplacement] = []
     private var strokeTrackpadAccum: CGFloat = 0
@@ -300,14 +303,21 @@ final class AnnotationSurface: RedactionHost, RedactionJobObserver {
             let spot = SpotlightAnnotation(uiScale: pixelScale)
             spot.rect = CGRect(origin: p, size: .zero)
             spot.baseBounds = redactionBaseBounds
+            let existingSpots = annotations.compactMap { $0 as? SpotlightAnnotation }
+            if SliceBCompositor.allowsMultipleSpotlights,
+               let existing = existingSpots.last {
+                // Shared darkness: a new hole joins the group at the
+                // group's dim, not at the 0.6 factory default.
+                spot.dimFraction = existing.dimFraction
+            }
             activeSpotlight = spot
             activeSpotlightAnchor = p
-            // v1 is a singleton, so the preview must show ONE candidate: take
-            // the existing spotlight out for the duration of the drag and put
-            // it back if the drag turns out to be a click.
-            if let existing = annotations.compactMap({
-                $0 as? SpotlightAnnotation
-            }).last,
+            // Preference OFF: v1 singleton, so the preview must show ONE
+            // candidate. Take the existing spotlight out for the duration of
+            // the drag and put it back if the drag turns out to be a click.
+            // Preference ON: add like any other mark — undo is a plain pop.
+            if !SliceBCompositor.allowsMultipleSpotlights,
+               let existing = existingSpots.last,
                let index = annotations.firstIndex(where: { $0 === existing }) {
                 // Keep the ORIGINAL position: removing and appending would
                 // reorder it after marks drawn later and break chronological
@@ -585,7 +595,7 @@ final class AnnotationSurface: RedactionHost, RedactionJobObserver {
                 if let replaced = replacedSpotlight {
                     spotlightReplacements.append(SpotlightReplacement(
                         new: spot, prior: replaced.spot,
-                        priorIndex: replaced.index))
+                        priorIndex: replaced.index, groupDimPriors: []))
                 }
                 redoAnnotations.removeAll()
                 pruneSpotlightReplacements()
@@ -613,20 +623,27 @@ final class AnnotationSurface: RedactionHost, RedactionJobObserver {
         // the spotlight this was meant to adjust and stranding the prior one.
         guard !isDragging else { return false }
         let clamped = max(0.1, min(0.9, fraction))
-        guard let current = annotations.compactMap({
-            $0 as? SpotlightAnnotation
-        }).last,
+        let live = annotations.compactMap { $0 as? SpotlightAnnotation }
+        guard let current = live.last,
               let index = annotations.firstIndex(where: { $0 === current })
         else { return false }
         guard abs(current.dimFraction - clamped) > 0.0001 else { return false }
         guard let clone = current.copyAnnotation() as? SpotlightAnnotation
         else { return false }
         clone.dimFraction = clamped
+        // Shared darkness: write every live hole. The last one still goes
+        // through the replacement record so undo restores dim in one step.
+        let others = live.filter { $0 !== current }
+        let groupPriors = others.map { (spot: $0, dim: $0.dimFraction) }
+        if SliceBCompositor.allowsMultipleSpotlights {
+            for other in others { other.dimFraction = clamped }
+        }
         annotations.remove(at: index)
         annotations.append(clone)
         spotlightReplacements.removeAll { $0.new === clone }
         spotlightReplacements.append(SpotlightReplacement(
-            new: clone, prior: current, priorIndex: index))
+            new: clone, prior: current, priorIndex: index,
+            groupDimPriors: groupPriors))
         redoAnnotations.removeAll()
         pruneSpotlightReplacements()
         historyDidChange?()
@@ -900,6 +917,9 @@ final class AnnotationSurface: RedactionHost, RedactionJobObserver {
            let replaced = spotlightReplacements.last(where: { $0.new === spot }) {
             annotations.insert(
                 replaced.prior, at: min(replaced.priorIndex, annotations.count))
+            for (other, dim) in replaced.groupDimPriors {
+                other.dimFraction = dim
+            }
         }
         redoAnnotations.append(annotation)
         clearActiveDraft()
@@ -919,6 +939,9 @@ final class AnnotationSurface: RedactionHost, RedactionJobObserver {
         if let spot = annotation as? SpotlightAnnotation,
            let replaced = spotlightReplacements.last(where: { $0.new === spot }) {
             annotations.removeAll { $0 === replaced.prior }
+            for (other, _) in replaced.groupDimPriors {
+                other.dimFraction = spot.dimFraction
+            }
         }
         annotations.append(annotation)
         clearActiveDraft()

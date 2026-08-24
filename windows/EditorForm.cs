@@ -898,8 +898,8 @@ sealed class EditorForm : Form
         if (_draft is MagnifierAnnotation pending) FinishMagnifier(pending);
         if (_draft is SpotlightAnnotation lit)
         {
-            // Exactly one spotlight: a second one would dim the first one's
-            // lit area, which reads as a bug rather than as two lights.
+            // Exactly one spotlight until WP8: a second Draw() would dim the
+            // first hole. macOS 1.2.14 branches on Settings.multipleSpotlight.
             if (lit.Rect.Width > 2 && lit.Rect.Height > 2)
             {
                 PushUndo();

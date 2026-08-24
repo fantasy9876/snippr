@@ -85,8 +85,8 @@ sealed class AreaReviewSession
     public void Add(Annotation annotation)
     {
         PushUndo();
-        // One spotlight, like the editor: a second would dim the first one's
-        // lit area, which reads as a bug rather than as two lights.
+        // One spotlight until WP8. macOS 1.2.14 keeps several holes behind
+        // Settings.multipleSpotlight and unions them in the compositor.
         if (annotation is SpotlightAnnotation)
             Annotations.RemoveAll(a => a is SpotlightAnnotation);
         Annotations.Add(annotation);

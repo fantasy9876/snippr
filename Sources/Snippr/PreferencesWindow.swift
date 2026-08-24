@@ -268,12 +268,20 @@ struct GeneralTab: View {
     @State private var launchAtStartup = LaunchAtLogin.isEnabled
     @State private var bgColor = Color(nsColor: Settings.shared.windowBGColor)
     @AppStorage(Settings.Keys.backdropAutoApply) private var backdropAutoApply = false
+    @AppStorage(Settings.Keys.multipleSpotlight) private var multipleSpotlight = true
     @State private var backdropPresets = BackdropPresetStore.load()
     @State private var autoApplyPreset = Settings.shared.backdropAutoApplyPreset ?? ""
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             backdropAutoApplySection
+            Row(label: "Spotlight") {
+                Toggle("Allow multiple Spotlight regions", isOn: $multipleSpotlight)
+            }
+            Text("When off, drawing a new Spotlight replaces the previous one.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .padding(.leading, 230)
             // visual picker — click a preview card to choose the backdrop
             VStack(alignment: .leading, spacing: 10) {
                 HStack(spacing: 6) {
