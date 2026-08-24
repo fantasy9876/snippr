@@ -1110,18 +1110,21 @@ enum SliceBBackdrop {
 
     /// Extra dest-sized buffers a raster fill keeps alive during compose.
     /// Gradient and solid paint into the outer context (no extra). Image /
-    /// wallpaper / blur hold a dest-sized source (the 3rd buffer the plan
-    /// called out). Inner is counted by the caller, not here.
+    /// wallpaper hold one dest-sized source. Blur keeps the scale-to-fill
+    /// raster and the CI output alive together (peak 2), not counting a
+    /// cache copy. Inner is counted by the caller, not here.
     static func extraFillBuffers(for style: BackdropStyle) -> Int {
         switch style.kind {
         case .none, .gradient, .solid: return 0
-        case .image, .wallpaper, .blurred: return 1
+        case .image, .wallpaper: return 1
+        case .blurred: return 2
         }
     }
 
     /// Bytes the outer frame will occupy for a given inner image. Both buffers
     /// are alive at once during a compose, so the caller must reserve this
-    /// before it renders the inner one. Raster fills add one dest-sized copy.
+    /// before it renders the inner one. Raster fills add extra dest-sized
+    /// copies (`extraFillBuffers`).
     static func reservedBytes(
         forInnerWidth width: Int, height: Int, preset: BackdropPreset,
         pixelScale: CGFloat = 1
@@ -1259,6 +1262,7 @@ enum SliceBBackdrop {
         ctx.clip(to: CGRect(origin: .zero, size: size))
         guard drawFill(
             in: ctx, size: size, style: style,
+            pixelScale: pixelScale,
             documentPixelsPerUserUnit: documentPixelsPerUserUnit)
         else { return false }
         let scale = max(1, pixelScale)
@@ -1293,6 +1297,7 @@ enum SliceBBackdrop {
         // across the plate edge instead of restarting at the plate's origin.
         guard drawFill(
             in: ctx, size: size, style: style,
+            pixelScale: pixelScale,
             documentPixelsPerUserUnit: documentPixelsPerUserUnit) else {
             ctx.restoreGState()
             return false
@@ -1305,24 +1310,34 @@ enum SliceBBackdrop {
     /// wash from the upper left, and a deterministic grain that breaks up the
     /// banding a smooth ramp shows on an 8-bit display.
     ///
-    /// `documentPixelsPerUserUnit` is what keeps the grain the same SIZE in
-    /// both draw paths. Compose works in bitmap pixels (1), the preview works
-    /// in points (the document's scale), and the tile is specified in document
-    /// pixels — mixing the two makes a @2x preview show a grain twice the
-    /// period of the exported one.
+    /// Two independent scales:
+    /// - `pixelScale` is the scale of THIS context, the same argument
+    ///   `drawFrame` uses for corner radius and shadow. Preview is in points
+    ///   (1); export is in document pixels (the image scale). Blur radius is
+    ///   a point metric, so it multiplies this — preview 28×1 = 28pt, export
+    ///   28×2 = 56px = 28pt. Feeding grain's `documentPixelsPerUserUnit`
+    ///   here inverted the ratio and made a @2x preview 4× blurrier than
+    ///   the export.
+    /// - `documentPixelsPerUserUnit` keeps the grain the same SIZE in both
+    ///   draw paths. Compose works in bitmap pixels (1), the preview works
+    ///   in points (the document's scale), and the tile is specified in
+    ///   document pixels.
     @discardableResult
     static func drawFill(
         in ctx: CGContext, size: CGSize, preset: BackdropPreset,
+        pixelScale: CGFloat = 1,
         documentPixelsPerUserUnit: CGFloat = 1
     ) -> Bool {
         drawFill(
             in: ctx, size: size, style: .from(preset: preset),
+            pixelScale: pixelScale,
             documentPixelsPerUserUnit: documentPixelsPerUserUnit)
     }
 
     @discardableResult
     static func drawFill(
         in ctx: CGContext, size: CGSize, style: BackdropStyle,
+        pixelScale: CGFloat = 1,
         documentPixelsPerUserUnit: CGFloat = 1
     ) -> Bool {
         guard style.kind != .none else { return true }
@@ -1340,7 +1355,7 @@ enum SliceBBackdrop {
         ctx.clip(to: CGRect(origin: .zero, size: size))
         guard paintFill(
             in: ctx, size: size, style: style,
-            pixelScale: documentPixelsPerUserUnit)
+            pixelScale: pixelScale)
         else { return false }
 
         // Grain for every painted fill. v0 four keep their dedicated seed;
@@ -1525,10 +1540,79 @@ enum SliceBBackdrop {
 
     private static let blurFillLock = NSLock()
     private nonisolated(unsafe) static var blurFillCache: [BlurFillKey: CGImage] = [:]
+    private nonisolated(unsafe) static var blurFillCacheOrder: [BlurFillKey] = []
+    private nonisolated(unsafe) static var blurFillCacheBytes = 0
+    private nonisolated(unsafe) static var lastBlurRadiusUserUnits: CGFloat = -1
+    /// Preview-size tiles stay. An export-size dest (~90 MB @2x on a large
+    /// capture) is painted once and is not worth keeping; a count cap of 8
+    /// would let eight of those sit at once.
+    private static let blurFillCacheByteCap = 128 * 1024 * 1024
+    private static let blurFillCacheEntryByteCap = 16 * 1024 * 1024
     private static let ciContext = CIContext(options: [
         .workingColorSpace: CGColorSpace(name: CGColorSpace.sRGB)!,
         .outputColorSpace: CGColorSpace(name: CGColorSpace.sRGB)!,
     ])
+
+    /// Radius actually handed to `CIGaussianBlur`, in the current context's
+    /// user units. Self-test compares the preview call tuple (pixelScale 1,
+    /// grain scale 2) against the export tuple (pixelScale 2, grain scale 1).
+    static var lastBlurRadiusForTesting: CGFloat {
+        blurFillLock.lock()
+        defer { blurFillLock.unlock() }
+        return lastBlurRadiusUserUnits
+    }
+
+    static func resetLastBlurRadiusForTesting() {
+        blurFillLock.lock()
+        lastBlurRadiusUserUnits = -1
+        blurFillLock.unlock()
+    }
+
+    static var blurFillCacheCountForTesting: Int {
+        blurFillLock.lock()
+        defer { blurFillLock.unlock() }
+        return blurFillCache.count
+    }
+
+    static func resetBlurFillCacheForTesting() {
+        blurFillLock.lock()
+        blurFillCache.removeAll(keepingCapacity: true)
+        blurFillCacheOrder.removeAll(keepingCapacity: true)
+        blurFillCacheBytes = 0
+        blurFillLock.unlock()
+    }
+
+    private static func recordLastBlurRadiusForTesting(_ radius: CGFloat) {
+        blurFillLock.lock()
+        lastBlurRadiusUserUnits = radius
+        blurFillLock.unlock()
+    }
+
+    private static func cgImageByteCount(_ image: CGImage) -> Int {
+        let row = image.bytesPerRow
+        if row > 0 { return row * image.height }
+        return image.width * image.height * 4
+    }
+
+    private static func rememberBlurFill(_ image: CGImage, key: BlurFillKey) {
+        let bytes = cgImageByteCount(image)
+        guard bytes > 0, bytes <= blurFillCacheEntryByteCap else { return }
+        blurFillLock.lock()
+        defer { blurFillLock.unlock() }
+        if blurFillCache[key] != nil { return }
+        while !blurFillCacheOrder.isEmpty,
+              blurFillCacheBytes + bytes > blurFillCacheByteCap {
+            let old = blurFillCacheOrder.removeFirst()
+            if let gone = blurFillCache.removeValue(forKey: old) {
+                blurFillCacheBytes = max(
+                    0, blurFillCacheBytes - cgImageByteCount(gone))
+            }
+        }
+        if blurFillCacheBytes + bytes > blurFillCacheByteCap { return }
+        blurFillCache[key] = image
+        blurFillCacheOrder.append(key)
+        blurFillCacheBytes += bytes
+    }
 
     private static func paintBlurred(
         in ctx: CGContext, size: CGSize, style: BackdropStyle,
@@ -1550,6 +1634,7 @@ enum SliceBBackdrop {
         let destW = max(1, Int(ceil(size.width)))
         let destH = max(1, Int(ceil(size.height)))
         let radius = max(0, style.blurRadiusPt * max(1, pixelScale))
+        recordLastBlurRadiusForTesting(radius)
         let key = BlurFillKey(
             path: pathKey, radiusPx: Int((radius * 10).rounded()),
             width: destW, height: destH)
@@ -1571,10 +1656,7 @@ enum SliceBBackdrop {
         } else {
             painted = scaled
         }
-        blurFillLock.lock()
-        if blurFillCache.count >= 8 { blurFillCache.removeAll(keepingCapacity: true) }
-        blurFillCache[key] = painted
-        blurFillLock.unlock()
+        rememberBlurFill(painted, key: key)
         ctx.draw(painted, in: CGRect(origin: .zero, size: size))
         return true
     }

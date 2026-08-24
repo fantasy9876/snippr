@@ -9400,6 +9400,43 @@ enum SelfTest {
                 } else if let sharp, let blurred, imagesEqual(sharp, blurred) {
                     fillFailures.append("blur==sharp")
                 }
+                // Preview draws in POINTS (pixelScale 1, grain = layout.pixelScale);
+                // export compose draws in PIXELS (pixelScale = image scale, grain = 1).
+                // The two must yield the same visual radius: 28pt, i.e. 56px @2x.
+                func blurRadiusViaDrawFrame(
+                    pixelScale: CGFloat, documentPixelsPerUserUnit: CGFloat
+                ) -> CGFloat {
+                    let w = 80, h = 50
+                    var bytes = [UInt8](repeating: 0, count: w * h * 4)
+                    guard let c = CGContext(
+                        data: &bytes, width: w, height: h,
+                        bitsPerComponent: 8, bytesPerRow: w * 4,
+                        space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+                    else { return -1 }
+                    SliceBBackdrop.resetLastBlurRadiusForTesting()
+                    _ = SliceBBackdrop.drawFrame(
+                        in: c,
+                        size: CGSize(width: w, height: h),
+                        target: CGRect(x: 10, y: 10, width: 60, height: 30),
+                        style: blurStyle,
+                        pixelScale: pixelScale,
+                        documentPixelsPerUserUnit: documentPixelsPerUserUnit)
+                    return SliceBBackdrop.lastBlurRadiusForTesting
+                }
+                let previewRadius = blurRadiusViaDrawFrame(
+                    pixelScale: 1, documentPixelsPerUserUnit: 2)
+                let exportRadius = blurRadiusViaDrawFrame(
+                    pixelScale: 2, documentPixelsPerUserUnit: 1)
+                if abs(previewRadius - 28) > 0.01
+                    || abs(exportRadius - 56) > 0.01 {
+                    fillFailures.append(
+                        "blur radius preview \(previewRadius) export \(exportRadius)")
+                }
+                if SliceBBackdrop.extraFillBuffers(for: blurStyle) != 2 {
+                    fillFailures.append(
+                        "extraFillBuffers blurred \(SliceBBackdrop.extraFillBuffers(for: blurStyle))")
+                }
                 let kept = BackdropStyle.blurred(
                     source: .image, imagePath: "/tmp/x.png")
                 if kept.imagePath != "/tmp/x.png" || kept.blurSource != .image {
@@ -9412,9 +9449,46 @@ enum SelfTest {
                     forInnerWidth: 50, height: 40, style: .gradient("ocean"))
                 let imageReserve = SliceBBackdrop.reservedBytes(
                     forInnerWidth: 50, height: 40, style: .image("/tmp/x.png"))
+                let blurReserve = SliceBBackdrop.reservedBytes(
+                    forInnerWidth: 50, height: 40, style: blurStyle)
                 if oceanReserve == Int.max || imageReserve != oceanReserve * 2 {
                     fillFailures.append(
                         "reserve ocean \(oceanReserve) image \(imageReserve)")
+                }
+                if oceanReserve == Int.max || blurReserve != oceanReserve * 3 {
+                    fillFailures.append(
+                        "reserve blur \(blurReserve) ocean \(oceanReserve)")
+                }
+                // Small preview-size blur is worth caching. An export-size
+                // dest (>16 MB) is used once and must not occupy a slot.
+                SliceBBackdrop.resetBlurFillCacheForTesting()
+                _ = blurRadiusViaDrawFrame(
+                    pixelScale: 1, documentPixelsPerUserUnit: 1)
+                if SliceBBackdrop.blurFillCacheCountForTesting != 1 {
+                    fillFailures.append(
+                        "small blur cache \(SliceBBackdrop.blurFillCacheCountForTesting)")
+                }
+                do {
+                    let big = 2300
+                    var bigStyle = blurStyle
+                    bigStyle.blurRadiusPt = 1
+                    var bigBytes = [UInt8](
+                        repeating: 0, count: big * big * 4)
+                    if let bigCtx = CGContext(
+                        data: &bigBytes, width: big, height: big,
+                        bitsPerComponent: 8, bytesPerRow: big * 4,
+                        space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+                    {
+                        _ = SliceBBackdrop.drawFill(
+                            in: bigCtx,
+                            size: CGSize(width: big, height: big),
+                            style: bigStyle)
+                    }
+                    if SliceBBackdrop.blurFillCacheCountForTesting != 1 {
+                        fillFailures.append(
+                            "export-size blur cached \(SliceBBackdrop.blurFillCacheCountForTesting)")
+                    }
                 }
                 check("sliceB-backdrop-fills-wp2",
                       fillFailures.isEmpty,
