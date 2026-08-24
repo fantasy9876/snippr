@@ -1841,6 +1841,15 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
             spot.baseBounds = CGRect(
                 x: 0, y: 0,
                 width: image.cgImage.width, height: image.cgImage.height)
+            if SliceBCompositor.allowsMultipleSpotlights,
+               let existing = annotations
+                .compactMap({ $0 as? SpotlightAnnotation }).last {
+                // Shared darkness: join the group NOW so preview dim
+                // (drawSpotlights reads spots.last) does not flash to the
+                // 0.6 factory default for the whole drag, then snap back
+                // on mouseUp. Overlay beginDrag does the same.
+                spot.dimFraction = existing.dimFraction
+            }
             drafting = spot
         case .magnifier:
             let mag = MagnifierAnnotation(uiScale: pxScale)
@@ -2510,7 +2519,12 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
 
     /// Drives a real drag through the production mouse handlers, in image
     /// pixels, so a gate can create an annotation the way a user does.
-    func dragForTesting(from start: CGPoint, to end: CGPoint) {
+    /// `midDrag` runs after the dragged event and before mouseUp, which is
+    /// the window where a spotlight draft is live in the preview but not
+    /// yet committed.
+    func dragForTesting(
+        from start: CGPoint, to end: CGPoint, midDrag: (() -> Void)? = nil
+    ) {
         let scale = pxScale
         let a = CGPoint(x: start.x / scale, y: start.y / scale)
         let b = CGPoint(x: end.x / scale, y: end.y / scale)
@@ -2523,7 +2537,13 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
         }
         if let down = event(.leftMouseDown, a) { mouseDown(with: down) }
         if let drag = event(.leftMouseDragged, b) { mouseDragged(with: drag) }
+        midDrag?()
         if let up = event(.leftMouseUp, b) { mouseUp(with: up) }
+    }
+
+    /// Dim of the live spotlight draft, or nil when none is in progress.
+    var draftingSpotlightDimForTesting: CGFloat? {
+        (drafting as? SpotlightAnnotation)?.dimFraction
     }
 
     /// The exact predicate `keyDown` routes on, so a preflight cannot assert a

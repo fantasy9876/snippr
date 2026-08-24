@@ -17759,7 +17759,59 @@ enum SelfTest {
                 check("sliceB-spotlight-multiple",
                       multiFails.isEmpty,
                       multiFails.joined(separator: " | "))
-                SliceBCompositor.multipleSpotlightOverrideForTesting = false
+                // Production default is ON via registerDefaults. Pin-singleton
+                // gates above needed OFF; leave the rest of the suite on the
+                // shipped config, not a leftover false override.
+                SliceBCompositor.multipleSpotlightOverrideForTesting = nil
+            }
+
+            // 8c. Editor draft must inherit group dim at mouseDown, not at
+            //     mouseUp. Preview appends the draft last and drawSpotlights
+            //     reads spots.last?.dimFraction — a 0.6 factory default
+            //     flashes the whole dim layer for the drag, then snaps back.
+            do {
+                var draftFails: [String] = []
+                let wc = EditorWindowController.open(
+                    with: CapturedImage(
+                        cgImage: makeSolidImage(
+                            width: 300, height: 200,
+                            color: NSColor.gray.cgColor),
+                        scale: 1),
+                    forceFitForTesting: true)
+                wc.window?.setContentSize(NSSize(width: 560, height: 420))
+                let canvas = wc.canvasForTesting
+                let first = SpotlightAnnotation(uiScale: 1)
+                first.rect = CGRect(x: 10, y: 10, width: 40, height: 30)
+                first.dimFraction = 0.3
+                first.baseBounds = CGRect(
+                    x: 0, y: 0, width: 300, height: 200)
+                canvas.annotations = [first]
+                wc.selectTool(.spotlight)
+                var midDim: CGFloat = -1
+                canvas.dragForTesting(
+                    from: CGPoint(x: 80, y: 80),
+                    to: CGPoint(x: 140, y: 130)
+                ) {
+                    midDim = canvas.draftingSpotlightDimForTesting ?? -1
+                }
+                if abs(midDim - 0.3) > 0.0001 {
+                    draftFails.append("mid \(midDim)")
+                }
+                let live = canvas.annotations
+                    .compactMap { $0 as? SpotlightAnnotation }
+                if live.count != 2 || live[0] !== first {
+                    draftFails.append("live \(live.count)")
+                }
+                if live.contains(where: {
+                    abs($0.dimFraction - 0.3) > 0.0001
+                }) {
+                    draftFails.append(
+                        "commit \(live.map { $0.dimFraction })")
+                }
+                check("sliceB-editor-spotlight-draft-inherits-dim",
+                      draftFails.isEmpty,
+                      draftFails.joined(separator: " | "))
+                wc.window?.close()
             }
 
             // 9. Real key routing + real toolbar + symbol fallback
