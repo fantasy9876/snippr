@@ -932,7 +932,7 @@ enum BackdropCornerStyle: String, CaseIterable {
 /// where the image sat inside the frame — and a click landed on a different
 /// pixel than the one under the cursor.
 struct BackdropLayout: Equatable {
-    let preset: BackdropPreset
+    let style: BackdropStyle
     let pixelScale: CGFloat
     /// Padding on every edge, in pixels and in points.
     let padPixels: CGFloat
@@ -942,16 +942,21 @@ struct BackdropLayout: Equatable {
     let innerPointSize: CGSize
     let outerPointSize: CGSize
 
-    init(innerPixels: CGSize, pixelScale: CGFloat, preset: BackdropPreset) {
+    /// v0 five-case view of `style`. Non-v0 fills are not a preset; callers
+    /// that still switch on this must also check `style.kind`.
+    var preset: BackdropPreset { style.legacyPreset ?? .none }
+
+    init(innerPixels: CGSize, pixelScale: CGFloat, style: BackdropStyle) {
         let scale = max(1, pixelScale)
         let inner = CGSize(
             width: max(0, innerPixels.width), height: max(0, innerPixels.height))
-        let pad: CGFloat = preset == .none
+        let clamped = style.clamped()
+        let pad: CGFloat = clamped.kind == .none
             ? 0
             : SliceBBackdrop.padding(
                 forLongEdge: max(inner.width, inner.height),
-                pixelScale: scale)
-        self.preset = preset
+                pixelScale: scale, style: clamped)
+        self.style = clamped
         self.pixelScale = scale
         self.padPixels = pad
         self.padPoints = pad / scale
@@ -965,6 +970,12 @@ struct BackdropLayout: Equatable {
             height: (inner.height + pad * 2) / scale)
     }
 
+    init(innerPixels: CGSize, pixelScale: CGFloat, preset: BackdropPreset) {
+        self.init(
+            innerPixels: innerPixels, pixelScale: pixelScale,
+            style: .from(preset: preset))
+    }
+
     /// Where the untouched document sits inside the frame, in points. The
     /// canvas keeps its own coordinates: nothing is translated or baked, so a
     /// mark, a crop, a guide and an OCR box all stay source-local.
@@ -975,7 +986,7 @@ struct BackdropLayout: Equatable {
     }
 
     /// `.none` collapses: the frame is not a thin border, it is absent.
-    var isCollapsed: Bool { preset == .none || padPixels == 0 }
+    var isCollapsed: Bool { style.kind == .none || padPixels == 0 }
 }
 
 enum SliceBBackdrop {
@@ -994,9 +1005,13 @@ enum SliceBBackdrop {
     /// contract.
     static let shadowSafetyFactor: CGFloat = 1.25
 
-    static func shadowExtent(pixelScale: CGFloat) -> CGFloat {
+    static func shadowExtent(
+        pixelScale: CGFloat,
+        offsetPt: CGFloat = shadowOffsetPt,
+        blurPt: CGFloat = shadowBlurPt
+    ) -> CGFloat {
         let scale = max(1, pixelScale)
-        let nominal = (shadowBlurPt + abs(shadowOffsetPt)) * scale
+        let nominal = (blurPt + abs(offsetPt)) * scale
         return (nominal * shadowSafetyFactor).rounded(.up)
     }
 
@@ -1006,9 +1021,26 @@ enum SliceBBackdrop {
     static func padding(
         forLongEdge edge: CGFloat, pixelScale: CGFloat = 1
     ) -> CGFloat {
-        let floor = max(minPadding, shadowExtent(pixelScale: pixelScale))
+        padding(
+            forLongEdge: edge, pixelScale: pixelScale,
+            style: BackdropStyle.gradient("ocean"))
+    }
+
+    /// Parameterized padding. v0 defaults (`paddingFraction` 0.06, shadow
+    /// strength 1.0 → offset −8 / blur 24) produce the same numbers the
+    /// no-style overload freezes.
+    static func padding(
+        forLongEdge edge: CGFloat, pixelScale: CGFloat, style: BackdropStyle
+    ) -> CGFloat {
+        guard style.kind != .none else { return 0 }
+        let metrics = style.shadowMetrics()
+        let floor = max(
+            minPadding,
+            shadowExtent(
+                pixelScale: pixelScale, offsetPt: metrics.offsetPt,
+                blurPt: metrics.blurPt))
         let cap = max(maxPadding, floor)
-        return min(cap, max(floor, (edge * paddingFraction).rounded()))
+        return min(cap, max(floor, (edge * style.paddingFraction).rounded()))
     }
 
     /// Outer canvas size for an inner image of these dimensions. Preview,
@@ -1018,11 +1050,20 @@ enum SliceBBackdrop {
         innerWidth: Int, innerHeight: Int, preset: BackdropPreset,
         pixelScale: CGFloat = 1
     ) -> (width: Int, height: Int)? {
+        outerDimensions(
+            innerWidth: innerWidth, innerHeight: innerHeight,
+            style: .from(preset: preset), pixelScale: pixelScale)
+    }
+
+    static func outerDimensions(
+        innerWidth: Int, innerHeight: Int, style: BackdropStyle,
+        pixelScale: CGFloat = 1
+    ) -> (width: Int, height: Int)? {
         guard innerWidth > 0, innerHeight > 0 else { return nil }
-        guard preset != .none else { return (innerWidth, innerHeight) }
+        guard style.kind != .none else { return (innerWidth, innerHeight) }
         let pad = Int(padding(
             forLongEdge: CGFloat(max(innerWidth, innerHeight)),
-            pixelScale: pixelScale))
+            pixelScale: pixelScale, style: style))
         let (twice, tOverflow) = pad.multipliedReportingOverflow(by: 2)
         guard !tOverflow else { return nil }
         let (w, wOverflow) = innerWidth.addingReportingOverflow(twice)
@@ -1046,9 +1087,18 @@ enum SliceBBackdrop {
         forInnerWidth width: Int, height: Int, preset: BackdropPreset,
         pixelScale: CGFloat = 1
     ) -> Int {
-        guard preset != .none else { return 0 }
+        reservedBytes(
+            forInnerWidth: width, height: height,
+            style: .from(preset: preset), pixelScale: pixelScale)
+    }
+
+    static func reservedBytes(
+        forInnerWidth width: Int, height: Int, style: BackdropStyle,
+        pixelScale: CGFloat = 1
+    ) -> Int {
+        guard style.kind != .none else { return 0 }
         guard let outer = outerDimensions(
-            innerWidth: width, innerHeight: height, preset: preset,
+            innerWidth: width, innerHeight: height, style: style,
             pixelScale: pixelScale),
             let bytes = SliceBExport.byteCount(
                 width: outer.width, height: outer.height)
@@ -1062,6 +1112,15 @@ enum SliceBBackdrop {
     ) -> Int {
         reservedBytes(
             forInnerWidth: image.width, height: image.height, preset: preset,
+            pixelScale: pixelScale)
+    }
+
+    static func reservedBytes(
+        forInner image: CGImage, style: BackdropStyle,
+        pixelScale: CGFloat = 1
+    ) -> Int {
+        reservedBytes(
+            forInnerWidth: image.width, height: image.height, style: style,
             pixelScale: pixelScale)
     }
 
@@ -1127,7 +1186,23 @@ enum SliceBBackdrop {
         preset: BackdropPreset, pixelScale: CGFloat,
         documentPixelsPerUserUnit: CGFloat = 1
     ) -> Bool {
-        guard preset != .none else { return true }
+        var style = BackdropStyle.from(preset: preset)
+        // Preset path keeps the live Settings corner: the menu writes Settings
+        // and a layout rebuild that skipped it used to leave the clip behind.
+        style.cornerStyle = cornerStyle
+        return drawFrame(
+            in: ctx, size: size, target: target, style: style,
+            pixelScale: pixelScale,
+            documentPixelsPerUserUnit: documentPixelsPerUserUnit)
+    }
+
+    @discardableResult
+    static func drawFrame(
+        in ctx: CGContext, size: CGSize, target: CGRect,
+        style: BackdropStyle, pixelScale: CGFloat,
+        documentPixelsPerUserUnit: CGFloat = 1
+    ) -> Bool {
+        guard style.kind != .none else { return true }
         // Nothing the frame draws may land outside the canvas it was asked
         // for. The fill clips itself, but the plate's drop shadow reaches
         // beyond the plate as well, and in a window context there is no buffer
@@ -1138,21 +1213,22 @@ enum SliceBBackdrop {
         defer { ctx.restoreGState() }
         ctx.clip(to: CGRect(origin: .zero, size: size))
         guard drawFill(
-            in: ctx, size: size, preset: preset,
+            in: ctx, size: size, style: style,
             documentPixelsPerUserUnit: documentPixelsPerUserUnit)
         else { return false }
         let scale = max(1, pixelScale)
+        let shadow = style.shadowMetrics()
         ctx.setShadow(
-            offset: CGSize(width: 0, height: shadowOffsetPt * scale),
-            blur: shadowBlurPt * scale,
-            color: NSColor.black.withAlphaComponent(0.35).cgColor)
+            offset: CGSize(width: 0, height: shadow.offsetPt * scale),
+            blur: shadow.blurPt * scale,
+            color: NSColor.black.withAlphaComponent(shadow.alpha).cgColor)
         // The radius is a DOCUMENT metric, so it comes from the document this
         // frame is around — measured in points — and is then drawn at whatever
         // scale the caller works in.
         let radius = cornerRadius(
             documentPoints: CGSize(
                 width: target.width / scale, height: target.height / scale),
-            style: cornerStyle) * scale
+            style: style.cornerStyle) * scale
         let rounded = CGPath(
             roundedRect: target, cornerWidth: radius, cornerHeight: radius,
             transform: nil)
@@ -1171,7 +1247,7 @@ enum SliceBBackdrop {
         // the clip keeps the gradient, the wash and the grain phase continuous
         // across the plate edge instead of restarting at the plate's origin.
         guard drawFill(
-            in: ctx, size: size, preset: preset,
+            in: ctx, size: size, style: style,
             documentPixelsPerUserUnit: documentPixelsPerUserUnit) else {
             ctx.restoreGState()
             return false
@@ -1194,7 +1270,17 @@ enum SliceBBackdrop {
         in ctx: CGContext, size: CGSize, preset: BackdropPreset,
         documentPixelsPerUserUnit: CGFloat = 1
     ) -> Bool {
-        guard preset != .none else { return true }
+        drawFill(
+            in: ctx, size: size, style: .from(preset: preset),
+            documentPixelsPerUserUnit: documentPixelsPerUserUnit)
+    }
+
+    @discardableResult
+    static func drawFill(
+        in ctx: CGContext, size: CGSize, style: BackdropStyle,
+        documentPixelsPerUserUnit: CGFloat = 1
+    ) -> Bool {
+        guard style.kind != .none else { return true }
         // The fill CLIPS ITSELF. Every primitive below covers the whole clip
         // region rather than a rect: a gradient has no bounds, and `byTiling`
         // replicates until the clip stops it. In a bitmap the edge of the
@@ -1207,32 +1293,11 @@ enum SliceBBackdrop {
         ctx.saveGState()
         defer { ctx.restoreGState() }
         ctx.clip(to: CGRect(origin: .zero, size: size))
-        let stops = gradientStops(for: preset)
-        guard let fill = CGGradient(
-            colorsSpace: CGColorSpace(name: CGColorSpace.sRGB)!,
-            colors: stops.map(\.color) as CFArray,
-            locations: stops.map(\.location))
-        else { return false }
-        let axis = gradientAxis(width: size.width, height: size.height)
-        ctx.drawLinearGradient(
-            fill, start: axis.start, end: axis.end, options: [])
+        guard paintFill(in: ctx, size: size, style: style) else { return false }
 
-        let wash = radialWash(for: preset)
-        guard let washGradient = CGGradient(
-            colorsSpace: CGColorSpace(name: CGColorSpace.sRGB)!,
-            colors: [wash.centre, wash.edge] as CFArray, locations: [0, 1])
-        else { return false }
-        ctx.drawRadialGradient(
-            washGradient,
-            startCenter: CGPoint(
-                x: 0.22 * size.width, y: 0.78 * size.height),
-            startRadius: 0,
-            endCenter: CGPoint(
-                x: 0.22 * size.width, y: 0.78 * size.height),
-            endRadius: hypot(size.width, size.height) * 0.85,
-            options: [])
-
-        guard let grain = grainTile(for: preset) else { return false }
+        // Grain for every painted fill. v0 four keep their dedicated seed;
+        // new ids hash the gradient id so the tile is stable across machines.
+        guard let grain = grainTile(for: style) else { return false }
         // Tiled from the canvas ORIGIN every time, never from a dirty rect:
         // panning or a partial redraw must not shift the pattern. CGPattern is
         // deliberately not used — its phase follows the CTM.
@@ -1256,11 +1321,91 @@ enum SliceBBackdrop {
         return true
     }
 
+    /// Linear ramp (+ v0 radial wash). Grain is applied by `drawFill`.
+    @discardableResult
+    private static func paintFill(
+        in ctx: CGContext, size: CGSize, style: BackdropStyle
+    ) -> Bool {
+        if let preset = style.legacyPreset, preset != .none,
+           BackdropGradientCatalog.v0ProductionIds.contains(preset.rawValue) {
+            let stops = gradientStops(for: preset)
+            guard let fill = CGGradient(
+                colorsSpace: CGColorSpace(name: CGColorSpace.sRGB)!,
+                colors: stops.map(\.color) as CFArray,
+                locations: stops.map(\.location))
+            else { return false }
+            let axis = gradientAxis(width: size.width, height: size.height)
+            ctx.drawLinearGradient(
+                fill, start: axis.start, end: axis.end, options: [])
+            let wash = radialWash(for: preset)
+            guard let washGradient = CGGradient(
+                colorsSpace: CGColorSpace(name: CGColorSpace.sRGB)!,
+                colors: [wash.centre, wash.edge] as CFArray, locations: [0, 1])
+            else { return false }
+            ctx.drawRadialGradient(
+                washGradient,
+                startCenter: CGPoint(
+                    x: 0.22 * size.width, y: 0.78 * size.height),
+                startRadius: 0,
+                endCenter: CGPoint(
+                    x: 0.22 * size.width, y: 0.78 * size.height),
+                endRadius: hypot(size.width, size.height) * 0.85,
+                options: [])
+            return true
+        }
+
+        switch style.kind {
+        case .none:
+            return true
+        case .gradient:
+            guard let id = style.gradientId,
+                  let entry = BackdropGradientCatalog.entry(id: id),
+                  let gradient = catalogGradient(entry)
+            else { return false }
+            let axis = gradientAxis(width: size.width, height: size.height)
+            ctx.drawLinearGradient(
+                gradient, start: axis.start, end: axis.end, options: [])
+            return true
+        case .solid:
+            let hex = style.solidColor ?? "#1C1F24"
+            let color = BackdropGradientCatalog.nsColor(hex: hex)
+                ?? NSColor(srgbRed: 0.11, green: 0.12, blue: 0.14, alpha: 1)
+            ctx.setFillColor(color.cgColor)
+            ctx.fill(CGRect(origin: .zero, size: size))
+            return true
+        case .image, .wallpaper, .blurred:
+            // WP2: scale-to-fill / CIGaussianBlur. A dark plate until then
+            // so the frame is visible rather than transparent-on-black.
+            ctx.setFillColor(
+                NSColor(srgbRed: 0.11, green: 0.12, blue: 0.14, alpha: 1)
+                    .cgColor)
+            ctx.fill(CGRect(origin: .zero, size: size))
+            return true
+        }
+    }
+
+    private static func catalogGradient(
+        _ entry: BackdropGradientEntry
+    ) -> CGGradient? {
+        let colors: [CGColor] = entry.stops.compactMap {
+            BackdropGradientCatalog.nsColor(hex: $0)?.cgColor
+        }
+        guard colors.count == entry.stops.count,
+              colors.count == entry.locations.count
+        else { return nil }
+        var locations = entry.locations
+        return CGGradient(
+            colorsSpace: CGColorSpace(name: CGColorSpace.sRGB)!,
+            colors: colors as CFArray,
+            locations: &locations)
+    }
+
     /// The 1pt white line that softens the plate's clipped edge. Drawn AFTER
     /// the image and inside the plate's clip, so it sits on top of the
     /// screenshot rather than under it.
     static func drawPlateHairline(
-        in ctx: CGContext, rect: CGRect, pixelScale: CGFloat
+        in ctx: CGContext, rect: CGRect, pixelScale: CGFloat,
+        cornerStyle: BackdropCornerStyle = SliceBBackdrop.cornerStyle
     ) {
         let scale = max(1, pixelScale)
         // The plate's OWN radius: a hairline curving by a different amount
@@ -1339,8 +1484,27 @@ enum SliceBBackdrop {
     private nonisolated(unsafe) static var grainCache: [UInt32: CGImage] = [:]
     private static let grainCacheLock = NSLock()
 
+    static func grainSeed(for style: BackdropStyle) -> UInt32 {
+        if let preset = style.legacyPreset {
+            return grainSeed(for: preset)
+        }
+        let key = style.gradientId ?? style.solidColor ?? style.kind.rawValue
+        var hash: UInt32 = 0xB4CD_0000
+        for b in key.utf8 {
+            hash = hash &* 167_776_19 &+ UInt32(b)
+        }
+        return hash == 0 ? 0xB4CD_00FF : hash
+    }
+
+    static func grainTile(for style: BackdropStyle) -> CGImage? {
+        grainTile(seed: grainSeed(for: style))
+    }
+
     static func grainTile(for preset: BackdropPreset) -> CGImage? {
-        let seed = grainSeed(for: preset)
+        grainTile(seed: grainSeed(for: preset))
+    }
+
+    static func grainTile(seed: UInt32) -> CGImage? {
         grainCacheLock.lock()
         defer { grainCacheLock.unlock() }
         if let cached = grainCache[seed] { return cached }
@@ -1440,13 +1604,24 @@ enum SliceBBackdrop {
         image: CGImage, preset: BackdropPreset, budgetBytes: Int,
         pixelScale: CGFloat = 1
     ) -> CGImage? {
-        guard preset != .none else { return image }
+        var style = BackdropStyle.from(preset: preset)
+        style.cornerStyle = cornerStyle
+        return compose(
+            image: image, style: style, budgetBytes: budgetBytes,
+            pixelScale: pixelScale)
+    }
+
+    static func compose(
+        image: CGImage, style: BackdropStyle, budgetBytes: Int,
+        pixelScale: CGFloat = 1
+    ) -> CGImage? {
+        guard style.kind != .none else { return image }
         guard !ForcedOuterComposeFailure.isActive else { return nil }
         let pad = padding(
             forLongEdge: CGFloat(max(image.width, image.height)),
-            pixelScale: pixelScale)
+            pixelScale: pixelScale, style: style)
         guard let outer = outerDimensions(
-            innerWidth: image.width, innerHeight: image.height, preset: preset,
+            innerWidth: image.width, innerHeight: image.height, style: style,
             pixelScale: pixelScale),
             let bytes = SliceBExport.byteCount(
                 width: outer.width, height: outer.height),
@@ -1473,7 +1648,7 @@ enum SliceBBackdrop {
         // with no background, which terminal callers would treat as success.
         guard drawFrame(
             in: ctx, size: CGSize(width: w, height: h), target: target,
-            preset: preset, pixelScale: pixelScale,
+            style: style, pixelScale: pixelScale,
             // The context IS the document's pixel grid here, so a grain texel
             // is a document pixel.
             documentPixelsPerUserUnit: 1)
@@ -1484,7 +1659,7 @@ enum SliceBBackdrop {
             documentPoints: CGSize(
                 width: target.width / scaleForRadius,
                 height: target.height / scaleForRadius),
-            style: cornerStyle) * scaleForRadius
+            style: style.cornerStyle) * scaleForRadius
         ctx.addPath(CGPath(
             roundedRect: target, cornerWidth: radius, cornerHeight: radius,
             transform: nil))
@@ -1492,7 +1667,9 @@ enum SliceBBackdrop {
         ctx.draw(image, in: target)
         // Inside the same clip and ON TOP of the screenshot: it softens the
         // clipped edge, which is the "jagged frame" the report was about.
-        drawPlateHairline(in: ctx, rect: target, pixelScale: pixelScale)
+        drawPlateHairline(
+            in: ctx, rect: target, pixelScale: pixelScale,
+            cornerStyle: style.cornerStyle)
         ctx.restoreGState()
         return ctx.makeImage()
     }

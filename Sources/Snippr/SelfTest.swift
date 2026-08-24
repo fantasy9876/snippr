@@ -9197,6 +9197,100 @@ enum SelfTest {
                       specFailures.prefix(6).joined(separator: " | "))
             }
 
+            // WP1: BackdropStyle freeze + v0 compositor parity.
+            do {
+                var styleFailures: [String] = []
+                let ids = BackdropGradientCatalog.ids
+                if ids != [
+                    "ocean", "sunset", "mint", "graphite",
+                    "lavender", "rose", "ember", "meadow",
+                    "lagoon", "midnight", "paper", "fog",
+                ] {
+                    styleFailures.append("catalog ids \(ids)")
+                }
+                if BackdropGradientCatalog.entry(id: "ocean")?.stops
+                    != ["#4F7DF3", "#3B2FB8"]
+                    || BackdropGradientCatalog.entry(id: "paper")?
+                        .shadowAlphaAtStrength1 != 0.22
+                    || BackdropGradientCatalog.visualAxis
+                        != "topLeftToBottomRight" {
+                    styleFailures.append("catalog bytes")
+                }
+                let ocean = BackdropStyle.from(preset: .ocean)
+                if ocean.kind != .gradient || ocean.gradientId != "ocean"
+                    || ocean.legacyPreset != .ocean
+                    || ocean.paddingFraction != 0.06
+                    || ocean.shadowStrength != 1
+                    || ocean.cornerStyle != .medium
+                    || ocean.alignment != .cc || ocean.ratio != .auto
+                    || !ocean.autoBalance {
+                    styleFailures.append("from-ocean \(ocean)")
+                }
+                if BackdropStyle.from(preset: .none).kind != .none
+                    || BackdropStyle.gradient("nope").gradientId != "ocean" {
+                    styleFailures.append("clamp/none")
+                }
+                let encoded = try? JSONEncoder().encode(ocean)
+                let decoded = encoded.flatMap {
+                    try? JSONDecoder().decode(BackdropStyle.self, from: $0)
+                }
+                if decoded != ocean {
+                    styleFailures.append("codable")
+                }
+                // Parameterized padding with v0 defaults matches the frozen
+                // numbers: 1000 → 60, 400 → 40, 40000 → 320, retina floor 80.
+                if SliceBBackdrop.padding(
+                    forLongEdge: 1000, pixelScale: 1, style: ocean) != 60
+                    || SliceBBackdrop.padding(
+                        forLongEdge: 400, pixelScale: 1, style: ocean) != 40
+                    || SliceBBackdrop.padding(
+                        forLongEdge: 40000, pixelScale: 1, style: ocean) != 320
+                    || SliceBBackdrop.padding(
+                        forLongEdge: 60, pixelScale: 2, style: ocean) != 80 {
+                    styleFailures.append("padding-v0")
+                }
+                let weak = { () -> BackdropStyle in
+                    var s = ocean
+                    s.shadowStrength = 0
+                    return s
+                }()
+                if SliceBBackdrop.padding(
+                    forLongEdge: 60, pixelScale: 2, style: weak)
+                    != SliceBBackdrop.minPadding {
+                    styleFailures.append("padding-no-shadow-floor")
+                }
+                let inner = makeSolidImage(
+                    width: 50, height: 40, color: NSColor.white.cgColor)
+                let cornerBefore = Settings.shared.backdropCornerStyle
+                Settings.shared.backdropCornerStyle = .medium
+                defer { Settings.shared.backdropCornerStyle = cornerBefore }
+                let viaPreset = SliceBBackdrop.compose(
+                    image: inner, preset: .ocean,
+                    budgetBytes: SliceBExport.defaultBudgetBytes)
+                let viaStyle = SliceBBackdrop.compose(
+                    image: inner, style: ocean,
+                    budgetBytes: SliceBExport.defaultBudgetBytes)
+                if viaPreset == nil || viaStyle == nil
+                    || (viaPreset != nil && viaStyle != nil
+                        && !imagesEqual(viaPreset!, viaStyle!)) {
+                    styleFailures.append("compose-parity")
+                }
+                let shadow = ocean.shadowMetrics()
+                if abs(shadow.offsetPt - SliceBBackdrop.shadowOffsetPt) > 0.001
+                    || abs(shadow.blurPt - SliceBBackdrop.shadowBlurPt) > 0.001
+                    || abs(shadow.alpha - 0.35) > 0.001 {
+                    styleFailures.append(
+                        "shadow \(shadow.offsetPt) \(shadow.blurPt) \(shadow.alpha)")
+                }
+                let paper = BackdropStyle.gradient("paper").shadowMetrics()
+                if abs(paper.alpha - 0.22) > 0.001 {
+                    styleFailures.append("paper-alpha \(paper.alpha)")
+                }
+                check("sliceB-backdrop-style-v0-parity",
+                      styleFailures.isEmpty,
+                      styleFailures.prefix(6).joined(separator: " | "))
+            }
+
             // 1b-2. The fill paints INSIDE the canvas and nowhere else.
             //
             // Every primitive the fill uses covers the current clip rather
@@ -17665,7 +17759,7 @@ enum SelfTest {
                 // clip was already 16, clicking Large was a no-op, and the
                 // check stayed green even with the wiring reverted. A gate
                 // that only fails on some machines is not a gate.
-                Settings.shared.backdropCornerStyle = .medium
+                canvas.applyBackdropCornerStyle(.medium)
                 wc.documentWrapperForTesting?.applyLayout(canvas.backdropLayout)
                 let startRadius = SliceBBackdrop.cornerRadius(
                     documentPoints: canvas.backdropLayout.innerPointSize,

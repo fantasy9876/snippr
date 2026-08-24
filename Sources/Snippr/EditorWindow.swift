@@ -655,7 +655,7 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
             item.target = self
             item.tag = BackdropCornerStyle.allCases.firstIndex(of: style) ?? 0
             item.identifier = SliceBBackdrop.cornerItemIdentifier
-            item.state = style == SliceBBackdrop.cornerStyle ? .on : .off
+            item.state = style == canvas.backdropStyle.cornerStyle ? .on : .off
             menu.addItem(item)
         }
         return menu
@@ -665,14 +665,9 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
     @objc func backdropCornerChosen(_ sender: NSMenuItem) {
         let styles = BackdropCornerStyle.allCases
         guard styles.indices.contains(sender.tag) else { return }
-        Settings.shared.backdropCornerStyle = styles[sender.tag]
-        // NOT `refreshBackdropLayout()`: that returns early when the layout is
-        // unchanged, and the corner style is not part of the layout — it is
-        // read live from Settings. Going through it left the document's clip
-        // and the caption's mask on the OLD radius while the frame, the
-        // hairline and the corner hit test had already moved to the new one:
-        // preview against export, and a corner that looked cut while still
-        // swallowing clicks.
+        canvas.applyBackdropCornerStyle(styles[sender.tag])
+        // Corner now lives on `BackdropLayout.style`, so a layout rebuild
+        // picks up the new radius for the clip, the hairline and the hit test.
         documentWrapper?.applyLayout(canvas.backdropLayout)
         documentWrapper?.needsDisplay = true
         canvas.needsDisplay = true
@@ -976,7 +971,7 @@ final class BackdropDocumentView: NSView {
             ? 0
             : SliceBBackdrop.cornerRadius(
                 documentPoints: layout.innerPointSize,
-                style: SliceBBackdrop.cornerStyle)
+                style: layout.style.cornerStyle)
         canvas.documentCornerRadius = radius
         canvas.layer?.cornerRadius = 0
         canvas.layer?.masksToBounds = false
@@ -991,7 +986,7 @@ final class BackdropDocumentView: NSView {
         // export because every metric it uses is scaled by the caller.
         SliceBBackdrop.drawFrame(
             in: ctx, size: layout.outerPointSize,
-            target: layout.innerPointRect, preset: layout.preset,
+            target: layout.innerPointRect, style: layout.style,
             // Radius and shadow are POINT metrics and this context is in
             // points, so their scale is 1. The grain is not: its period is
             // fixed in DOCUMENT pixels, so at @2x a 128px tile has to be drawn
@@ -1016,7 +1011,7 @@ final class BackdropDocumentView: NSView {
             // but still swallows clicks is a worse lie than a square one.
             let radius = SliceBBackdrop.cornerRadius(
                 documentPoints: layout.innerPointSize,
-                style: SliceBBackdrop.cornerStyle)
+                style: layout.style.cornerStyle)
             let rounded = CGPath(
                 roundedRect: inner, cornerWidth: radius, cornerHeight: radius,
                 transform: nil)
@@ -1113,6 +1108,9 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
     init(image: CapturedImage) {
         self.image = image
         super.init(frame: CGRect(origin: .zero, size: image.pointSize))
+        var initial = BackdropStyle.none
+        initial.cornerStyle = Settings.shared.backdropCornerStyle
+        backdropStyle = initial
         wantsLayer = true
         redactionDelegate = self
         addTrackingArea(NSTrackingArea(
@@ -1156,9 +1154,13 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
     /// Outer frame applied at EXPORT time. It is never baked into `image`, so
     /// crop, resize and the annotation coordinate space are untouched and the
     /// padding is recomputed from whatever the document is at the time.
-    private(set) var backdropPreset: BackdropPreset = .none
+    private(set) var backdropStyle: BackdropStyle = .none
+
+    var backdropPreset: BackdropPreset { backdropStyle.legacyPreset ?? .none }
 
     var backdropPresetForTesting: BackdropPreset { backdropPreset }
+
+    var backdropStyleForTesting: BackdropStyle { backdropStyle }
 
     /// The single geometry description for this document. Preview, fit, the
     /// size badge and the export all read it, so none of them can invent its
@@ -1168,7 +1170,7 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
             innerPixels: CGSize(
                 width: CGFloat(image.cgImage.width),
                 height: CGFloat(image.cgImage.height)),
-            pixelScale: pxScale, preset: backdropPreset)
+            pixelScale: pxScale, style: backdropStyle)
     }
 
     /// The layout an export would produce right now, which honours a pending
@@ -1180,7 +1182,7 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
         return BackdropLayout(
             innerPixels: CGSize(
                 width: CGFloat(inner.width), height: CGFloat(inner.height)),
-            pixelScale: pxScale, preset: backdropPreset)
+            pixelScale: pxScale, style: backdropStyle)
     }
 
     /// The integral pixel rect a flatten would render right now, or nil when
@@ -1225,8 +1227,16 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
     func backdropPeakFits(
         _ preset: BackdropPreset, width: Int, height: Int
     ) -> Bool {
+        backdropPeakFits(
+            .from(preset: preset, cornerStyle: backdropStyle.cornerStyle),
+            width: width, height: height)
+    }
+
+    func backdropPeakFits(
+        _ style: BackdropStyle, width: Int, height: Int
+    ) -> Bool {
         let reserve = SliceBBackdrop.reservedBytes(
-            forInnerWidth: width, height: height, preset: preset,
+            forInnerWidth: width, height: height, style: style,
             pixelScale: pxScale)
         guard let innerBudget = SliceBExport.budget(
             SliceBExport.defaultBudgetBytes, minus: reserve),
@@ -1238,7 +1248,15 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
     /// Applying the SAME preset is not an edit and must not touch history.
     @discardableResult
     func applyBackdrop(_ preset: BackdropPreset) -> Bool {
-        guard preset != backdropPreset else { return false }
+        applyBackdropStyle(
+            .from(preset: preset, cornerStyle: backdropStyle.cornerStyle))
+    }
+
+    /// Honey WP6 / WP2 entry: persist the full style. Same-style is a no-op.
+    @discardableResult
+    func applyBackdropStyle(_ style: BackdropStyle) -> Bool {
+        let next = style.clamped()
+        guard next != backdropStyle else { return false }
         // Validate the PEAK here, not at export: a preset the document cannot
         // afford must be refused while the user is choosing it, with a message
         // about the backdrop rather than a redaction error much later. The
@@ -1248,19 +1266,33 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
         //
         // Removing a frame is always allowed: it only lowers the peak, and a
         // document must never be stuck wearing one it cannot export.
-        guard preset == .none || backdropPeakFits(
-            preset, width: image.cgImage.width,
+        guard next.kind == .none || backdropPeakFits(
+            next, width: image.cgImage.width,
             height: image.cgImage.height) else {
             ToastHUD.show(
                 "This image is too large for a backdrop",
                 symbol: "exclamationmark.triangle.fill")
             return false
         }
-        registerBackdropUndo(from: backdropPreset)
-        backdropPreset = preset
+        registerBackdropUndo(from: backdropStyle)
+        backdropStyle = next
         needsDisplay = true
         onStateChange?()
         return true
+    }
+
+    /// Corner is document state (Honey slider) AND the Settings default for
+    /// the next capture. Not an affordance check: radius does not grow the
+    /// outer buffer.
+    func applyBackdropCornerStyle(_ corner: BackdropCornerStyle) {
+        Settings.shared.backdropCornerStyle = corner
+        guard backdropStyle.cornerStyle != corner else { return }
+        var next = backdropStyle
+        next.cornerStyle = corner
+        registerBackdropUndo(from: backdropStyle)
+        backdropStyle = next
+        needsDisplay = true
+        onStateChange?()
     }
 
     /// Text-redaction jobs owned by this canvas. GREEN2 wires the tool to it;
@@ -1370,7 +1402,7 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
         // committed. The budget the inner render may use is reduced by what the
         // outer frame will need, because both buffers exist at the same time.
         let outerReserve = SliceBBackdrop.reservedBytes(
-            forInner: base, preset: backdropPreset, pixelScale: pxScale)
+            forInner: base, style: backdropStyle, pixelScale: pxScale)
         guard let innerBudget = SliceBExport.budget(
             SliceBExport.defaultBudgetBytes, minus: outerReserve)
         else { return nil }
@@ -1380,11 +1412,11 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
             // Framed output is composed in sRGB, so the inner render has to
             // blend there too — see checkedRender. `.none` keeps the
             // document's own space.
-            destinationSpace: backdropPreset == .none
+            destinationSpace: backdropStyle.kind == .none
                 ? nil : CGColorSpace(name: CGColorSpace.sRGB))
         else { return nil }
         guard let cg = SliceBBackdrop.compose(
-            image: inner, preset: backdropPreset,
+            image: inner, style: backdropStyle,
             budgetBytes: SliceBExport.defaultBudgetBytes,
             pixelScale: pxScale)
         else {
@@ -1557,16 +1589,16 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
     private struct DocumentSnapshot {
         let annotations: [Annotation]
         let image: CapturedImage
-        let backdrop: BackdropPreset
+        let backdrop: BackdropStyle
     }
 
     private func snapshot() -> DocumentSnapshot {
         DocumentSnapshot(
             annotations: annotations.map { $0.copyAnnotation() },
-            image: image, backdrop: backdropPreset)
+            image: image, backdrop: backdropStyle)
     }
 
-    /// A preset change touches ONE field, so its undo restores one field.
+    /// A style change touches ONE field, so its undo restores one field.
     ///
     /// It must not cancel OCR jobs (that would widen pending masks to full as
     /// an invisible, un-undoable side effect of picking a colour) and it must
@@ -1576,14 +1608,20 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
     /// the visible mask never narrows; a result landing before it is thrown
     /// away when the stale pending clone is restored. Keeping annotation
     /// identity untouched makes both delivery orders correct.
-    func registerBackdropUndo(from previous: BackdropPreset) {
+    func registerBackdropUndo(from previous: BackdropStyle) {
         historyMutationCountForTesting += 1
-        undoManager?.registerUndo(withTarget: self) { canvas in
-            canvas.registerBackdropUndo(from: canvas.backdropPreset)
-            canvas.backdropPreset = previous
+        let um = undoManager
+        // Menu clicks under `groupsByEvent = false` (headless gates) have no
+        // open group; NSUndoManager throws if we register without one.
+        let opened = um != nil && um!.groupingLevel == 0
+        if opened { um?.beginUndoGrouping() }
+        um?.registerUndo(withTarget: self) { canvas in
+            canvas.registerBackdropUndo(from: canvas.backdropStyle)
+            canvas.backdropStyle = previous
             canvas.needsDisplay = true
             canvas.onStateChange?()
         }
+        if opened { um?.endUndoGrouping() }
     }
 
     func registerUndoSnapshot() {
@@ -1611,7 +1649,7 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
 
     private func restore(_ snap: DocumentSnapshot) {
         annotations = snap.annotations
-        backdropPreset = snap.backdrop
+        backdropStyle = snap.backdrop
         if snap.image.cgImage !== image.cgImage {
             setImage(snap.image)
         }
@@ -2290,9 +2328,9 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
         guard let target = ImageResizer.targetDimensions(for: image, by: factor)
         else { return }
         guard backdropPeakFits(
-            backdropPreset, width: target.width, height: target.height) else {
+            backdropStyle, width: target.width, height: target.height) else {
             ToastHUD.show(
-                backdropPreset == .none
+                backdropStyle.kind == .none
                     ? "This size is too large to export"
                     : "This size is too large for the backdrop",
                 symbol: "exclamationmark.triangle.fill")
@@ -2506,11 +2544,11 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
         // size when a crop is pending — reporting the full image there would
         // make the fingerprint disagree with the export it is meant to police.
         let outerSize: String = {
-            guard backdropPreset != .none else { return "none" }
+            guard backdropStyle.kind != .none else { return "none" }
             let inner = prospectiveInnerPixelSize()
             guard let outer = SliceBBackdrop.outerDimensions(
                 innerWidth: inner.width, innerHeight: inner.height,
-                preset: backdropPreset, pixelScale: pxScale)
+                style: backdropStyle, pixelScale: pxScale)
             else { return "invalid" }
             return "\(outer.width)x\(outer.height)"
         }()
