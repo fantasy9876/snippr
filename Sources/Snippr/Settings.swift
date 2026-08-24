@@ -224,6 +224,9 @@ final class Settings {
         static let preferZoom100 = "preferZoom100"
         static let escCopy = "escCopy"
         static let backdropCorners = "backdropCorners"
+        static let backdropPresets = "backdropPresets_v1"
+        static let backdropAutoApply = "backdropAutoApply"
+        static let backdropAutoApplyPreset = "backdropAutoApplyPreset"
         static let escSave = "escSave"
         static let confirmationStyle = "confirmationStyle"
         static let urlSchemeEnabled = "urlSchemeEnabled"
@@ -397,6 +400,27 @@ final class Settings {
             return style
         }
         set { d.set(newValue.rawValue, forKey: Keys.backdropCorners) }
+    }
+
+    /// The named presets, as one JSON blob. See BackdropPresetStore.
+    var backdropPresetData: Data? {
+        get { d.data(forKey: Keys.backdropPresets) }
+        set { d.set(newValue, forKey: Keys.backdropPresets) }
+    }
+
+    /// Off by default. Framing every capture is a strong default to impose,
+    /// and a build that turned it on for existing users would change what
+    /// their hotkeys produce without being asked.
+    var backdropAutoApplyEnabled: Bool {
+        get { d.bool(forKey: Keys.backdropAutoApply) }
+        set { d.set(newValue, forKey: Keys.backdropAutoApply) }
+    }
+
+    /// Stored BY NAME, so the panel and Preferences agree on which preset is
+    /// the automatic one even after the list is reordered.
+    var backdropAutoApplyPreset: String? {
+        get { d.string(forKey: Keys.backdropAutoApplyPreset) }
+        set { d.set(newValue, forKey: Keys.backdropAutoApplyPreset) }
     }
 
     var escCopy: Bool {

@@ -487,27 +487,54 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: result routing
 
+    /// Bakes a backdrop into a capture for the routes that have no document to
+    /// hold one. Fails CLOSED to the bare shot: an over-budget frame must cost
+    /// the user their frame, never their screenshot.
+    static func compose(
+        _ image: CapturedImage, backdrop style: BackdropStyle
+    ) -> CapturedImage? {
+        guard style.kind != .none else { return image }
+        guard let composed = SliceBBackdrop.compose(
+            image: image.cgImage, style: style,
+            budgetBytes: SliceBExport.defaultBudgetBytes,
+            pixelScale: image.scale)
+        else { return nil }
+        return CapturedImage(cgImage: composed, scale: image.scale)
+    }
+
     private func handleResult(_ image: CapturedImage, source: CaptureSource) {
         AppServices.lastCapture = image
         logEvent("capture source=\(source) px=\(image.cgImage.width)x\(image.cgImage.height)")
         let s = Settings.shared
         let copied = s.afterCopy
 
+        // Auto-apply (WP7): the chosen preset frames every capture. It reaches
+        // the two routes DIFFERENTLY on purpose. The editor gets it as document
+        // state so the frame stays non-destructive — the whole point of
+        // Backdrop is changing your mind after the shot. Copy and save have no
+        // document to carry it, so for them the frame is composed into the
+        // bitmap. One style, read once, so the two routes cannot disagree.
+        let autoBackdrop = BackdropPresetStore.autoApplyStyle
+        let framed: CapturedImage = {
+            guard let style = autoBackdrop, !s.afterShow else { return image }
+            return Self.compose(image, backdrop: style) ?? image
+        }()
+
         if copied {
-            SaveService.shared.copyToClipboard(image)
+            SaveService.shared.copyToClipboard(framed)
         }
         if s.afterSave {
             // encoding runs in the background; announce when it lands (only
             // when no editor opens — same visibility rule as before)
             let announce = !s.afterShow
-            SaveService.shared.save(image) { url in
+            SaveService.shared.save(framed) { url in
                 guard announce else { return }
                 var toasts: [String] = copied ? ["copied"] : []
                 if let url {
                     toasts.append("saved \(url.lastPathComponent)")
                 } else {
                     // the only configured action failed — rescue the shot
-                    if !copied { SaveService.shared.copyToClipboard(image) }
+                    if !copied { SaveService.shared.copyToClipboard(framed) }
                     toasts.append(copied ? "save failed" : "save failed — copied instead")
                 }
                 ToastHUD.show("Screenshot \(toasts.joined(separator: " · "))")
@@ -517,10 +544,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if s.afterShow {
             if source == .area && s.afterCropShow == .thumbnail {
                 ThumbnailHUD.show(image) { img in
-                    EditorWindowController.open(with: img)
+                    EditorWindowController.open(with: img, backdrop: autoBackdrop)
                 }
             } else {
-                EditorWindowController.open(with: image)
+                EditorWindowController.open(with: image, backdrop: autoBackdrop)
             }
         } else if s.afterSave {
             // toast arrives from the save completion above
@@ -528,7 +555,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             ToastHUD.show("Screenshot copied")
         } else {
             // nothing configured — at least copy so the shot isn't lost
-            SaveService.shared.copyToClipboard(image)
+            SaveService.shared.copyToClipboard(framed)
             ToastHUD.show("Screenshot copied to clipboard")
         }
     }

@@ -9906,6 +9906,153 @@ enum SelfTest {
                       panelFailures.prefix(8).joined(separator: " | "))
             }
 
+            // 1a-4. WP7 presets and auto-apply.
+            //
+            // A preset is a NAMED BackdropStyle, so it cannot describe a
+            // backdrop the app is unable to draw. Auto-apply reaches the
+            // editor as document state and copy/save as composed pixels, and
+            // the two must read the SAME style or a capture is framed on one
+            // route and bare on the other.
+            do {
+                var presetFailures: [String] = []
+                // The gate writes real defaults, so it restores them.
+                let savedBlob = Settings.shared.backdropPresetData
+                let savedEnabled = Settings.shared.backdropAutoApplyEnabled
+                let savedChoice = Settings.shared.backdropAutoApplyPreset
+                defer {
+                    Settings.shared.backdropPresetData = savedBlob
+                    Settings.shared.backdropAutoApplyEnabled = savedEnabled
+                    Settings.shared.backdropAutoApplyPreset = savedChoice
+                }
+                BackdropPresetStore.removeAllForTesting()
+
+                var lagoon = BackdropStyle.gradient("lagoon")
+                lagoon.paddingFraction = 0.11
+                lagoon.shadowStrength = 0.5
+                if BackdropPresetStore.add(name: "  Studio  ", style: lagoon) == nil {
+                    presetFailures.append("add-refused")
+                }
+                // Whitespace is trimmed on the way in, or "Studio" and
+                // "Studio " would be two presets a user cannot tell apart.
+                if BackdropPresetStore.load().first?.name != "Studio" {
+                    presetFailures.append(
+                        "name \(BackdropPresetStore.load().first?.name ?? "nil")")
+                }
+                // Round-trip: every field, not just the fill.
+                if BackdropPresetStore.style(named: "studio") != lagoon.clamped() {
+                    presetFailures.append("roundtrip")
+                }
+                // A duplicate name is REFUSED, not silently renamed or made to
+                // overwrite the preset the user already has.
+                if BackdropPresetStore.add(name: "STUDIO", style: .gradient("ocean")) != nil
+                    || BackdropPresetStore.load().count != 1 {
+                    presetFailures.append("duplicate-accepted")
+                }
+                if BackdropPresetStore.add(name: "   ", style: lagoon) != nil {
+                    presetFailures.append("blank-accepted")
+                }
+
+                // Auto-apply is stored by NAME, so a rename has to follow it or
+                // it would quietly stop applying anything.
+                Settings.shared.backdropAutoApplyEnabled = true
+                Settings.shared.backdropAutoApplyPreset = "Studio"
+                if BackdropPresetStore.rename(from: "Studio", to: "Studio Warm") == nil {
+                    presetFailures.append("rename-refused")
+                }
+                if Settings.shared.backdropAutoApplyPreset != "Studio Warm" {
+                    presetFailures.append(
+                        "rename-orphans-autoapply "
+                        + (Settings.shared.backdropAutoApplyPreset ?? "nil"))
+                }
+                if BackdropPresetStore.autoApplyStyle != lagoon.clamped() {
+                    presetFailures.append("autoapply-style")
+                }
+                // Off means off, whatever is selected.
+                Settings.shared.backdropAutoApplyEnabled = false
+                if BackdropPresetStore.autoApplyStyle != nil {
+                    presetFailures.append("autoapply-ignores-toggle")
+                }
+                Settings.shared.backdropAutoApplyEnabled = true
+
+                // Deleting the preset every capture used turns auto-apply OFF
+                // rather than leaving it pointing at nothing.
+                if BackdropPresetStore.remove(name: "studio warm") == nil {
+                    presetFailures.append("remove-refused")
+                }
+                if Settings.shared.backdropAutoApplyPreset != nil
+                    || BackdropPresetStore.autoApplyStyle != nil {
+                    presetFailures.append("delete-leaves-dangling-autoapply")
+                }
+                if !BackdropPresetStore.load().isEmpty {
+                    presetFailures.append("remove-left-entries")
+                }
+
+                // The editor route: document state, NOT baked pixels. The user
+                // must still be able to drop the frame after the shot.
+                let shot = CapturedImage(
+                    cgImage: SelfTest.makeTestImage(width: 200, height: 160),
+                    scale: 1)
+                let framedEditor = EditorWindowController.open(
+                    with: shot, backdrop: lagoon, forceFitForTesting: true)
+                let editorCanvas = framedEditor.canvasForTesting
+                if editorCanvas.backdropStyleForTesting.gradientId != "lagoon"
+                    || editorCanvas.backdropStyleForTesting.paddingFraction != 0.11 {
+                    presetFailures.append(
+                        "editor-style \(editorCanvas.backdropStyleForTesting.gradientId ?? "nil")")
+                }
+                if editorCanvas.image.cgImage.width != 200 {
+                    presetFailures.append(
+                        "editor-baked \(editorCanvas.image.cgImage.width)")
+                }
+                // And it is undoable/removable like any other backdrop.
+                if !editorCanvas.applyBackdropStyle(.none)
+                    || editorCanvas.backdropStyleForTesting.kind != .none {
+                    presetFailures.append("editor-frame-stuck")
+                }
+                // An editor opened WITHOUT a backdrop stays bare even with
+                // auto-apply on: a gate or a file must not inherit the user's
+                // hotkey setting.
+                let bare = EditorWindowController.open(
+                    with: shot, forceFitForTesting: true)
+                if bare.canvasForTesting.backdropStyleForTesting.kind != .none {
+                    presetFailures.append("bare-editor-inherited")
+                }
+
+                // The copy/save route: composed pixels, same style, and the
+                // outer size the ONE geometry source predicts.
+                if let composed = AppDelegate.compose(shot, backdrop: lagoon) {
+                    let layout = BackdropLayout(
+                        innerPixels: CGSize(width: 200, height: 160),
+                        pixelScale: 1, style: lagoon.clamped())
+                    if composed.cgImage.width != Int(layout.outerPixelSize.width)
+                        || composed.cgImage.height
+                            != Int(layout.outerPixelSize.height) {
+                        presetFailures.append(
+                            "composed \(composed.cgImage.width)x\(composed.cgImage.height) "
+                            + "want \(Int(layout.outerPixelSize.width))x\(Int(layout.outerPixelSize.height))")
+                    }
+                } else {
+                    presetFailures.append("compose-nil")
+                }
+                // Fails CLOSED: a frame the budget cannot afford costs the
+                // frame, never the screenshot.
+                let huge = CapturedImage(
+                    cgImage: SelfTest.makeTestImage(width: 40, height: 40), scale: 1)
+                let refused = ForcedOuterComposeFailure.scoped {
+                    AppDelegate.compose(huge, backdrop: lagoon)
+                }
+                if refused != nil {
+                    presetFailures.append("compose-not-fail-closed")
+                }
+                // `.none` is the identity, not a compose.
+                if AppDelegate.compose(shot, backdrop: .none)?.cgImage.width != 200 {
+                    presetFailures.append("none-composed")
+                }
+                check("sliceB-backdrop-presets-autoapply",
+                      presetFailures.isEmpty,
+                      presetFailures.prefix(8).joined(separator: " | "))
+            }
+
             // 1b-2. The fill paints INSIDE the canvas and nowhere else.
             //
             // Every primitive the fill uses covers the current clip rather

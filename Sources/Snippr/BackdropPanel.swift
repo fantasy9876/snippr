@@ -17,8 +17,8 @@ enum BackdropPanelFeature {
     static var geometryEnabled = true
     /// WP2: custom image / wallpaper / blurred sources.
     static var imageSourcesEnabled = false
-    /// WP7: named presets and auto-apply.
-    static var presetsEnabled = false
+    /// WP7 landed the store, the panel row and the Preferences toggle.
+    static var presetsEnabled = true
 }
 
 // MARK: - Swatch
@@ -292,6 +292,58 @@ final class BackdropPanelModel: ObservableObject {
     }
 
     var isNone: Bool { style.kind == .none }
+
+    // MARK: presets
+
+    @Published var presets: [BackdropNamedPreset] = BackdropPresetStore.load()
+    /// Set when a save or rename is refused, so the panel can say why instead
+    /// of appearing to do nothing.
+    @Published var presetError: String?
+
+    /// The saved preset the document currently matches, if any. Compared by
+    /// VALUE: a preset is its style, so editing any field means the document
+    /// is no longer that preset and the row must stop claiming it is.
+    var matchingPresetName: String? {
+        presets.first { $0.style == style }?.name
+    }
+
+    func savePreset(named name: String) {
+        let trimmed = BackdropPresetStore.normalized(name)
+        guard !trimmed.isEmpty else {
+            presetError = "Give the preset a name"
+            return
+        }
+        guard let updated = BackdropPresetStore.add(name: trimmed, style: style)
+        else {
+            presetError = presets.count >= BackdropPresetStore.maxPresets
+                ? "No room for more presets"
+                : "“\(trimmed)” already exists"
+            return
+        }
+        presets = updated
+        presetError = nil
+    }
+
+    func renamePreset(_ old: String, to new: String) {
+        guard let updated = BackdropPresetStore.rename(from: old, to: new) else {
+            presetError = "Could not rename to “\(BackdropPresetStore.normalized(new))”"
+            return
+        }
+        presets = updated
+        presetError = nil
+    }
+
+    func deletePreset(_ name: String) {
+        guard let updated = BackdropPresetStore.remove(name: name) else { return }
+        presets = updated
+        presetError = nil
+    }
+
+    /// Applying a preset is one edit, exactly like picking a chip.
+    func applyPreset(named name: String) {
+        guard let style = BackdropPresetStore.style(named: name) else { return }
+        apply(style)
+    }
 }
 
 // MARK: - View
@@ -299,6 +351,8 @@ final class BackdropPanelModel: ObservableObject {
 /// The Option A sidebar. Every control edits one field of `BackdropStyle`.
 struct BackdropPanelView: View {
     @ObservedObject var model: BackdropPanelModel
+    @State private var isNamingPreset = false
+    @State private var draftPresetName = ""
 
     static let width: CGFloat = 236
 
@@ -309,6 +363,7 @@ struct BackdropPanelView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 14) {
+                if BackdropPanelFeature.presetsEnabled { presetRow }
                 noneButton
                 gradients
                 solids
@@ -320,6 +375,97 @@ struct BackdropPanelView: View {
         }
         .frame(width: Self.width)
         .background(Color(nsColor: NSColor(white: 0.11, alpha: 1)))
+    }
+
+    private var presetRow: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Picker("", selection: Binding(
+                    get: { model.matchingPresetName ?? "" },
+                    set: { name in
+                        guard !name.isEmpty else { return }
+                        model.applyPreset(named: name)
+                    })
+                ) {
+                    // The empty tag is what the document shows when it matches
+                    // no saved preset — which is most of the time, and is not
+                    // an error state worth hiding.
+                    Text(model.presets.isEmpty ? "No presets" : "Custom")
+                        .tag("")
+                    ForEach(model.presets, id: \.name) { preset in
+                        Text(preset.name).tag(preset.name)
+                    }
+                }
+                .labelsHidden()
+                .disabled(model.presets.isEmpty)
+                .accessibilityIdentifier(BackdropPanelIdentifier.presetPicker)
+
+                Button {
+                    isNamingPreset = true
+                    draftPresetName = suggestedPresetName()
+                } label: {
+                    Image(systemName: "plus")
+                }
+                .help("Save the current backdrop as a preset")
+                .accessibilityIdentifier(BackdropPanelIdentifier.presetAdd)
+
+                Menu {
+                    ForEach(model.presets, id: \.name) { preset in
+                        Button("Delete “\(preset.name)”") {
+                            model.deletePreset(preset.name)
+                        }
+                    }
+                } label: {
+                    Image(systemName: "ellipsis")
+                }
+                .menuIndicator(.hidden)
+                .disabled(model.presets.isEmpty)
+                .help("Manage presets")
+                .accessibilityIdentifier(BackdropPanelIdentifier.presetMenu)
+            }
+
+            if isNamingPreset {
+                HStack(spacing: 6) {
+                    TextField("Preset name", text: $draftPresetName)
+                        .textFieldStyle(.roundedBorder)
+                        .accessibilityIdentifier(
+                            BackdropPanelIdentifier.presetNameField)
+                    Button("Save") {
+                        model.savePreset(named: draftPresetName)
+                        if model.presetError == nil { isNamingPreset = false }
+                    }
+                }
+            }
+            if let error = model.presetError {
+                Text(error)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.orange)
+            }
+        }
+    }
+
+    /// A first suggestion the user can accept: "Ocean 2" beats an empty field
+    /// when the answer is almost always the fill they just picked.
+    private func suggestedPresetName() -> String {
+        let base: String = {
+            switch model.style.kind {
+            case .gradient:
+                guard let id = model.style.gradientId,
+                      let entry = BackdropGradientCatalog.entry(id: id)
+                else { return "Preset" }
+                return entry.name
+            case .solid: return "Color"
+            case .image: return "Image"
+            case .wallpaper: return "Wallpaper"
+            case .blurred: return "Blurred"
+            case .none: return "Preset"
+            }
+        }()
+        let taken = Set(model.presets.map { $0.name.lowercased() })
+        guard taken.contains(base.lowercased()) else { return base }
+        var n = 2
+        while taken.contains("\(base) \(n)".lowercased()) { n += 1 }
+        return "\(base) \(n)"
     }
 
     private var noneButton: some View {
@@ -600,6 +746,10 @@ enum BackdropPanelIdentifier {
     static let corners = "backdrop.panel.corners"
     static let shadow = "backdrop.panel.shadow"
     static let inset = "backdrop.panel.inset"
+    static let presetPicker = "backdrop.panel.preset.picker"
+    static let presetAdd = "backdrop.panel.preset.add"
+    static let presetMenu = "backdrop.panel.preset.menu"
+    static let presetNameField = "backdrop.panel.preset.name"
     static let ratio = "backdrop.panel.ratio"
     static let autoBalance = "backdrop.panel.autoBalance"
 

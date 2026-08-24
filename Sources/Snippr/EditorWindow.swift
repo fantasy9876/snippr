@@ -50,9 +50,12 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
 
     @discardableResult
     static func open(
-        with image: CapturedImage, forceFitForTesting: Bool = false
+        with image: CapturedImage, backdrop: BackdropStyle? = nil,
+        forceFitForTesting: Bool = false
     ) -> EditorWindowController {
-        let wc = EditorWindowController(image: image, forceFitForTesting: forceFitForTesting)
+        let wc = EditorWindowController(
+            image: image, backdrop: backdrop,
+            forceFitForTesting: forceFitForTesting)
         controllers.append(wc)
         // macOS 14+ can refuse activation for a menu-bar app, which used to
         // leave the first capture's editor stranded behind the frontmost app.
@@ -66,8 +69,11 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
         return wc
     }
 
-    init(image: CapturedImage, forceFitForTesting: Bool = false) {
-        canvas = EditorCanvasView(image: image)
+    init(
+        image: CapturedImage, backdrop: BackdropStyle? = nil,
+        forceFitForTesting: Bool = false
+    ) {
+        canvas = EditorCanvasView(image: image, backdrop: backdrop)
         self.forceFitForTesting = forceFitForTesting
 
         // Two rows of controls; see buildUI.
@@ -1152,12 +1158,19 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
     private var textField: NSTextField?
     private var editingTextAnnotation: TextAnnotation?
 
-    init(image: CapturedImage) {
+    /// `backdrop` is the auto-apply style, when the capture route asked for
+    /// one. It arrives as DOCUMENT STATE rather than baked into the bitmap, so
+    /// the user can still change or drop the frame — auto-apply is a starting
+    /// point, not a decision made for them. It is deliberately not read from
+    /// Settings here: an editor opened by a gate or by a file must not inherit
+    /// whatever the user set for their hotkeys.
+    init(image: CapturedImage, backdrop: BackdropStyle? = nil) {
         self.image = image
         super.init(frame: CGRect(origin: .zero, size: image.pointSize))
-        var initial = BackdropStyle.none
-        initial.cornerStyle = Settings.shared.backdropCornerStyle
-        backdropStyle = initial
+        var initial = backdrop ?? .none
+        initial.cornerStyle = backdrop?.cornerStyle
+            ?? Settings.shared.backdropCornerStyle
+        backdropStyle = initial.clamped()
         wantsLayer = true
         redactionDelegate = self
         addTrackingArea(NSTrackingArea(
