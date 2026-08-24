@@ -668,23 +668,36 @@ final class AnnotationSurface: RedactionHost, RedactionJobObserver {
     /// there is no crop. Nil = unclamped (legacy placement).
     var magnifierBounds: (() -> CGRect?)?
 
-    /// The frame the document currently wears: the LAST preset chosen, read
+    /// The frame the document currently wears: the LAST style chosen, read
     /// straight out of history so undo and redo need no separate bookkeeping.
-    var backdropPreset: BackdropPreset {
-        annotations.compactMap { ($0 as? BackdropAnnotation)?.preset }.last
+    var backdropStyle: BackdropStyle {
+        annotations.compactMap { ($0 as? BackdropAnnotation)?.style }.last
             ?? .none
     }
 
-    /// Choosing a preset is an edit and joins the same timeline as the marks.
+    /// v0 five-case view. Non-v0 fills (lavender, padding-only, …) are not a
+    /// preset — they read as `.none` here. Overlay preview/export must use
+    /// `backdropStyle`.
+    var backdropPreset: BackdropPreset {
+        backdropStyle.legacyPreset ?? .none
+    }
+
+    /// Choosing a frame is an edit and joins the same timeline as the marks.
     /// Choosing the one already on is not an edit and must not touch history.
     /// Returns false when nothing changed.
     @discardableResult
-    func applyBackdrop(_ preset: BackdropPreset) -> Bool {
+    func applyBackdropStyle(_ style: BackdropStyle) -> Bool {
         guard !isDragging else { return false }
-        guard preset != backdropPreset else { return false }
+        let next = style.clamped()
+        guard next != backdropStyle else { return false }
         appendNewAnnotation(BackdropAnnotation(
-            preset: preset, uiScale: pixelScale))
+            style: next, uiScale: pixelScale))
         return true
+    }
+
+    @discardableResult
+    func applyBackdrop(_ preset: BackdropPreset) -> Bool {
+        applyBackdropStyle(.from(preset: preset))
     }
 
     /// The image the surface samples from. Hosts set it beside

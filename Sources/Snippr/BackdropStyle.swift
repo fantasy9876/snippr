@@ -6,8 +6,9 @@ import Foundation
 // Contract Honey WP6 / Grok WP2–WP3 / Windows WP8 code against. Field names
 // and raw values are frozen. Adding a field is a new WP; renaming is not.
 //
-// v0 five-case `BackdropPreset` stays as the migration key and the overlay
-// annotation payload. `BackdropStyle.from(preset:)` is the only map.
+// v0 five-case `BackdropPreset` stays as the migration key.
+// Overlay WP4b stores `BackdropStyle` on `BackdropAnnotation`;
+// `from(preset:)` is the v0 map, not the overlay payload.
 
 enum BackdropKind: String, Codable, CaseIterable, Hashable {
     case none, gradient, solid, image, wallpaper, blurred

@@ -407,6 +407,7 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
 
     fileprivate func handleEscape() {
         if isSaving || isFinished { return }
+        if hideBackdropMini() { return }
         owner?.finish(.cancelled)
     }
     func handleEscapeForTesting() { handleEscape() }
@@ -509,6 +510,7 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
     private var toolToolbarButtons: [NSButton] = []
     private var actionToolbarButtons: [NSButton] = []
     private var toolbarButtons: [NSButton] = []
+    private var backdropMini: OverlayBackdropMiniView?
     let hoverHint = HoverHint()
 
     private static let colorPresets: [NSColor] = [
@@ -612,6 +614,7 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
         guard isReviewing, let selection = areaSelection else {
             reviewToolRail?.isHidden = true
             reviewActionBar?.isHidden = true
+            hideBackdropMini()
             return
         }
         let toolRail: NSView
@@ -654,6 +657,7 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
         let enabled = owner?.session.acceptsCommits ?? false
         for button in toolbarButtons { button.isEnabled = enabled }
         updateHistoryButtons()
+        layoutBackdropMini()
     }
 
     private func updateHistoryButtons() {
@@ -692,112 +696,150 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
 
     // MARK: Backdrop
 
+    private var backdropStyle: BackdropStyle {
+        annotationSurface?.backdropStyle ?? .none
+    }
     private var backdropPreset: BackdropPreset {
         annotationSurface?.backdropPreset ?? .none
     }
     private var backdropTint: NSColor {
-        backdropPreset == .none ? .white : .controlAccentColor
+        backdropStyle.kind == .none ? .white : .controlAccentColor
     }
 
-    /// Built separately from being shown: `popUp` runs a nested event loop, so
-    /// a headless gate can exercise the real items, targets and actions only
-    /// if construction stands on its own. Mirrors the editor's chooser.
-    func backdropMenu() -> NSMenu {
-        let menu = NSMenu(title: "Backdrop")
-        for (index, preset) in BackdropPreset.allCases.enumerated() {
-            let item = NSMenuItem(
-                title: preset == .none ? "None" : preset.rawValue.capitalized,
-                action: #selector(backdropPresetChosen(_:)), keyEquivalent: "")
-            item.target = self
-            item.tag = index
-            // The menu has two sections now. Naming them is what lets a gate
-            // say "one preset ticked and one corner ticked" instead of
-            // counting rows and hoping.
-            item.identifier = SliceBBackdrop.presetItemIdentifier
-            item.state = preset == backdropPreset ? .on : .off
-            menu.addItem(item)
+    /// Overlay preview/export follow the live Settings corner the way the
+    /// v0 menu did: handles, clip and plate must agree, and a gate that
+    /// flips `Settings.backdropCornerStyle` after applying Ocean still
+    /// probes the large radius.
+    private var overlayDrawStyle: BackdropStyle {
+        var s = backdropStyle
+        s.cornerStyle = SliceBBackdrop.cornerStyle
+        return s
+    }
+
+    /// Built separately from being shown, same policy as the editor sidebar:
+    /// opening changes nothing, only choosing a control applies a style.
+    private func makeBackdropMini() -> OverlayBackdropMiniView {
+        let mini = OverlayBackdropMiniView(
+            frame: CGRect(origin: .zero, size: OverlayQuickBackdrop.size))
+        mini.isHidden = true
+        mini.onChoose = { [weak self] style in
+            _ = self?.applyBackdropStyle(style)
         }
-        // The corner choice lives in the SAME menu as the preset: it is a
-        // property of the frame, and a user looking for it will look here
-        // before they look in Settings.
-        menu.addItem(.separator())
-        for style in BackdropCornerStyle.allCases {
-            let item = NSMenuItem(
-                title: style.title,
-                action: #selector(backdropCornerChosen(_:)), keyEquivalent: "")
-            item.target = self
-            item.tag = BackdropCornerStyle.allCases.firstIndex(of: style) ?? 0
-            item.identifier = SliceBBackdrop.cornerItemIdentifier
-            item.state = style == SliceBBackdrop.cornerStyle ? .on : .off
-            menu.addItem(item)
+        mini.onOpenEditor = { [weak self] in
+            self?.openBackdropEditor()
         }
-        return menu
-    }
-
-    /// Sender is an NSMenuItem, so the style travels as an Int tag.
-    @objc private func backdropCornerChosen(_ sender: NSMenuItem) {
-        let styles = BackdropCornerStyle.allCases
-        guard styles.indices.contains(sender.tag) else { return }
-        Settings.shared.backdropCornerStyle = styles[sender.tag]
-        updateTextEntryClip()
-        needsDisplay = true
-    }
-
-    private(set) var backdropMenuForTesting: NSMenu?
-
-    private func showBackdropMenu(from sender: NSButton) {
-        // popUp runs a nested event loop: a hint still up would sit under the
-        // menu until that loop exits. Opening changes nothing else; only
-        // choosing an item applies a preset.
-        hoverHint.hide()
-        let menu = backdropMenu()
-        backdropMenuForTesting = menu
-        menu.popUp(
-            positioning: nil,
-            at: NSPoint(x: 0, y: sender.bounds.height), in: sender)
-    }
-
-    /// Sender is an NSMenuItem, so the preset travels as an Int tag: a Swift
-    /// enum is not representable in Objective-C.
-    @objc private func backdropPresetChosen(_ sender: NSMenuItem) {
-        let presets = BackdropPreset.allCases
-        guard presets.indices.contains(sender.tag) else { return }
-        applyBackdropPreset(presets[sender.tag])
+        return mini
     }
 
     @discardableResult
-    func applyBackdropPreset(_ preset: BackdropPreset) -> Bool {
+    private func hideBackdropMini() -> Bool {
+        guard let mini = backdropMini, !mini.isHidden else { return false }
+        mini.isHidden = true
+        return true
+    }
+
+    private func showBackdropMini(from sender: NSButton) {
+        hoverHint.hide()
+        if backdropMini == nil {
+            let mini = makeBackdropMini()
+            addSubview(mini, positioned: .above, relativeTo: nil)
+            backdropMini = mini
+            hoverHint.attach(to: mini.hintButtons)
+        }
+        guard let mini = backdropMini else { return }
+        if !mini.isHidden {
+            hideBackdropMini()
+            return
+        }
+        mini.sync(style: backdropStyle)
+        mini.isHidden = false
+        layoutBackdropMini()
+    }
+
+    private func layoutBackdropMini() {
+        guard let mini = backdropMini, !mini.isHidden else { return }
+        guard isReviewing, let selection = areaSelection,
+              let button = toolbarButtons.first(where: {
+                  $0.tag == OverlayAnnotationTool.backdropToolbarTag
+              })
+        else {
+            mini.isHidden = true
+            return
+        }
+        let size = OverlayQuickBackdrop.size
+        let anchor = button.convert(button.bounds, to: self)
+        let occupied = [reviewToolRail, reviewActionBar].compactMap { bar in
+            bar.flatMap { $0.isHidden ? nil : $0.frame }
+        }
+        if let placed = OverlayToolbarLayout.popover(
+            size: size, anchor: anchor, avoid: selection, bounds: bounds,
+            occupied: occupied)
+        {
+            mini.frame = placed.frame
+            mini.isHidden = false
+        } else {
+            mini.isHidden = true
+        }
+    }
+
+    func showBackdropMiniForTesting() {
+        guard let button = toolbarButtons.first(where: {
+            $0.tag == OverlayAnnotationTool.backdropToolbarTag
+        }) else { return }
+        if backdropMini?.isHidden == false { return }
+        showBackdropMini(from: button)
+    }
+
+    var backdropMiniIsShownForTesting: Bool {
+        backdropMini?.isHidden == false
+    }
+
+    var backdropMiniFrameForTesting: CGRect? {
+        guard let mini = backdropMini, !mini.isHidden else { return nil }
+        return mini.frame
+    }
+
+    func backdropMiniControlForTesting(_ identifier: String) -> NSButton? {
+        backdropMini?.control(identifier: identifier)
+    }
+
+    func openBackdropEditorForTesting() { openBackdropEditor() }
+
+    @discardableResult
+    func applyBackdropStyle(_ style: BackdropStyle) -> Bool {
         guard owner?.session.phase == .reviewing, let surface = annotationSurface
         else { return false }
-        // The same rule every other mutating route follows.
         guard !annotationDragging, areaDrag == nil else { return false }
-        // Judge the PEAK — inner and outer alive at once — on the FULL frozen
-        // image, not the current crop: the user can enlarge the selection
-        // afterwards, and a preset that becomes unaffordable when they do
-        // would fail at the terminal action instead of here.
-        guard preset == .none || backdropPeakFits(preset) else {
+        let next = style.clamped()
+        guard next.kind == .none || backdropPeakFits(next) else {
             ToastHUD.show(
                 "Vùng chọn quá lớn cho Backdrop",
                 symbol: "exclamationmark.triangle.fill",
                 on: window?.screen ?? screen, above: window?.level)
             return false
         }
-        guard surface.applyBackdrop(preset) else { return false }
+        guard surface.applyBackdropStyle(next) else { return false }
         refreshBackdropButton()
+        backdropMini?.sync(style: surface.backdropStyle)
         updateTextEntryClip()
         needsDisplay = true
         return true
     }
 
+    @discardableResult
+    func applyBackdropPreset(_ preset: BackdropPreset) -> Bool {
+        applyBackdropStyle(.from(preset: preset))
+    }
+
     /// Mirrors the editor's peak arithmetic exactly: reserve what the outer
     /// frame will need, then ask whether the inner render still fits in what
     /// is left. Both buffers are alive during a compose.
-    private func backdropPeakFits(_ preset: BackdropPreset) -> Bool {
+    private func backdropPeakFits(_ style: BackdropStyle) -> Bool {
         guard let frozen else { return false }
         let width = frozen.cgImage.width
         let height = frozen.cgImage.height
         let reserve = SliceBBackdrop.reservedBytes(
-            forInnerWidth: width, height: height, preset: preset,
+            forInnerWidth: width, height: height, style: style,
             pixelScale: frozen.scale)
         guard let innerBudget = SliceBExport.budget(
             SliceBExport.defaultBudgetBytes, minus: reserve),
@@ -805,6 +847,52 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
                 width: width, height: height)
         else { return false }
         return innerBytes <= innerBudget
+    }
+
+    /// Popover "Open in Editor…": the crop plus overlay marks as the
+    /// document, the current overlay style as live Backdrop state. Baking
+    /// the frame first would put a second plate around it the moment the
+    /// sidebar changed padding. The toolbar's macwindow action still sends
+    /// the composed picture — that path has no document to carry a style.
+    private func openBackdropEditor() {
+        hoverHint.hide()
+        guard !annotationDragging, areaDrag == nil else { return }
+        guard let owner, owner.session.acceptsCommits,
+              let selection = areaSelection?.intersection(bounds),
+              selection.width >= 4, selection.height >= 4,
+              frozen != nil
+        else { return }
+        let prospectiveText = prospectiveTextAnnotation()
+        let canonical = syncSessionPixelRect() ?? selection
+        guard let payload = reviewPayload(prospectiveText: prospectiveText)
+        else {
+            let message = lastPayloadFailure == .backdrop
+                ? "Không dựng được nền Backdrop — thử preset khác"
+                : "Không xuất được ảnh có nét vẽ — thử lại"
+            if let toast = owner.routerDependenciesOverride?.toast {
+                toast(message)
+            } else {
+                ToastHUD.show(
+                    message, on: window?.screen ?? screen, above: window?.level)
+            }
+            return
+        }
+        endTextEntry(commit: true)
+        hideBackdropMini()
+        var passStyle: BackdropStyle? = overlayDrawStyle
+        if passStyle?.kind == .none { passStyle = nil }
+        let global = globalRect(for: canonical)
+        owner.finish(.handled)
+        if let deps = owner.routerDependenciesOverride {
+            deps.setLastCapture(payload.visual)
+            deps.setLastAreaRect(global)
+            deps.openEditor(payload.semantic)
+            return
+        }
+        AppServices.lastCapture = payload.visual
+        Settings.shared.lastAreaRect = global
+        EditorWindowController.open(
+            with: payload.semantic, backdrop: passStyle)
     }
 
     /// Clips the live caption to the crop the export will produce — rounded
@@ -823,7 +911,7 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
             return
         }
         field.wantsLayer = true
-        let radius = backdropPreset == .none
+        let radius = backdropStyle.kind == .none
             ? 0
             : SliceBBackdrop.cornerRadius(
                 documentPoints: plate.size, style: SliceBBackdrop.cornerStyle)
@@ -852,7 +940,7 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
         // Same reason as the editor's document view: what is reviewed has to
         // live in the space the export is composed in, or a P3 display shows
         // colours the framed export has already clipped.
-        window?.colorSpace = backdropPreset == .none ? nil : .sRGB
+        window?.colorSpace = backdropStyle.kind == .none ? nil : .sRGB
     }
 
     private func performHistoryAction(redo: Bool) {
@@ -898,7 +986,7 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
             return
         }
         if sender.tag == OverlayAnnotationTool.backdropToolbarTag {
-            showBackdropMenu(from: sender)
+            showBackdropMini(from: sender)
             return
         }
         guard sender.tag >= 0,
@@ -1132,7 +1220,7 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
     /// here cannot drift from what compose emits.
     @discardableResult
     private func drawBackdropPreview(in ctx: CGContext) -> CGPath? {
-        guard isReviewing, backdropPreset != .none,
+        guard isReviewing, overlayDrawStyle.kind != .none,
               let (sel, layout) = backdropPreviewGeometry() else { return nil }
         guard let frozen else { return nil }
         let scale = frozen.scale
@@ -1155,7 +1243,7 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
             in: ctx, size: outer.size,
             target: CGRect(
                 origin: CGPoint(x: pad, y: pad), size: sel.size),
-            preset: backdropPreset, pixelScale: 1,
+            style: overlayDrawStyle, pixelScale: 1,
             // Grain period is fixed in document pixels; this context is in
             // points, so it has to be told the document's scale.
             documentPixelsPerUserUnit: scale)
@@ -1191,7 +1279,7 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
         let scale = frozen.scale
         let layout = BackdropLayout(
             innerPixels: px.size, pixelScale: scale,
-            preset: backdropPreset)
+            style: overlayDrawStyle)
         guard !layout.isCollapsed else { return nil }
         // Pixel rect -> view points. The pixel rect is TOP-left origin (it
         // indexes the frozen image); the view is bottom-left.
@@ -1206,7 +1294,7 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
     /// Gate visibility: the exact outer rect the preview draws, in view
     /// points, so a gate can prove preview and export agree on geometry.
     var backdropPreviewOuterRectForTesting: CGRect? {
-        guard backdropPreset != .none,
+        guard overlayDrawStyle.kind != .none,
               let (sel, layout) = backdropPreviewGeometry() else { return nil }
         return sel.insetBy(dx: -layout.padPoints, dy: -layout.padPoints)
     }
@@ -1215,7 +1303,7 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
     /// handles on the geometric corners — same as capture, which has no
     /// preset yet.
     private func reviewCornerRadius(for rect: CGRect) -> CGFloat {
-        guard isReviewing, backdropPreset != .none else { return 0 }
+        guard isReviewing, overlayDrawStyle.kind != .none else { return 0 }
         return SliceBBackdrop.cornerRadius(
             documentPoints: rect.size, style: SliceBBackdrop.cornerStyle)
     }
@@ -1379,6 +1467,11 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
         // Same rule as the drag: once the session has produced its result,
         // a click can start nothing.
         if isSaving || isFinished { return }
+        if let mini = backdropMini, !mini.isHidden {
+            if mini.frame.contains(p) { return }
+            hideBackdropMini()
+            return
+        }
         if textEditingActive {
             // While the text field is first responder, a click on the canvas
             // must NOT move/resize the frame or cancel the session — the
@@ -1608,7 +1701,7 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
            let button = toolbarButtons.first(where: {
                $0.tag == OverlayAnnotationTool.backdropToolbarTag
            }) {
-            showBackdropMenu(from: button)
+            showBackdropMini(from: button)
             return
         }
         if owner?.session.phase == .reviewing,
@@ -2002,14 +2095,14 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
         guard let owner, let frozen else { return nil }
         let px = owner.session.pixelRect
         guard px.width >= 1, px.height >= 1 else { return nil }
-        let preset = backdropPreset
+        let style = overlayDrawStyle
         // Reserve what the FRAME will need before rendering the crop, and
         // render the crop inside what is left: both buffers are alive during
         // the compose, so the peak is inner + outer, not whichever is larger.
         // Same arithmetic as the editor's flatten.
         let reserve = SliceBBackdrop.reservedBytes(
             forInnerWidth: Int(px.width), height: Int(px.height),
-            preset: preset, pixelScale: frozen.scale)
+            style: style, pixelScale: frozen.scale)
         guard let innerBudget = SliceBExport.budget(
             SliceBExport.defaultBudgetBytes, minus: reserve),
             let innerBytes = SliceBExport.byteCount(
@@ -2024,7 +2117,7 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
         // sRGB as well — including the semantic payload, so OCR reads exactly
         // the pixels the frame was built around. With no frame the document
         // keeps its own space, byte for byte.
-        let destinationSpace: CGColorSpace? = preset == .none
+        let destinationSpace: CGColorSpace? = style.kind == .none
             ? nil : CGColorSpace(name: CGColorSpace.sRGB)
         let extra: [Annotation] = prospectiveText.map { [$0] } ?? []
         let inner: CGImage
@@ -2046,11 +2139,11 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
             inner = cropped
         }
         let semantic = CapturedImage(cgImage: inner, scale: frozen.scale)
-        guard preset != .none else {
+        guard style.kind != .none else {
             return ReviewPayload(visual: semantic, semantic: semantic)
         }
         guard let composed = SliceBBackdrop.compose(
-            image: inner, preset: preset,
+            image: inner, style: style,
             budgetBytes: SliceBExport.defaultBudgetBytes,
             pixelScale: frozen.scale)
         else {
