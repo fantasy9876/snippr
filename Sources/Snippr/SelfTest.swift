@@ -9689,6 +9689,370 @@ enum SelfTest {
                       geoFailures.prefix(8).joined(separator: " | "))
             }
 
+            // 1a-2. A sidebar chip is a PREVIEW, so it is drawn by the one
+            //       fill the canvas and the export use.
+            //
+            // Building a chip from `entry.stops` is the tempting shortcut and
+            // it is wrong: `paintFill` ignores the catalog entirely for the
+            // four v0 ids and paints the production ramp, so a hand-rolled
+            // chip advertises a colour the canvas can never produce — the user
+            // picks Ocean and gets a different Ocean. This compares the chip's
+            // FRAME pixels against a reference drawn straight through
+            // `drawFrame`, reading the chip's own geometry so the two cannot
+            // drift apart.
+            do {
+                var swatchFailures: [String] = []
+                let chipSize = BackdropSwatch.size
+                let scale: CGFloat = 2
+                let px = CGSize(
+                    width: chipSize.width * scale, height: chipSize.height * scale)
+
+                func pixels(_ image: CGImage) -> [UInt8]? {
+                    let w = image.width, h = image.height
+                    var bytes = [UInt8](repeating: 0, count: w * h * 4)
+                    guard let c = CGContext(
+                        data: &bytes, width: w, height: h, bitsPerComponent: 8,
+                        bytesPerRow: w * 4,
+                        space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+                    else { return nil }
+                    c.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
+                    return bytes
+                }
+
+                for id in BackdropGradientCatalog.ids {
+                    let style = BackdropStyle.gradient(id)
+                    guard let chip = BackdropSwatch.image(
+                        for: style, size: chipSize, scale: scale),
+                        let chipCG = chip.cgImage(
+                            forProposedRect: nil, context: nil, hints: nil)
+                    else {
+                        swatchFailures.append("\(id):no-chip")
+                        continue
+                    }
+                    guard let reference = CGContext(
+                        data: nil, width: Int(px.width), height: Int(px.height),
+                        bitsPerComponent: 8, bytesPerRow: 0,
+                        space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+                    else {
+                        swatchFailures.append("\(id):no-context")
+                        continue
+                    }
+                    // Production, with the chip's own geometry.
+                    _ = SliceBBackdrop.drawFrame(
+                        in: reference, size: px,
+                        target: BackdropSwatch.frameTarget(
+                            pixelSize: px, style: style),
+                        style: style, pixelScale: scale,
+                        documentPixelsPerUserUnit:
+                            BackdropSwatch.documentPixelsPerUserUnit)
+                    guard let refCG = reference.makeImage(),
+                          let a = pixels(chipCG), let b = pixels(refCG),
+                          a.count == b.count
+                    else {
+                        swatchFailures.append("\(id):no-pixels")
+                        continue
+                    }
+                    // Only the frame is compared: the chip fills the plate with
+                    // a stand-in document, which the reference leaves as fill.
+                    let plate = BackdropSwatch.frameTarget(
+                        pixelSize: px, style: style).insetBy(dx: -2, dy: -2)
+                    let w = Int(px.width)
+                    var checked = 0, differing = 0
+                    for y in 0..<Int(px.height) {
+                        for x in 0..<w where !plate.contains(
+                            CGPoint(x: CGFloat(x), y: CGFloat(y))) {
+                            let i = (y * w + x) * 4
+                            checked += 1
+                            // Exact: both went through the same function, in
+                            // the same colour space, at the same scale.
+                            if a[i] != b[i] || a[i + 1] != b[i + 1]
+                                || a[i + 2] != b[i + 2] {
+                                differing += 1
+                            }
+                        }
+                    }
+                    if checked < 200 {
+                        swatchFailures.append("\(id):frame-too-small \(checked)")
+                    }
+                    if differing != 0 {
+                        swatchFailures.append(
+                            "\(id):not-production \(differing)/\(checked)")
+                    }
+                }
+                // None removes the frame, so its chip must not paint one.
+                if let noneChip = BackdropSwatch.image(
+                    for: .none, size: chipSize, scale: scale),
+                    let cg = noneChip.cgImage(
+                        forProposedRect: nil, context: nil, hints: nil),
+                    let bytes = pixels(cg) {
+                    // Corner pixel: plain chrome, not a gradient.
+                    if bytes[0] != bytes[1] || bytes[1] != bytes[2] {
+                        swatchFailures.append("none:painted-a-frame")
+                    }
+                } else {
+                    swatchFailures.append("none:no-chip")
+                }
+                check("sliceB-backdrop-swatch-uses-production-fill",
+                      swatchFailures.isEmpty,
+                      swatchFailures.prefix(6).joined(separator: " | "))
+            }
+
+            // 1a-3. The panel's own contract: what a control means, and when
+            //       a drag is one edit rather than none or forty.
+            do {
+                var panelFailures: [String] = []
+                var applied: [BackdropStyle] = []
+                var groupsOpened = 0, groupsClosed = 0
+
+                func makeModel(
+                    _ start: BackdropStyle = .gradient("ocean")
+                ) -> BackdropPanelModel {
+                    applied.removeAll()
+                    groupsOpened = 0
+                    groupsClosed = 0
+                    let m = BackdropPanelModel(style: start)
+                    m.onApply = { style in
+                        applied.append(style)
+                        return true
+                    }
+                    m.onBeginContinuousEdit = { groupsOpened += 1 }
+                    m.onEndContinuousEdit = { groupsClosed += 1 }
+                    return m
+                }
+
+                // Picking a cell is a statement about where the shot sits, so
+                // it turns auto-balance off — and does it in ONE apply, or the
+                // user needs two undos to take back one click.
+                let align = makeModel()
+                if !align.style.autoBalance {
+                    panelFailures.append("fixture-autobalance-off")
+                }
+                align.choose(alignment: .tl)
+                if applied.count != 1 {
+                    panelFailures.append("alignment-applies \(applied.count)")
+                }
+                if align.style.alignment != .tl || align.style.autoBalance {
+                    panelFailures.append(
+                        "alignment \(align.style.alignment) ab \(align.style.autoBalance)")
+                }
+
+                // Turning auto-balance back on KEEPS the anchor: the
+                // compositor ignores it, and turning it off again must return
+                // the shot where the user last put it, not to the centre.
+                align.setAutoBalance(true)
+                if !align.style.autoBalance || align.style.alignment != .tl {
+                    panelFailures.append(
+                        "autobalance-loses-anchor \(align.style.alignment)")
+                }
+                align.setAutoBalance(false)
+                if align.style.alignment != .tl {
+                    panelFailures.append("anchor-not-restored")
+                }
+
+                // A drag that changes nothing must leave NO undo group. An
+                // empty group is one Cmd+Z that undoes nothing, which reads as
+                // a lost undo.
+                let empty = makeModel()
+                empty.beginContinuousEdit()
+                empty.endContinuousEdit()
+                if groupsOpened != 0 || groupsClosed != 0 {
+                    panelFailures.append(
+                        "empty-drag-groups \(groupsOpened)/\(groupsClosed)")
+                }
+
+                // A drag that does change something is exactly ONE group,
+                // however many steps it took.
+                let dragged = makeModel()
+                dragged.beginContinuousEdit()
+                for step in 1...20 {
+                    var next = dragged.style
+                    next.paddingFraction = 0.02 + CGFloat(step) * 0.005
+                    dragged.apply(next)
+                }
+                dragged.endContinuousEdit()
+                if groupsOpened != 1 || groupsClosed != 1 {
+                    panelFailures.append(
+                        "drag-groups \(groupsOpened)/\(groupsClosed)")
+                }
+                if applied.count != 20 {
+                    panelFailures.append("drag-applies \(applied.count)")
+                }
+
+                // The chip cache key carries the style's continuous fields, so
+                // a drag mints a new chip per step. It must not grow forever.
+                BackdropSwatch.resetCache()
+                for step in 0..<200 {
+                    var style = BackdropStyle.gradient("ocean")
+                    style.paddingFraction = 0.02 + CGFloat(step) * 0.0005
+                    _ = BackdropSwatch.image(for: style)
+                }
+                if BackdropSwatch.cacheCountForTesting > 96 {
+                    panelFailures.append(
+                        "cache-unbounded \(BackdropSwatch.cacheCountForTesting)")
+                }
+                BackdropSwatch.resetCache()
+                if BackdropSwatch.cacheCountForTesting != 0 {
+                    panelFailures.append("cache-not-cleared")
+                }
+
+                // The geometry group is only shown once a compositor reads it.
+                if !BackdropPanelFeature.geometryEnabled {
+                    panelFailures.append("geometry-hidden-after-wp3")
+                }
+                check("sliceB-backdrop-panel-contract",
+                      panelFailures.isEmpty,
+                      panelFailures.prefix(8).joined(separator: " | "))
+            }
+
+            // 1a-4. WP7 presets and auto-apply.
+            //
+            // A preset is a NAMED BackdropStyle, so it cannot describe a
+            // backdrop the app is unable to draw. Auto-apply reaches the
+            // editor as document state and copy/save as composed pixels, and
+            // the two must read the SAME style or a capture is framed on one
+            // route and bare on the other.
+            do {
+                var presetFailures: [String] = []
+                // The gate writes real defaults, so it restores them.
+                let savedBlob = Settings.shared.backdropPresetData
+                let savedEnabled = Settings.shared.backdropAutoApplyEnabled
+                let savedChoice = Settings.shared.backdropAutoApplyPreset
+                defer {
+                    Settings.shared.backdropPresetData = savedBlob
+                    Settings.shared.backdropAutoApplyEnabled = savedEnabled
+                    Settings.shared.backdropAutoApplyPreset = savedChoice
+                }
+                BackdropPresetStore.removeAllForTesting()
+
+                var lagoon = BackdropStyle.gradient("lagoon")
+                lagoon.paddingFraction = 0.11
+                lagoon.shadowStrength = 0.5
+                if BackdropPresetStore.add(name: "  Studio  ", style: lagoon) == nil {
+                    presetFailures.append("add-refused")
+                }
+                // Whitespace is trimmed on the way in, or "Studio" and
+                // "Studio " would be two presets a user cannot tell apart.
+                if BackdropPresetStore.load().first?.name != "Studio" {
+                    presetFailures.append(
+                        "name \(BackdropPresetStore.load().first?.name ?? "nil")")
+                }
+                // Round-trip: every field, not just the fill.
+                if BackdropPresetStore.style(named: "studio") != lagoon.clamped() {
+                    presetFailures.append("roundtrip")
+                }
+                // A duplicate name is REFUSED, not silently renamed or made to
+                // overwrite the preset the user already has.
+                if BackdropPresetStore.add(name: "STUDIO", style: .gradient("ocean")) != nil
+                    || BackdropPresetStore.load().count != 1 {
+                    presetFailures.append("duplicate-accepted")
+                }
+                if BackdropPresetStore.add(name: "   ", style: lagoon) != nil {
+                    presetFailures.append("blank-accepted")
+                }
+
+                // Auto-apply is stored by NAME, so a rename has to follow it or
+                // it would quietly stop applying anything.
+                Settings.shared.backdropAutoApplyEnabled = true
+                Settings.shared.backdropAutoApplyPreset = "Studio"
+                if BackdropPresetStore.rename(from: "Studio", to: "Studio Warm") == nil {
+                    presetFailures.append("rename-refused")
+                }
+                if Settings.shared.backdropAutoApplyPreset != "Studio Warm" {
+                    presetFailures.append(
+                        "rename-orphans-autoapply "
+                        + (Settings.shared.backdropAutoApplyPreset ?? "nil"))
+                }
+                if BackdropPresetStore.autoApplyStyle != lagoon.clamped() {
+                    presetFailures.append("autoapply-style")
+                }
+                // Off means off, whatever is selected.
+                Settings.shared.backdropAutoApplyEnabled = false
+                if BackdropPresetStore.autoApplyStyle != nil {
+                    presetFailures.append("autoapply-ignores-toggle")
+                }
+                Settings.shared.backdropAutoApplyEnabled = true
+
+                // Deleting the preset every capture used turns auto-apply OFF
+                // rather than leaving it pointing at nothing.
+                if BackdropPresetStore.remove(name: "studio warm") == nil {
+                    presetFailures.append("remove-refused")
+                }
+                if Settings.shared.backdropAutoApplyPreset != nil
+                    || BackdropPresetStore.autoApplyStyle != nil {
+                    presetFailures.append("delete-leaves-dangling-autoapply")
+                }
+                if !BackdropPresetStore.load().isEmpty {
+                    presetFailures.append("remove-left-entries")
+                }
+
+                // The editor route: document state, NOT baked pixels. The user
+                // must still be able to drop the frame after the shot.
+                let shot = CapturedImage(
+                    cgImage: SelfTest.makeTestImage(width: 200, height: 160),
+                    scale: 1)
+                let framedEditor = EditorWindowController.open(
+                    with: shot, backdrop: lagoon, forceFitForTesting: true)
+                let editorCanvas = framedEditor.canvasForTesting
+                if editorCanvas.backdropStyleForTesting.gradientId != "lagoon"
+                    || editorCanvas.backdropStyleForTesting.paddingFraction != 0.11 {
+                    presetFailures.append(
+                        "editor-style \(editorCanvas.backdropStyleForTesting.gradientId ?? "nil")")
+                }
+                if editorCanvas.image.cgImage.width != 200 {
+                    presetFailures.append(
+                        "editor-baked \(editorCanvas.image.cgImage.width)")
+                }
+                // And it is undoable/removable like any other backdrop.
+                if !editorCanvas.applyBackdropStyle(.none)
+                    || editorCanvas.backdropStyleForTesting.kind != .none {
+                    presetFailures.append("editor-frame-stuck")
+                }
+                // An editor opened WITHOUT a backdrop stays bare even with
+                // auto-apply on: a gate or a file must not inherit the user's
+                // hotkey setting.
+                let bare = EditorWindowController.open(
+                    with: shot, forceFitForTesting: true)
+                if bare.canvasForTesting.backdropStyleForTesting.kind != .none {
+                    presetFailures.append("bare-editor-inherited")
+                }
+
+                // The copy/save route: composed pixels, same style, and the
+                // outer size the ONE geometry source predicts.
+                if let composed = AppDelegate.compose(shot, backdrop: lagoon) {
+                    let layout = BackdropLayout(
+                        innerPixels: CGSize(width: 200, height: 160),
+                        pixelScale: 1, style: lagoon.clamped())
+                    if composed.cgImage.width != Int(layout.outerPixelSize.width)
+                        || composed.cgImage.height
+                            != Int(layout.outerPixelSize.height) {
+                        presetFailures.append(
+                            "composed \(composed.cgImage.width)x\(composed.cgImage.height) "
+                            + "want \(Int(layout.outerPixelSize.width))x\(Int(layout.outerPixelSize.height))")
+                    }
+                } else {
+                    presetFailures.append("compose-nil")
+                }
+                // Fails CLOSED: a frame the budget cannot afford costs the
+                // frame, never the screenshot.
+                let huge = CapturedImage(
+                    cgImage: SelfTest.makeTestImage(width: 40, height: 40), scale: 1)
+                let refused = ForcedOuterComposeFailure.scoped {
+                    AppDelegate.compose(huge, backdrop: lagoon)
+                }
+                if refused != nil {
+                    presetFailures.append("compose-not-fail-closed")
+                }
+                // `.none` is the identity, not a compose.
+                if AppDelegate.compose(shot, backdrop: .none)?.cgImage.width != 200 {
+                    presetFailures.append("none-composed")
+                }
+                check("sliceB-backdrop-presets-autoapply",
+                      presetFailures.isEmpty,
+                      presetFailures.prefix(8).joined(separator: " | "))
+            }
+
             // 1b-2. The fill paints INSIDE the canvas and nowhere else.
             //
             // Every primitive the fill uses covers the current clip rather
@@ -12362,8 +12726,10 @@ enum SelfTest {
                     if button.identifier?.rawValue != tool.rawValue {
                         toolbarFailures.append("\(tool.rawValue):identifier")
                     }
+                    // Backdrop opens the Option A sidebar; it is a document
+                    // style, not a drawing mode, so it never selects a tool.
                     let expectedSelector = tool == .backdrop
-                        ? NSSelectorFromString("showBackdropMenu:")
+                        ? NSSelectorFromString("toggleBackdropPanel:")
                         : NSSelectorFromString("toolTapped:")
                     if button.target !== wc
                         || button.action != expectedSelector {
@@ -16786,11 +17152,10 @@ enum SelfTest {
                 uiCanvas.keyDown(with: event)
                 return uiCanvas.currentTool.tooltip
             }
-            // D is deliberately NOT synthesized. It opens the preset chooser
-            // instead of selecting a tool, and `NSMenu.popUp` runs a nested
-            // event loop that would hang a headless run. Its wiring is pinned
-            // below through the button, and what the chooser does is covered by
-            // the menu gate that drives the real items.
+            // D is deliberately NOT synthesized. It toggles the backdrop
+            // sidebar instead of selecting a tool. Its wiring is pinned below
+            // through the button, and what the sidebar does is covered by the
+            // panel gate that drives the real model.
             let sTool = toolAfter("s")
             let mTool = toolAfter("m")
             let shiftBTool = toolAfter("b", .shift)
@@ -16798,7 +17163,7 @@ enum SelfTest {
             let backdropButton = uiWC.toolButtonsForTesting
                 .first { $0.tool == .backdrop }?.button
             let backdropWiring = backdropButton?.action
-                == #selector(EditorWindowController.showBackdropMenu(_:))
+                == #selector(EditorWindowController.toggleBackdropPanel(_:))
                 && backdropButton?.target === uiWC
                 && backdropButton?.accessibilityLabel()?
                     .hasPrefix("Backdrop") == true
@@ -18167,15 +18532,16 @@ enum SelfTest {
                         "corner-precondition \(canvas.documentCornerRadius) "
                             + "want \(startRadius)")
                 }
-                let cornerMenu = wc.backdropMenu()
-                let largeTag = BackdropCornerStyle.allCases.firstIndex(of: .large)
-                if let row = cornerMenu.items.firstIndex(where: {
-                    $0.identifier == SliceBBackdrop.cornerItemIdentifier
-                        && $0.tag == largeTag
-                }) {
-                    cornerMenu.performActionForItem(at: row)
+                // Driven through the panel's own model, which is what the
+                // sidebar's Corners control calls — not a direct canvas call,
+                // which would bypass the wiring this gate exists to pin.
+                if let cornerModel = wc.backdropPanelModel {
+                    cornerModel.setCornerStyle(.large)
+                    if cornerModel.style.cornerStyle != .large {
+                        chromeFailures.append("corner-model-not-updated")
+                    }
                 } else {
-                    chromeFailures.append("corner-row-missing")
+                    chromeFailures.append("panel-missing")
                 }
                 if Settings.shared.backdropCornerStyle != .large {
                     chromeFailures.append("corner-not-stored")
@@ -18283,10 +18649,17 @@ enum SelfTest {
                 let selectionBefore = canvas.selectedRefForTesting
                 let transientBefore = canvas.transientDescriptionForTesting
                 let refsBefore = canvas.annotationRefsForTesting
-                // The real menu, built by production. `popUp` runs a nested
-                // event loop and cannot run headlessly, so the gate stops at
-                // construction and then fires the item's OWN target/action.
-                let menu = wc.backdropMenu()
+                // The real panel, built by production. It is built with the
+                // window and toggled here the way the toolbar button does, so
+                // the gate drives the model the sidebar's own controls call.
+                wc.setBackdropPanelOpen(true)
+                let panel = wc.backdropPanelModel
+                if panel == nil { applyFailures.append("panel-missing") }
+                if !wc.isBackdropPanelOpen {
+                    applyFailures.append("panel-not-open")
+                }
+                // OPENING is not an edit. The menu this replaced had the same
+                // rule and the same gate: a chooser is a view of state.
                 if canvas.currentTool != toolBefore
                     || canvas.historyMutationCountForTesting != historyBefore
                     || canvas.documentFingerprintForTesting != fingerprintBefore
@@ -18294,54 +18667,38 @@ enum SelfTest {
                     applyFailures.append("chooser-mutates")
                 }
                 let presets = BackdropPreset.allCases
-                // The menu carries two sections now — presets and corners —
-                // so it is read by SECTION rather than by row count.
-                func section(
-                    _ items: [NSMenuItem], _ id: NSUserInterfaceItemIdentifier
-                ) -> [NSMenuItem] {
-                    items.filter { $0.identifier == id }
+                // The grid offers every catalog id and nothing invented: the
+                // panel is a view of the catalog, the same way the menu was a
+                // view of the five-case enum.
+                if BackdropGradientCatalog.entries.count != 12
+                    || Set(BackdropGradientCatalog.ids).count != 12 {
+                    applyFailures.append(
+                        "catalog-count \(BackdropGradientCatalog.entries.count)")
                 }
-                let presetItems = section(
-                    menu.items, SliceBBackdrop.presetItemIdentifier)
-                let cornerItems = section(
-                    menu.items, SliceBBackdrop.cornerItemIdentifier)
-                if presetItems.count != presets.count {
-                    applyFailures.append("menu-count \(presetItems.count)")
+                // Every v0 preset except `.none` must still be reachable by id,
+                // or a document saved on 1.2.7 has no chip to come back to.
+                for preset in presets where preset != .none {
+                    if BackdropGradientCatalog.entry(id: preset.rawValue) == nil {
+                        applyFailures.append("catalog-missing \(preset.rawValue)")
+                    }
                 }
-                if cornerItems.count != BackdropCornerStyle.allCases.count {
-                    applyFailures.append("corner-count \(cornerItems.count)")
+                // The panel shows what the document wears, not its own idea of
+                // it: nothing is selected while the backdrop is none.
+                if panel?.style != canvas.backdropStyleForTesting {
+                    applyFailures.append("panel-desync-open")
                 }
-                let checked = presetItems.filter { $0.state == .on }
-                if checked.count != 1
-                    || checked.first?.tag != presets.firstIndex(of: .none) {
-                    applyFailures.append("menu-check")
+                if panel?.isNone != true {
+                    applyFailures.append("panel-none-not-selected")
                 }
-                // Exactly one corner ticked, and it is the one in force.
-                let cornerChecked = cornerItems.filter { $0.state == .on }
-                if cornerChecked.count != 1
-                    || cornerChecked.first?.tag
-                        != BackdropCornerStyle.allCases.firstIndex(
-                            of: SliceBBackdrop.cornerStyle) {
-                    applyFailures.append("corner-check")
+                if panel?.style.cornerStyle != canvas.backdropStyleForTesting.cornerStyle {
+                    applyFailures.append("panel-corner-desync")
                 }
-                // Drive the menu the way the user does: real dispatch, not a
-                // direct perform, which would bypass validation and fire an
-                // item the user could never click. Separators are not items a
-                // user can click, so they are not asked to be enabled.
-                if !menu.items.allSatisfy({ $0.isSeparatorItem || $0.isEnabled }) {
-                    applyFailures.append("menu-disabled")
-                }
-                if let mintIndex = menu.items.firstIndex(
-                    where: {
-                        $0.identifier == SliceBBackdrop.presetItemIdentifier
-                            && $0.tag == presets.firstIndex(of: .mint)
-                    }) {
-                    canvas.undoManager?.beginUndoGrouping()
-                    menu.performActionForItem(at: mintIndex)
-                    canvas.undoManager?.endUndoGrouping()
-                } else {
-                    applyFailures.append("menu-mint-missing")
-                }
+                // Drive it the way a chip does — through the model the button
+                // calls — not by setting canvas state directly, which would
+                // bypass the wiring this gate exists to pin.
+                canvas.undoManager?.beginUndoGrouping()
+                panel?.choose(gradientId: BackdropPreset.mint.rawValue)
+                canvas.undoManager?.endUndoGrouping()
                 // Choosing a preset changes the PRESET and nothing else: not
                 // the active tool, not the selection, not the pending crop or
                 // the transient overlay the user was in the middle of.
@@ -18400,19 +18757,24 @@ enum SelfTest {
                     || canvas.transientDescriptionForTesting != transientBefore {
                     applyFailures.append("menu-undo")
                 }
-                // Reopening must show the CURRENT preset ticked at each step,
-                // and choosing the already-current item must do nothing at all
-                // — the menu is a view of state, not a second source of it.
-                func checkedTag(_ label: String) -> Int? {
-                    let items = wc.backdropMenu().items
-                        .filter { $0.identifier == SliceBBackdrop.presetItemIdentifier }
-                    let on = items.filter { $0.state == .on }
-                    if on.count != 1 {
-                        applyFailures.append("\(label)-checks \(on.count)")
+                // The panel must follow the CANVAS at each step, and choosing
+                // the already-current chip must do nothing at all — the
+                // sidebar is a view of state, not a second source of it.
+                // Undo happens on the canvas, so the panel is resynced the way
+                // production does it, through the layout refresh.
+                func selectedGradient(_ label: String) -> String? {
+                    wc.refreshBackdropLayout()
+                    guard let live = wc.backdropPanelModel else {
+                        applyFailures.append("\(label)-panel-missing")
+                        return nil
                     }
-                    return on.first?.tag
+                    if live.style != canvas.backdropStyleForTesting {
+                        applyFailures.append("\(label)-desync")
+                    }
+                    return live.style.kind == .gradient
+                        ? live.style.gradientId : nil
                 }
-                if checkedTag("after-undo") != presets.firstIndex(of: .none) {
+                if selectedGradient("after-undo") != nil {
                     applyFailures.append("menu-check-undo")
                 }
                 canvas.undoManager?.redo()
@@ -18426,7 +18788,7 @@ enum SelfTest {
                     ("history=\(historyBefore)", "history=\(historyBefore + 3)"),
                 ], "menu-redo")
                 if canvas.backdropPresetForTesting != .mint
-                    || checkedTag("after-redo") != presets.firstIndex(of: .mint)
+                    || selectedGradient("after-redo") != BackdropPreset.mint.rawValue
                     || canvas.documentFingerprintForTesting != afterRedo
                     || canvas.currentTool != toolBefore
                     || canvas.selectedRefForTesting !== selectionBefore
@@ -18440,11 +18802,12 @@ enum SelfTest {
                         + canvas.documentFingerprintForTesting)
                 }
                 let beforeNoop = canvas.documentFingerprintForTesting
-                let reopened = wc.backdropMenu()
-                if let currentIndex = reopened.items.firstIndex(
-                    where: { $0.tag == presets.firstIndex(of: .mint) }) {
-                    reopened.performActionForItem(at: currentIndex)
-                }
+                // Closing and reopening the sidebar is not an edit either, and
+                // the chip already in force stays a no-op when clicked again.
+                wc.setBackdropPanelOpen(false)
+                wc.setBackdropPanelOpen(true)
+                wc.backdropPanelModel?.choose(
+                    gradientId: BackdropPreset.mint.rawValue)
                 if canvas.documentFingerprintForTesting != beforeNoop
                     || canvas.backdropPresetForTesting != .mint {
                     applyFailures.append("menu-current-noop")

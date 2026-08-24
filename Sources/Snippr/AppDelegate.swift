@@ -487,27 +487,76 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: result routing
 
+    /// Bakes a backdrop into a capture for the routes that have no document to
+    /// hold one. Fails CLOSED to the bare shot: an over-budget frame must cost
+    /// the user their frame, never their screenshot.
+    static func compose(
+        _ image: CapturedImage, backdrop style: BackdropStyle
+    ) -> CapturedImage? {
+        guard style.kind != .none else { return image }
+        guard let composed = SliceBBackdrop.compose(
+            image: image.cgImage, style: style,
+            budgetBytes: SliceBExport.defaultBudgetBytes,
+            pixelScale: image.scale)
+        else { return nil }
+        return CapturedImage(cgImage: composed, scale: image.scale)
+    }
+
     private func handleResult(_ image: CapturedImage, source: CaptureSource) {
         AppServices.lastCapture = image
         logEvent("capture source=\(source) px=\(image.cgImage.width)x\(image.cgImage.height)")
         let s = Settings.shared
         let copied = s.afterCopy
 
+        // Auto-apply (WP7): the chosen preset frames every capture. The two
+        // kinds of destination take it DIFFERENTLY, and which ones run is
+        // independent of that.
+        //
+        // The editor gets the style as document state, so the frame stays
+        // non-destructive — the whole point of Backdrop is changing your mind
+        // after the shot. The clipboard and the saved file are pixels with
+        // nowhere to keep a style, so they get it composed in.
+        //
+        // Both can happen at once. An earlier cut composed only when NO editor
+        // opened, which meant "copy + save + show" put a bare shot on the
+        // clipboard and a bare file on disk while the editor displayed a frame
+        // — three things disagreeing, including this app's own Preferences
+        // text. Whether the editor opens says nothing about what the clipboard
+        // should contain.
+        //
+        // Composed at most once, and only if some pixel route actually asks:
+        // an editor-only capture must not pay for a frame nobody reads.
+        //
+        // Scrolling captures deliberately do NOT come through here — they route
+        // via ScrollResultPresenter — so auto-apply does not frame a scrollshot.
+        // A 20,000pt strip gains nothing from padding and would be the first
+        // thing to hit the byte budget.
+        let autoBackdrop = BackdropPresetStore.autoApplyStyle
+        var composedForPixels: CapturedImage?
+        func pixels() -> CapturedImage {
+            guard let style = autoBackdrop else { return image }
+            if let ready = composedForPixels { return ready }
+            let made = Self.compose(image, backdrop: style) ?? image
+            composedForPixels = made
+            return made
+        }
+
         if copied {
-            SaveService.shared.copyToClipboard(image)
+            SaveService.shared.copyToClipboard(pixels())
         }
         if s.afterSave {
             // encoding runs in the background; announce when it lands (only
             // when no editor opens — same visibility rule as before)
             let announce = !s.afterShow
-            SaveService.shared.save(image) { url in
+            let toSave = pixels()
+            SaveService.shared.save(toSave) { url in
                 guard announce else { return }
                 var toasts: [String] = copied ? ["copied"] : []
                 if let url {
                     toasts.append("saved \(url.lastPathComponent)")
                 } else {
                     // the only configured action failed — rescue the shot
-                    if !copied { SaveService.shared.copyToClipboard(image) }
+                    if !copied { SaveService.shared.copyToClipboard(toSave) }
                     toasts.append(copied ? "save failed" : "save failed — copied instead")
                 }
                 ToastHUD.show("Screenshot \(toasts.joined(separator: " · "))")
@@ -517,10 +566,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if s.afterShow {
             if source == .area && s.afterCropShow == .thumbnail {
                 ThumbnailHUD.show(image) { img in
-                    EditorWindowController.open(with: img)
+                    EditorWindowController.open(with: img, backdrop: autoBackdrop)
                 }
             } else {
-                EditorWindowController.open(with: image)
+                EditorWindowController.open(with: image, backdrop: autoBackdrop)
             }
         } else if s.afterSave {
             // toast arrives from the save completion above
@@ -528,7 +577,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             ToastHUD.show("Screenshot copied")
         } else {
             // nothing configured — at least copy so the shot isn't lost
-            SaveService.shared.copyToClipboard(image)
+            SaveService.shared.copyToClipboard(pixels())
             ToastHUD.show("Screenshot copied to clipboard")
         }
     }

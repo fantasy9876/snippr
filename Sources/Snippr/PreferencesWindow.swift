@@ -107,6 +107,40 @@ private struct Row<Content: View>: View {
     }
 }
 
+extension GeneralTab {
+    /// Auto-apply: frame every capture with a saved preset, so a shot is
+    /// presentable without opening the editor. Off by default — see
+    /// `Settings.backdropAutoApplyEnabled`.
+    @ViewBuilder var backdropAutoApplySection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Toggle("Frame every screenshot with a Backdrop preset",
+                   isOn: $backdropAutoApply)
+                .disabled(backdropPresets.isEmpty)
+            HStack(spacing: 8) {
+                Picker("Preset", selection: $autoApplyPreset) {
+                    Text("None").tag("")
+                    ForEach(backdropPresets, id: \.name) { preset in
+                        Text(preset.name).tag(preset.name)
+                    }
+                }
+                .frame(width: 260)
+                .disabled(!backdropAutoApply || backdropPresets.isEmpty)
+                .onChange(of: autoApplyPreset) { _, new in
+                    Settings.shared.backdropAutoApplyPreset =
+                        new.isEmpty ? nil : new
+                }
+                Button("Reload") { backdropPresets = BackdropPresetStore.load() }
+            }
+            Text(backdropPresets.isEmpty
+                 ? "Save a preset in the editor's Backdrop panel first."
+                 : "The editor still opens with the frame as editable state — "
+                   + "copy and save get it composed in.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+        }
+    }
+}
+
 // MARK: - Window background style cards (visual picker)
 
 /// Visual previews: each card shows what the window screenshot will
@@ -233,9 +267,13 @@ struct GeneralTab: View {
     @State private var folderLabel = Settings.shared.screenshotsFolder.path
     @State private var launchAtStartup = LaunchAtLogin.isEnabled
     @State private var bgColor = Color(nsColor: Settings.shared.windowBGColor)
+    @AppStorage(Settings.Keys.backdropAutoApply) private var backdropAutoApply = false
+    @State private var backdropPresets = BackdropPresetStore.load()
+    @State private var autoApplyPreset = Settings.shared.backdropAutoApplyPreset ?? ""
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
+            backdropAutoApplySection
             // visual picker — click a preview card to choose the backdrop
             VStack(alignment: .leading, spacing: 10) {
                 HStack(spacing: 6) {

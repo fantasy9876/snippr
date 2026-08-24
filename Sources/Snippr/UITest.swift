@@ -41,9 +41,32 @@ enum UITest {
         smallEditor.window?.setContentSize(NSSize(width: 820, height: 560))
         // Tall scrolling result: its fit factor is below the old 10% zoom
         // floor, which used to leave both scrollers visible in "Fit" mode.
+        // Backdrop sidebar (Option A), open and wearing a gradient: the panel
+        // is the one piece of editor chrome a snapshot has to catch, because
+        // its width comes off the canvas and a layout mistake is invisible in
+        // a headless gate.
+        fittedEditor.canvasForTesting.applyBackdropStyle(
+            BackdropStyle.gradient("lagoon"))
+        fittedEditor.setBackdropPanelOpen(true)
+        // Presets are INJECTED into the model rather than saved: the harness
+        // must not write the user's defaults, and the row only needs a list to
+        // render. Saving through the + button is covered by the gate.
+        fittedEditor.backdropPanelModel?.presets = [
+            BackdropNamedPreset(name: "Studio", style: .gradient("lagoon")),
+            BackdropNamedPreset(name: "Docs light", style: .gradient("paper")),
+        ]
         let tall = CapturedImage(cgImage: SelfTest.makeTestImage(width: 400, height: 24_000), scale: 2)
         let tallEditor = EditorWindowController.open(with: tall, forceFitForTesting: true)
         tallEditor.selectTool(.crop)
+        // The panel is taller than a 520pt viewport, so the whole sidebar is
+        // only visible in a tall window. Snapshot it there too rather than
+        // trusting that what is below the scroll fold laid out.
+        tallEditor.canvasForTesting.applyBackdropStyle(
+            BackdropStyle.gradient("midnight"))
+        tallEditor.setBackdropPanelOpen(true)
+        tallEditor.backdropPanelModel?.presets = [
+            BackdropNamedPreset(name: "Studio", style: .gradient("lagoon")),
+        ]
         // opened the way the menu's "About Snippr" does — must land on About
         PreferencesWindowController.show(tab: .about)
         ToastHUD.show("Snippr UI test — toast OK", symbol: "checkmark.seal.fill", duration: 6)
