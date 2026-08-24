@@ -712,6 +712,11 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
         let target: CGFloat = open ? BackdropPanelView.width : 0
         guard backdropPanelWidth.constant != target else { return }
         backdropPanelWidth.constant = target
+        if !open {
+            // A drag's worth of chips is not worth holding while the sidebar
+            // is shut; they redraw in microseconds when it reopens.
+            BackdropSwatch.resetCache()
+        }
         backdropPanelModel?.syncFromCanvas(canvas.backdropStyle)
         backdropButton?.contentTintColor = open ? .controlAccentColor : .lightGray
         window?.contentView?.layoutSubtreeIfNeeded()

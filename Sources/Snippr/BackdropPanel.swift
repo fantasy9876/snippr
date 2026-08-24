@@ -13,8 +13,8 @@ import SwiftUI
 /// missing one — so the layout ships now and WP3 flips one flag rather than
 /// redesigning the panel around it.
 enum BackdropPanelFeature {
-    /// WP3: asymmetric insets, ratio, auto-balance.
-    static var geometryEnabled = false
+    /// WP3 (`6ee5e37`) landed the compositor side, so the controls are live.
+    static var geometryEnabled = true
     /// WP2: custom image / wallpaper / blurred sources.
     static var imageSourcesEnabled = false
     /// WP7: named presets and auto-apply.
@@ -48,12 +48,27 @@ enum BackdropSwatch {
         let scale: Int
     }
 
+    /// Bounded, because the key carries the style's CONTINUOUS fields: one
+    /// slow drag across Padding is a few hundred distinct styles at ~31KB a
+    /// chip, and an unbounded dictionary would keep every frame of that drag
+    /// for the life of the process.
+    private static let cacheLimit = 96
     private nonisolated(unsafe) static var cache: [Key: NSImage] = [:]
+    private nonisolated(unsafe) static var cacheOrder: [Key] = []
     private static let cacheLock = NSLock()
 
-    static func resetCacheForTesting() {
+    static var cacheCountForTesting: Int {
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+        return cache.count
+    }
+
+    /// Called when the panel closes: chips are cheap to redraw and there is no
+    /// reason to hold a drag's worth of them while the sidebar is shut.
+    static func resetCache() {
         cacheLock.lock()
         cache.removeAll()
+        cacheOrder.removeAll()
         cacheLock.unlock()
     }
 
@@ -70,7 +85,15 @@ enum BackdropSwatch {
             return nil
         }
         cacheLock.lock()
-        cache[key] = made
+        if cache[key] == nil {
+            cache[key] = made
+            cacheOrder.append(key)
+            // Oldest first: a drag's intermediate frames are exactly the ones
+            // the user will not come back to.
+            while cacheOrder.count > cacheLimit {
+                cache.removeValue(forKey: cacheOrder.removeFirst())
+            }
+        }
         cacheLock.unlock()
         return made
     }
@@ -178,8 +201,16 @@ final class BackdropPanelModel: ObservableObject {
     /// A slider drag is ONE edit. The canvas registers single-field undo per
     /// change, so the drag is wrapped in an undo group instead: without this a
     /// user dragging Padding across 40 steps would need 40 undos to get back.
+    ///
+    /// The group is opened LAZILY, on the first change the drag actually
+    /// produces. Clicking a slider's knob without moving it still sends
+    /// begin/end, and opening a group there left an empty one on the stack —
+    /// one Cmd+Z that undoes nothing, which reads as a lost undo.
     var onBeginContinuousEdit: (() -> Void)?
     var onEndContinuousEdit: (() -> Void)?
+
+    private var isDragging = false
+    private var groupIsOpen = false
 
     init(style: BackdropStyle) { self.style = style }
 
@@ -193,9 +224,22 @@ final class BackdropPanelModel: ObservableObject {
     func apply(_ next: BackdropStyle) {
         let clamped = next.clamped()
         guard clamped != style else { return }
+        if isDragging && !groupIsOpen {
+            groupIsOpen = true
+            onBeginContinuousEdit?()
+        }
         if onApply?(clamped) == true {
             style = clamped
         }
+    }
+
+    func beginContinuousEdit() { isDragging = true }
+
+    func endContinuousEdit() {
+        isDragging = false
+        guard groupIsOpen else { return }
+        groupIsOpen = false
+        onEndContinuousEdit?()
     }
 
     func choose(gradientId: String) {
@@ -209,6 +253,27 @@ final class BackdropPanelModel: ObservableObject {
         var next = style
         next.kind = .solid
         next.solidColor = solidHex
+        apply(next)
+    }
+
+    /// Picking a cell is a statement about where the shot sits, so it turns
+    /// auto-balance off — in ONE apply, so it is one undo. The grid stays
+    /// live while auto-balance is on rather than dimming: a control that is
+    /// disabled by the default setting reads as broken.
+    func choose(alignment: BackdropAlignment) {
+        var next = style
+        next.alignment = alignment
+        next.autoBalance = false
+        apply(next)
+    }
+
+    /// Turning auto-balance back on KEEPS the anchor. The compositor ignores
+    /// it, and turning auto-balance off again returns the shot where the user
+    /// last put it instead of to the centre.
+    func setAutoBalance(_ on: Bool) {
+        guard on != style.autoBalance else { return }
+        var next = style
+        next.autoBalance = on
         apply(next)
     }
 
@@ -369,6 +434,17 @@ struct BackdropPanelView: View {
     /// panel never offers a control the compositor ignores.
     private var geometry: some View {
         VStack(alignment: .leading, spacing: 10) {
+            labelledSlider(
+                "Inset",
+                value: Binding(
+                    get: { model.style.insetFraction },
+                    set: { v in
+                        var next = model.style
+                        next.insetFraction = v
+                        model.apply(next)
+                    }),
+                range: BackdropStyle.insetFractionRange,
+                identifier: BackdropPanelIdentifier.inset)
             sectionTitle("Alignment")
             alignmentGrid
             VStack(alignment: .leading, spacing: 4) {
@@ -390,11 +466,7 @@ struct BackdropPanelView: View {
             }
             Toggle("Auto-balance", isOn: Binding(
                 get: { model.style.autoBalance },
-                set: { on in
-                    var next = model.style
-                    next.autoBalance = on
-                    model.apply(next)
-                }))
+                set: { model.setAutoBalance($0) }))
                 .accessibilityIdentifier(BackdropPanelIdentifier.autoBalance)
         }
         .disabled(model.isNone)
@@ -407,11 +479,14 @@ struct BackdropPanelView: View {
                 HStack(spacing: 4) {
                     ForEach(0..<3, id: \.self) { col in
                         let anchor = BackdropAlignment.allCases[row * 3 + col]
-                        let selected = model.style.alignment == anchor
+                        // With auto-balance on the compositor divides the
+                        // space evenly and ignores the anchor, so no cell is
+                        // the one in force — highlighting one would claim an
+                        // effect the picture does not have.
+                        let selected = !model.style.autoBalance
+                            && model.style.alignment == anchor
                         Button {
-                            var next = model.style
-                            next.alignment = anchor
-                            model.apply(next)
+                            model.choose(alignment: anchor)
                         } label: {
                             RoundedRectangle(cornerRadius: 3)
                                 .fill(selected
@@ -480,9 +555,9 @@ struct BackdropPanelView: View {
                 in: Double(range.lowerBound)...Double(range.upperBound),
                 onEditingChanged: { editing in
                     if editing {
-                        model.onBeginContinuousEdit?()
+                        model.beginContinuousEdit()
                     } else {
-                        model.onEndContinuousEdit?()
+                        model.endContinuousEdit()
                     }
                 })
                 .controlSize(.small)
@@ -524,6 +599,7 @@ enum BackdropPanelIdentifier {
     static let padding = "backdrop.panel.padding"
     static let corners = "backdrop.panel.corners"
     static let shadow = "backdrop.panel.shadow"
+    static let inset = "backdrop.panel.inset"
     static let ratio = "backdrop.panel.ratio"
     static let autoBalance = "backdrop.panel.autoBalance"
 

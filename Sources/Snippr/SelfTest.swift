@@ -9799,6 +9799,113 @@ enum SelfTest {
                       swatchFailures.prefix(6).joined(separator: " | "))
             }
 
+            // 1a-3. The panel's own contract: what a control means, and when
+            //       a drag is one edit rather than none or forty.
+            do {
+                var panelFailures: [String] = []
+                var applied: [BackdropStyle] = []
+                var groupsOpened = 0, groupsClosed = 0
+
+                func makeModel(
+                    _ start: BackdropStyle = .gradient("ocean")
+                ) -> BackdropPanelModel {
+                    applied.removeAll()
+                    groupsOpened = 0
+                    groupsClosed = 0
+                    let m = BackdropPanelModel(style: start)
+                    m.onApply = { style in
+                        applied.append(style)
+                        return true
+                    }
+                    m.onBeginContinuousEdit = { groupsOpened += 1 }
+                    m.onEndContinuousEdit = { groupsClosed += 1 }
+                    return m
+                }
+
+                // Picking a cell is a statement about where the shot sits, so
+                // it turns auto-balance off — and does it in ONE apply, or the
+                // user needs two undos to take back one click.
+                let align = makeModel()
+                if !align.style.autoBalance {
+                    panelFailures.append("fixture-autobalance-off")
+                }
+                align.choose(alignment: .tl)
+                if applied.count != 1 {
+                    panelFailures.append("alignment-applies \(applied.count)")
+                }
+                if align.style.alignment != .tl || align.style.autoBalance {
+                    panelFailures.append(
+                        "alignment \(align.style.alignment) ab \(align.style.autoBalance)")
+                }
+
+                // Turning auto-balance back on KEEPS the anchor: the
+                // compositor ignores it, and turning it off again must return
+                // the shot where the user last put it, not to the centre.
+                align.setAutoBalance(true)
+                if !align.style.autoBalance || align.style.alignment != .tl {
+                    panelFailures.append(
+                        "autobalance-loses-anchor \(align.style.alignment)")
+                }
+                align.setAutoBalance(false)
+                if align.style.alignment != .tl {
+                    panelFailures.append("anchor-not-restored")
+                }
+
+                // A drag that changes nothing must leave NO undo group. An
+                // empty group is one Cmd+Z that undoes nothing, which reads as
+                // a lost undo.
+                let empty = makeModel()
+                empty.beginContinuousEdit()
+                empty.endContinuousEdit()
+                if groupsOpened != 0 || groupsClosed != 0 {
+                    panelFailures.append(
+                        "empty-drag-groups \(groupsOpened)/\(groupsClosed)")
+                }
+
+                // A drag that does change something is exactly ONE group,
+                // however many steps it took.
+                let dragged = makeModel()
+                dragged.beginContinuousEdit()
+                for step in 1...20 {
+                    var next = dragged.style
+                    next.paddingFraction = 0.02 + CGFloat(step) * 0.005
+                    dragged.apply(next)
+                }
+                dragged.endContinuousEdit()
+                if groupsOpened != 1 || groupsClosed != 1 {
+                    panelFailures.append(
+                        "drag-groups \(groupsOpened)/\(groupsClosed)")
+                }
+                if applied.count != 20 {
+                    panelFailures.append("drag-applies \(applied.count)")
+                }
+
+                // The chip cache key carries the style's continuous fields, so
+                // a drag mints a new chip per step. It must not grow forever.
+                BackdropSwatch.resetCache()
+                for step in 0..<200 {
+                    var style = BackdropStyle.gradient("ocean")
+                    style.paddingFraction = 0.02 + CGFloat(step) * 0.0005
+                    _ = BackdropSwatch.image(for: style)
+                }
+                if BackdropSwatch.cacheCountForTesting > 96 {
+                    panelFailures.append(
+                        "cache-unbounded \(BackdropSwatch.cacheCountForTesting)")
+                }
+                BackdropSwatch.resetCache()
+                if BackdropSwatch.cacheCountForTesting != 0 {
+                    panelFailures.append("cache-not-cleared")
+                }
+
+                // The geometry group is only shown once a compositor reads it.
+                if !BackdropPanelFeature.geometryEnabled {
+                    panelFailures.append("geometry-hidden-after-wp3")
+                }
+                check("sliceB-backdrop-panel-contract",
+                      panelFailures.isEmpty,
+                      panelFailures.prefix(8).joined(separator: " | "))
+            }
+
             // 1b-2. The fill paints INSIDE the canvas and nowhere else.
             //
             // Every primitive the fill uses covers the current clip rather
