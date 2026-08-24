@@ -1,4 +1,6 @@
 import AppKit
+import CoreImage
+import ImageIO
 import Vision
 
 /// Slice B compositor: redaction, spotlight lighting and magnifier patches.
@@ -905,6 +907,32 @@ enum ForcedOuterComposeFailure {
     }
 }
 
+/// Test hook: wallpaper fill without touching the real desktop. Production
+/// never sets this. Compose can run off the main thread, so the slot is locked.
+enum BackdropFillOverride {
+    nonisolated(unsafe) private static var wallpaper: CGImage?
+    private static let lock = NSLock()
+
+    static var wallpaperImage: CGImage? {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return wallpaper
+        }
+        set {
+            lock.lock()
+            wallpaper = newValue
+            lock.unlock()
+        }
+    }
+
+    static func scopedWallpaper<T>(_ image: CGImage, _ body: () -> T) -> T {
+        wallpaperImage = image
+        defer { wallpaperImage = nil }
+        return body()
+    }
+}
+
 enum BackdropPreset: String, CaseIterable {
     case none, ocean, sunset, mint, graphite
 }
@@ -1080,9 +1108,23 @@ enum SliceBBackdrop {
         CGPoint(x: point.x - padding, y: point.y - padding)
     }
 
+    /// Extra dest-sized buffers a raster fill keeps alive during compose.
+    /// Gradient and solid paint into the outer context (no extra). Image /
+    /// wallpaper hold one dest-sized source. Blur keeps the scale-to-fill
+    /// raster and the CI output alive together (peak 2), not counting a
+    /// cache copy. Inner is counted by the caller, not here.
+    static func extraFillBuffers(for style: BackdropStyle) -> Int {
+        switch style.kind {
+        case .none, .gradient, .solid: return 0
+        case .image, .wallpaper: return 1
+        case .blurred: return 2
+        }
+    }
+
     /// Bytes the outer frame will occupy for a given inner image. Both buffers
     /// are alive at once during a compose, so the caller must reserve this
-    /// before it renders the inner one.
+    /// before it renders the inner one. Raster fills add extra dest-sized
+    /// copies (`extraFillBuffers`).
     static func reservedBytes(
         forInnerWidth width: Int, height: Int, preset: BackdropPreset,
         pixelScale: CGFloat = 1
@@ -1103,7 +1145,13 @@ enum SliceBBackdrop {
             let bytes = SliceBExport.byteCount(
                 width: outer.width, height: outer.height)
         else { return Int.max }
-        return bytes
+        var total = bytes
+        for _ in 0..<extraFillBuffers(for: style) {
+            let (next, overflow) = total.addingReportingOverflow(bytes)
+            if overflow { return Int.max }
+            total = next
+        }
+        return total
     }
 
     static func reservedBytes(
@@ -1214,6 +1262,7 @@ enum SliceBBackdrop {
         ctx.clip(to: CGRect(origin: .zero, size: size))
         guard drawFill(
             in: ctx, size: size, style: style,
+            pixelScale: pixelScale,
             documentPixelsPerUserUnit: documentPixelsPerUserUnit)
         else { return false }
         let scale = max(1, pixelScale)
@@ -1248,6 +1297,7 @@ enum SliceBBackdrop {
         // across the plate edge instead of restarting at the plate's origin.
         guard drawFill(
             in: ctx, size: size, style: style,
+            pixelScale: pixelScale,
             documentPixelsPerUserUnit: documentPixelsPerUserUnit) else {
             ctx.restoreGState()
             return false
@@ -1260,24 +1310,34 @@ enum SliceBBackdrop {
     /// wash from the upper left, and a deterministic grain that breaks up the
     /// banding a smooth ramp shows on an 8-bit display.
     ///
-    /// `documentPixelsPerUserUnit` is what keeps the grain the same SIZE in
-    /// both draw paths. Compose works in bitmap pixels (1), the preview works
-    /// in points (the document's scale), and the tile is specified in document
-    /// pixels — mixing the two makes a @2x preview show a grain twice the
-    /// period of the exported one.
+    /// Two independent scales:
+    /// - `pixelScale` is the scale of THIS context, the same argument
+    ///   `drawFrame` uses for corner radius and shadow. Preview is in points
+    ///   (1); export is in document pixels (the image scale). Blur radius is
+    ///   a point metric, so it multiplies this — preview 28×1 = 28pt, export
+    ///   28×2 = 56px = 28pt. Feeding grain's `documentPixelsPerUserUnit`
+    ///   here inverted the ratio and made a @2x preview 4× blurrier than
+    ///   the export.
+    /// - `documentPixelsPerUserUnit` keeps the grain the same SIZE in both
+    ///   draw paths. Compose works in bitmap pixels (1), the preview works
+    ///   in points (the document's scale), and the tile is specified in
+    ///   document pixels.
     @discardableResult
     static func drawFill(
         in ctx: CGContext, size: CGSize, preset: BackdropPreset,
+        pixelScale: CGFloat = 1,
         documentPixelsPerUserUnit: CGFloat = 1
     ) -> Bool {
         drawFill(
             in: ctx, size: size, style: .from(preset: preset),
+            pixelScale: pixelScale,
             documentPixelsPerUserUnit: documentPixelsPerUserUnit)
     }
 
     @discardableResult
     static func drawFill(
         in ctx: CGContext, size: CGSize, style: BackdropStyle,
+        pixelScale: CGFloat = 1,
         documentPixelsPerUserUnit: CGFloat = 1
     ) -> Bool {
         guard style.kind != .none else { return true }
@@ -1293,7 +1353,10 @@ enum SliceBBackdrop {
         ctx.saveGState()
         defer { ctx.restoreGState() }
         ctx.clip(to: CGRect(origin: .zero, size: size))
-        guard paintFill(in: ctx, size: size, style: style) else { return false }
+        guard paintFill(
+            in: ctx, size: size, style: style,
+            pixelScale: pixelScale)
+        else { return false }
 
         // Grain for every painted fill. v0 four keep their dedicated seed;
         // new ids hash the gradient id so the tile is stable across machines.
@@ -1321,10 +1384,12 @@ enum SliceBBackdrop {
         return true
     }
 
-    /// Linear ramp (+ v0 radial wash). Grain is applied by `drawFill`.
+    /// Linear ramp (+ radial wash), solid, scale-to-fill, or blur.
+    /// Grain is applied by `drawFill`.
     @discardableResult
     private static func paintFill(
-        in ctx: CGContext, size: CGSize, style: BackdropStyle
+        in ctx: CGContext, size: CGSize, style: BackdropStyle,
+        pixelScale: CGFloat
     ) -> Bool {
         if let preset = style.legacyPreset, preset != .none,
            BackdropGradientCatalog.v0ProductionIds.contains(preset.rawValue) {
@@ -1337,21 +1402,7 @@ enum SliceBBackdrop {
             let axis = gradientAxis(width: size.width, height: size.height)
             ctx.drawLinearGradient(
                 fill, start: axis.start, end: axis.end, options: [])
-            let wash = radialWash(for: preset)
-            guard let washGradient = CGGradient(
-                colorsSpace: CGColorSpace(name: CGColorSpace.sRGB)!,
-                colors: [wash.centre, wash.edge] as CFArray, locations: [0, 1])
-            else { return false }
-            ctx.drawRadialGradient(
-                washGradient,
-                startCenter: CGPoint(
-                    x: 0.22 * size.width, y: 0.78 * size.height),
-                startRadius: 0,
-                endCenter: CGPoint(
-                    x: 0.22 * size.width, y: 0.78 * size.height),
-                endRadius: hypot(size.width, size.height) * 0.85,
-                options: [])
-            return true
+            return paintWash(radialWash(for: preset), in: ctx, size: size)
         }
 
         switch style.kind {
@@ -1365,7 +1416,7 @@ enum SliceBBackdrop {
             let axis = gradientAxis(width: size.width, height: size.height)
             ctx.drawLinearGradient(
                 gradient, start: axis.start, end: axis.end, options: [])
-            return true
+            return paintCatalogWash(entry.wash, in: ctx, size: size)
         case .solid:
             let hex = style.solidColor ?? "#1C1F24"
             let color = BackdropGradientCatalog.nsColor(hex: hex)
@@ -1373,15 +1424,268 @@ enum SliceBBackdrop {
             ctx.setFillColor(color.cgColor)
             ctx.fill(CGRect(origin: .zero, size: size))
             return true
-        case .image, .wallpaper, .blurred:
-            // WP2: scale-to-fill / CIGaussianBlur. A dark plate until then
-            // so the frame is visible rather than transparent-on-black.
-            ctx.setFillColor(
-                NSColor(srgbRed: 0.11, green: 0.12, blue: 0.14, alpha: 1)
-                    .cgColor)
-            ctx.fill(CGRect(origin: .zero, size: size))
+        case .image:
+            guard let path = style.imagePath,
+                  let image = loadFillImage(path: path)
+            else { return paintFallbackPlate(in: ctx, size: size) }
+            drawScaleToFill(image, in: ctx, size: size)
+            return true
+        case .wallpaper:
+            guard let image = loadWallpaperImage()
+            else { return paintFallbackPlate(in: ctx, size: size) }
+            drawScaleToFill(image, in: ctx, size: size)
+            return true
+        case .blurred:
+            return paintBlurred(
+                in: ctx, size: size, style: style, pixelScale: pixelScale)
+        }
+    }
+
+    private static func paintWash(
+        _ wash: (centre: CGColor, edge: CGColor),
+        in ctx: CGContext, size: CGSize
+    ) -> Bool {
+        guard let washGradient = CGGradient(
+            colorsSpace: CGColorSpace(name: CGColorSpace.sRGB)!,
+            colors: [wash.centre, wash.edge] as CFArray, locations: [0, 1])
+        else { return false }
+        ctx.drawRadialGradient(
+            washGradient,
+            startCenter: CGPoint(x: 0.22 * size.width, y: 0.78 * size.height),
+            startRadius: 0,
+            endCenter: CGPoint(x: 0.22 * size.width, y: 0.78 * size.height),
+            endRadius: hypot(size.width, size.height) * 0.85,
+            options: [])
+        return true
+    }
+
+    private static func paintCatalogWash(
+        _ wash: BackdropWash, in ctx: CGContext, size: CGSize
+    ) -> Bool {
+        guard let base = BackdropGradientCatalog.nsColor(hex: wash.color)?
+            .usingColorSpace(.sRGB)
+        else { return false }
+        var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+        base.getRed(&r, green: &g, blue: &b, alpha: &a)
+        let centre = NSColor(srgbRed: r, green: g, blue: b, alpha: wash.alpha)
+            .cgColor
+        let edge = NSColor(srgbRed: r, green: g, blue: b, alpha: 0).cgColor
+        guard let washGradient = CGGradient(
+            colorsSpace: CGColorSpace(name: CGColorSpace.sRGB)!,
+            colors: [centre, edge] as CFArray, locations: [0, 1])
+        else { return false }
+        let center = CGPoint(
+            x: wash.centerUnit.x * size.width,
+            y: wash.centerUnit.y * size.height)
+        ctx.drawRadialGradient(
+            washGradient,
+            startCenter: center, startRadius: 0,
+            endCenter: center,
+            endRadius: hypot(size.width, size.height)
+                * wash.radiusDiagonalFactor,
+            options: [])
+        return true
+    }
+
+    private static func paintFallbackPlate(
+        in ctx: CGContext, size: CGSize
+    ) -> Bool {
+        ctx.setFillColor(
+            NSColor(srgbRed: 0.11, green: 0.12, blue: 0.14, alpha: 1).cgColor)
+        ctx.fill(CGRect(origin: .zero, size: size))
+        return true
+    }
+
+    private static func drawScaleToFill(
+        _ image: CGImage, in ctx: CGContext, size: CGSize
+    ) {
+        let iw = CGFloat(image.width), ih = CGFloat(image.height)
+        guard iw > 0, ih > 0, size.width > 0, size.height > 0 else { return }
+        let ratio = max(size.width / iw, size.height / ih)
+        let dw = iw * ratio, dh = ih * ratio
+        ctx.draw(image, in: CGRect(
+            x: (size.width - dw) / 2, y: (size.height - dh) / 2,
+            width: dw, height: dh))
+    }
+
+    private static func loadFillImage(path: String) -> CGImage? {
+        loadCGImage(url: URL(fileURLWithPath: path))
+    }
+
+    private static func loadWallpaperImage() -> CGImage? {
+        if let override = BackdropFillOverride.wallpaperImage { return override }
+        let screen = NSScreen.main ?? NSScreen.screens.first
+        guard let screen,
+              let url = NSWorkspace.shared.desktopImageURL(for: screen)
+        else { return nil }
+        return loadCGImage(url: url)
+    }
+
+    private static func loadCGImage(url: URL) -> CGImage? {
+        if let src = CGImageSourceCreateWithURL(url as CFURL, nil),
+           let image = CGImageSourceCreateImageAtIndex(src, 0, nil) {
+            return image
+        }
+        guard let ns = NSImage(contentsOf: url) else { return nil }
+        var rect = CGRect(origin: .zero, size: ns.size)
+        return ns.cgImage(forProposedRect: &rect, context: nil, hints: nil)
+    }
+
+    private struct BlurFillKey: Hashable {
+        var path: String
+        var radiusPx: Int
+        var width: Int
+        var height: Int
+    }
+
+    private static let blurFillLock = NSLock()
+    private nonisolated(unsafe) static var blurFillCache: [BlurFillKey: CGImage] = [:]
+    private nonisolated(unsafe) static var blurFillCacheOrder: [BlurFillKey] = []
+    private nonisolated(unsafe) static var blurFillCacheBytes = 0
+    private nonisolated(unsafe) static var lastBlurRadiusUserUnits: CGFloat = -1
+    /// Preview-size tiles stay. An export-size dest (~90 MB @2x on a large
+    /// capture) is painted once and is not worth keeping; a count cap of 8
+    /// would let eight of those sit at once.
+    private static let blurFillCacheByteCap = 128 * 1024 * 1024
+    private static let blurFillCacheEntryByteCap = 16 * 1024 * 1024
+    private static let ciContext = CIContext(options: [
+        .workingColorSpace: CGColorSpace(name: CGColorSpace.sRGB)!,
+        .outputColorSpace: CGColorSpace(name: CGColorSpace.sRGB)!,
+    ])
+
+    /// Radius actually handed to `CIGaussianBlur`, in the current context's
+    /// user units. Self-test compares the preview call tuple (pixelScale 1,
+    /// grain scale 2) against the export tuple (pixelScale 2, grain scale 1).
+    static var lastBlurRadiusForTesting: CGFloat {
+        blurFillLock.lock()
+        defer { blurFillLock.unlock() }
+        return lastBlurRadiusUserUnits
+    }
+
+    static func resetLastBlurRadiusForTesting() {
+        blurFillLock.lock()
+        lastBlurRadiusUserUnits = -1
+        blurFillLock.unlock()
+    }
+
+    static var blurFillCacheCountForTesting: Int {
+        blurFillLock.lock()
+        defer { blurFillLock.unlock() }
+        return blurFillCache.count
+    }
+
+    static func resetBlurFillCacheForTesting() {
+        blurFillLock.lock()
+        blurFillCache.removeAll(keepingCapacity: true)
+        blurFillCacheOrder.removeAll(keepingCapacity: true)
+        blurFillCacheBytes = 0
+        blurFillLock.unlock()
+    }
+
+    private static func recordLastBlurRadiusForTesting(_ radius: CGFloat) {
+        blurFillLock.lock()
+        lastBlurRadiusUserUnits = radius
+        blurFillLock.unlock()
+    }
+
+    private static func cgImageByteCount(_ image: CGImage) -> Int {
+        let row = image.bytesPerRow
+        if row > 0 { return row * image.height }
+        return image.width * image.height * 4
+    }
+
+    private static func rememberBlurFill(_ image: CGImage, key: BlurFillKey) {
+        let bytes = cgImageByteCount(image)
+        guard bytes > 0, bytes <= blurFillCacheEntryByteCap else { return }
+        blurFillLock.lock()
+        defer { blurFillLock.unlock() }
+        if blurFillCache[key] != nil { return }
+        while !blurFillCacheOrder.isEmpty,
+              blurFillCacheBytes + bytes > blurFillCacheByteCap {
+            let old = blurFillCacheOrder.removeFirst()
+            if let gone = blurFillCache.removeValue(forKey: old) {
+                blurFillCacheBytes = max(
+                    0, blurFillCacheBytes - cgImageByteCount(gone))
+            }
+        }
+        if blurFillCacheBytes + bytes > blurFillCacheByteCap { return }
+        blurFillCache[key] = image
+        blurFillCacheOrder.append(key)
+        blurFillCacheBytes += bytes
+    }
+
+    private static func paintBlurred(
+        in ctx: CGContext, size: CGSize, style: BackdropStyle,
+        pixelScale: CGFloat
+    ) -> Bool {
+        let source: CGImage?
+        let pathKey: String
+        switch style.blurSource ?? .wallpaper {
+        case .wallpaper:
+            source = loadWallpaperImage()
+            pathKey = "__wallpaper__"
+        case .image:
+            pathKey = style.imagePath ?? ""
+            source = style.imagePath.flatMap(loadFillImage)
+        }
+        guard let source else {
+            return paintFallbackPlate(in: ctx, size: size)
+        }
+        let destW = max(1, Int(ceil(size.width)))
+        let destH = max(1, Int(ceil(size.height)))
+        let radius = max(0, style.blurRadiusPt * max(1, pixelScale))
+        recordLastBlurRadiusForTesting(radius)
+        let key = BlurFillKey(
+            path: pathKey, radiusPx: Int((radius * 10).rounded()),
+            width: destW, height: destH)
+        blurFillLock.lock()
+        let cached = blurFillCache[key]
+        blurFillLock.unlock()
+        if let cached {
+            ctx.draw(cached, in: CGRect(origin: .zero, size: size))
             return true
         }
+        guard let scaled = rasterScaleToFill(
+            source, width: destW, height: destH)
+        else { return paintFallbackPlate(in: ctx, size: size) }
+        let painted: CGImage
+        if radius < 0.5 {
+            painted = scaled
+        } else if let blurred = gaussianBlur(scaled, radius: radius) {
+            painted = blurred
+        } else {
+            painted = scaled
+        }
+        rememberBlurFill(painted, key: key)
+        ctx.draw(painted, in: CGRect(origin: .zero, size: size))
+        return true
+    }
+
+    private static func rasterScaleToFill(
+        _ image: CGImage, width: Int, height: Int
+    ) -> CGImage? {
+        guard let ctx = CGContext(
+            data: nil, width: width, height: height, bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: CGColorSpace(name: CGColorSpace.sRGB)!,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        else { return nil }
+        drawScaleToFill(
+            image, in: ctx,
+            size: CGSize(width: width, height: height))
+        return ctx.makeImage()
+    }
+
+    private static func gaussianBlur(
+        _ image: CGImage, radius: CGFloat
+    ) -> CGImage? {
+        let input = CIImage(cgImage: image)
+        guard let filter = CIFilter(name: "CIGaussianBlur") else { return nil }
+        filter.setValue(input.clampedToExtent(), forKey: kCIInputImageKey)
+        filter.setValue(radius, forKey: kCIInputRadiusKey)
+        guard let output = filter.outputImage else { return nil }
+        let cropped = output.cropped(to: input.extent)
+        return ciContext.createCGImage(cropped, from: input.extent)
     }
 
     private static func catalogGradient(

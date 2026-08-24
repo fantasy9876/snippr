@@ -1,4 +1,5 @@
 import AppKit
+import ImageIO
 import Vision
 
 /// RED-only compile seam for S4. Before production owns a second history
@@ -9209,9 +9210,13 @@ enum SelfTest {
                     styleFailures.append("catalog ids \(ids)")
                 }
                 if BackdropGradientCatalog.entry(id: "ocean")?.stops
-                    != ["#4F7DF3", "#3B2FB8"]
+                    != ["#8BB4FF", "#4A7CF0", "#2E3DB8", "#1A1868"]
+                    || BackdropGradientCatalog.entry(id: "graphite")?
+                        .locations != BackdropGradientCatalog.graphiteLocations
                     || BackdropGradientCatalog.entry(id: "paper")?
                         .shadowAlphaAtStrength1 != 0.22
+                    || BackdropGradientCatalog.entry(id: "paper")?
+                        .wash.alpha != 0.10
                     || BackdropGradientCatalog.visualAxis
                         != "topLeftToBottomRight" {
                     styleFailures.append("catalog bytes")
@@ -9289,6 +9294,205 @@ enum SelfTest {
                 check("sliceB-backdrop-style-v0-parity",
                       styleFailures.isEmpty,
                       styleFailures.prefix(6).joined(separator: " | "))
+            }
+
+            // WP2: JSON v2 catalog + wash on the 8 new ids, plus solid /
+            // image / wallpaper / blur fills and the extra dest-sized reserve.
+            do {
+                var fillFailures: [String] = []
+                for id in BackdropGradientCatalog.ids {
+                    guard let e = BackdropGradientCatalog.entry(id: id) else {
+                        fillFailures.append("missing \(id)")
+                        continue
+                    }
+                    if e.stops.count != 4 || e.locations.count != 4 {
+                        fillFailures.append("\(id) stops \(e.stops.count)")
+                    }
+                    if e.wash.centerUnit != CGPoint(x: 0.22, y: 0.78)
+                        || abs(e.wash.radiusDiagonalFactor - 0.85) > 0.001 {
+                        fillFailures.append("\(id) wash geom")
+                    }
+                }
+                let lavender = BackdropGradientCatalog.entry(id: "lavender")
+                if lavender?.stops != ["#C6B5FC", "#A78BFA", "#6D48D7", "#3C2876"]
+                    || lavender?.wash.color != "#F5F0FF"
+                    || lavender?.wash.alpha != 0.18 {
+                    fillFailures.append("lavender v2")
+                }
+                let inner = makeSolidImage(
+                    width: 50, height: 40, color: NSColor.white.cgColor)
+                let ocean = SliceBBackdrop.compose(
+                    image: inner, style: .gradient("ocean"),
+                    budgetBytes: SliceBExport.defaultBudgetBytes)
+                let lavenderFrame = SliceBBackdrop.compose(
+                    image: inner, style: .gradient("lavender"),
+                    budgetBytes: SliceBExport.defaultBudgetBytes)
+                if lavenderFrame == nil {
+                    fillFailures.append("lavender compose")
+                } else if let ocean, let lavenderFrame,
+                          imagesEqual(ocean, lavenderFrame) {
+                    fillFailures.append("lavender==ocean")
+                }
+                let red = SliceBBackdrop.compose(
+                    image: inner, style: .solid("#EF4444"),
+                    budgetBytes: SliceBExport.defaultBudgetBytes)
+                if let red, !cornerIsMostly(red, rMin: 180, gMax: 130, bMax: 130) {
+                    fillFailures.append("solid-red corner")
+                } else if red == nil {
+                    fillFailures.append("solid compose")
+                }
+                let fillDir = URL(fileURLWithPath: NSTemporaryDirectory())
+                    .appendingPathComponent("snippr-wp2-fill")
+                try? FileManager.default.createDirectory(
+                    at: fillDir, withIntermediateDirectories: true)
+                let redURL = fillDir.appendingPathComponent("red.png")
+                let halfURL = fillDir.appendingPathComponent("half.png")
+                if !writePNG(
+                    makeSolidImage(
+                        width: 10, height: 10,
+                        color: NSColor(srgbRed: 1, green: 0, blue: 0, alpha: 1)
+                            .cgColor),
+                    to: redURL)
+                {
+                    fillFailures.append("write red png")
+                }
+                let half = makeLeftRightImage(
+                    width: 80, height: 40,
+                    left: NSColor.black.cgColor, right: NSColor.white.cgColor)
+                if !writePNG(half, to: halfURL) {
+                    fillFailures.append("write half png")
+                }
+                let fromFile = SliceBBackdrop.compose(
+                    image: inner, style: .image(redURL.path),
+                    budgetBytes: SliceBExport.defaultBudgetBytes)
+                if let fromFile,
+                   !cornerIsMostly(fromFile, rMin: 180, gMax: 80, bMax: 80) {
+                    fillFailures.append("image-red corner")
+                } else if fromFile == nil {
+                    fillFailures.append("image compose")
+                }
+                let green = makeSolidImage(
+                    width: 12, height: 12,
+                    color: NSColor(srgbRed: 0, green: 1, blue: 0, alpha: 1)
+                        .cgColor)
+                let papered = BackdropFillOverride.scopedWallpaper(green) {
+                    SliceBBackdrop.compose(
+                        image: inner, style: .wallpaper(),
+                        budgetBytes: SliceBExport.defaultBudgetBytes)
+                }
+                if let papered,
+                   !cornerIsMostly(papered, rMax: 80, gMin: 180, bMax: 80) {
+                    fillFailures.append("wallpaper-green corner")
+                } else if papered == nil {
+                    fillFailures.append("wallpaper compose")
+                }
+                let sharp = SliceBBackdrop.compose(
+                    image: inner, style: .image(halfURL.path),
+                    budgetBytes: SliceBExport.defaultBudgetBytes)
+                var blurStyle = BackdropStyle.blurred(
+                    source: .image, imagePath: halfURL.path)
+                blurStyle.blurRadiusPt = 28
+                let blurred = SliceBBackdrop.compose(
+                    image: inner, style: blurStyle,
+                    budgetBytes: SliceBExport.defaultBudgetBytes)
+                if sharp == nil || blurred == nil {
+                    fillFailures.append("blur compose")
+                } else if let sharp, let blurred, imagesEqual(sharp, blurred) {
+                    fillFailures.append("blur==sharp")
+                }
+                // Preview draws in POINTS (pixelScale 1, grain = layout.pixelScale);
+                // export compose draws in PIXELS (pixelScale = image scale, grain = 1).
+                // The two must yield the same visual radius: 28pt, i.e. 56px @2x.
+                func blurRadiusViaDrawFrame(
+                    pixelScale: CGFloat, documentPixelsPerUserUnit: CGFloat
+                ) -> CGFloat {
+                    let w = 80, h = 50
+                    var bytes = [UInt8](repeating: 0, count: w * h * 4)
+                    guard let c = CGContext(
+                        data: &bytes, width: w, height: h,
+                        bitsPerComponent: 8, bytesPerRow: w * 4,
+                        space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+                    else { return -1 }
+                    SliceBBackdrop.resetLastBlurRadiusForTesting()
+                    _ = SliceBBackdrop.drawFrame(
+                        in: c,
+                        size: CGSize(width: w, height: h),
+                        target: CGRect(x: 10, y: 10, width: 60, height: 30),
+                        style: blurStyle,
+                        pixelScale: pixelScale,
+                        documentPixelsPerUserUnit: documentPixelsPerUserUnit)
+                    return SliceBBackdrop.lastBlurRadiusForTesting
+                }
+                let previewRadius = blurRadiusViaDrawFrame(
+                    pixelScale: 1, documentPixelsPerUserUnit: 2)
+                let exportRadius = blurRadiusViaDrawFrame(
+                    pixelScale: 2, documentPixelsPerUserUnit: 1)
+                if abs(previewRadius - 28) > 0.01
+                    || abs(exportRadius - 56) > 0.01 {
+                    fillFailures.append(
+                        "blur radius preview \(previewRadius) export \(exportRadius)")
+                }
+                if SliceBBackdrop.extraFillBuffers(for: blurStyle) != 2 {
+                    fillFailures.append(
+                        "extraFillBuffers blurred \(SliceBBackdrop.extraFillBuffers(for: blurStyle))")
+                }
+                let kept = BackdropStyle.blurred(
+                    source: .image, imagePath: "/tmp/x.png")
+                if kept.imagePath != "/tmp/x.png" || kept.blurSource != .image {
+                    fillFailures.append("blur imagePath clamped away")
+                }
+                if BackdropStyle.image("/tmp/x.png").imagePath == nil {
+                    fillFailures.append("image path clamped")
+                }
+                let oceanReserve = SliceBBackdrop.reservedBytes(
+                    forInnerWidth: 50, height: 40, style: .gradient("ocean"))
+                let imageReserve = SliceBBackdrop.reservedBytes(
+                    forInnerWidth: 50, height: 40, style: .image("/tmp/x.png"))
+                let blurReserve = SliceBBackdrop.reservedBytes(
+                    forInnerWidth: 50, height: 40, style: blurStyle)
+                if oceanReserve == Int.max || imageReserve != oceanReserve * 2 {
+                    fillFailures.append(
+                        "reserve ocean \(oceanReserve) image \(imageReserve)")
+                }
+                if oceanReserve == Int.max || blurReserve != oceanReserve * 3 {
+                    fillFailures.append(
+                        "reserve blur \(blurReserve) ocean \(oceanReserve)")
+                }
+                // Small preview-size blur is worth caching. An export-size
+                // dest (>16 MB) is used once and must not occupy a slot.
+                SliceBBackdrop.resetBlurFillCacheForTesting()
+                _ = blurRadiusViaDrawFrame(
+                    pixelScale: 1, documentPixelsPerUserUnit: 1)
+                if SliceBBackdrop.blurFillCacheCountForTesting != 1 {
+                    fillFailures.append(
+                        "small blur cache \(SliceBBackdrop.blurFillCacheCountForTesting)")
+                }
+                do {
+                    let big = 2300
+                    var bigStyle = blurStyle
+                    bigStyle.blurRadiusPt = 1
+                    var bigBytes = [UInt8](
+                        repeating: 0, count: big * big * 4)
+                    if let bigCtx = CGContext(
+                        data: &bigBytes, width: big, height: big,
+                        bitsPerComponent: 8, bytesPerRow: big * 4,
+                        space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+                    {
+                        _ = SliceBBackdrop.drawFill(
+                            in: bigCtx,
+                            size: CGSize(width: big, height: big),
+                            style: bigStyle)
+                    }
+                    if SliceBBackdrop.blurFillCacheCountForTesting != 1 {
+                        fillFailures.append(
+                            "export-size blur cached \(SliceBBackdrop.blurFillCacheCountForTesting)")
+                    }
+                }
+                check("sliceB-backdrop-fills-wp2",
+                      fillFailures.isEmpty,
+                      fillFailures.prefix(8).joined(separator: " | "))
             }
 
             // 1b-2. The fill paints INSIDE the canvas and nowhere else.
@@ -21034,6 +21238,42 @@ enum SelfTest {
         c.setFillColor(color)
         c.fill(CGRect(x: 0, y: 0, width: width, height: height))
         return c.makeImage()!
+    }
+
+    private static func makeLeftRightImage(
+        width: Int, height: Int, left: CGColor, right: CGColor
+    ) -> CGImage {
+        let c = ctx(width, height)
+        c.setFillColor(left)
+        c.fill(CGRect(x: 0, y: 0, width: width / 2, height: height))
+        c.setFillColor(right)
+        c.fill(CGRect(
+            x: width / 2, y: 0, width: width - width / 2, height: height))
+        return c.makeImage()!
+    }
+
+    private static func writePNG(_ image: CGImage, to url: URL) -> Bool {
+        guard let dest = CGImageDestinationCreateWithURL(
+            url as CFURL, "public.png" as CFString, 1, nil)
+        else { return false }
+        CGImageDestinationAddImage(dest, image, nil)
+        return CGImageDestinationFinalize(dest)
+    }
+
+    /// Frame corner (bottom-left pixel) after grain: a painted fill, not the
+    /// inner plate. Loose bounds because overlay grain nudges luma by ±2.
+    private static func cornerIsMostly(
+        _ image: CGImage,
+        rMin: UInt8 = 0, rMax: UInt8 = 255,
+        gMin: UInt8 = 0, gMax: UInt8 = 255,
+        bMin: UInt8 = 0, bMax: UInt8 = 255
+    ) -> Bool {
+        let bytes = rgbaBytes(image)
+        guard bytes.count >= 4 else { return false }
+        let r = bytes[0], g = bytes[1], b = bytes[2]
+        return r >= rMin && r <= rMax
+            && g >= gMin && g <= gMax
+            && b >= bMin && b <= bMax
     }
 
     private static func makeNoiseImage(width: Int, height: Int) -> CGImage {
