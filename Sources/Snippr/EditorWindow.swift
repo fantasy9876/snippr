@@ -1,4 +1,5 @@
 import AppKit
+import SwiftUI
 
 // MARK: - Editor window controller
 
@@ -28,6 +29,11 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
     private var cropActionBar: NSStackView!
     private var scrollView: NSScrollView!
     private var documentWrapper: BackdropDocumentView!
+    /// Option A sidebar. Built with the window and kept hidden, so a headless
+    /// gate can drive the real controls without a window ever being shown.
+    private var backdropPanelContainer: NSView!
+    private var backdropPanelWidth: NSLayoutConstraint!
+    private(set) var backdropPanelModel: BackdropPanelModel!
     private var keepsImageFitted = true
     private let forceFitForTesting: Bool
 
@@ -199,10 +205,10 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
 
         var toolViews: [NSView] = []
         for tool in EditorTool.allCases {
-            // Backdrop is a document style, so its button opens the preset
-            // menu rather than entering a drawing mode.
+            // Backdrop is a document style, so its button opens the sidebar
+            // rather than entering a drawing mode.
             let action = tool == .backdrop
-                ? #selector(showBackdropMenu(_:))
+                ? #selector(toggleBackdropPanel(_:))
                 : #selector(toolTapped(_:))
             let b = makeButton(symbol: tool.symbol, tooltip: tool.tooltip, action: action)
             b.identifier = NSUserInterfaceItemIdentifier(tool.rawValue)
@@ -327,6 +333,9 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
         hoverHint.attach(
             to: toolButtons.values.map { $0 }
                 + actionButtons.map { $0.button } + [sizeBadge])
+        buildBackdropPanel()
+
+        contentView.addSubview(backdropPanelContainer)
         contentView.addSubview(scrollView)
         contentView.addSubview(bar)
         contentView.addSubview(cropActions)
@@ -339,8 +348,15 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
             stack.trailingAnchor.constraint(equalTo: bar.trailingAnchor),
             stack.topAnchor.constraint(equalTo: bar.topAnchor),
             stack.bottomAnchor.constraint(equalTo: bar.bottomAnchor),
+            backdropPanelContainer.topAnchor.constraint(equalTo: bar.bottomAnchor),
+            backdropPanelContainer.leadingAnchor.constraint(
+                equalTo: contentView.leadingAnchor),
+            backdropPanelContainer.bottomAnchor.constraint(
+                equalTo: contentView.bottomAnchor),
+            backdropPanelWidth,
             scrollView.topAnchor.constraint(equalTo: bar.bottomAnchor),
-            scrollView.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
+            scrollView.leadingAnchor.constraint(
+                equalTo: backdropPanelContainer.trailingAnchor),
             scrollView.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
             scrollView.bottomAnchor.constraint(equalTo: contentView.bottomAnchor),
             cropActions.centerXAnchor.constraint(equalTo: scrollView.centerXAnchor),
@@ -473,6 +489,10 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
     /// The wrapper follows the document; both read the same layout, so the
     /// preview cannot describe a different frame than the export produces.
     func refreshBackdropLayout() {
+        // The canvas is the source of truth. Undo, or a preset applied from
+        // anywhere but the panel, has to move the panel's selection too or it
+        // will show a chip the document is not wearing.
+        backdropPanelModel?.syncFromCanvas(canvas.backdropStyle)
         let layout = canvas.backdropLayout
         guard let documentWrapper, documentWrapper.layout != layout else { return }
         documentWrapper.applyLayout(layout)
@@ -618,81 +638,97 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
         canvas.applyBackdrop(preset)
     }
 
-    /// The real preset menu. Opening it changes nothing; only choosing an item
-    /// applies a preset, and choosing the current one is a no-op.
+    /// The real chooser. Opening it changes nothing; only choosing a control
+    /// applies anything, and choosing what is already in force is a no-op.
     /// One policy for both entry points: never touches the active tool.
     func openBackdropChooser() {
-        guard let button = backdropButton else { return }
-        showBackdropMenu(button)
+        toggleBackdropPanel(backdropButton)
     }
 
-    /// Built separately from being shown: `popUp` runs a nested event loop, so
-    /// a headless gate can exercise the real items, targets and actions only if
-    /// construction stands on its own.
-    func backdropMenu() -> NSMenu {
-        let menu = NSMenu(title: "Backdrop")
-        for (index, preset) in BackdropPreset.allCases.enumerated() {
-            let item = NSMenuItem(
-                title: preset == .none ? "None" : preset.rawValue.capitalized,
-                action: #selector(backdropPresetChosen(_:)), keyEquivalent: "")
-            item.target = self
-            item.tag = index
-            // The menu has two sections now. Naming them is what lets a gate
-            // say "one preset ticked and one corner ticked" instead of
-            // counting rows and hoping.
-            item.identifier = SliceBBackdrop.presetItemIdentifier
-            item.state = preset == canvas.backdropPreset ? .on : .off
-            menu.addItem(item)
+    // MARK: backdrop panel
+
+    /// Built with the window, not on first click: `NSHostingView` sizing
+    /// settles on a layout pass, and a panel created inside the click handler
+    /// showed its first frame at zero width. Kept collapsed until asked for —
+    /// the same "build separated from show" the menu it replaced followed, so
+    /// a headless gate can drive the real controls without a window on screen.
+    private func buildBackdropPanel() {
+        let model = BackdropPanelModel(style: canvas.backdropStyle)
+        // Both entry points end in `onStateChange`, which is already wired to
+        // `refreshBackdropLayout` — the panel does not repaint the document
+        // itself, or two owners would be deciding when the frame is stale.
+        model.onApply = { [weak self] style in
+            self?.canvas.applyBackdropStyle(style) ?? false
         }
-        // The corner choice lives in the SAME menu as the preset: it is a
-        // property of the frame, and a user looking for it will look here
-        // before they look in Settings.
-        menu.addItem(.separator())
-        for style in BackdropCornerStyle.allCases {
-            let item = NSMenuItem(
-                title: style.title,
-                action: #selector(backdropCornerChosen(_:)), keyEquivalent: "")
-            item.target = self
-            item.tag = BackdropCornerStyle.allCases.firstIndex(of: style) ?? 0
-            item.identifier = SliceBBackdrop.cornerItemIdentifier
-            item.state = style == canvas.backdropStyle.cornerStyle ? .on : .off
-            menu.addItem(item)
+        model.onCornerStyle = { [weak self] corner in
+            self?.canvas.applyBackdropCornerStyle(corner)
         }
-        return menu
+        // A drag is ONE edit. The canvas registers single-field undo per
+        // change, so without this group a user dragging Padding across forty
+        // steps would need forty undos to get back where they started.
+        model.onBeginContinuousEdit = { [weak self] in
+            self?.canvas.undoManager?.beginUndoGrouping()
+        }
+        model.onEndContinuousEdit = { [weak self] in
+            self?.canvas.undoManager?.endUndoGrouping()
+        }
+        backdropPanelModel = model
+
+        let hosting = NSHostingView(rootView: BackdropPanelView(model: model))
+        hosting.translatesAutoresizingMaskIntoConstraints = false
+        hosting.identifier = NSUserInterfaceItemIdentifier(
+            BackdropPanelIdentifier.root)
+
+        let container = NSView()
+        container.translatesAutoresizingMaskIntoConstraints = false
+        container.wantsLayer = true
+        container.layer?.backgroundColor = NSColor(white: 0.11, alpha: 1).cgColor
+        // The panel CLIPS instead of compressing: a collapsed sidebar has to
+        // give the canvas its width back completely, not leave a sliver of
+        // chrome the user cannot get rid of.
+        container.clipsToBounds = true
+        container.addSubview(hosting)
+        NSLayoutConstraint.activate([
+            hosting.topAnchor.constraint(equalTo: container.topAnchor),
+            hosting.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+            hosting.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            hosting.widthAnchor.constraint(
+                equalToConstant: BackdropPanelView.width),
+        ])
+        backdropPanelContainer = container
+        backdropPanelWidth = container.widthAnchor.constraint(equalToConstant: 0)
     }
 
-    /// Sender is an NSMenuItem, so the style travels as an Int tag.
-    @objc func backdropCornerChosen(_ sender: NSMenuItem) {
-        let styles = BackdropCornerStyle.allCases
-        guard styles.indices.contains(sender.tag) else { return }
-        canvas.applyBackdropCornerStyle(styles[sender.tag])
-        // Corner now lives on `BackdropLayout.style`, so a layout rebuild
-        // picks up the new radius for the clip, the hairline and the hit test.
-        documentWrapper?.applyLayout(canvas.backdropLayout)
-        documentWrapper?.needsDisplay = true
-        canvas.needsDisplay = true
+    /// An unbuilt panel is CLOSED, not open: `nil != 0` reads as true and
+    /// would have a controller with no sidebar claim to be showing one.
+    var isBackdropPanelOpen: Bool { (backdropPanelWidth?.constant ?? 0) != 0 }
+
+    var backdropPanelContainerForTesting: NSView? { backdropPanelContainer }
+
+    /// Opening or closing the panel is NOT an edit: it must not touch the
+    /// document, the active tool or the undo stack.
+    func setBackdropPanelOpen(_ open: Bool) {
+        guard let backdropPanelWidth else { return }
+        let target: CGFloat = open ? BackdropPanelView.width : 0
+        guard backdropPanelWidth.constant != target else { return }
+        backdropPanelWidth.constant = target
+        backdropPanelModel?.syncFromCanvas(canvas.backdropStyle)
+        backdropButton?.contentTintColor = open ? .controlAccentColor : .lightGray
+        window?.contentView?.layoutSubtreeIfNeeded()
+        // The viewport just changed width, so a fitted document is no longer
+        // fitted — the same reason a frame change refits.
+        guard keepsImageFitted else { return }
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.keepsImageFitted else { return }
+            self.fitImageToWindow()
+        }
     }
 
-    @objc func showBackdropMenu(_ sender: NSButton) {
-        // popUp runs a nested event loop: a hint still on screen would sit
-        // under the menu until the loop exits.
+    @objc func toggleBackdropPanel(_ sender: NSButton?) {
         hoverHint.hide()
-        let menu = backdropMenu()
-        backdropMenuForTesting = menu
-        menu.popUp(
-            positioning: nil,
-            at: NSPoint(x: 0, y: sender.bounds.height), in: sender)
+        setBackdropPanelOpen(!isBackdropPanelOpen)
     }
 
-    /// Sender is an NSMenuItem, so the preset travels as an Int tag rather than
-    /// a Swift enum, which is not representable in Objective-C.
-    @objc func backdropPresetChosen(_ sender: NSMenuItem) {
-        let presets = BackdropPreset.allCases
-        guard presets.indices.contains(sender.tag) else { return }
-        canvas.applyBackdrop(presets[sender.tag])
-    }
-
-    private(set) var backdropMenuForTesting: NSMenu?
 
     @objc private func toolTapped(_ sender: NSButton) {
         hoverHint.hide()
