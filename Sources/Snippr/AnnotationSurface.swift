@@ -974,12 +974,13 @@ final class AnnotationSurface: RedactionHost, RedactionJobObserver {
     /// the intersecting region; it never materializes a second full stitch.
     private func drawAnnotations(
         in ctx: CGContext, base: CGImage, visiblePixels: CGRect,
-        extra: [Annotation] = []
+        extra: [Annotation] = [],
+        marks: [Annotation]? = nil
     ) -> Bool {
         // One renderer for every surface: phases, regional pixelation and the
         // opaque fail-closed cover all live in SliceBCompositor.
         return SliceBCompositor.draw(
-            annotations + extra, in: ctx, base: base,
+            (marks ?? annotations) + extra, in: ctx, base: base,
             visiblePixels: visiblePixels, pixelScale: pixelScale)
     }
 
@@ -1101,11 +1102,18 @@ final class AnnotationSurface: RedactionHost, RedactionJobObserver {
     /// exactly as the user left it.
     func flattened(
         base: CGImage, cropPixels: CGRect, extra: [Annotation] = [],
-        destinationSpace: CGColorSpace? = nil
+        destinationSpace: CGColorSpace? = nil,
+        omittingSpotlights: Bool = false
     ) -> CGImage? {
         let crop = cropPixels.integral
         guard crop.width >= 1, crop.height >= 1 else { return nil }
-        guard !annotations.isEmpty || !extra.isEmpty else {
+        let marks = omittingSpotlights
+            ? annotations.filter { !($0 is SpotlightAnnotation) }
+            : annotations
+        let extraMarks = omittingSpotlights
+            ? extra.filter { !($0 is SpotlightAnnotation) }
+            : extra
+        guard !marks.isEmpty || !extraMarks.isEmpty else {
             // No drawings. Normally a plain (shared-storage) crop materialized
             // once — but when a destination space is demanded the pixels have
             // to be converted INTO it here, or the frame would be composed in
@@ -1142,7 +1150,8 @@ final class AnnotationSurface: RedactionHost, RedactionJobObserver {
         RenderTrace.record(
             kind: "destination", destination: "\(width)x\(height)", rect: crop)
         guard drawAnnotations(
-            in: ctx, base: base, visiblePixels: visibleBL, extra: extra)
+            in: ctx, base: base, visiblePixels: visibleBL,
+            extra: extraMarks, marks: marks)
         else { return nil }
         return ctx.makeImage()
     }

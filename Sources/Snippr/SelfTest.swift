@@ -17814,6 +17814,230 @@ enum SelfTest {
                 wc.window?.close()
             }
 
+            // 8d. Overlay → editor must not bake spotlight dim. Flatten
+            //     omits the holes, handoff keeps live annotations (drop a
+            //     miss, keep a partial, preserve dim), and a second hole
+            //     in the editor shares one dim layer — the 1.2.14 bug was
+            //     double darkness + a stacked "frame" on the old hole.
+            handoffCheck: do {
+                SliceBCompositor.multipleSpotlightOverrideForTesting = true
+                defer {
+                    SliceBCompositor.multipleSpotlightOverrideForTesting = nil
+                }
+                var handoffFails: [String] = []
+                let white = makeSolidImage(
+                    width: 200, height: 120, color: NSColor.white.cgColor)
+                // CGImage crop, top-left. BL origin of this crop is (20, 10).
+                let crop = CGRect(x: 20, y: 10, width: 160, height: 100)
+                let surface = AnnotationSurface(pixelScale: 1)
+                surface.redactionBaseBounds = CGRect(
+                    x: 0, y: 0, width: 200, height: 120)
+                let inCrop = SpotlightAnnotation(uiScale: 1)
+                inCrop.rect = CGRect(x: 40, y: 30, width: 40, height: 30)
+                inCrop.baseBounds = surface.redactionBaseBounds
+                inCrop.dimFraction = 0.3
+                surface.addAnnotationForTesting(inCrop)
+                let miss = SpotlightAnnotation(uiScale: 1)
+                miss.rect = CGRect(x: 0, y: 0, width: 10, height: 8)
+                miss.baseBounds = surface.redactionBaseBounds
+                miss.dimFraction = 0.3
+                surface.addAnnotationForTesting(miss)
+                let partial = SpotlightAnnotation(uiScale: 1)
+                partial.rect = CGRect(x: 10, y: 20, width: 30, height: 20)
+                partial.baseBounds = surface.redactionBaseBounds
+                partial.dimFraction = 0.3
+                surface.addAnnotationForTesting(partial)
+
+                guard let baked = surface.flattened(
+                    base: white, cropPixels: crop),
+                      let omitted = surface.flattened(
+                        base: white, cropPixels: crop,
+                        omittingSpotlights: true)
+                else {
+                    check("sliceB-overlay-editor-spotlight-handoff",
+                          false, "flatten")
+                    break handoffCheck
+                }
+                let bakedOut = luma(probe2(baked, 5, 5))
+                let omittedOut = luma(probe2(omitted, 5, 5))
+                if omittedOut < 240 {
+                    handoffFails.append("omitted-dim \(omittedOut)")
+                }
+                if bakedOut >= omittedOut - 8 {
+                    handoffFails.append(
+                        "copy-still-bakes \(bakedOut)/\(omittedOut)")
+                }
+                let holeInCrop = luma(probe2(baked, 25, 25))
+                if holeInCrop < 240 {
+                    handoffFails.append("baked-hole \(holeInCrop)")
+                }
+
+                let handed = SpotlightAnnotation.handoffForCroppedEditor(
+                    from: surface.annotations, cropPixels: crop,
+                    imageHeight: 120)
+                if handed.count != 2 {
+                    handoffFails.append("count \(handed.count)")
+                }
+                if handed.contains(where: {
+                    abs($0.dimFraction - 0.3) > 0.0001
+                }) {
+                    handoffFails.append(
+                        "dim \(handed.map { $0.dimFraction })")
+                }
+                if abs((handed.first?.rect.minX ?? -1) - 20) > 0.01
+                    || abs((handed.first?.rect.minY ?? -1) - 20) > 0.01 {
+                    handoffFails.append(
+                        "in-crop \(String(describing: handed.first?.rect))")
+                }
+                if abs((handed.last?.rect.minX ?? 0) + 10) > 0.01
+                    || abs((handed.last?.rect.minY ?? 0) - 10) > 0.01 {
+                    handoffFails.append(
+                        "partial \(String(describing: handed.last?.rect))")
+                }
+                let canvasBounds = CGRect(
+                    x: 0, y: 0, width: 160, height: 100)
+                if handed.contains(where: { $0.baseBounds != canvasBounds }) {
+                    handoffFails.append("baseBounds")
+                }
+
+                let wc = EditorWindowController.open(
+                    with: CapturedImage(cgImage: omitted, scale: 1),
+                    forceFitForTesting: true,
+                    annotations: handed)
+                wc.window?.setContentSize(NSSize(width: 560, height: 420))
+                let canvas = wc.canvasForTesting
+                let opened = canvas.annotations
+                    .compactMap { $0 as? SpotlightAnnotation }
+                if opened.count != 2 {
+                    handoffFails.append("opened \(opened.count)")
+                }
+                if opened.contains(where: {
+                    abs($0.dimFraction - 0.3) > 0.0001
+                }) {
+                    handoffFails.append(
+                        "opened-dim \(opened.map { $0.dimFraction })")
+                }
+                wc.selectTool(.spotlight)
+                canvas.dragForTesting(
+                    from: CGPoint(x: 90, y: 40),
+                    to: CGPoint(x: 130, y: 70))
+                let live = canvas.annotations
+                    .compactMap { $0 as? SpotlightAnnotation }
+                if live.count != 3 {
+                    handoffFails.append("second \(live.count)")
+                }
+                if live.contains(where: {
+                    abs($0.dimFraction - 0.3) > 0.0001
+                }) {
+                    handoffFails.append(
+                        "inherit \(live.map { $0.dimFraction })")
+                }
+                guard let exported = canvas.flattened()?.cgImage else {
+                    handoffFails.append("export")
+                    wc.window?.close()
+                    check("sliceB-overlay-editor-spotlight-handoff",
+                          false, handoffFails.joined(separator: " | "))
+                    break handoffCheck
+                }
+                let once = AnnotationRenderer.render(
+                    base: omitted, annotations: live, pixellated: nil)
+                let outL = luma(probe2(exported, 5, 5))
+                let holeL = luma(probe2(exported, 25, 25))
+                let onceOut = luma(probe2(once, 5, 5))
+                let baseL = luma(probe2(omitted, 5, 5))
+                // One 0.3 layer on white is ~178; two stacked layers ~125.
+                if holeL < 240 {
+                    handoffFails.append("old-hole-dimmed \(holeL)")
+                }
+                if Swift.abs(outL - onceOut) > 4 {
+                    handoffFails.append("compose \(outL)/\(onceOut)")
+                }
+                if outL > 210 {
+                    handoffFails.append("not-dimmed \(outL)")
+                }
+                if outL < 150 {
+                    handoffFails.append("double-dim \(outL) base \(baseL)")
+                }
+                wc.window?.close()
+
+                // Call site: Open in Editor hands the spy an unbaked crop.
+                if let screen = NSScreen.screens.first {
+                    let frozenImage = makeSolidImage(
+                        width: Int(screen.frame.width * 2),
+                        height: Int(screen.frame.height * 2),
+                        color: NSColor.white.cgColor)
+                    var editorImages: [CGImage] = []
+                    let overlay = SelectionOverlay(
+                        purpose: .areaReview,
+                        inputs: OverlaySessionInputs(
+                            afterShow: true, afterCopy: false,
+                            afterSave: false),
+                        completion: { _ in })
+                    overlay.routerDependenciesOverride =
+                        CaptureActionRouter.Dependencies(
+                            copyToClipboard: { _ in },
+                            autoSave: { _, _ in },
+                            saveAs: { _, _ in },
+                            pin: { _ in }, ocr: { _ in },
+                            openEditor: { editorImages.append($0.cgImage) },
+                            toast: { _ in },
+                            setLastCapture: { _ in },
+                            setLastAreaRect: { _ in },
+                            logEvent: { _ in })
+                    let view = SelectionOverlayView(
+                        mode: .area, screen: screen,
+                        frozen: CapturedImage(
+                            cgImage: frozenImage, scale: 2),
+                        windowList: [], owner: overlay)
+                    view.selectForTesting(
+                        rect: CGRect(x: 80, y: 80, width: 240, height: 180))
+                    let px = overlay.session.pixelRect
+                    let origin = EditableSelectionGeometry.annotationOffset(
+                        forPixelCrop: px,
+                        imageHeight: CGFloat(frozenImage.height))
+                    if let liveSurface = view.annotationSurface {
+                        let hole = SpotlightAnnotation(uiScale: 2)
+                        hole.rect = CGRect(
+                            x: origin.x + 40, y: origin.y + 40,
+                            width: 50, height: 40)
+                        hole.baseBounds = CGRect(
+                            x: 0, y: 0,
+                            width: frozenImage.width,
+                            height: frozenImage.height)
+                        hole.dimFraction = 0.3
+                        liveSurface.addAnnotationForTesting(hole)
+                    } else {
+                        handoffFails.append("no-surface")
+                    }
+                    view.openBackdropEditorForTesting()
+                    if editorImages.count != 1 {
+                        handoffFails.append(
+                            "editor-calls \(editorImages.count)")
+                    } else {
+                        let handedImage = editorImages[0]
+                        let dimSample = luma(probe2(handedImage, 8, 8))
+                        let holeX = min(65, handedImage.width - 2)
+                        let holeY = min(60, handedImage.height - 2)
+                        let holeSample = luma(probe2(handedImage, holeX, holeY))
+                        if dimSample < 240 {
+                            handoffFails.append(
+                                "call-site-baked \(dimSample)")
+                        }
+                        if holeSample < 240 {
+                            handoffFails.append(
+                                "call-site-hole \(holeSample)")
+                        }
+                    }
+                    overlay.dismissForTesting()
+                } else {
+                    handoffFails.append("no-screen")
+                }
+
+                check("sliceB-overlay-editor-spotlight-handoff",
+                      handoffFails.isEmpty,
+                      handoffFails.prefix(8).joined(separator: " | "))
+            }
+
             // 9. Real key routing + real toolbar + symbol fallback
             let uiWC = EditorWindowController.open(
                 with: CapturedImage(

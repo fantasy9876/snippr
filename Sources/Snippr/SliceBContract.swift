@@ -308,6 +308,41 @@ final class SpotlightAnnotation: Annotation {
         c.color = color
         return c
     }
+
+    /// Overlay → editor. Dim is compose-once global state, so the hole
+    /// travels as a live annotation rather than baked pixels.
+    ///
+    /// `cropPixels` is the CGImage crop (top-left). Annotation space is
+    /// bottom-left. A hole that misses the crop is dropped so it cannot
+    /// occupy an undo slot as an invisible mark; a partial overlap keeps
+    /// the translated rect (the compositor clips). Order is preserved so
+    /// `drawSpotlights` still reads the group's dim from `.last`.
+    static func handoffForCroppedEditor(
+        from annotations: [Annotation],
+        cropPixels: CGRect,
+        imageHeight: CGFloat
+    ) -> [SpotlightAnnotation] {
+        let crop = cropPixels.integral
+        guard crop.width >= 1, crop.height >= 1 else { return [] }
+        let origin = EditableSelectionGeometry.annotationOffset(
+            forPixelCrop: crop, imageHeight: imageHeight)
+        let canvas = CGRect(
+            x: 0, y: 0, width: crop.width, height: crop.height)
+        var out: [SpotlightAnnotation] = []
+        for annotation in annotations {
+            guard let spot = annotation as? SpotlightAnnotation,
+                  let clone = spot.copyAnnotation() as? SpotlightAnnotation
+            else { continue }
+            clone.translateForDocumentChange(
+                by: CGPoint(x: -origin.x, y: -origin.y))
+            guard clone.rect.intersects(canvas),
+                  clone.rect.width > 0, clone.rect.height > 0
+            else { continue }
+            clone.baseBounds = canvas
+            out.append(clone)
+        }
+        return out
+    }
 }
 
 /// The document's backdrop, carried as an annotation.

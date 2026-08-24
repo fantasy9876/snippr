@@ -871,20 +871,23 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
     /// Popover "Open in Editor…": the crop plus overlay marks as the
     /// document, the current overlay style as live Backdrop state. Baking
     /// the frame first would put a second plate around it the moment the
-    /// sidebar changed padding. The toolbar's macwindow action still sends
-    /// the composed picture — that path has no document to carry a style.
+    /// sidebar changed padding. Spotlight dim is compose-once global
+    /// state, not a local mark — flatten everything except the holes and
+    /// hand the live annotations to the editor so a second hole cannot
+    /// stack darkness. Copy/Save/OCR still bake through `reviewPayload`.
+    /// The toolbar's macwindow action still sends the composed picture —
+    /// that path has no document to carry a style.
     private func openBackdropEditor() {
         hoverHint.hide()
         guard !annotationDragging, areaDrag == nil else { return }
         guard let owner, owner.session.acceptsCommits,
               let selection = areaSelection?.intersection(bounds),
               selection.width >= 4, selection.height >= 4,
-              frozen != nil
+              let frozen
         else { return }
         let prospectiveText = prospectiveTextAnnotation()
         let canonical = syncSessionPixelRect() ?? selection
-        guard let payload = reviewPayload(prospectiveText: prospectiveText)
-        else {
+        func payloadFailed() {
             let message = lastPayloadFailure == .backdrop
                 ? "Không dựng được nền Backdrop — thử preset khác"
                 : "Không xuất được ảnh có nét vẽ — thử lại"
@@ -894,8 +897,16 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
                 ToastHUD.show(
                     message, on: window?.screen ?? screen, above: window?.level)
             }
-            return
         }
+        guard let payload = reviewPayload(prospectiveText: prospectiveText)
+        else { payloadFailed(); return }
+        guard let editorPayload = reviewPayload(
+            prospectiveText: prospectiveText, omittingSpotlights: true)
+        else { payloadFailed(); return }
+        let handoff = SpotlightAnnotation.handoffForCroppedEditor(
+            from: annotationSurface?.annotations ?? [],
+            cropPixels: owner.session.pixelRect,
+            imageHeight: CGFloat(frozen.cgImage.height))
         endTextEntry(commit: true)
         hideBackdropMini()
         var passStyle: BackdropStyle? = overlayDrawStyle
@@ -905,14 +916,15 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
         if let deps = owner.routerDependenciesOverride {
             deps.setLastCapture(payload.visual)
             deps.setLastAreaRect(global)
-            deps.openEditor(payload.semantic)
+            deps.openEditor(editorPayload.semantic)
             return
         }
         AppServices.lastCapture = payload.visual
         Settings.shared.lastAreaRect = global
         EditorWindowController.open(
-            with: payload.semantic, backdrop: passStyle,
-            openBackdropPanel: true)
+            with: editorPayload.semantic, backdrop: passStyle,
+            openBackdropPanel: true,
+            annotations: handoff)
     }
 
     /// Clips the live caption to the crop the export will produce — rounded
@@ -2113,7 +2125,8 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
     /// session's integral pixelRect — the view rect is quantized exactly
     /// once, in syncSessionPixelRect.
     fileprivate func reviewPayload(
-        prospectiveText: TextAnnotation? = nil
+        prospectiveText: TextAnnotation? = nil,
+        omittingSpotlights: Bool = false
     ) -> ReviewPayload? {
         lastPayloadFailure = .render
         guard let owner, let frozen else { return nil }
@@ -2154,7 +2167,8 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
            !surface.isEmpty || !extra.isEmpty || destinationSpace != nil {
             guard let flat = surface.flattened(
                 base: frozen.cgImage, cropPixels: px, extra: extra,
-                destinationSpace: destinationSpace)
+                destinationSpace: destinationSpace,
+                omittingSpotlights: omittingSpotlights)
             else { return nil }
             inner = flat
         } else {
