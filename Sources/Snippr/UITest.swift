@@ -41,6 +41,13 @@ enum UITest {
         smallEditor.window?.setContentSize(NSSize(width: 820, height: 560))
         // Tall scrolling result: its fit factor is below the old 10% zoom
         // floor, which used to leave both scrollers visible in "Fit" mode.
+        // Backdrop sidebar (Option A), open and wearing a gradient: the panel
+        // is the one piece of editor chrome a snapshot has to catch, because
+        // its width comes off the canvas and a layout mistake is invisible in
+        // a headless gate.
+        fittedEditor.canvasForTesting.applyBackdropStyle(
+            BackdropStyle.gradient("lagoon"))
+        fittedEditor.setBackdropPanelOpen(true)
         let tall = CapturedImage(cgImage: SelfTest.makeTestImage(width: 400, height: 24_000), scale: 2)
         let tallEditor = EditorWindowController.open(with: tall, forceFitForTesting: true)
         tallEditor.selectTool(.crop)
