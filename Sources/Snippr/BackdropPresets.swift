@@ -122,3 +122,67 @@ enum BackdropPresetStore {
         Settings.shared.backdropAutoApplyPreset = nil
     }
 }
+
+// MARK: - Auto-apply routing
+//
+// `handleResult` used to pick destinations inline, next to clipboard
+// and disk writes. The two halves (open-with-style, compose) were
+// testable; the CHOICE was not. The choice lives here so a gate can
+// pin it without those side effects. `handleResult` only carries out
+// the plan. Copy/save/rescue bake regardless of afterShow — that
+// guard was the WP7 bug.
+
+enum BackdropAutoApply {
+    /// Where a capture goes after auto-apply has been decided.
+    enum Destination: Equatable {
+        /// Original pixels, style as document state. Nil style is a bare
+        /// editor — auto-apply off, or the user chose none.
+        case editor(style: BackdropStyle?)
+        /// No editor. Copy/save receive `exportImage`, which is composed
+        /// when a style is in force and the original when it is not.
+        case export
+    }
+
+    struct Plan {
+        /// Pixels copy, save, and the rescue copy receive. Composed when
+        /// a pixel route will actually read them — or the original,
+        /// fail-closed. Independent of whether the editor also opens.
+        var exportImage: CapturedImage
+        var destination: Destination
+
+        var opensEditor: Bool {
+            if case .editor = destination { return true }
+            return false
+        }
+    }
+
+    /// One style, one decision. `compose` is injected so a gate can count
+    /// calls and force a failure without touching `SaveService`.
+    ///
+    /// Whether the editor opens does not decide what copy/save receive.
+    /// Pixel routes (copy, save, or the rescue copy when nothing is
+    /// configured) get a composed bitmap. The editor always gets the
+    /// original plus document state. Editor-only does not call `compose`:
+    /// a capture that nobody will export must not pay for a frame.
+    static func plan(
+        image: CapturedImage,
+        afterShow: Bool,
+        afterCopy: Bool,
+        afterSave: Bool,
+        style: BackdropStyle?,
+        compose: (CapturedImage, BackdropStyle) -> CapturedImage?
+    ) -> Plan {
+        let destination: Destination = afterShow
+            ? .editor(style: style)
+            : .export
+        // Copy, save, or the rescue copy when no action is configured.
+        // `afterShow` is not in this expression: that was the WP7 bug.
+        let needsPixels = afterCopy || afterSave || !afterShow
+        guard needsPixels, let style, style.kind != .none else {
+            return Plan(exportImage: image, destination: destination)
+        }
+        return Plan(
+            exportImage: compose(image, style) ?? image,
+            destination: destination)
+    }
+}

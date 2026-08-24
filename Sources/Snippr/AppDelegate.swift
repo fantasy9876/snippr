@@ -526,59 +526,63 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         //
         // Composed at most once, and only if some pixel route actually asks:
         // an editor-only capture must not pay for a frame nobody reads.
+        // `BackdropAutoApply.plan` is that choice, so a gate can pin it
+        // without touching the clipboard. This function only carries it out.
         //
         // Scrolling captures deliberately do NOT come through here — they route
         // via ScrollResultPresenter — so auto-apply does not frame a scrollshot.
         // A 20,000pt strip gains nothing from padding and would be the first
         // thing to hit the byte budget.
         let autoBackdrop = BackdropPresetStore.autoApplyStyle
-        var composedForPixels: CapturedImage?
-        func pixels() -> CapturedImage {
-            guard let style = autoBackdrop else { return image }
-            if let ready = composedForPixels { return ready }
-            let made = Self.compose(image, backdrop: style) ?? image
-            composedForPixels = made
-            return made
-        }
+        let plan = BackdropAutoApply.plan(
+            image: image,
+            afterShow: s.afterShow,
+            afterCopy: copied,
+            afterSave: s.afterSave,
+            style: autoBackdrop,
+            compose: { Self.compose($0, backdrop: $1) })
+        let framed = plan.exportImage
 
         if copied {
-            SaveService.shared.copyToClipboard(pixels())
+            SaveService.shared.copyToClipboard(framed)
         }
         if s.afterSave {
             // encoding runs in the background; announce when it lands (only
             // when no editor opens — same visibility rule as before)
-            let announce = !s.afterShow
-            let toSave = pixels()
-            SaveService.shared.save(toSave) { url in
+            let announce = !plan.opensEditor
+            SaveService.shared.save(framed) { url in
                 guard announce else { return }
                 var toasts: [String] = copied ? ["copied"] : []
                 if let url {
                     toasts.append("saved \(url.lastPathComponent)")
                 } else {
                     // the only configured action failed — rescue the shot
-                    if !copied { SaveService.shared.copyToClipboard(toSave) }
+                    if !copied { SaveService.shared.copyToClipboard(framed) }
                     toasts.append(copied ? "save failed" : "save failed — copied instead")
                 }
                 ToastHUD.show("Screenshot \(toasts.joined(separator: " · "))")
             }
         }
 
-        if s.afterShow {
+        switch plan.destination {
+        case .editor(let style):
             if source == .area && s.afterCropShow == .thumbnail {
                 ThumbnailHUD.show(image) { img in
-                    EditorWindowController.open(with: img, backdrop: autoBackdrop)
+                    EditorWindowController.open(with: img, backdrop: style)
                 }
             } else {
-                EditorWindowController.open(with: image, backdrop: autoBackdrop)
+                EditorWindowController.open(with: image, backdrop: style)
             }
-        } else if s.afterSave {
-            // toast arrives from the save completion above
-        } else if copied {
-            ToastHUD.show("Screenshot copied")
-        } else {
-            // nothing configured — at least copy so the shot isn't lost
-            SaveService.shared.copyToClipboard(pixels())
-            ToastHUD.show("Screenshot copied to clipboard")
+        case .export:
+            if s.afterSave {
+                // toast arrives from the save completion above
+            } else if copied {
+                ToastHUD.show("Screenshot copied")
+            } else {
+                // nothing configured — at least copy so the shot isn't lost
+                SaveService.shared.copyToClipboard(framed)
+                ToastHUD.show("Screenshot copied to clipboard")
+            }
         }
     }
 }

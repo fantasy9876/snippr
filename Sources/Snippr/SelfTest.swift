@@ -10053,6 +10053,216 @@ enum SelfTest {
                       presetFailures.prefix(8).joined(separator: " | "))
             }
 
+            // 1a-5. The branch that CHOOSES editor-as-state vs copy/save-as-
+            //       pixels. The two halves are gated above; this is the
+            //       missing middle. It is a pure plan — compose is injected
+            //       so the gate never touches the clipboard or the disk.
+            //
+            // Copy/save/rescue do NOT depend on afterShow (the WP7 bug
+            // was `!afterShow` skipping the bake when the editor opened).
+            // Editor-only does not compose: a capture nobody will export
+            // must not pay for a frame.
+            //
+            // Intended mutation: `needsPixels = !afterShow` (the old guard)
+            // → `copy-show-left-bare`.
+            do {
+                var routeFailures: [String] = []
+                let shot = CapturedImage(
+                    cgImage: SelfTest.makeTestImage(width: 200, height: 160),
+                    scale: 1)
+                var lagoon = BackdropStyle.gradient("lagoon")
+                lagoon.paddingFraction = 0.11
+                var composeCalls = 0
+                func bake(
+                    _ image: CapturedImage, _ style: BackdropStyle
+                ) -> CapturedImage? {
+                    composeCalls += 1
+                    return AppDelegate.compose(image, backdrop: style)
+                }
+                func plan(
+                    show: Bool, copy: Bool = false, save: Bool = false,
+                    style: BackdropStyle?,
+                    compose: (CapturedImage, BackdropStyle) -> CapturedImage?
+                        = bake
+                ) -> BackdropAutoApply.Plan {
+                    BackdropAutoApply.plan(
+                        image: shot, afterShow: show, afterCopy: copy,
+                        afterSave: save, style: style, compose: compose)
+                }
+                let layout = BackdropLayout(
+                    innerPixels: CGSize(width: 200, height: 160),
+                    pixelScale: 1, style: lagoon.clamped())
+                func isComposed(_ image: CapturedImage) -> Bool {
+                    image.cgImage !== shot.cgImage
+                        && image.cgImage.width == Int(layout.outerPixelSize.width)
+                        && image.cgImage.height == Int(layout.outerPixelSize.height)
+                }
+
+                // Editor-only + style: document state, no bake.
+                composeCalls = 0
+                let shown = plan(show: true, style: lagoon)
+                if composeCalls != 0 {
+                    routeFailures.append("editor-only-composed \(composeCalls)")
+                }
+                if shown.exportImage.cgImage !== shot.cgImage {
+                    routeFailures.append("editor-only-baked")
+                }
+                if case .editor(let style) = shown.destination {
+                    if style != lagoon {
+                        routeFailures.append(
+                            "editor-style \(style?.gradientId ?? "nil")")
+                    }
+                } else {
+                    routeFailures.append("editor-not-document")
+                }
+
+                // Copy WHILE the editor opens: clipboard is composed, editor
+                // is still document state. This is the WP7 bug if export
+                // stays the original.
+                composeCalls = 0
+                let copyShow = plan(show: true, copy: true, style: lagoon)
+                if composeCalls != 1 {
+                    routeFailures.append("copy-show-calls \(composeCalls)")
+                }
+                if !isComposed(copyShow.exportImage) {
+                    routeFailures.append("copy-show-left-bare")
+                }
+                if case .editor(let style) = copyShow.destination {
+                    if style != lagoon {
+                        routeFailures.append("copy-show-lost-style")
+                    }
+                } else {
+                    routeFailures.append("copy-show-no-editor")
+                }
+
+                // Save WHILE the editor opens: file is composed, editor
+                // is still document state. Same WP7 bug on the save
+                // route — Honey's A3.
+                composeCalls = 0
+                let saveShow = plan(show: true, save: true, style: lagoon)
+                if composeCalls != 1 {
+                    routeFailures.append("save-show-calls \(composeCalls)")
+                }
+                if !isComposed(saveShow.exportImage) {
+                    routeFailures.append("save-show-left-bare")
+                }
+                if case .editor(let style) = saveShow.destination {
+                    if style != lagoon {
+                        routeFailures.append("save-show-lost-style")
+                    }
+                } else {
+                    routeFailures.append("save-show-no-editor")
+                }
+
+                // Save-only + style: compose once, no editor. Honey A4.
+                composeCalls = 0
+                let saveOnly = plan(show: false, save: true, style: lagoon)
+                if composeCalls != 1 {
+                    routeFailures.append("save-only-calls \(composeCalls)")
+                }
+                if saveOnly.opensEditor {
+                    routeFailures.append("save-only-opens-editor")
+                }
+                if !isComposed(saveOnly.exportImage) {
+                    routeFailures.append("save-only-left-bare")
+                }
+
+                // Copy AND save, with editor: one bake, one bitmap.
+                composeCalls = 0
+                let both = plan(
+                    show: true, copy: true, save: true, style: lagoon)
+                if composeCalls != 1 {
+                    routeFailures.append("copy-save-calls \(composeCalls)")
+                }
+                if !isComposed(both.exportImage) {
+                    routeFailures.append("copy-save-left-bare")
+                }
+                if !both.opensEditor {
+                    routeFailures.append("copy-save-no-editor")
+                }
+
+                // Copy-only + style: compose once, no editor.
+                composeCalls = 0
+                let baked = plan(show: false, copy: true, style: lagoon)
+                if composeCalls != 1 {
+                    routeFailures.append("bake-calls \(composeCalls)")
+                }
+                if baked.opensEditor {
+                    routeFailures.append("bake-opens-editor")
+                }
+                if !isComposed(baked.exportImage) {
+                    routeFailures.append("bake-left-bare")
+                }
+
+                // Rescue copy (nothing configured) still bakes.
+                composeCalls = 0
+                let rescue = plan(show: false, style: lagoon)
+                if composeCalls != 1 {
+                    routeFailures.append("rescue-calls \(composeCalls)")
+                }
+                if rescue.opensEditor {
+                    routeFailures.append("rescue-opens-editor")
+                }
+                if !isComposed(rescue.exportImage) {
+                    routeFailures.append("rescue-left-bare")
+                }
+
+                // Compose refuses: keep the shot, copy+show still opens editor.
+                let refused = plan(
+                    show: true, copy: true, style: lagoon,
+                    compose: { _, _ in nil })
+                if refused.exportImage.cgImage !== shot.cgImage {
+                    routeFailures.append("fail-closed-lost-shot")
+                }
+                if !refused.opensEditor {
+                    routeFailures.append("fail-closed-drops-editor")
+                }
+
+                // Editor with no style stays bare, and does not compose.
+                composeCalls = 0
+                let bareEditor = plan(show: true, style: nil)
+                if composeCalls != 0 {
+                    routeFailures.append("bare-editor-composed")
+                }
+                if case .editor(let style) = bareEditor.destination {
+                    if style != nil {
+                        routeFailures.append("bare-editor-got-style")
+                    }
+                } else {
+                    routeFailures.append("bare-editor-not-opened")
+                }
+
+                // Copy with no style: original, no compose, no editor.
+                composeCalls = 0
+                let bareExport = plan(show: false, copy: true, style: nil)
+                if composeCalls != 0 {
+                    routeFailures.append("none-composed")
+                }
+                if bareExport.exportImage.cgImage !== shot.cgImage {
+                    routeFailures.append("none-baked")
+                }
+                if bareExport.opensEditor {
+                    routeFailures.append("none-opens-editor")
+                }
+
+                // `.none` is the identity, not a bake — even on the export
+                // route. `autoApplyStyle` already filters this; plan must
+                // too, or a caller that skipped the store would still bake.
+                composeCalls = 0
+                let identity = plan(
+                    show: false, copy: true, style: BackdropStyle.none)
+                if composeCalls != 0 {
+                    routeFailures.append("kind-none-composed")
+                }
+                if identity.exportImage.cgImage !== shot.cgImage {
+                    routeFailures.append("kind-none-baked")
+                }
+
+                check("sliceB-backdrop-autoapply-route",
+                      routeFailures.isEmpty,
+                      routeFailures.prefix(8).joined(separator: " | "))
+            }
+
             // 1b-2. The fill paints INSIDE the canvas and nowhere else.
             //
             // Every primitive the fill uses covers the current clip rather
