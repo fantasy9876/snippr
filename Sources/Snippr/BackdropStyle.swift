@@ -30,12 +30,29 @@ enum BackdropBlurSource: String, Codable, CaseIterable, Hashable {
     case wallpaper, image
 }
 
-/// One named fill from `RESEARCH/snippr-backdrop-spec/gradients-v1.json`.
+/// Radial wash from Honey JSON v2. Additive on the catalog entry — not a
+/// `BackdropStyle` field. Geometry matches production: centre (0.22, 0.78)
+/// in CoreGraphics y-up units, radius 0.85 × diagonal.
+struct BackdropWash: Equatable, Hashable {
+    let color: String
+    let alpha: CGFloat
+    let centerUnit: CGPoint
+    let radiusDiagonalFactor: CGFloat
+
+    static func family(color: String, alpha: CGFloat) -> BackdropWash {
+        BackdropWash(
+            color: color, alpha: alpha,
+            centerUnit: CGPoint(x: 0.22, y: 0.78),
+            radiusDiagonalFactor: 0.85)
+    }
+}
+
+/// One named fill from `RESEARCH/snippr-backdrop-spec/gradients-v1.json` v2.
 /// `id` is the `gradientId` key Honey WP6 must bind swatches to.
 struct BackdropGradientEntry: Equatable, Hashable {
     let id: String
     let name: String
-    /// sRGB `#RRGGBB`, at least two.
+    /// sRGB `#RRGGBB`, four stops in JSON v2 (graphite locations differ).
     let stops: [String]
     let locations: [CGFloat]
     let isLight: Bool
@@ -44,6 +61,7 @@ struct BackdropGradientEntry: Equatable, Hashable {
     /// dark plates, 0.22 on paper/fog so the same black does not read as dirt.
     let shadowAlphaAtStrength1: CGFloat
     let meanLuminance: CGFloat
+    let wash: BackdropWash
 }
 
 enum BackdropGradientCatalog {
@@ -55,44 +73,64 @@ enum BackdropGradientCatalog {
     static let gdiPlusUnitStart = CGPoint(x: 0, y: 0)
     static let gdiPlusUnitEnd = CGPoint(x: 1, y: 1)
 
+    /// Shared 4-stop locations. Graphite is the exception (0.32 / 0.68).
+    static let familyLocations: [CGFloat] = [0, 0.28, 0.62, 1]
+    static let graphiteLocations: [CGFloat] = [0, 0.32, 0.68, 1]
+
     static let entries: [BackdropGradientEntry] = [
-        .init(id: "ocean", name: "Ocean",
-              stops: ["#4F7DF3", "#3B2FB8"], locations: [0, 1],
-              isLight: false, shadowAlphaAtStrength1: 0.35, meanLuminance: 0.146),
-        .init(id: "sunset", name: "Sunset",
-              stops: ["#FF8A4C", "#E8447F"], locations: [0, 1],
-              isLight: false, shadowAlphaAtStrength1: 0.35, meanLuminance: 0.314),
-        .init(id: "mint", name: "Mint",
-              stops: ["#2FD3A5", "#1E9E8F"], locations: [0, 1],
-              isLight: false, shadowAlphaAtStrength1: 0.35, meanLuminance: 0.383),
-        .init(id: "graphite", name: "Graphite",
-              stops: ["#3A3F46", "#1C1F24"], locations: [0, 1],
-              isLight: false, shadowAlphaAtStrength1: 0.35, meanLuminance: 0.031),
-        .init(id: "lavender", name: "Lavender",
-              stops: ["#A78BFA", "#6D48D7"], locations: [0, 1],
-              isLight: false, shadowAlphaAtStrength1: 0.35, meanLuminance: 0.232),
-        .init(id: "rose", name: "Rose",
-              stops: ["#FB7AA8", "#C0348E"], locations: [0, 1],
-              isLight: false, shadowAlphaAtStrength1: 0.35, meanLuminance: 0.264),
-        .init(id: "ember", name: "Ember",
-              stops: ["#FBBF5C", "#D64545"], locations: [0, 1],
-              isLight: false, shadowAlphaAtStrength1: 0.35, meanLuminance: 0.388),
-        .init(id: "meadow", name: "Meadow",
-              stops: ["#A8E063", "#3F9142"], locations: [0, 1],
-              isLight: false, shadowAlphaAtStrength1: 0.35, meanLuminance: 0.421),
-        .init(id: "lagoon", name: "Lagoon",
-              stops: ["#5AD1E8", "#2A7FB8"], locations: [0, 1],
-              isLight: false, shadowAlphaAtStrength1: 0.35, meanLuminance: 0.364),
-        .init(id: "midnight", name: "Midnight",
-              stops: ["#2B3A67", "#0E1330"], locations: [0, 1],
-              isLight: false, shadowAlphaAtStrength1: 0.35, meanLuminance: 0.026),
-        .init(id: "paper", name: "Paper",
-              stops: ["#F4F1EA", "#D9D2C4"], locations: [0, 1],
-              isLight: true, shadowAlphaAtStrength1: 0.22, meanLuminance: 0.765),
-        .init(id: "fog", name: "Fog",
-              stops: ["#DCE3EC", "#A9B6C7"], locations: [0, 1],
-              isLight: true, shadowAlphaAtStrength1: 0.22, meanLuminance: 0.611),
+        entry("ocean", "Ocean",
+              ["#8BB4FF", "#4A7CF0", "#2E3DB8", "#1A1868"],
+              luma: 0.192, wash: "#FFFFFF", washAlpha: 0.20),
+        entry("sunset", "Sunset",
+              ["#FFD08A", "#FF7E4A", "#E63D78", "#7A2288"],
+              luma: 0.334, wash: "#FFE8C0", washAlpha: 0.18),
+        entry("mint", "Mint",
+              ["#9AF5D4", "#3DDCB0", "#1A9A8A", "#0A4550"],
+              luma: 0.406, wash: "#E8FFF6", washAlpha: 0.16),
+        entry("graphite", "Graphite",
+              ["#5A6270", "#343A46", "#1C2028", "#0B0D11"],
+              locations: graphiteLocations,
+              luma: 0.045, wash: "#8B9BB8", washAlpha: 0.14),
+        entry("lavender", "Lavender",
+              ["#C6B5FC", "#A78BFA", "#6D48D7", "#3C2876"],
+              luma: 0.256, wash: "#F5F0FF", washAlpha: 0.18),
+        entry("rose", "Rose",
+              ["#FCAAC7", "#FB7AA8", "#C0348E", "#6A1D4E"],
+              luma: 0.277, wash: "#FFEEF6", washAlpha: 0.18),
+        entry("ember", "Ember",
+              ["#FCD697", "#FBBF5C", "#D64545", "#762626"],
+              luma: 0.385, wash: "#FFF0D6", washAlpha: 0.18),
+        entry("meadow", "Meadow",
+              ["#C7EB9B", "#A8E063", "#3F9142", "#235024"],
+              luma: 0.411, wash: "#F0FFE6", washAlpha: 0.16),
+        entry("lagoon", "Lagoon",
+              ["#95E1F0", "#5AD1E8", "#2A7FB8", "#174665"],
+              luma: 0.362, wash: "#EBFCFF", washAlpha: 0.18),
+        entry("midnight", "Midnight",
+              ["#6E7CAE", "#3F5290", "#2B3A67", "#0E1330"],
+              luma: 0.088, wash: "#C8D6FF", washAlpha: 0.14),
+        entry("paper", "Paper",
+              ["#FAF9F5", "#F4F1EA", "#D9D2C4", "#BFB9AC"],
+              isLight: true, shadow: 0.22,
+              luma: 0.741, wash: "#FFFFFF", washAlpha: 0.10),
+        entry("fog", "Fog",
+              ["#E9EEF4", "#DCE3EC", "#A9B6C7", "#919DAB"],
+              isLight: true, shadow: 0.22,
+              luma: 0.601, wash: "#FFFFFF", washAlpha: 0.10),
     ]
+
+    private static func entry(
+        _ id: String, _ name: String, _ stops: [String],
+        locations: [CGFloat] = [0, 0.28, 0.62, 1],
+        isLight: Bool = false, shadow: CGFloat = 0.35,
+        luma: CGFloat, wash: String, washAlpha: CGFloat
+    ) -> BackdropGradientEntry {
+        BackdropGradientEntry(
+            id: id, name: name, stops: stops, locations: locations,
+            isLight: isLight, shadowAlphaAtStrength1: shadow,
+            meanLuminance: luma,
+            wash: .family(color: wash, alpha: washAlpha))
+    }
 
     static let ids: [String] = entries.map(\.id)
 
@@ -101,9 +139,10 @@ enum BackdropGradientCatalog {
     }
 
     /// The four v0 ids whose production fill is the 4-stop + wash + grain
-    /// table in `SliceBBackdrop`, NOT the 2-stop JSON. JSON 2-stop colours
-    /// stay as swatch chips and as the migrate key; shipping Ocean is the
-    /// richer ramp. WP2 must not replace those four ramps with 2-stop.
+    /// table in `SliceBBackdrop`, not `entry.stops` / `entry.wash`. Catalog
+    /// bytes now match JSON v2 / production (so swatches and Windows agree),
+    /// but the renderer still bypasses the catalog for these four — a later
+    /// catalog edit cannot change a v1.2.7 Ocean export.
     static let v0ProductionIds: Set<String> = [
         "ocean", "sunset", "mint", "graphite",
     ]
@@ -226,6 +265,29 @@ struct BackdropStyle: Equatable, Hashable, Codable {
         return s.clamped()
     }
 
+    static func image(_ path: String) -> BackdropStyle {
+        var s = none
+        s.kind = .image
+        s.imagePath = path
+        return s.clamped()
+    }
+
+    static func wallpaper() -> BackdropStyle {
+        var s = none
+        s.kind = .wallpaper
+        return s.clamped()
+    }
+
+    static func blurred(
+        source: BackdropBlurSource, imagePath: String? = nil
+    ) -> BackdropStyle {
+        var s = none
+        s.kind = .blurred
+        s.blurSource = source
+        s.imagePath = imagePath
+        return s.clamped()
+    }
+
     /// Map the v0 five-case enum. Corner comes from Settings at the call
     /// site when the user is choosing a preset; tests pass the default.
     static func from(
@@ -291,7 +353,9 @@ struct BackdropStyle: Equatable, Hashable, Codable {
         s.blurRadiusPt = Self.clamp(blurRadiusPt, Self.blurRadiusRange)
         if s.kind != .gradient { s.gradientId = nil }
         if s.kind != .solid { s.solidColor = nil }
-        if s.kind != .image { s.imagePath = nil }
+        let keepImagePath = s.kind == .image
+            || (s.kind == .blurred && s.blurSource == .image)
+        if !keepImagePath { s.imagePath = nil }
         if s.kind != .blurred {
             s.blurSource = nil
         }
