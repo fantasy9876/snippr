@@ -15,6 +15,24 @@ enum BackdropKind: String, Codable, CaseIterable, Hashable {
 
 enum BackdropAlignment: String, Codable, CaseIterable, Hashable {
     case tl, tc, tr, cl, cc, cr, bl, bc, br
+
+    /// −1 left, 0 centre, +1 right.
+    var horizontal: Int {
+        switch self {
+        case .tl, .cl, .bl: return -1
+        case .tc, .cc, .bc: return 0
+        case .tr, .cr, .br: return 1
+        }
+    }
+
+    /// −1 bottom, 0 centre, +1 top, in CoreGraphics / AppKit y-up.
+    var vertical: Int {
+        switch self {
+        case .bl, .bc, .br: return -1
+        case .cl, .cc, .cr: return 0
+        case .tl, .tc, .tr: return 1
+        }
+    }
 }
 
 enum BackdropRatio: String, Codable, CaseIterable, Hashable {
@@ -24,6 +42,18 @@ enum BackdropRatio: String, Codable, CaseIterable, Hashable {
     case sixteenNine = "16:9"
     case nineSixteen = "9:16"
     case fiveFour = "5:4"
+
+    /// Width / height, or nil for `.auto`.
+    var widthOverHeight: CGFloat? {
+        switch self {
+        case .auto: return nil
+        case .oneOne: return 1
+        case .fourThree: return 4 / 3
+        case .sixteenNine: return 16 / 9
+        case .nineSixteen: return 9 / 16
+        case .fiveFour: return 5 / 4
+        }
+    }
 }
 
 enum BackdropBlurSource: String, Codable, CaseIterable, Hashable {
@@ -317,8 +347,8 @@ struct BackdropStyle: Equatable, Hashable, Codable {
 
     var isCollapsed: Bool { kind == .none }
 
-    /// Geometry the compositor applies today. Alignment / ratio / inset /
-    /// auto-balance are stored and ignored until WP3.
+    /// True when WP3 geometry is a no-op: the layout is the v0 symmetric
+    /// pad. Honey's panel hides the controls until this is false.
     var usesV0SymmetricGeometry: Bool {
         paddingFraction == Self.defaultPaddingFraction
             && insetFraction == 0
