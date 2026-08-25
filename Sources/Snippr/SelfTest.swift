@@ -6108,6 +6108,9 @@ enum SelfTest {
                     .sorted { $0.0 < $1.0 }
             }
 
+            let translateTag12 = OverlayActionCatalog.items.firstIndex {
+                $0.intent == .translate
+            } ?? -1
             var areaTranslateCalls = 0
             var areaTranslateModes: [Bool] = []
             var areaCompletion = 0
@@ -6148,7 +6151,11 @@ enum SelfTest {
                 width: 240, height: 160)
             areaTranslateHost.selectForTesting(rect: areaTranslateSelection)
             let areaTranslateButtons = allButtons12(in: areaTranslateHost)
-                .filter { $0.accessibilityLabel() == "OCR + Translate" }
+                // Located by CATALOG TAG, not by a copy of the tooltip: the
+                // tooltips now name their shortcut key, and a filter holding a
+                // stale literal matches nothing — which reads as a passing
+                // click that never happened rather than as a failure.
+                .filter { $0.tag == translateTag12 }
             areaTranslateButtons.first?.performClick(nil)
 
             var panelTranslateCalls = 0
@@ -6182,7 +6189,11 @@ enum SelfTest {
             panelTranslateProbe = panelTranslate
             let panelRoot12 = panelTranslate.contentView ?? NSView()
             let panelTranslateButtons = allButtons12(in: panelRoot12)
-                .filter { $0.accessibilityLabel() == "OCR + Translate" }
+                // Located by CATALOG TAG, not by a copy of the tooltip: the
+                // tooltips now name their shortcut key, and a filter holding a
+                // stale literal matches nothing — which reads as a passing
+                // click that never happened rather than as a failure.
+                .filter { $0.tag == translateTag12 }
             let areaCatalog12 = actionCatalog12(in: areaTranslateHost)
             let panelCatalog12 = actionCatalog12(in: panelRoot12)
             panelTranslateButtons.first?.performClick(nil)
@@ -6211,6 +6222,415 @@ enum SelfTest {
             // panel through an existing terminal route.
             if ScrollResultPanel.current === panelTranslate {
                 panelTranslate.performActionForTesting(.copy)
+            }
+
+            // --- 1.2.16: region OCR keeps the shot, and reads the RIGHT region
+            //
+            // The fixture carries DIFFERENT text in its top and bottom halves.
+            // A region over the top must return the top's words and not the
+            // bottom's — which is what pins the coordinate system. View points
+            // are bottom-left; `CGImage.cropping(to:)`, `session.pixelRect`
+            // and `flattened(cropPixels:)` are top-left. Scaling the view rect
+            // without flipping it reads the region mirrored, and every other
+            // assertion here would still pass.
+            do {
+                var ocrFailures: [String] = []
+                let regionFixture = makeSplitTextImage(
+                    top: "TOPMARK", bottom: "LOWMARK",
+                    width: 900, height: 600)
+                let regionFrozen = CapturedImage(
+                    cgImage: regionFixture, scale: 1)
+                var regionCompletions = 0
+                let regionOverlay = SelectionOverlay(
+                    purpose: .areaReview,
+                    inputs: OverlaySessionInputs(
+                        afterShow: true, afterCopy: false, afterSave: false),
+                    completion: { _ in regionCompletions += 1 })
+                regionOverlay.routerDependenciesOverride =
+                    CaptureActionRouter.Dependencies(
+                        copyToClipboard: { _ in }, autoSave: { _, _ in },
+                        saveAs: { _, _ in }, pin: { _ in },
+                        ocrWithMode: { _, _ in
+                            // Reaching the ROUTER at all means the sub-mode
+                            // fell through to the old terminal intent.
+                            ocrFailures.append("routed-terminal-ocr")
+                        },
+                        openEditor: { _ in }, toast: { _ in },
+                        setLastCapture: { _ in }, setLastAreaRect: { _ in },
+                        logEvent: { _ in })
+                let regionHost = SelectionOverlayView(
+                    mode: .area, screen: screen, frozen: regionFrozen,
+                    windowList: [], owner: regionOverlay)
+                regionHost.frame = CGRect(
+                    x: 0, y: 0, width: 900, height: 600)
+                let regionCrop = CGRect(x: 40, y: 40, width: 820, height: 520)
+                regionHost.selectForTesting(rect: regionCrop)
+
+                // Upper half in VIEW coordinates (bottom-left origin), which
+                // is where "TOPMARK" is drawn.
+                let upper = CGRect(x: 60, y: 330, width: 780, height: 210)
+                // Armed through the REAL button, by catalog tag. Calling the
+                // test hook here left the dispatcher untested: deleting the
+                // `.ocr` intercept in `performReviewAction` restored the whole
+                // 1.2.15 terminal behaviour with the suite still green.
+                guard let ocrTag = OverlayActionCatalog.items.firstIndex(
+                    where: { $0.intent == .ocr })
+                else {
+                    ocrFailures.append("no-ocr-catalog-entry")
+                    check("sliceB-overlay-ocr-region", false, "no catalog entry")
+                    return
+                }
+                regionHost.clickReviewToolbarButtonForTesting(tag: ocrTag)
+                if !regionHost.ocrRegionPickingForTesting {
+                    ocrFailures.append("button-did-not-arm-picking")
+                }
+                if regionOverlay.session.phase != .reviewing {
+                    ocrFailures.append(
+                        "arming-changed-phase \(regionOverlay.session.phase)")
+                }
+                regionHost.pickOCRRegionForTesting(
+                    from: CGPoint(x: upper.minX, y: upper.minY),
+                    to: CGPoint(x: upper.maxX, y: upper.maxY))
+
+                // Recognition is async; spin the run loop rather than sleeping
+                // so the MainActor hop that fills the panel can actually run.
+                let regionDeadline = Date().addingTimeInterval(30)
+                while Date() < regionDeadline,
+                      regionHost.ocrResultPanelForTesting?
+                        .recognizedText.isEmpty != false {
+                    RunLoop.current.run(
+                        mode: .default, before: Date().addingTimeInterval(0.05))
+                }
+                let recognized = (regionHost.ocrResultPanelForTesting?
+                    .recognizedText ?? "").uppercased()
+                if !recognized.contains("TOPMARK") {
+                    ocrFailures.append("missing-top '\(recognized)'")
+                }
+                if recognized.contains("LOWMARK") {
+                    ocrFailures.append("read-mirrored '\(recognized)'")
+                }
+
+                // The whole point of the owner's request: the shot survives.
+                if regionOverlay.session.phase != .reviewing {
+                    ocrFailures.append(
+                        "session-ended \(regionOverlay.session.phase)")
+                }
+                if regionCompletions != 0 {
+                    ocrFailures.append("completed \(regionCompletions)")
+                }
+                if regionHost.areaSelectionForTesting != regionCrop {
+                    ocrFailures.append("crop-moved")
+                }
+
+                // The panel is for reading text NEXT to its pixels, so it may
+                // not sit on them.
+                if let panelFrame = regionHost.ocrResultPanelFrameForTesting {
+                    if panelFrame.intersects(upper) {
+                        ocrFailures.append("panel-covers-region \(panelFrame)")
+                    }
+                } else {
+                    ocrFailures.append("no-panel")
+                }
+
+                // Moving the crop has to carry the panel with it. Measuring
+                // only at the moment it opens leaves this green while the
+                // panel sits on the shot.
+                let movedCrop = regionCrop.offsetBy(dx: 20, dy: -20)
+                regionHost.selectForTesting(rect: movedCrop)
+                regionHost.layoutReviewToolbarForTesting()
+                if let movedFrame = regionHost.ocrResultPanelFrameForTesting,
+                   movedFrame.intersects(upper) {
+                    ocrFailures.append("panel-covers-after-move \(movedFrame)")
+                }
+                regionHost.selectForTesting(rect: regionCrop)
+                regionHost.layoutReviewToolbarForTesting()
+
+                // Copy takes the text WITHOUT taking the session with it.
+                if let copyButton = regionHost.ocrResultPanelForTesting?
+                    .control(identifier: OverlayOCRPanel.copyIdentifier) {
+                    copyButton.performClick(nil)
+                } else {
+                    ocrFailures.append("no-copy-button")
+                }
+                if regionOverlay.session.phase != .reviewing
+                    || regionCompletions != 0 {
+                    ocrFailures.append(
+                        "copy-ended-session \(regionOverlay.session.phase)")
+                }
+                if regionHost.ocrResultPanelFrameForTesting != nil {
+                    ocrFailures.append("copy-left-panel-open")
+                }
+
+                // Esc unwinds one layer at a time: panel, then the pick, then
+                // the session. Closing the shot while the text is on screen is
+                // exactly what the owner asked us to stop doing.
+                regionHost.clickReviewToolbarButtonForTesting(tag: ocrTag)
+                if !regionHost.ocrRegionPickingForTesting {
+                    ocrFailures.append("second-arm-failed")
+                }
+                regionHost.handleEscapeForTesting()
+                if regionHost.ocrRegionPickingForTesting {
+                    ocrFailures.append("esc-left-picking-armed")
+                }
+                if regionOverlay.session.phase != .reviewing {
+                    ocrFailures.append("esc-ended-session-too-early")
+                }
+                regionHost.handleEscapeForTesting()
+                if regionOverlay.session.phase != .completed {
+                    ocrFailures.append(
+                        "esc-did-not-cancel \(regionOverlay.session.phase)")
+                }
+                // The security case. Region OCR reads the FLATTENED surface,
+                // so a pixelation the user drew over something sensitive hides
+                // it from Vision too. Cropping the raw freeze instead would
+                // read straight through the redaction and hand back the very
+                // words they just covered — and every other assertion above
+                // would still pass, because with no annotations the two paths
+                // return identical bytes.
+                let redactOverlay = SelectionOverlay(
+                    purpose: .areaReview,
+                    inputs: OverlaySessionInputs(
+                        afterShow: true, afterCopy: false, afterSave: false),
+                    completion: { _ in })
+                redactOverlay.routerDependenciesOverride =
+                    CaptureActionRouter.Dependencies(
+                        copyToClipboard: { _ in }, autoSave: { _, _ in },
+                        saveAs: { _, _ in }, pin: { _ in },
+                        ocrWithMode: { _, _ in }, openEditor: { _ in },
+                        toast: { _ in }, setLastCapture: { _ in },
+                        setLastAreaRect: { _ in }, logEvent: { _ in })
+                let redactHost = SelectionOverlayView(
+                    mode: .area, screen: screen, frozen: regionFrozen,
+                    windowList: [], owner: redactOverlay)
+                redactHost.frame = CGRect(x: 0, y: 0, width: 900, height: 600)
+                redactHost.selectForTesting(rect: regionCrop)
+                redactHost.clickReviewToolbarButtonForTesting(
+                    tag: OverlayAnnotationTool.blur.toolbarTag)
+                // Cover the upper band, generously, through the real drag.
+                redactHost.annotationDragForTesting(
+                    from: CGPoint(x: upper.minX - 10, y: upper.minY - 10),
+                    to: CGPoint(x: upper.maxX + 10, y: upper.maxY + 10))
+                redactHost.clickReviewToolbarButtonForTesting(tag: ocrTag)
+                redactHost.pickOCRRegionForTesting(
+                    from: CGPoint(x: upper.minX, y: upper.minY),
+                    to: CGPoint(x: upper.maxX, y: upper.maxY))
+                let redactDeadline = Date().addingTimeInterval(30)
+                while Date() < redactDeadline,
+                      redactHost.ocrResultPanelForTesting?
+                        .statusForTesting == "Recognizing…" {
+                    RunLoop.current.run(
+                        mode: .default, before: Date().addingTimeInterval(0.05))
+                }
+                let redacted = (redactHost.ocrResultPanelForTesting?
+                    .recognizedText ?? "").uppercased()
+                if redactHost.annotationSurfaceIsEmptyForTesting {
+                    // The fixture failed, not the feature: with no annotation
+                    // the flattened and raw paths return identical bytes, so
+                    // the assertion below would prove nothing.
+                    ocrFailures.append("redaction-fixture-empty")
+                }
+                if let sent = redactHost.lastOCRSourceForTesting {
+                    writePNG(sent, to: "\(outputDir)/ocr-region-redacted.png")
+                }
+                if let clean = regionHost.lastOCRSourceForTesting {
+                    writePNG(clean, to: "\(outputDir)/ocr-region-clean.png")
+                }
+                if redacted.contains("TOPMARK") {
+                    ocrFailures.append("read-through-redaction '\(redacted)'")
+                }
+                redactHost.handleEscapeForTesting()
+                redactHost.handleEscapeForTesting()
+
+                check("sliceB-overlay-ocr-region",
+                      ocrFailures.isEmpty,
+                      ocrFailures.prefix(6).joined(separator: " | "))
+            }
+
+            // --- 1.2.16: the action keys and the hints that advertise them
+            do {
+                var keyFailures: [String] = []
+                // Routing and the hint read one field, so they cannot drift:
+                // a key that routes but is named nowhere is undiscoverable,
+                // and a hint naming a key nothing routes is a broken promise.
+                for item in OverlayActionCatalog.items {
+                    guard let key = item.shortcut else { continue }
+                    if !item.tooltip.uppercased().contains(key.uppercased()) {
+                        keyFailures.append(
+                            "unadvertised \(key) '\(item.tooltip)'")
+                    }
+                    if OverlayActionCatalog.intent(forShortcutKey: key)
+                        != item.intent {
+                        keyFailures.append("lookup \(key)")
+                    }
+                    // Disjoint from the drawing tools by CONSTRUCTION, not by
+                    // where the two branches happen to sit in `keyDown`.
+                    if OverlayAnnotationTool.tool(forShortcutKey: key) != nil {
+                        keyFailures.append("collides-with-tool \(key)")
+                    }
+                }
+                let expected: [(String, CaptureIntent)] = [
+                    ("e", .openEditor), ("x", .ocr),
+                    ("g", .translate), ("f", .pin),
+                ]
+                for (key, intent) in expected {
+                    if OverlayActionCatalog.intent(forShortcutKey: key)
+                        != intent {
+                        keyFailures.append(
+                            "table \(key) -> "
+                            + String(describing:
+                                OverlayActionCatalog.intent(forShortcutKey: key)))
+                    }
+                }
+                // Save keeps a modifier and must NOT be reachable bare, or a
+                // stray S would open a save sheet instead of Spotlight.
+                if OverlayActionCatalog.intent(
+                    forShortcutKey: OverlayActionCatalog.saveKey) != nil {
+                    keyFailures.append("save-reachable-bare")
+                }
+                if OverlayAnnotationTool.tool(
+                    forShortcutKey: OverlayActionCatalog.saveKey) != .spotlight {
+                    keyFailures.append("bare-s-not-spotlight")
+                }
+                // --- the keys have to actually REACH the view.
+                //
+                // The table above is static: deleting the whole action-key
+                // branch from `keyDown` killed E/X/G/F outright and left this
+                // gate green, with the tooltips still advertising them. So
+                // every key is fired at a live host through the real
+                // responder entry points, and the intent is observed at the
+                // router rather than in the catalog.
+                @MainActor func keyEvent(
+                    _ characters: String,
+                    modifiers: NSEvent.ModifierFlags = []
+                ) -> NSEvent? {
+                    NSEvent.keyEvent(
+                        with: .keyDown, location: .zero,
+                        modifierFlags: modifiers, timestamp: 0,
+                        windowNumber: 0, context: nil,
+                        characters: characters,
+                        charactersIgnoringModifiers: characters.lowercased(),
+                        isARepeat: false, keyCode: 0)
+                }
+                let keyFrozen = CapturedImage(
+                    cgImage: makeTestImage(width: 900, height: 600), scale: 1)
+                @MainActor func keyHost(
+                    _ record: @escaping (String) -> Void
+                ) -> (SelectionOverlay, SelectionOverlayView) {
+                    let overlay = SelectionOverlay(
+                        purpose: .areaReview,
+                        inputs: OverlaySessionInputs(
+                            afterShow: true, afterCopy: false, afterSave: false),
+                        completion: { _ in record("finish") })
+                    overlay.routerDependenciesOverride =
+                        CaptureActionRouter.Dependencies(
+                            copyToClipboard: { _ in record("copy") },
+                            autoSave: { _, _ in record("autoSave") },
+                            saveAs: { _, done in
+                                record("saveAs")
+                                done(.cancelled)
+                            },
+                            pin: { _ in record("pin") },
+                            ocrWithMode: { _, translate in
+                                record(translate ? "translate" : "ocr")
+                            },
+                            openEditor: { _ in record("openEditor") },
+                            toast: { _ in }, setLastCapture: { _ in },
+                            setLastAreaRect: { _ in }, logEvent: { _ in })
+                    let view = SelectionOverlayView(
+                        mode: .area, screen: screen, frozen: keyFrozen,
+                        windowList: [], owner: overlay)
+                    view.frame = CGRect(x: 0, y: 0, width: 900, height: 600)
+                    view.selectForTesting(
+                        rect: CGRect(x: 100, y: 100, width: 500, height: 340))
+                    return (overlay, view)
+                }
+
+                // X arms the picker and must NOT reach the router: the whole
+                // point of 1.2.16 is that OCR stopped being terminal.
+                var xEffects: [String] = []
+                let (xOverlay, xView) = keyHost { xEffects.append($0) }
+                if let event = keyEvent("x") { xView.keyDown(with: event) }
+                if !xView.ocrRegionPickingForTesting {
+                    keyFailures.append(
+                        "x-did-not-arm phase="
+                        + String(describing: xOverlay.session.phase)
+                        + " sel=" + String(describing:
+                            xView.areaSelectionForTesting))
+                }
+                if !xEffects.isEmpty {
+                    keyFailures.append("x-routed \(xEffects)")
+                }
+                // And a key arriving mid-drag is swallowed, or a stray letter
+                // during a pen stroke would change what the shot is for.
+                var dragEffects: [String] = []
+                let (dragOverlay, dragView) = keyHost { dragEffects.append($0) }
+                dragView.clickReviewToolbarButtonForTesting(
+                    tag: OverlayAnnotationTool.pen.toolbarTag)
+                dragView.annotationDragForTesting(
+                    from: CGPoint(x: 150, y: 150),
+                    to: CGPoint(x: 300, y: 260),
+                    whileDown: {
+                        if let event = keyEvent("x") {
+                            dragView.keyDown(with: event)
+                        }
+                        if dragView.ocrRegionPickingForTesting {
+                            keyFailures.append("x-armed-mid-drag")
+                        }
+                        if let event = keyEvent("f") {
+                            dragView.keyDown(with: event)
+                        }
+                    })
+                if dragEffects.contains("pin") {
+                    keyFailures.append("f-routed-mid-drag")
+                }
+
+                // Each terminal key closes its own session, so each gets its
+                // own host — reusing one would test only the first.
+                let terminals: [(String, String)] = [
+                    ("e", "openEditor"), ("g", "translate"), ("f", "pin"),
+                ]
+                for (key, expectedEffect) in terminals {
+                    var effects: [String] = []
+                    let (overlay, view) = keyHost { effects.append($0) }
+                    if let event = keyEvent(key) { view.keyDown(with: event) }
+                    if !effects.contains(expectedEffect) {
+                        keyFailures.append(
+                            "\(key)-missed \(expectedEffect) got \(effects)"
+                            + " phase=" + String(describing: overlay.session.phase)
+                            + " payloadFail=" + String(describing:
+                                view.lastPayloadFailureForTesting))
+                    }
+                }
+
+                // ⌘S goes through the equivalent chain, where ⌘C already
+                // lives — from `keyDown` it would never arrive.
+                var saveEffects: [String] = []
+                let (saveOverlay, saveView) = keyHost { saveEffects.append($0) }
+                if let event = keyEvent("s", modifiers: .command) {
+                    _ = saveView.performKeyEquivalent(with: event)
+                }
+                if !saveEffects.contains("saveAs") {
+                    keyFailures.append("cmd-s-missed \(saveEffects)")
+                }
+                // Bare S stays Spotlight: the modifier is what distinguishes
+                // them, and losing that turns a tool key into a save sheet.
+                var bareEffects: [String] = []
+                let (bareOverlay, bareView) = keyHost { bareEffects.append($0) }
+                if let event = keyEvent("s") { bareView.keyDown(with: event) }
+                if bareEffects.contains("saveAs") {
+                    keyFailures.append("bare-s-saved")
+                }
+
+                // `SelectionOverlayView.owner` is WEAK. Binding an overlay to
+                // `_` lets ARC free it before the key is fired, and every
+                // guard that reads `owner` then fails silently — which reads
+                // as "the key is not routed" when the routing is fine.
+                withExtendedLifetime(
+                    [xOverlay, dragOverlay, saveOverlay, bareOverlay]
+                ) {}
+                check("sliceB-overlay-action-keys",
+                      keyFailures.isEmpty,
+                      keyFailures.prefix(6).joined(separator: " | "))
             }
 
             // S5 layout contract. Editing chrome is a vertical rail beside
@@ -8813,7 +9233,10 @@ enum SelfTest {
                             "initial capture decorated \(String(describing: dualSpy.lastCaptures.first))")
                     }
 
-                    dualView.performReviewActionForTesting(.ocr)
+                    // See the note at the colour-space gate: OCR is a
+                    // sub-mode now, and Translate carries the same
+                    // undecorated reading through the router.
+                    dualView.performReviewActionForTesting(.translate)
                     if dualSpy.ocr.last != innerPixels {
                         bdFailures.append(
                             "OCR got a framed image \(String(describing: dualSpy.ocr.last))")
@@ -10904,7 +11327,14 @@ enum SelfTest {
                 if let (overlay, view) = review(
                     framedSpy, scale: 1, selection: colourSelection) {
                     _ = view.applyBackdropPreset(.ocean)
-                    view.performReviewActionForTesting(.ocr)
+                    // `.translate`, not `.ocr`: since 1.2.16 the OCR button
+                    // opens the region sub-mode and never reaches the router,
+                    // so it can no longer serve as the vehicle for observing a
+                    // payload. Translate is the OTHER undecorated intent —
+                    // `usesDecoration` returns false for both and the router
+                    // hands both the same snapshot — so what this gate
+                    // measures is unchanged.
+                    view.performReviewActionForTesting(.translate)
                     if let semantic = framedSpy.semantic.last {
                         if semantic.colorSpace?.name != CGColorSpace.sRGB {
                             c1Failures.append(
@@ -10975,7 +11405,14 @@ enum SelfTest {
                 let plainSpy = ImageSpy()
                 if let (overlay, view) = review(
                     plainSpy, scale: 1, selection: colourSelection) {
-                    view.performReviewActionForTesting(.ocr)
+                    // `.translate`, not `.ocr`: since 1.2.16 the OCR button
+                    // opens the region sub-mode and never reaches the router,
+                    // so it can no longer serve as the vehicle for observing a
+                    // payload. Translate is the OTHER undecorated intent —
+                    // `usesDecoration` returns false for both and the router
+                    // hands both the same snapshot — so what this gate
+                    // measures is unchanged.
+                    view.performReviewActionForTesting(.translate)
                     if let semantic = plainSpy.semantic.last {
                         if semantic.colorSpace?.name != CGColorSpace.displayP3 {
                             c1Failures.append(
@@ -23006,6 +23443,37 @@ enum SelfTest {
             space: CGColorSpace(name: CGColorSpace.sRGB)!,
             bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
         )!
+        return c.makeImage()!
+    }
+
+    /// Two DIFFERENT words, one in each half. A region gate that asserts only
+    /// "the text came back" passes just as happily on the mirrored region;
+    /// asking which half it came from is what makes the coordinate system
+    /// testable at all.
+    private static func makeSplitTextImage(
+        top: String, bottom: String, width: Int, height: Int
+    ) -> CGImage {
+        let c = ctx(width, height)
+        c.setFillColor(NSColor.white.cgColor)
+        c.fill(CGRect(x: 0, y: 0, width: width, height: height))
+        let nsCtx = NSGraphicsContext(cgContext: c, flipped: false)
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = nsCtx
+        let attrs: [NSAttributedString.Key: Any] = [
+            // Small on purpose. At 80pt the pixelation blocks are a fraction
+            // of a glyph and "TOPMARK" stays perfectly legible through the
+            // redaction — the security assertion below would fail against
+            // correct code. Vision still reads this size comfortably.
+            .font: NSFont.boldSystemFont(ofSize: 22),
+            .foregroundColor: NSColor.black,
+        ]
+        // Non-flipped context: larger y is HIGHER on screen, so `top` is drawn
+        // in the upper half the way a reader would expect.
+        (top as NSString).draw(
+            at: CGPoint(x: 60, y: CGFloat(height) * 0.62), withAttributes: attrs)
+        (bottom as NSString).draw(
+            at: CGPoint(x: 60, y: CGFloat(height) * 0.12), withAttributes: attrs)
+        NSGraphicsContext.restoreGraphicsState()
         return c.makeImage()!
     }
 
