@@ -6353,23 +6353,29 @@ enum SelfTest {
                 && zip(areaCatalog12, panelCatalog12).allSatisfy {
                     $0.0.0 == $0.1.0 && $0.0.1 == $0.1.1
                 }
+            // 1.2.17: the two hosts deliberately DIVERGE on what Translate
+            // does, while still building from one catalog. On the area review
+            // it arms the region sub-mode and the shot stays up — reaching the
+            // router at all would mean the terminal came back. The scroll
+            // panel has no region to pick inside, so it stays terminal, and
+            // that half of the gate is unchanged.
             let translateHostsOK = areaTranslateButtons.count == 1
                 && panelTranslateButtons.count == 1
                 && areaCatalog12.count == 6
                 && catalogsMatch12
                 && Set(areaCatalog12.map(\.0)).count == 6
-                && areaTranslateCalls == 1
-                && areaTranslateModes == [true]
-                && areaTranslateOverlay.session.phase == .completed
-                && areaCompletion == 1
-                && areaPhaseDuring == .completed
-                && areaCompletionDuring == 1
-                && areaTranslateRects.count == 1
+                && areaTranslateCalls == 0
+                && areaTranslateHost.ocrRegionPickingForTesting
+                && areaTranslateHost.ocrRegionTranslatesForTesting
+                && areaTranslateOverlay.session.phase == .reviewing
+                && areaCompletion == 0
+                && areaTranslateRects.isEmpty
                 && panelTranslateCalls == 1
                 && panelTranslateModes == [true]
                 && panelDetachedDuring && panelAreaRects == 0
             check("overlay12-translate-hosts-s5", translateHostsOK,
-                  "buttons \(areaTranslateButtons.count)/\(panelTranslateButtons.count) catalog \(areaCatalog12)/\(panelCatalog12) calls \(areaTranslateCalls)/\(panelTranslateCalls) modes \(areaTranslateModes)/\(panelTranslateModes) area phase/completion \(areaTranslateOverlay.session.phase)/\(areaCompletion) observed \(String(describing: areaPhaseDuring))/\(areaCompletionDuring) rects \(areaTranslateRects.count)/\(panelAreaRects) detached \(panelDetachedDuring)")
+                  "buttons \(areaTranslateButtons.count)/\(panelTranslateButtons.count) catalog \(areaCatalog12)/\(panelCatalog12) calls \(areaTranslateCalls)/\(panelTranslateCalls) modes \(areaTranslateModes)/\(panelTranslateModes) area picking \(areaTranslateHost.ocrRegionPickingForTesting)/\(areaTranslateHost.ocrRegionTranslatesForTesting) area phase/completion \(areaTranslateOverlay.session.phase)/\(areaCompletion) observed \(String(describing: areaPhaseDuring))/\(areaCompletionDuring) rects \(areaTranslateRects.count)/\(panelAreaRects) detached \(panelDetachedDuring)")
+            areaTranslateOverlay.dismissForTesting()
             // RED cleanup: if no Translate button existed, close the retained
             // panel through an existing terminal route.
             if ScrollResultPanel.current === panelTranslate {
@@ -6498,11 +6504,23 @@ enum SelfTest {
                 regionHost.layoutReviewToolbarForTesting()
 
                 // Copy takes the text WITHOUT taking the session with it.
+                // Through the sink, not the real pasteboard: the suite runs on
+                // someone's actual machine, and wiping their clipboard is a
+                // real accident rather than a test detail.
+                var regionCopied: [String] = []
+                OverlayOCRClipboard.sinkForTesting = { regionCopied.append($0) }
+                let regionExpectedCopy = regionHost.ocrResultPanelForTesting?
+                    .recognizedText ?? ""
                 if let copyButton = regionHost.ocrResultPanelForTesting?
                     .control(identifier: OverlayOCRPanel.copyIdentifier) {
                     copyButton.performClick(nil)
                 } else {
                     ocrFailures.append("no-copy-button")
+                }
+                OverlayOCRClipboard.sinkForTesting = nil
+                if regionCopied != [regionExpectedCopy] {
+                    ocrFailures.append(
+                        "copied \(regionCopied.map { String($0.prefix(24)) })")
                 }
                 if regionOverlay.session.phase != .reviewing
                     || regionCompletions != 0 {
@@ -6736,10 +6754,37 @@ enum SelfTest {
                     keyFailures.append("f-routed-mid-drag")
                 }
 
+                // G is the SECOND arming key since 1.2.17: Translate stopped
+                // being terminal and became the same region pick with a
+                // translation hop. Reaching the router would mean the result
+                // window is back on top of a torn-down shot.
+                var gEffects: [String] = []
+                let (gOverlay, gView) = keyHost { gEffects.append($0) }
+                if let event = keyEvent("g") { gView.keyDown(with: event) }
+                if !gView.ocrRegionPickingForTesting {
+                    keyFailures.append(
+                        "g-did-not-arm phase="
+                        + String(describing: gOverlay.session.phase)
+                        + " payloadFail=" + String(describing:
+                            gView.lastPayloadFailureForTesting))
+                }
+                if !gView.ocrRegionTranslatesForTesting {
+                    keyFailures.append("g-armed-without-translate")
+                }
+                if !gEffects.isEmpty {
+                    keyFailures.append("g-routed \(gEffects)")
+                }
+                // X after G is a PLAIN recognition again: the mode belongs to
+                // the arming, not to the panel it opens.
+                if let event = keyEvent("x") { gView.keyDown(with: event) }
+                if gView.ocrRegionTranslatesForTesting {
+                    keyFailures.append("x-inherited-translate")
+                }
+
                 // Each terminal key closes its own session, so each gets its
                 // own host — reusing one would test only the first.
                 let terminals: [(String, String)] = [
-                    ("e", "openEditor"), ("g", "translate"), ("f", "pin"),
+                    ("e", "openEditor"), ("f", "pin"),
                 ]
                 for (key, expectedEffect) in terminals {
                     var effects: [String] = []
@@ -6778,11 +6823,366 @@ enum SelfTest {
                 // guard that reads `owner` then fails silently — which reads
                 // as "the key is not routed" when the routing is fine.
                 withExtendedLifetime(
-                    [xOverlay, dragOverlay, saveOverlay, bareOverlay]
+                    [xOverlay, dragOverlay, gOverlay, saveOverlay, bareOverlay]
                 ) {}
                 check("sliceB-overlay-action-keys",
                       keyFailures.isEmpty,
                       keyFailures.prefix(6).joined(separator: " | "))
+            }
+
+            // --- 1.2.17: the result panel is readable in BOTH system modes
+            //
+            // 1.2.16 mixed a hard-coded dark background with DYNAMIC text
+            // colours. On a light-mode Mac `.labelColor` resolves to
+            // near-black, so the recognized text disappeared into the panel's
+            // own dark box — the owner's "khung tối thui". The gate forces the
+            // app LIGHT (the mode that broke) and reads the colour as resolved
+            // in the appearance the panel actually draws in: reading
+            // `textView.textColor` alone would return a dynamic colour and
+            // prove nothing.
+            do {
+                var apFailures: [String] = []
+                let application = NSApplication.shared
+                let savedAppearance = application.appearance
+                application.appearance = NSAppearance(named: .aqua)
+                let apFrozen = CapturedImage(
+                    cgImage: makeSplitTextImage(
+                        top: "TOPMARK", bottom: "LOWMARK",
+                        width: 900, height: 600),
+                    scale: 1)
+                let apOverlay = SelectionOverlay(
+                    purpose: .areaReview,
+                    inputs: OverlaySessionInputs(
+                        afterShow: true, afterCopy: false, afterSave: false),
+                    completion: { _ in })
+                apOverlay.routerDependenciesOverride =
+                    CaptureActionRouter.Dependencies(
+                        copyToClipboard: { _ in }, autoSave: { _, _ in },
+                        saveAs: { _, _ in }, pin: { _ in },
+                        ocrWithMode: { _, _ in }, openEditor: { _ in },
+                        toast: { _ in }, setLastCapture: { _ in },
+                        setLastAreaRect: { _ in }, logEvent: { _ in })
+                let apHost = SelectionOverlayView(
+                    mode: .area, screen: screen, frozen: apFrozen,
+                    windowList: [], owner: apOverlay)
+                apHost.frame = CGRect(x: 0, y: 0, width: 900, height: 600)
+                apHost.selectForTesting(
+                    rect: CGRect(x: 40, y: 40, width: 820, height: 520))
+                if let ocrTag = OverlayActionCatalog.items.firstIndex(
+                    where: { $0.intent == .ocr }) {
+                    apHost.clickReviewToolbarButtonForTesting(tag: ocrTag)
+                } else {
+                    apFailures.append("no-ocr-catalog-entry")
+                }
+                apHost.pickOCRRegionForTesting(
+                    from: CGPoint(x: 60, y: 330),
+                    to: CGPoint(x: 840, y: 540))
+                if let panel = apHost.ocrResultPanelForTesting {
+                    if panel.effectiveAppearance.name != .darkAqua {
+                        apFailures.append(
+                            "panel drew in "
+                            + panel.effectiveAppearance.name.rawValue)
+                    }
+                    if let text = panel.resolvedTextColorForTesting {
+                        let luma = 0.2126 * text.redComponent
+                            + 0.7152 * text.greenComponent
+                            + 0.0722 * text.blueComponent
+                        // The panel's own background, which is fixed dark.
+                        let background = 0.11
+                        if luma < 0.6 {
+                            apFailures.append(
+                                "text luma \(String(format: "%.2f", luma))")
+                        }
+                        if abs(luma - background) < 0.4 {
+                            apFailures.append(
+                                "text vs panel \(String(format: "%.2f", luma))"
+                                + " vs \(background)")
+                        }
+                    } else {
+                        apFailures.append("no-resolved-colour")
+                    }
+                } else {
+                    apFailures.append("no-panel")
+                }
+                application.appearance = savedAppearance
+                apOverlay.dismissForTesting()
+                withExtendedLifetime(apOverlay) {}
+                check("sliceB-overlay-ocr-panel-appearance",
+                      apFailures.isEmpty,
+                      apFailures.prefix(6).joined(separator: " | "))
+            }
+
+            // --- 1.2.17: Translate is the same region pick, plus one hop
+            //
+            // The owner's report: pressing OCR+Translate opened a window and
+            // the shot vanished. So `.translate` now arms the picker like
+            // `.ocr` and the translation lands in the SAME panel — reaching
+            // the router at all means the terminal came back.
+            translateGate: do {
+                var trFailures: [String] = []
+                let savedTarget = Settings.shared.translateTarget
+                // A translator that cannot touch the network, and whose output
+                // names the language it was asked for — so the gate can tell a
+                // re-translation from a stale one.
+                TranslateService.translatorOverrideForTesting = { text, lang in
+                    "[\(lang)] " + text
+                }
+                let trFrozen = CapturedImage(
+                    cgImage: makeSplitTextImage(
+                        top: "TOPMARK", bottom: "LOWMARK",
+                        width: 900, height: 600),
+                    scale: 1)
+                var trCompletions = 0
+                let trOverlay = SelectionOverlay(
+                    purpose: .areaReview,
+                    inputs: OverlaySessionInputs(
+                        afterShow: true, afterCopy: false, afterSave: false),
+                    completion: { _ in trCompletions += 1 })
+                trOverlay.routerDependenciesOverride =
+                    CaptureActionRouter.Dependencies(
+                        copyToClipboard: { _ in }, autoSave: { _, _ in },
+                        saveAs: { _, _ in }, pin: { _ in },
+                        ocrWithMode: { _, _ in
+                            trFailures.append("routed-terminal-translate")
+                        },
+                        openEditor: { _ in }, toast: { _ in },
+                        setLastCapture: { _ in }, setLastAreaRect: { _ in },
+                        logEvent: { _ in })
+                let trHost = SelectionOverlayView(
+                    mode: .area, screen: screen, frozen: trFrozen,
+                    windowList: [], owner: trOverlay)
+                trHost.frame = CGRect(x: 0, y: 0, width: 900, height: 600)
+                let trCrop = CGRect(x: 40, y: 40, width: 820, height: 520)
+                trHost.selectForTesting(rect: trCrop)
+                let upperBand = CGRect(x: 60, y: 330, width: 780, height: 210)
+
+                // Armed through the REAL button, located by catalog index —
+                // never by a tooltip literal, which matches nothing the day
+                // the tooltip gains a shortcut and reads as a passing click.
+                guard let translateTag = OverlayActionCatalog.items.firstIndex(
+                    where: { $0.intent == .translate })
+                else {
+                    check("sliceB-overlay-ocr-translate", false,
+                          "no translate catalog entry")
+                    TranslateService.translatorOverrideForTesting = nil
+                    break translateGate
+                }
+                trHost.clickReviewToolbarButtonForTesting(tag: translateTag)
+                if !trHost.ocrRegionPickingForTesting {
+                    trFailures.append("button-did-not-arm")
+                }
+                if !trHost.ocrRegionTranslatesForTesting {
+                    trFailures.append("armed-without-translate")
+                }
+                trHost.pickOCRRegionForTesting(
+                    from: CGPoint(x: upperBand.minX, y: upperBand.minY),
+                    to: CGPoint(x: upperBand.maxX, y: upperBand.maxY))
+
+                @MainActor func spin(
+                    seconds: TimeInterval, until done: () -> Bool
+                ) {
+                    let deadline = Date().addingTimeInterval(seconds)
+                    while Date() < deadline, !done() {
+                        RunLoop.current.run(
+                            mode: .default,
+                            before: Date().addingTimeInterval(0.05))
+                    }
+                }
+                spin(seconds: 30) {
+                    trHost.ocrResultPanelForTesting?.statusForTesting
+                        .hasPrefix("Đã dịch") == true
+                }
+                guard let trPanel = trHost.ocrResultPanelForTesting else {
+                    check("sliceB-overlay-ocr-translate", false, "no panel")
+                    TranslateService.translatorOverrideForTesting = nil
+                    break translateGate
+                }
+                if !trPanel.isTranslateMode || !trPanel.languageIsShownForTesting {
+                    trFailures.append(
+                        "panel not in translate mode "
+                        + "\(trPanel.isTranslateMode)/"
+                        + "\(trPanel.languageIsShownForTesting)")
+                }
+                // The translation is what the panel shows and what Copy would
+                // take; the recognition is kept underneath it.
+                if !trPanel.recognizedText.hasPrefix("[\(savedTarget)]") {
+                    trFailures.append(
+                        "not translated '\(trPanel.recognizedText.prefix(40))'")
+                }
+                if !trPanel.sourceText.uppercased().contains("TOPMARK") {
+                    trFailures.append(
+                        "source lost '\(trPanel.sourceText.prefix(40))'")
+                }
+                // The whole point of the report: the shot is still there.
+                if trOverlay.session.phase != .reviewing || trCompletions != 0 {
+                    trFailures.append(
+                        "session \(trOverlay.session.phase)/\(trCompletions)")
+                }
+                if trHost.areaSelectionForTesting != trCrop {
+                    trFailures.append("crop-moved")
+                }
+                if let frame = trHost.ocrResultPanelFrameForTesting {
+                    if frame.intersects(upperBand) {
+                        trFailures.append("panel-covers-region \(frame)")
+                    }
+                    // The taller translate panel must be PLACED at the size it
+                    // draws at, or the check above measures a rectangle that
+                    // does not exist.
+                    if frame.size != OverlayOCRPanel.size(translating: true) {
+                        trFailures.append("placed at \(frame.size)")
+                    }
+                } else {
+                    trFailures.append("no-panel-frame")
+                }
+
+                // What COPY puts on the clipboard, read at the sink the
+                // handler writes to. Asserting `recognizedText` above only
+                // proves the panel holds the translation: pointing the handler
+                // at `sourceText` instead would paste the original — the first
+                // thing a user notices — with every assertion here still green.
+                var copiedTexts: [String] = []
+                OverlayOCRClipboard.sinkForTesting = { copiedTexts.append($0) }
+                let expectedCopy = trPanel.recognizedText
+                if let copyButton = trPanel.control(
+                    identifier: OverlayOCRPanel.copyIdentifier) {
+                    copyButton.performClick(nil)
+                } else {
+                    trFailures.append("no-copy-button")
+                }
+                if copiedTexts != [expectedCopy] {
+                    trFailures.append(
+                        "copied \(copiedTexts.map { String($0.prefix(24)) }) "
+                        + "want '\(expectedCopy.prefix(24))'")
+                }
+                if copiedTexts.first == trPanel.sourceText,
+                   trPanel.sourceText != expectedCopy {
+                    trFailures.append("copied the recognition, not the translation")
+                }
+                if trOverlay.session.phase != .reviewing || trCompletions != 0 {
+                    trFailures.append("copy ended the session")
+                }
+
+                // Copy closes the panel, so the rest of the flow needs a fresh
+                // pick — the same way a user would take a second region.
+                trHost.clickReviewToolbarButtonForTesting(tag: translateTag)
+                trHost.pickOCRRegionForTesting(
+                    from: CGPoint(x: upperBand.minX, y: upperBand.minY),
+                    to: CGPoint(x: upperBand.maxX, y: upperBand.maxY))
+                spin(seconds: 30) {
+                    trHost.ocrResultPanelForTesting?.statusForTesting
+                        .hasPrefix("Đã dịch") == true
+                }
+
+                // Choosing another language re-translates the RECOGNITION and
+                // stores the choice where the translate window reads it.
+                let other = TranslateService.languages.first {
+                    $0.code != savedTarget
+                }
+                if let other,
+                   let index = TranslateService.languages.firstIndex(
+                       where: { $0.code == other.code }),
+                   let popup = trPanel.control(
+                       identifier: OverlayOCRPanel.languageIdentifier)
+                       as? NSPopUpButton {
+                    popup.selectItem(at: index)
+                    if let action = popup.action {
+                        _ = NSApplication.shared.sendAction(
+                            action, to: popup.target, from: popup)
+                    }
+                    spin(seconds: 30) {
+                        trPanel.recognizedText.hasPrefix("[\(other.code)]")
+                    }
+                    if !trPanel.recognizedText.hasPrefix("[\(other.code)]") {
+                        trFailures.append(
+                            "language change '\(trPanel.recognizedText.prefix(40))'")
+                    }
+                    // Translating the translation would compound its errors.
+                    if trPanel.recognizedText.contains("[\(savedTarget)]") {
+                        trFailures.append("re-translated the translation")
+                    }
+                    if Settings.shared.translateTarget != other.code {
+                        trFailures.append(
+                            "target not stored \(Settings.shared.translateTarget)")
+                    }
+                } else {
+                    trFailures.append("no-language-control")
+                }
+
+                // A dead network fails OPEN: the recognition stays on screen
+                // and stays copyable. Blanking it would throw away the work
+                // Vision already did.
+                TranslateService.translatorOverrideForTesting = { _, _ in
+                    throw URLError(.notConnectedToInternet)
+                }
+                if let popup = trPanel.control(
+                    identifier: OverlayOCRPanel.languageIdentifier)
+                    as? NSPopUpButton, let action = popup.action {
+                    _ = NSApplication.shared.sendAction(
+                        action, to: popup.target, from: popup)
+                }
+                spin(seconds: 30) {
+                    trPanel.statusForTesting.hasPrefix("Dịch thất bại")
+                }
+                if !trPanel.statusForTesting.hasPrefix("Dịch thất bại") {
+                    trFailures.append(
+                        "no failure status '\(trPanel.statusForTesting)'")
+                }
+                if trPanel.recognizedText != trPanel.sourceText {
+                    trFailures.append("failure did not fail open")
+                }
+                if !trPanel.copyButtonIsEnabledForTesting {
+                    trFailures.append("failure left copy disabled")
+                }
+
+                // The stale-translation case. Translate is the SECOND await,
+                // so the generation has to be re-checked AFTER it: without
+                // that, a translation for an abandoned region lands in the
+                // panel describing different pixels.
+                TranslateService.translatorOverrideForTesting = { text, lang in
+                    try await Task.sleep(nanoseconds: 250_000_000)
+                    return "[stale-\(lang)] " + text
+                }
+                trHost.clickReviewToolbarButtonForTesting(tag: translateTag)
+                trHost.pickOCRRegionForTesting(
+                    from: CGPoint(x: upperBand.minX, y: upperBand.minY),
+                    to: CGPoint(x: upperBand.maxX, y: upperBand.maxY))
+                spin(seconds: 30) {
+                    trHost.ocrResultPanelForTesting?.statusForTesting
+                        .hasPrefix("Đang dịch") == true
+                }
+                // Abandon it while the translation is still out, then take a
+                // plain recognition of the SAME region.
+                trHost.handleEscapeForTesting()
+                if let ocrTag = OverlayActionCatalog.items.firstIndex(
+                    where: { $0.intent == .ocr }) {
+                    trHost.clickReviewToolbarButtonForTesting(tag: ocrTag)
+                }
+                trHost.pickOCRRegionForTesting(
+                    from: CGPoint(x: upperBand.minX, y: upperBand.minY),
+                    to: CGPoint(x: upperBand.maxX, y: upperBand.maxY))
+                spin(seconds: 30) {
+                    trHost.ocrResultPanelForTesting?.recognizedText
+                        .isEmpty == false
+                }
+                // Past the sleeping translator's deadline.
+                spin(seconds: 1) { false }
+                if let text = trHost.ocrResultPanelForTesting?.recognizedText,
+                   text.contains("[stale-") {
+                    trFailures.append("stale translation landed")
+                }
+                if trHost.ocrResultPanelForTesting?.isTranslateMode == true {
+                    trFailures.append("plain pick kept translate mode")
+                }
+
+                TranslateService.translatorOverrideForTesting = nil
+                OverlayOCRClipboard.sinkForTesting = nil
+                Settings.shared.translateTarget = savedTarget
+                trHost.handleEscapeForTesting()
+                trHost.handleEscapeForTesting()
+                withExtendedLifetime(trOverlay) {}
+                check("sliceB-overlay-ocr-translate",
+                      trFailures.isEmpty,
+                      trFailures.prefix(6).joined(separator: " | "))
             }
 
             // S5 layout contract. Editing chrome is a vertical rail beside
@@ -9385,24 +9785,35 @@ enum SelfTest {
                             "initial capture decorated \(String(describing: dualSpy.lastCaptures.first))")
                     }
 
-                    // See the note at the colour-space gate: OCR is a
-                    // sub-mode now, and Translate carries the same
-                    // undecorated reading through the router.
-                    dualView.performReviewActionForTesting(.translate)
-                    if dualSpy.ocr.last != innerPixels {
-                        bdFailures.append(
-                            "OCR got a framed image \(String(describing: dualSpy.ocr.last))")
-                    }
-                    // Same call, two readings: the recognizer reads the crop,
-                    // the app remembers the picture the user saw.
-                    if let expectedOuter {
-                        let framed = CGSize(
-                            width: CGFloat(expectedOuter.width),
-                            height: CGFloat(expectedOuter.height))
-                        if dualSpy.lastCaptures.last != framed {
+                    // 1.2.17: neither undecorated intent is terminal any more
+                    // (OCR and Translate are both region sub-modes), so the
+                    // dual reading is observed through the payload seam rather
+                    // than by routing an intent whose only remaining job would
+                    // be to be watched. It runs the production compose.
+                    if let dualPayload = dualView.reviewPayloadForTesting() {
+                        let semanticSize = CGSize(
+                            width: dualPayload.semantic.cgImage.width,
+                            height: dualPayload.semantic.cgImage.height)
+                        if semanticSize != innerPixels {
                             bdFailures.append(
-                                "OCR remembered \(String(describing: dualSpy.lastCaptures.last)) want \(framed)")
+                                "semantic reading is framed \(semanticSize)")
                         }
+                        // One freeze, two readings: the recognizer reads the
+                        // crop, the picture the user saw keeps its frame.
+                        if let expectedOuter {
+                            let framed = CGSize(
+                                width: CGFloat(expectedOuter.width),
+                                height: CGFloat(expectedOuter.height))
+                            let visualSize = CGSize(
+                                width: dualPayload.visual.cgImage.width,
+                                height: dualPayload.visual.cgImage.height)
+                            if visualSize != framed {
+                                bdFailures.append(
+                                    "visual reading \(visualSize) want \(framed)")
+                            }
+                        }
+                    } else {
+                        bdFailures.append("no dual payload")
                     }
                     dualOverlay.dismissForTesting()
 
@@ -11475,19 +11886,20 @@ enum SelfTest {
                 // -- framed: the semantic payload is sRGB and carries the
                 //    CONVERTED colour, computed here by CoreGraphics rather
                 //    than by the code under test.
+                var framedSemantic: CGImage?
                 let framedSpy = ImageSpy()
                 if let (overlay, view) = review(
                     framedSpy, scale: 1, selection: colourSelection) {
                     _ = view.applyBackdropPreset(.ocean)
-                    // `.translate`, not `.ocr`: since 1.2.16 the OCR button
-                    // opens the region sub-mode and never reaches the router,
-                    // so it can no longer serve as the vehicle for observing a
-                    // payload. Translate is the OTHER undecorated intent —
-                    // `usesDecoration` returns false for both and the router
-                    // hands both the same snapshot — so what this gate
-                    // measures is unchanged.
-                    view.performReviewActionForTesting(.translate)
-                    if let semantic = framedSpy.semantic.last {
+                    // 1.2.17: the payload seam, not an intent. 1.2.16 moved
+                    // this from `.ocr` to `.translate` because OCR had become
+                    // a sub-mode; Translate is one too now, and NO undecorated
+                    // intent is terminal. Keeping one alive purely so a gate
+                    // could watch it would be a hidden production path — the
+                    // seam composes through the same `reviewPayload`.
+                    framedSemantic = view.reviewPayloadForTesting()?
+                        .semantic.cgImage
+                    if let semantic = framedSemantic {
                         if semantic.colorSpace?.name != CGColorSpace.sRGB {
                             c1Failures.append(
                                 "semantic space "
@@ -11536,7 +11948,7 @@ enum SelfTest {
                             visual,
                             Int(bandInCrop.x + layout.padPixels),
                             Int(bandInCrop.y + layout.padPixels), in: sRGB)
-                        let inSemantic = framedSpy.semantic.last.flatMap {
+                        let inSemantic = framedSemantic.flatMap {
                             read(
                                 $0, Int(bandInCrop.x), Int(bandInCrop.y),
                                 in: sRGB)
@@ -11557,15 +11969,10 @@ enum SelfTest {
                 let plainSpy = ImageSpy()
                 if let (overlay, view) = review(
                     plainSpy, scale: 1, selection: colourSelection) {
-                    // `.translate`, not `.ocr`: since 1.2.16 the OCR button
-                    // opens the region sub-mode and never reaches the router,
-                    // so it can no longer serve as the vehicle for observing a
-                    // payload. Translate is the OTHER undecorated intent —
-                    // `usesDecoration` returns false for both and the router
-                    // hands both the same snapshot — so what this gate
-                    // measures is unchanged.
-                    view.performReviewActionForTesting(.translate)
-                    if let semantic = plainSpy.semantic.last {
+                    // Payload seam, same reason as the framed case above: no
+                    // undecorated intent is terminal since 1.2.17.
+                    if let semantic = view.reviewPayloadForTesting()?
+                        .semantic.cgImage {
                         if semantic.colorSpace?.name != CGColorSpace.displayP3 {
                             c1Failures.append(
                                 "none converted to "

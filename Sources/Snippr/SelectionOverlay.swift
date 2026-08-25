@@ -527,6 +527,9 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
     /// Bumped per request so a slow recognition landing after the user has
     /// picked a NEW region cannot overwrite the newer result.
     private var ocrRegionGeneration = 0
+    /// Whether this pick also translates. Set when the picker is armed, so
+    /// arming with X after a G is a plain recognition again.
+    private var ocrRegionTranslates = false
     let hoverHint = HoverHint()
 
     private static let colorPresets: [NSColor] = [
@@ -766,10 +769,15 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
 
     /// Arms the picker. Not a terminal action and not an edit: nothing is
     /// committed, no history entry is added, and the session stays in review.
-    fileprivate func beginOCRRegionPicking() {
+    ///
+    /// `translate` is the SAME pick with a second async hop after Vision: the
+    /// owner asked for one shape, so Translate stopped being a terminal that
+    /// tore the shot down and opened a window of its own.
+    fileprivate func beginOCRRegionPicking(translate: Bool = false) {
         guard isReviewing, areaSelection != nil else { return }
         hideBackdropMini()
         hideOCRResult()
+        ocrRegionTranslates = translate
         ocrRegionPicking = true
         ocrRegionAnchor = nil
         ocrRegion = nil
@@ -845,13 +853,48 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
         panel?.showRecognizing()
         ocrRegionGeneration &+= 1
         let generation = ocrRegionGeneration
+        let translating = ocrRegionTranslates
         Task { [weak self] in
             let result = await OCRService.shared.recognize(image)
-            await MainActor.run {
+            let next: (panel: OverlayOCRResultView,
+                       language: TranslateService.Language,
+                       text: String)? = await MainActor.run {
                 guard let self, self.ocrRegionGeneration == generation,
                       let panel = self.ocrResultPanel, !panel.isHidden
-                else { return }
+                else { return nil }
                 panel.show(result: result)
+                guard translating, !panel.recognizedText.isEmpty else {
+                    return nil
+                }
+                let language = panel.selectedLanguage
+                panel.showTranslating(to: language)
+                return (panel, language, panel.recognizedText)
+            }
+            guard let next else { return }
+            await self?.translate(
+                next.text, to: next.language, in: next.panel,
+                generation: generation)
+        }
+    }
+
+    /// The SECOND async hop. Every await needs its own generation check, not
+    /// just the first: a translation that comes back after the user has picked
+    /// a new region would otherwise land in the panel describing those other
+    /// pixels — text from somewhere else, with nothing on screen to explain it.
+    private func translate(
+        _ text: String, to language: TranslateService.Language,
+        in panel: OverlayOCRResultView, generation: Int
+    ) async {
+        let translated = try? await TranslateService.translate(
+            text, to: language.code)
+        await MainActor.run { [weak self] in
+            guard let self, self.ocrRegionGeneration == generation,
+                  self.ocrResultPanel === panel, !panel.isHidden
+            else { return }
+            if let translated, !translated.isEmpty {
+                panel.showTranslated(translated, to: language)
+            } else {
+                panel.showTranslateFailed()
             }
         }
     }
@@ -862,12 +905,16 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
             let panel = OverlayOCRResultView(
                 target: self,
                 copyAction: #selector(ocrResultCopyPressed(_:)),
-                closeAction: #selector(ocrResultClosePressed(_:)))
+                closeAction: #selector(ocrResultClosePressed(_:)),
+                languageAction: #selector(ocrResultLanguageChanged(_:)))
             addSubview(panel, positioned: .above, relativeTo: nil)
             ocrResultPanel = panel
             hoverHint.attach(to: panel.hintButtons)
         }
         guard let panel = ocrResultPanel else { return nil }
+        // BEFORE the placement below: translate mode is a taller panel, and
+        // the popover is placed by size.
+        panel.setTranslateMode(ocrRegionTranslates)
         ocrRegion = region
         panel.isHidden = false
         layoutOCRResult()
@@ -895,7 +942,8 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
             bar.flatMap { $0.isHidden ? nil : $0.frame }
         }
         if let placed = OverlayToolbarLayout.popover(
-            size: OverlayOCRPanel.size, anchor: region, avoid: region,
+            size: OverlayOCRPanel.size(translating: panel.isTranslateMode),
+            anchor: region, avoid: region,
             bounds: bounds, occupied: occupied)
         {
             panel.frame = placed.frame
@@ -909,9 +957,7 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
         guard let panel = ocrResultPanel, !panel.isHidden else { return }
         let text = panel.recognizedText
         guard !text.isEmpty else { return }
-        let board = NSPasteboard.general
-        board.clearContents()
-        board.setString(text, forType: .string)
+        OverlayOCRClipboard.put(text)
         // Copy closes the panel and says so — but the SESSION lives on. The
         // owner's whole request was that the shot survives the copy.
         hideOCRResult()
@@ -920,6 +966,26 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
 
     @objc private func ocrResultClosePressed(_ sender: NSButton) {
         hideOCRResult()
+    }
+
+    /// Choosing another language re-translates the RECOGNITION, never the
+    /// translation on screen — running a translation through a second language
+    /// compounds its errors. The choice is stored in the same preference the
+    /// translate window reads, so the two surfaces agree.
+    @objc private func ocrResultLanguageChanged(_ sender: NSPopUpButton) {
+        guard let panel = ocrResultPanel, !panel.isHidden,
+              panel.isTranslateMode else { return }
+        let language = panel.selectedLanguage
+        Settings.shared.translateTarget = language.code
+        let source = panel.sourceText
+        guard !source.isEmpty else { return }
+        panel.showTranslating(to: language)
+        ocrRegionGeneration &+= 1
+        let generation = ocrRegionGeneration
+        Task { [weak self] in
+            await self?.translate(
+                source, to: language, in: panel, generation: generation)
+        }
     }
 
     var ocrRegionPickingForTesting: Bool { ocrRegionPicking }
@@ -933,6 +999,21 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
         return panel
     }
     func beginOCRRegionPickingForTesting() { beginOCRRegionPicking() }
+    var ocrRegionTranslatesForTesting: Bool { ocrRegionTranslates }
+    /// PAYLOAD observation for gates that measure the crop itself — colour
+    /// space, decorated vs undecorated pixels — rather than routing. They used
+    /// to ride `.ocr`, then `.translate`, through the router; both are region
+    /// sub-modes now and NO undecorated intent is terminal, so the payload
+    /// needs its own read-only seam. It runs the production compose (the same
+    /// `syncSessionPixelRect` + `reviewPayload` a terminal runs), because a
+    /// gate that composed its own image would pass while production drifted.
+    func reviewPayloadForTesting()
+        -> (visual: CapturedImage, semantic: CapturedImage)? {
+        guard isReviewing else { return nil }
+        _ = syncSessionPixelRect()
+        guard let payload = reviewPayload() else { return nil }
+        return (payload.visual, payload.semantic)
+    }
     /// The production relayout, which is what a crop drag triggers. Exposed so
     /// the gate can prove the panel follows the frame instead of only checking
     /// where it landed when it opened.
@@ -1266,11 +1347,14 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
     fileprivate func performReviewAction(_ intent: CaptureIntent) {
         hoverHint.hide()
         guard !annotationDragging, areaDrag == nil else { return }
-        // OCR is no longer terminal. The owner asked for Lark's shape: pick a
-        // region, read the text beside it, keep the shot. Translate is
-        // untouched — it still commits and hands off to the result window.
-        if intent == .ocr {
-            beginOCRRegionPicking()
+        // Neither OCR nor Translate is terminal. The owner asked for Lark's
+        // shape for both: pick a region, read the text beside it, keep the
+        // shot. Translate is the same pick with a second hop, so `.translate`
+        // never reaches the router from this host any more — the result window
+        // would have to cover the overlay to be read, which is what tore the
+        // capture down in 1.2.16.
+        if intent == .ocr || intent == .translate {
+            beginOCRRegionPicking(translate: intent == .translate)
             return
         }
         // Toolbar macwindow and the catalog `.openEditor` key share this
@@ -1362,7 +1446,7 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
                         self?.layoutReviewToolbar()
                     }
                 })
-        case .pin, .ocr, .translate, .openEditor:
+        case .pin, .openEditor:
             // teardown BEFORE presenting so the .screenSaver-level overlay
             // can't cover the new surface
             owner.finish(.handled)
@@ -1371,7 +1455,11 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
                 inputs: inputs, finalGlobalRect: global,
                 dependencies: baseDependencies,
                 lastCaptureOverride: lastCaptureOverride)
-        case .initialCapture, .scrollFinished:
+        case .ocr, .translate, .initialCapture, .scrollFinished:
+            // `.ocr`/`.translate` are intercepted at the top of this method
+            // and never arrive: listing them HERE, with nothing to run, is
+            // what makes deleting that intercept a compile-visible change of
+            // behaviour rather than a silent return to the 1.2.15 terminal.
             break
         }
     }
