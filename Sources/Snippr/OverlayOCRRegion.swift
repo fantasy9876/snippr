@@ -60,6 +60,28 @@ enum OverlayOCRPanel {
     }
 }
 
+/// Where the panel's Copy button puts its text.
+///
+/// Production is the general pasteboard. A gate overrides the sink so it can
+/// press the REAL button and read the exact string the handler chose — the
+/// panel's own `recognizedText` is a field, and asserting a field cannot tell
+/// "Copy took the translation" from "Copy took the recognition instead". The
+/// override also keeps a suite run from overwriting the clipboard of whoever
+/// happens to be using the machine.
+enum OverlayOCRClipboard {
+    nonisolated(unsafe) static var sinkForTesting: ((String) -> Void)?
+
+    @MainActor static func put(_ text: String) {
+        if let sink = sinkForTesting {
+            sink(text)
+            return
+        }
+        let board = NSPasteboard.general
+        board.clearContents()
+        board.setString(text, forType: .string)
+    }
+}
+
 /// The panel itself. Deliberately not a window: a `.screenSaver`-level overlay
 /// would cover a child window, and the panel has to sit ON the shot.
 final class OverlayOCRResultView: NSView {

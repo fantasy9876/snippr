@@ -957,9 +957,7 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
         guard let panel = ocrResultPanel, !panel.isHidden else { return }
         let text = panel.recognizedText
         guard !text.isEmpty else { return }
-        let board = NSPasteboard.general
-        board.clearContents()
-        board.setString(text, forType: .string)
+        OverlayOCRClipboard.put(text)
         // Copy closes the panel and says so — but the SESSION lives on. The
         // owner's whole request was that the shot survives the copy.
         hideOCRResult()

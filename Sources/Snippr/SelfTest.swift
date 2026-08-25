@@ -6352,11 +6352,23 @@ enum SelfTest {
                 regionHost.layoutReviewToolbarForTesting()
 
                 // Copy takes the text WITHOUT taking the session with it.
+                // Through the sink, not the real pasteboard: the suite runs on
+                // someone's actual machine, and wiping their clipboard is a
+                // real accident rather than a test detail.
+                var regionCopied: [String] = []
+                OverlayOCRClipboard.sinkForTesting = { regionCopied.append($0) }
+                let regionExpectedCopy = regionHost.ocrResultPanelForTesting?
+                    .recognizedText ?? ""
                 if let copyButton = regionHost.ocrResultPanelForTesting?
                     .control(identifier: OverlayOCRPanel.copyIdentifier) {
                     copyButton.performClick(nil)
                 } else {
                     ocrFailures.append("no-copy-button")
+                }
+                OverlayOCRClipboard.sinkForTesting = nil
+                if regionCopied != [regionExpectedCopy] {
+                    ocrFailures.append(
+                        "copied \(regionCopied.map { String($0.prefix(24)) })")
                 }
                 if regionOverlay.session.phase != .reviewing
                     || regionCompletions != 0 {
@@ -6871,6 +6883,44 @@ enum SelfTest {
                     trFailures.append("no-panel-frame")
                 }
 
+                // What COPY puts on the clipboard, read at the sink the
+                // handler writes to. Asserting `recognizedText` above only
+                // proves the panel holds the translation: pointing the handler
+                // at `sourceText` instead would paste the original — the first
+                // thing a user notices — with every assertion here still green.
+                var copiedTexts: [String] = []
+                OverlayOCRClipboard.sinkForTesting = { copiedTexts.append($0) }
+                let expectedCopy = trPanel.recognizedText
+                if let copyButton = trPanel.control(
+                    identifier: OverlayOCRPanel.copyIdentifier) {
+                    copyButton.performClick(nil)
+                } else {
+                    trFailures.append("no-copy-button")
+                }
+                if copiedTexts != [expectedCopy] {
+                    trFailures.append(
+                        "copied \(copiedTexts.map { String($0.prefix(24)) }) "
+                        + "want '\(expectedCopy.prefix(24))'")
+                }
+                if copiedTexts.first == trPanel.sourceText,
+                   trPanel.sourceText != expectedCopy {
+                    trFailures.append("copied the recognition, not the translation")
+                }
+                if trOverlay.session.phase != .reviewing || trCompletions != 0 {
+                    trFailures.append("copy ended the session")
+                }
+
+                // Copy closes the panel, so the rest of the flow needs a fresh
+                // pick — the same way a user would take a second region.
+                trHost.clickReviewToolbarButtonForTesting(tag: translateTag)
+                trHost.pickOCRRegionForTesting(
+                    from: CGPoint(x: upperBand.minX, y: upperBand.minY),
+                    to: CGPoint(x: upperBand.maxX, y: upperBand.maxY))
+                spin(seconds: 30) {
+                    trHost.ocrResultPanelForTesting?.statusForTesting
+                        .hasPrefix("Đã dịch") == true
+                }
+
                 // Choosing another language re-translates the RECOGNITION and
                 // stores the choice where the translate window reads it.
                 let other = TranslateService.languages.first {
@@ -6973,6 +7023,7 @@ enum SelfTest {
                 }
 
                 TranslateService.translatorOverrideForTesting = nil
+                OverlayOCRClipboard.sinkForTesting = nil
                 Settings.shared.translateTarget = savedTarget
                 trHost.handleEscapeForTesting()
                 trHost.handleEscapeForTesting()
