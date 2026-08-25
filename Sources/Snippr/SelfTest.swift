@@ -6442,6 +6442,15 @@ enum SelfTest {
                 if !regionHost.ocrRegionPickingForTesting {
                     ocrFailures.append("button-did-not-arm-picking")
                 }
+                // Armed is a MODE with no toolbar highlight of its own, so the
+                // cursor is the only thing on screen saying "drag a region
+                // now". The hook reads what production last set, not a
+                // re-derivation.
+                if regionHost.currentCursorForTesting != .crosshair {
+                    ocrFailures.append(
+                        "armed cursor "
+                        + String(describing: regionHost.currentCursorForTesting))
+                }
                 if regionOverlay.session.phase != .reviewing {
                     ocrFailures.append(
                         "arming-changed-phase \(regionOverlay.session.phase)")
@@ -6900,6 +6909,50 @@ enum SelfTest {
                         }
                     } else {
                         apFailures.append("no-resolved-colour")
+                    }
+                    // The OTHER path into this bug: the panel is already on
+                    // screen when the user switches the system between light
+                    // and dark. AppKit walks the subtree with the new
+                    // appearance, and an explicit pin has to hold rather than
+                    // drift with it — opening the panel after the switch
+                    // exercises construction only, which is a different line
+                    // of code from staying put.
+                    //
+                    // This drives `NSApplication.appearance`, which production
+                    // never sets — a real user flips System Settings while it
+                    // is nil. The mechanism at the view is the same (a pinned
+                    // view keeps its pin), so this is real evidence, but it is
+                    // NOT the System Settings path and does not replace the
+                    // manual A3/A4 items in the RC checklist. Automating the
+                    // real path would mean writing the global
+                    // `AppleInterfaceStyle` preference, i.e. changing the
+                    // appearance of the machine someone is using, which no
+                    // gate may do.
+                    for ambient in [NSAppearance.Name.darkAqua, .aqua, .darkAqua] {
+                        application.appearance = NSAppearance(named: ambient)
+                        panel.needsDisplay = true
+                        RunLoop.current.run(
+                            mode: .default,
+                            before: Date().addingTimeInterval(0.05))
+                        if panel.effectiveAppearance.name != .darkAqua {
+                            apFailures.append(
+                                "drifted to "
+                                + panel.effectiveAppearance.name.rawValue
+                                + " under \(ambient.rawValue)")
+                        }
+                        if let text = panel.resolvedTextColorForTesting {
+                            let luma = 0.2126 * text.redComponent
+                                + 0.7152 * text.greenComponent
+                                + 0.0722 * text.blueComponent
+                            if luma < 0.6 {
+                                apFailures.append(
+                                    "text luma \(String(format: "%.2f", luma))"
+                                    + " under \(ambient.rawValue)")
+                            }
+                        } else {
+                            apFailures.append(
+                                "no-resolved-colour under \(ambient.rawValue)")
+                        }
                     }
                 } else {
                     apFailures.append("no-panel")
