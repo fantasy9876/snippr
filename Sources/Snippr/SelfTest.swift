@@ -5383,6 +5383,9 @@ enum SelfTest {
             // assert under BOTH app appearances. Pinning .darkAqua without
             // dropping the system bezel would still dim; making the panel
             // key would "fix" the bezel by stealing focus mid-scroll.
+            // Contrast is title vs the BUTTON FILL, not the container: the
+            // glyph sits on done.layer. Measuring container (white 0.09)
+            // lets a near-white fill (the original unreadable-button bug) pass.
             do {
                 var chromeFailures: [String] = []
                 let savedAppAppearance = NSApp.appearance
@@ -5464,18 +5467,36 @@ enum SelfTest {
                         chromeFailures.append(
                             "\(name.rawValue):title-luma \(titleLuma)")
                     }
-                    var bgLuma: Int?
+                    var containerLuma: Int?
                     if let cg = container?.layer?.backgroundColor,
                        let bg = NSColor(cgColor: cg) {
-                        bgLuma = lumaOf(bg)
+                        containerLuma = lumaOf(bg)
                     }
-                    if let bgLuma, bgLuma > 80 {
+                    if let containerLuma, containerLuma > 80 {
                         chromeFailures.append(
-                            "\(name.rawValue):bg-luma \(bgLuma)")
+                            "\(name.rawValue):bg-luma \(containerLuma)")
                     }
-                    if let bgLuma, titleLuma - bgLuma < 120 {
+                    if let containerLuma, titleLuma - containerLuma < 120 {
                         chromeFailures.append(
-                            "\(name.rawValue):contrast \(titleLuma)-\(bgLuma)")
+                            "\(name.rawValue):container-contrast \(titleLuma)-\(containerLuma)")
+                    }
+                    // Glyph sits on the button fill. A borderless control
+                    // without an explicit fill, or a fill within 120 luma
+                    // of the title, is the unreadable-button bug — catch
+                    // it even if the bezel checks are later deleted.
+                    if !done.isBordered {
+                        var fillLuma: Int?
+                        if let cg = done.layer?.backgroundColor,
+                           let fill = NSColor(cgColor: cg) {
+                            fillLuma = lumaOf(fill)
+                        }
+                        if fillLuma == nil {
+                            chromeFailures.append(
+                                "\(name.rawValue):no-button-fill")
+                        } else if let fillLuma, titleLuma - fillLuma < 120 {
+                            chromeFailures.append(
+                                "\(name.rawValue):fill-contrast \(titleLuma)-\(fillLuma)")
+                        }
                     }
                     chromeSession.hideChromeForTesting()
                     if chromeSession.previewPanelForTesting != nil {
