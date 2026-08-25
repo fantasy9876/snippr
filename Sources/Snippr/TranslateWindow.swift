@@ -22,7 +22,16 @@ enum TranslateService {
         .init(code: "th", label: "ไทย"),
     ]
 
+    /// Test seam. Gates drive the real translate flow — the button, the panel,
+    /// the language popup — without a network call, and without production
+    /// growing a second code path they could pass against.
+    nonisolated(unsafe) static var translatorOverrideForTesting:
+        ((String, String) async throws -> String)?
+
     static func translate(_ text: String, to lang: String) async throws -> String {
+        if let override = translatorOverrideForTesting {
+            return try await override(text, lang)
+        }
         // POST with the text in the body: a GET URL breaks past ~8 KB, which
         // is exactly the dense OCR/scroll captures where translation matters
         var comps = URLComponents(string: "https://translate.googleapis.com/translate_a/single")!
