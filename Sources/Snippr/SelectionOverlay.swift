@@ -705,6 +705,14 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
         // click handler alone would leave a hint describing the OLD tool on
         // screen after a keyboard switch.
         hoverHint.hide()
+        // Choosing a tool states a DIFFERENT intent, so it ends an armed
+        // region pick. Leaving the arm up made every visible signal lie at
+        // once: the toolbar lit the new tool, the cursor cannot tell them
+        // apart (`AppCursor.drawing` is `.crosshair` for every tool but text,
+        // and armed is `.crosshair` too), and the drag still cut an OCR
+        // region instead of drawing. A mode entered by a deliberate press
+        // leaves by one.
+        cancelOCRRegionPicking()
         annotationSurface?.tool = tool
         for button in toolbarButtons
             where OverlayAnnotationTool.tool(forToolbarTag: button.tag) != nil {
@@ -2322,26 +2330,61 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
     private func areaCursorRects() -> [(rect: CGRect, cursor: AppCursor)] {
         guard mode == .area else { return [(bounds, .crosshair)] }
         var rects: [(rect: CGRect, cursor: AppCursor)] = [(bounds, .crosshair)]
-        guard let selection = areaSelection else { return rects }
-        let tool = annotationSurface?.tool ?? .select
-        let drawing = isReviewing && !textEditingActive && tool != .select
-        if !drawing { rects.append((selection, .openHand)) }
-        let handleRects = EditableSelectionGeometry.handleRects(
-            for: selection, size: 18,
-            cornerRadius: reviewCornerRadius(for: selection))
-        let handleOrder: [SelectionHandle] = [
-            .bottom, .top, .left, .right,
-            .bottomLeft, .bottomRight, .topLeft, .topRight,
-        ]
-        for handle in handleOrder {
-            guard let entry = handleRects.first(where: { $0.0 == handle })
-            else { continue }
-            rects.append((entry.1, .resize(handle)))
+        // Armed for a region OCR pick, the whole canvas IS the picking
+        // surface — crop included, because the drag that picks a region starts
+        // anywhere. `beginOCRRegionPicking` sets the crosshair, but the first
+        // mouse move re-reads this table, so without the skip below the crop
+        // handed back `.openHand` a pixel later and the mode lost the only
+        // affordance it has: there is no toolbar highlight while armed.
+        if let selection = areaSelection, !ocrRegionPicking {
+            let tool = annotationSurface?.tool ?? .select
+            let drawing = isReviewing && !textEditingActive && tool != .select
+            if !drawing { rects.append((selection, .openHand)) }
+            let handleRects = EditableSelectionGeometry.handleRects(
+                for: selection, size: 18,
+                cornerRadius: reviewCornerRadius(for: selection))
+            let handleOrder: [SelectionHandle] = [
+                .bottom, .top, .left, .right,
+                .bottomLeft, .bottomRight, .topLeft, .topRight,
+            ]
+            for handle in handleOrder {
+                guard let entry = handleRects.first(where: { $0.0 == handle })
+                else { continue }
+                rects.append((entry.1, .resize(handle)))
+            }
+            if drawing { rects.append((selection, AppCursor.drawing(tool))) }
         }
-        if drawing { rects.append((selection, AppCursor.drawing(tool))) }
-        if let mini = backdropMini, !mini.isHidden {
-            let editor = convert(mini.openEditorButtonFrame, from: mini)
-            rects.append((editor, .pointingHand))
+        rects.append(contentsOf: chromeCursorRects())
+        return rects
+    }
+
+    /// Chrome LAST, so it wins the canvas underneath it (the lookup scans in
+    /// reverse). Toolbars are plain containers, so the overlay answers for
+    /// them; the popover and the OCR panel know their own insides and answer
+    /// for themselves through `OverlayCursorRegions`.
+    ///
+    /// The buttons stay clickable while a region pick is armed, so this table
+    /// is built the same way whether armed or not.
+    private func chromeCursorRects() -> [CursorRegion] {
+        var rects: [CursorRegion] = []
+        for container in [reviewToolRail, reviewActionBar].compactMap({ $0 })
+        where !container.isHidden {
+            rects.append((container.frame, .arrow))
+            for button in toolbarButtons
+            where button.superview === container && !button.isHidden {
+                // Locked during a save, and undo/redo when there is nothing to
+                // undo: a pressable-looking cursor over a dead button is the
+                // same lie as a move cursor over text.
+                rects.append((
+                    convert(button.frame, from: container),
+                    button.isEnabled ? .pointingHand : .arrow))
+            }
+        }
+        let panels: [OverlayCursorRegions?] = [backdropMini, ocrResultPanel]
+        for panel in panels.compactMap({ $0 }) where !panel.isHidden {
+            for region in panel.cursorRegions() {
+                rects.append((convert(region.rect, from: panel), region.cursor))
+            }
         }
         return rects
     }

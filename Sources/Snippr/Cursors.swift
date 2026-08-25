@@ -37,3 +37,27 @@ enum AppCursor: Equatable {
         tool == .text ? .iBeam : .crosshair
     }
 }
+
+/// One rectangle of a surface and what the pointer means over it, in the
+/// coordinates of whoever produced it.
+typealias CursorRegion = (rect: CGRect, cursor: AppCursor)
+
+/// Chrome that floats ON a drawing surface — a toolbar, a mini popover, the
+/// OCR result panel.
+///
+/// The host sets the cursor on every mouse move from its own hit table, which
+/// overrides any `resetCursorRects` a subview installs. So chrome that says
+/// nothing inherits the cursor of the CANVAS underneath it: an OCR panel over
+/// the crop got `.openHand`, the "drag this crop" cursor, over its text and
+/// its buttons alike. Chrome answers for itself here instead.
+///
+/// House vocabulary, so the same hit means the same thing everywhere:
+/// - chrome background, and any DISABLED control → `.arrow`
+/// - an enabled control you can click → `.pointingHand`
+/// - selectable text → `.iBeam`
+/// - the canvas itself is never chrome: it stays `.crosshair` or the tool's
+protocol OverlayCursorRegions: NSView {
+    /// General to specific: the host appends them in order and scans the
+    /// table in reverse, so a later, smaller region wins.
+    func cursorRegions() -> [CursorRegion]
+}

@@ -6451,6 +6451,77 @@ enum SelfTest {
                         "armed cursor "
                         + String(describing: regionHost.currentCursorForTesting))
                 }
+                // The pointer as the USER moves it, not as arming left it.
+                // Every reading below goes through a real mouseMoved so the
+                // cursor that comes back is the one production last set.
+                @MainActor func regionCursor(at point: CGPoint) -> AppCursor? {
+                    guard let move = NSEvent.mouseEvent(
+                        with: .mouseMoved, location: point, modifierFlags: [],
+                        timestamp: 0, windowNumber: 0, context: nil,
+                        eventNumber: 0, clickCount: 1, pressure: 1)
+                    else {
+                        ocrFailures.append("no-mouse-move-event")
+                        return nil
+                    }
+                    regionHost.mouseMoved(with: move)
+                    return regionHost.currentCursorForTesting
+                }
+                // The crosshair has to SURVIVE that move. The check above
+                // reads the value arming set; the table is re-read on the
+                // first twitch, and it used to hand the crop back its
+                // "drag me" open hand a pixel later — leaving an armed mode
+                // whose only affordance lasted one frame.
+                let cropCentre = CGPoint(
+                    x: regionCrop.midX, y: regionCrop.midY)
+                if let armedMoved = regionCursor(at: cropCentre),
+                   armedMoved != .crosshair {
+                    ocrFailures.append("armed cursor moved \(armedMoved)")
+                }
+                // The crop EDGE while armed. `mouseDown` at 1864 sends every
+                // point but the panel straight into `ocrRegionAnchor`, so a
+                // resize cursor out here would promise a resize the press can
+                // no longer perform. The armed table skips the handles for the
+                // same reason it skips the crop, and this pins that decision:
+                // whoever changes the mouseDown routing makes this red.
+                //
+                // The crop here nearly fills the host, so the toolbars fall
+                // INSIDE it — a fixed edge point would sit on chrome and prove
+                // nothing about handles. Take the first handle the chrome does
+                // not cover, and say so if there is none rather than skipping
+                // the case quietly.
+                let armedEdge = [
+                    SelectionHandle.left, .right, .top, .bottom,
+                    .topLeft, .topRight, .bottomLeft, .bottomRight,
+                ]
+                .map { $0.point(in: regionCrop) }
+                .first { point in
+                    guard let toolbars =
+                        regionHost.reviewToolbarFrameForTesting
+                    else { return true }
+                    return !toolbars.insetBy(dx: -2, dy: -2).contains(point)
+                }
+                if let armedEdge {
+                    if let overEdge = regionCursor(at: armedEdge),
+                       overEdge != .crosshair {
+                        ocrFailures.append("armed edge cursor \(overEdge)")
+                    }
+                } else {
+                    // Fixture problem, not a feature problem — say which.
+                    ocrFailures.append("every-edge-probe-under-toolbar")
+                }
+                // Chrome answers for itself even while armed, because its
+                // buttons stay clickable: an enabled toolbar button reads as
+                // pressable, not as canvas.
+                if let toolButton =
+                    regionHost.reviewToolbarButtonFramesForTesting.first {
+                    let got = regionCursor(
+                        at: CGPoint(x: toolButton.midX, y: toolButton.midY))
+                    if got != .pointingHand {
+                        ocrFailures.append(
+                            "toolbar cursor \(String(describing: got))")
+                    }
+                }
+                _ = regionCursor(at: cropCentre)
                 if regionOverlay.session.phase != .reviewing {
                     ocrFailures.append(
                         "arming-changed-phase \(regionOverlay.session.phase)")
@@ -6497,6 +6568,74 @@ enum SelfTest {
                     }
                 } else {
                     ocrFailures.append("no-panel")
+                }
+
+                // What the pointer says OVER the panel. The panel sits inside
+                // the crop, so before it answered for itself every one of
+                // these three points reported `.openHand` — "drag this crop" —
+                // over text to select and a button to press. That is the
+                // 1.2.17 report, and each point below turns red on its own.
+                if let panel = regionHost.ocrResultPanelForTesting,
+                   let panelFrame = regionHost.ocrResultPanelFrameForTesting {
+                    @MainActor func panelPoint(_ rect: CGRect) -> CGPoint {
+                        CGPoint(
+                            x: panelFrame.minX + rect.midX,
+                            y: panelFrame.minY + rect.midY)
+                    }
+                    let textBox = OverlayOCRPanel.textFrame(
+                        translating: panel.isTranslateMode)
+                    let overText = regionCursor(at: panelPoint(textBox))
+                    if overText != .iBeam {
+                        ocrFailures.append(
+                            "text cursor \(String(describing: overText))")
+                    }
+                    if let copy = panel.control(
+                        identifier: OverlayOCRPanel.copyIdentifier) {
+                        if !copy.isEnabled {
+                            // The pointingHand below only means something over
+                            // a LIVE button; a disabled one must read `.arrow`.
+                            ocrFailures.append("copy-disabled-before-cursor")
+                        }
+                        let overCopy = regionCursor(at: panelPoint(copy.frame))
+                        if overCopy != .pointingHand {
+                            ocrFailures.append(
+                                "copy cursor \(String(describing: overCopy))")
+                        }
+                    }
+                    // And the same button once it goes DEAD. Copy is disabled
+                    // while a recognition is in flight — production's own
+                    // `showRecognizing()`, the call the pick makes — and a
+                    // dead button that still says "press me" is the same lie
+                    // as a move cursor over text. Restored right after, from
+                    // the text the panel already held, so the Copy case below
+                    // still runs against a live button.
+                    let held = panel.recognizedText
+                    panel.showRecognizing()
+                    if let copy = panel.control(
+                        identifier: OverlayOCRPanel.copyIdentifier) {
+                        let overDead = regionCursor(at: panelPoint(copy.frame))
+                        if overDead != .arrow {
+                            ocrFailures.append(
+                                "disabled copy cursor "
+                                + String(describing: overDead))
+                        }
+                    }
+                    panel.show(
+                        result: OCRResult(text: held, qrPayloads: []))
+                    if panel.recognizedText != held {
+                        ocrFailures.append("restore-lost-text")
+                    }
+                    // The footer strip between Copy and ✕ is the status text:
+                    // chrome, not a control, and not the canvas either.
+                    let chrome = CGRect(
+                        x: panel.bounds.midX, y: OverlayOCRPanel.contentInset,
+                        width: 1, height: OverlayOCRPanel.footerHeight)
+                    let overChrome = regionCursor(at: panelPoint(chrome))
+                    if overChrome != .arrow {
+                        ocrFailures.append(
+                            "panel chrome cursor "
+                            + String(describing: overChrome))
+                    }
                 }
 
                 // Moving the crop has to carry the panel with it. Measuring
@@ -6623,6 +6762,80 @@ enum SelfTest {
                 check("sliceB-overlay-ocr-region",
                       ocrFailures.isEmpty,
                       ocrFailures.prefix(6).joined(separator: " | "))
+            }
+
+            // --- 1.2.18: arming a region pick is a MODE, and choosing a tool
+            // leaves it.
+            //
+            // Before this, X then P lit Pen on the toolbar and showed Pen's
+            // cursor — `AppCursor.drawing` is `.crosshair` for every tool but
+            // text, and armed is `.crosshair` too, so the pointer CANNOT tell
+            // the two apart — and then the drag cut an OCR region anyway.
+            // Every visible signal said pen; the behaviour was not pen. No
+            // cursor table can fix that, only the state can.
+            do {
+                var armFailures: [String] = []
+                let armFrozen = CapturedImage(
+                    cgImage: makeTestImage(width: 900, height: 600), scale: 1)
+                let armOverlay = SelectionOverlay(
+                    purpose: .areaReview,
+                    inputs: OverlaySessionInputs(
+                        afterShow: true, afterCopy: false, afterSave: false),
+                    completion: { _ in armFailures.append("session-finished") })
+                armOverlay.routerDependenciesOverride =
+                    CaptureActionRouter.Dependencies(
+                        copyToClipboard: { _ in }, autoSave: { _, _ in },
+                        saveAs: { _, _ in }, pin: { _ in },
+                        ocrWithMode: { _, _ in
+                            armFailures.append("routed-terminal-ocr")
+                        },
+                        openEditor: { _ in }, toast: { _ in },
+                        setLastCapture: { _ in }, setLastAreaRect: { _ in },
+                        logEvent: { _ in })
+                let armHost = SelectionOverlayView(
+                    mode: .area, screen: screen, frozen: armFrozen,
+                    windowList: [], owner: armOverlay)
+                armHost.frame = CGRect(x: 0, y: 0, width: 900, height: 600)
+                armHost.selectForTesting(
+                    rect: CGRect(x: 40, y: 40, width: 820, height: 520))
+                // Real keys through the real responder entry point, both of
+                // them: X from the action catalog, P from the tool map. A test
+                // hook that called `selectAnnotationTool` directly would pass
+                // even if `keyDown` routed the tool key somewhere else.
+                @MainActor func armKey(_ characters: String) -> NSEvent? {
+                    NSEvent.keyEvent(
+                        with: .keyDown, location: .zero, modifierFlags: [],
+                        timestamp: 0, windowNumber: 0, context: nil,
+                        characters: characters,
+                        charactersIgnoringModifiers: characters,
+                        isARepeat: false, keyCode: 0)
+                }
+                if let armed = armKey("x") { armHost.keyDown(with: armed) }
+                if !armHost.ocrRegionPickingForTesting {
+                    armFailures.append("x-did-not-arm")
+                }
+                if let pen = armKey("p") { armHost.keyDown(with: pen) }
+                if armHost.ocrRegionPickingForTesting {
+                    armFailures.append("tool-left-the-pick-armed")
+                }
+                // The flag is not the promise — the DRAG is. Asserting only
+                // the flag would stay green if the arm were cleared but
+                // `mouseDown` still routed the drag to the picker.
+                armHost.annotationDragForTesting(
+                    from: CGPoint(x: 200, y: 200),
+                    to: CGPoint(x: 420, y: 380))
+                if armHost.annotationSurfaceIsEmptyForTesting {
+                    armFailures.append("drag-drew-nothing")
+                }
+                if armHost.ocrRegionForTesting != nil {
+                    armFailures.append("drag-cut-a-region")
+                }
+                if armHost.ocrResultPanelFrameForTesting != nil {
+                    armFailures.append("drag-opened-the-panel")
+                }
+                check("sliceB-overlay-arm-yields-to-tool",
+                      armFailures.isEmpty,
+                      armFailures.joined(separator: " | "))
             }
 
             // --- 1.2.16: the action keys and the hints that advertise them

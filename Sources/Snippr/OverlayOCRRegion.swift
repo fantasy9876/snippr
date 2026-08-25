@@ -327,3 +327,28 @@ final class OverlayOCRResultView: NSView {
         return super.hitTest(point)
     }
 }
+
+extension OverlayOCRResultView: OverlayCursorRegions {
+    /// The panel eats the POINTER for the same reason it eats clicks: what is
+    /// under the mouse here is text to select and buttons to press, not the
+    /// crop underneath. Without this the overlay's own table answered, and the
+    /// text area reported `.openHand` — "drag this crop" — over text the user
+    /// was trying to select.
+    func cursorRegions() -> [CursorRegion] {
+        var regions: [CursorRegion] = [(bounds, .arrow)]
+        // Selectable but not editable (see the init): an I-beam is the only
+        // thing on screen that says "drag across this and it will highlight".
+        regions.append((scroll.frame, .iBeam))
+        // Driven off `hintButtons` — the SAME list the hover hints read — so a
+        // control added to the panel later gets its cursor and its hint from
+        // one edit instead of two, and cannot arrive with only one of them.
+        //
+        // A disabled Copy — empty recognition, or a translation still in
+        // flight — must NOT look pressable. It falls back to the panel's arrow.
+        for control in hintButtons where !control.isHidden {
+            regions.append(
+                (control.frame, control.isEnabled ? .pointingHand : .arrow))
+        }
+        return regions
+    }
+}

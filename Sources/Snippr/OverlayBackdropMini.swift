@@ -386,3 +386,18 @@ final class OverlayBackdropMiniView: NSView {
         onOpenEditor?()
     }
 }
+
+extension OverlayBackdropMiniView: OverlayCursorRegions {
+    /// The footer link already had a hover callback pushing `.pointingHand`
+    /// onto the host; the chips and the panel body had nothing, so they wore
+    /// the crop's `.openHand`. Now the whole popover answers in one table and
+    /// the callback only has to say what the ICON does.
+    func cursorRegions() -> [CursorRegion] {
+        var regions: [CursorRegion] = [(bounds, .arrow)]
+        for button in hintButtons where !button.isHidden {
+            regions.append(
+                (button.frame, button.isEnabled ? .pointingHand : .arrow))
+        }
+        return regions
+    }
+}
