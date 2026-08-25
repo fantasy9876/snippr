@@ -7185,6 +7185,356 @@ enum SelfTest {
                       trFailures.prefix(6).joined(separator: " | "))
             }
 
+            // --- 1.2.18: translate fail names the class, Retry is a real button
+            //
+            // Owner saw "Dịch thất bại" and we could not tell offline from 429
+            // from HTML-instead-of-JSON because `try?` swallowed the error.
+            // These gates pin the tokens AND the Retry click — injecting a
+            // translator and calling `translate` as a seam would pass a panel
+            // whose Retry button did nothing.
+            do {
+                var kindFailures: [String] = []
+                func expectToken(
+                    _ name: String, _ message: String, _ token: String
+                ) {
+                    if !message.hasPrefix("Dịch thất bại")
+                        || !message.contains(token) {
+                        kindFailures.append("\(name) '\(message)'")
+                    }
+                }
+                expectToken(
+                    "offline",
+                    TranslateService.Failure.offline.userMessage, "mất mạng")
+                expectToken(
+                    "timeout",
+                    TranslateService.Failure.timeout.userMessage, "hết thời gian")
+                expectToken(
+                    "429",
+                    TranslateService.Failure.http(status: 429).userMessage,
+                    "HTTP 429")
+                let blocked = TranslateService.Failure.http(status: 429)
+                    .userMessage
+                if !blocked.contains("chặn") && !blocked.contains("giới hạn") {
+                    kindFailures.append("429 missing block token '\(blocked)'")
+                }
+                expectToken(
+                    "payload",
+                    TranslateService.Failure.payload(status: 200).userMessage,
+                    "dữ liệu lạ")
+                if TranslateService.Failure.classify(
+                    URLError(.notConnectedToInternet)) != .offline {
+                    kindFailures.append("classify-offline")
+                }
+                if TranslateService.Failure.classify(URLError(.timedOut))
+                    != .timeout {
+                    kindFailures.append("classify-timeout")
+                }
+                if TranslateService.Failure.classify(
+                    TranslateService.Failure.http(status: 503))
+                    != .http(status: 503) {
+                    kindFailures.append("classify-identity")
+                }
+
+                do {
+                    _ = try TranslateService.decodeTranslation(
+                        data: Data("<html>blocked</html>".utf8),
+                        httpStatus: 200)
+                    kindFailures.append("html-200-did-not-throw")
+                } catch let failure as TranslateService.Failure {
+                    if case .payload(let status) = failure {
+                        if status != 200 {
+                            kindFailures.append(
+                                "html-200 status \(String(describing: status))")
+                        }
+                    } else {
+                        kindFailures.append("html-200 \(failure)")
+                    }
+                    if !failure.userMessage.contains("dữ liệu lạ") {
+                        kindFailures.append(
+                            "html-200 message '\(failure.userMessage)'")
+                    }
+                } catch {
+                    kindFailures.append("html-200 other \(error)")
+                }
+
+                do {
+                    _ = try TranslateService.decodeTranslation(
+                        data: Data(), httpStatus: 429)
+                    kindFailures.append("429-did-not-throw")
+                } catch let failure as TranslateService.Failure {
+                    if case .http(let status) = failure, status == 429 {
+                        if !failure.userMessage.contains("HTTP 429") {
+                            kindFailures.append(
+                                "429 message '\(failure.userMessage)'")
+                        }
+                    } else {
+                        kindFailures.append("429 \(failure)")
+                    }
+                } catch {
+                    kindFailures.append("429 other \(error)")
+                }
+
+                do {
+                    _ = try TranslateService.decodeTranslation(
+                        data: Data(), httpStatus: 503)
+                    kindFailures.append("503-did-not-throw")
+                } catch let failure as TranslateService.Failure {
+                    if case .http(let status) = failure, status == 503 {
+                        if !failure.userMessage.contains("HTTP 503") {
+                            kindFailures.append(
+                                "503 message '\(failure.userMessage)'")
+                        }
+                        if failure.userMessage.contains("chặn") {
+                            kindFailures.append("503 treated as blocked")
+                        }
+                    } else {
+                        kindFailures.append("503 \(failure)")
+                    }
+                } catch {
+                    kindFailures.append("503 other \(error)")
+                }
+
+                if let okJSON = try? JSONSerialization.data(
+                    withJSONObject: [[["Xin chào", "Hello"]]]) {
+                    do {
+                        let text = try TranslateService.decodeTranslation(
+                            data: okJSON, httpStatus: 200)
+                        if text != "Xin chào" {
+                            kindFailures.append("ok payload '\(text)'")
+                        }
+                    } catch {
+                        kindFailures.append("ok payload threw \(error)")
+                    }
+                } else {
+                    kindFailures.append("could-not-build-ok-json")
+                }
+
+                check("translate-service-failure-kinds",
+                      kindFailures.isEmpty,
+                      kindFailures.prefix(6).joined(separator: " | "))
+            }
+
+            translateReasonsGate: do {
+                var trFailures: [String] = []
+                let savedTarget = Settings.shared.translateTarget
+                defer {
+                    TranslateService.translatorOverrideForTesting = nil
+                    OverlayOCRClipboard.sinkForTesting = nil
+                    Settings.shared.translateTarget = savedTarget
+                }
+                TranslateService.translatorOverrideForTesting = { _, _ in
+                    throw URLError(.notConnectedToInternet)
+                }
+                let trFrozen = CapturedImage(
+                    cgImage: makeSplitTextImage(
+                        top: "TOPMARK", bottom: "LOWMARK",
+                        width: 900, height: 600),
+                    scale: 1)
+                var trCompletions = 0
+                let trOverlay = SelectionOverlay(
+                    purpose: .areaReview,
+                    inputs: OverlaySessionInputs(
+                        afterShow: true, afterCopy: false, afterSave: false),
+                    completion: { _ in trCompletions += 1 })
+                trOverlay.routerDependenciesOverride =
+                    CaptureActionRouter.Dependencies(
+                        copyToClipboard: { _ in }, autoSave: { _, _ in },
+                        saveAs: { _, _ in }, pin: { _ in },
+                        ocrWithMode: { _, _ in
+                            trFailures.append("routed-terminal-translate")
+                        },
+                        openEditor: { _ in }, toast: { _ in },
+                        setLastCapture: { _ in }, setLastAreaRect: { _ in },
+                        logEvent: { _ in })
+                let trHost = SelectionOverlayView(
+                    mode: .area, screen: screen, frozen: trFrozen,
+                    windowList: [], owner: trOverlay)
+                trHost.frame = CGRect(x: 0, y: 0, width: 900, height: 600)
+                let trCrop = CGRect(x: 40, y: 40, width: 820, height: 520)
+                trHost.selectForTesting(rect: trCrop)
+                let upperBand = CGRect(x: 60, y: 330, width: 780, height: 210)
+
+                guard let translateTag = OverlayActionCatalog.items.firstIndex(
+                    where: { $0.intent == .translate })
+                else {
+                    check("sliceB-overlay-ocr-translate-retry", false,
+                          "no translate catalog entry")
+                    break translateReasonsGate
+                }
+                trHost.clickReviewToolbarButtonForTesting(tag: translateTag)
+                trHost.pickOCRRegionForTesting(
+                    from: CGPoint(x: upperBand.minX, y: upperBand.minY),
+                    to: CGPoint(x: upperBand.maxX, y: upperBand.maxY))
+
+                @MainActor func spin(
+                    seconds: TimeInterval, until done: () -> Bool
+                ) {
+                    let deadline = Date().addingTimeInterval(seconds)
+                    while Date() < deadline, !done() {
+                        RunLoop.current.run(
+                            mode: .default,
+                            before: Date().addingTimeInterval(0.05))
+                    }
+                }
+                spin(seconds: 30) {
+                    trHost.ocrResultPanelForTesting?.statusForTesting
+                        .hasPrefix("Dịch thất bại") == true
+                }
+                guard let trPanel = trHost.ocrResultPanelForTesting else {
+                    check("sliceB-overlay-ocr-translate-retry", false,
+                          "no panel")
+                    break translateReasonsGate
+                }
+
+                @MainActor func clickRetry() -> Bool {
+                    guard let button = trPanel.control(
+                        identifier: OverlayOCRPanel.retryIdentifier)
+                    else {
+                        trFailures.append("no-retry-button")
+                        return false
+                    }
+                    if button.isHidden {
+                        trFailures.append("retry-hidden")
+                        return false
+                    }
+                    button.performClick(nil)
+                    return true
+                }
+
+                if !trPanel.statusForTesting.contains("mất mạng") {
+                    trFailures.append(
+                        "offline '\(trPanel.statusForTesting)'")
+                }
+                if trPanel.recognizedText != trPanel.sourceText {
+                    trFailures.append("offline did not fail open")
+                }
+                if !trPanel.copyButtonIsEnabledForTesting {
+                    trFailures.append("offline left copy disabled")
+                }
+                guard let firstRetry = trPanel.control(
+                    identifier: OverlayOCRPanel.retryIdentifier)
+                else {
+                    check("sliceB-overlay-ocr-translate-retry", false,
+                          "no retry identifier after offline"
+                          + " | \(trPanel.statusForTesting)")
+                    break translateReasonsGate
+                }
+                if firstRetry.isHidden {
+                    trFailures.append("retry hidden after offline")
+                }
+
+                TranslateService.translatorOverrideForTesting = { _, _ in
+                    throw TranslateService.Failure.http(status: 429)
+                }
+                if clickRetry() {
+                    spin(seconds: 10) {
+                        trPanel.statusForTesting.contains("HTTP 429")
+                    }
+                    if !trPanel.statusForTesting.contains("HTTP 429") {
+                        trFailures.append(
+                            "429 '\(trPanel.statusForTesting)'")
+                    }
+                }
+
+                TranslateService.translatorOverrideForTesting = { _, _ in
+                    throw TranslateService.Failure.payload(status: 200)
+                }
+                if clickRetry() {
+                    spin(seconds: 10) {
+                        trPanel.statusForTesting.contains("dữ liệu lạ")
+                    }
+                    if !trPanel.statusForTesting.contains("dữ liệu lạ") {
+                        trFailures.append(
+                            "payload '\(trPanel.statusForTesting)'")
+                    }
+                }
+
+                TranslateService.translatorOverrideForTesting = { _, _ in
+                    throw URLError(.timedOut)
+                }
+                if clickRetry() {
+                    spin(seconds: 10) {
+                        trPanel.statusForTesting.contains("hết thời gian")
+                    }
+                    if !trPanel.statusForTesting.contains("hết thời gian") {
+                        trFailures.append(
+                            "timeout '\(trPanel.statusForTesting)'")
+                    }
+                }
+
+                TranslateService.translatorOverrideForTesting = { text, lang in
+                    "[\(lang)] " + text
+                }
+                if clickRetry() {
+                    spin(seconds: 10) {
+                        trPanel.statusForTesting.hasPrefix("Đã dịch")
+                    }
+                    if !trPanel.recognizedText.hasPrefix("[\(savedTarget)]") {
+                        trFailures.append(
+                            "retry-success '\(trPanel.recognizedText.prefix(40))'")
+                    }
+                    if trPanel.control(
+                        identifier: OverlayOCRPanel.retryIdentifier)?
+                        .isHidden != true {
+                        trFailures.append("retry stayed visible after success")
+                    }
+                }
+
+                TranslateService.translatorOverrideForTesting = { _, _ in
+                    throw URLError(.notConnectedToInternet)
+                }
+                if let popup = trPanel.control(
+                    identifier: OverlayOCRPanel.languageIdentifier)
+                    as? NSPopUpButton, let action = popup.action {
+                    _ = NSApplication.shared.sendAction(
+                        action, to: popup.target, from: popup)
+                    spin(seconds: 10) {
+                        trPanel.statusForTesting.contains("mất mạng")
+                    }
+                } else {
+                    trFailures.append("no-language-control")
+                }
+
+                TranslateService.translatorOverrideForTesting = { text, lang in
+                    try await Task.sleep(nanoseconds: 250_000_000)
+                    return "[stale-retry-\(lang)] " + text
+                }
+                if clickRetry() {
+                    spin(seconds: 10) {
+                        trPanel.statusForTesting.hasPrefix("Đang dịch")
+                    }
+                    trHost.handleEscapeForTesting()
+                    if let ocrTag = OverlayActionCatalog.items.firstIndex(
+                        where: { $0.intent == .ocr }) {
+                        trHost.clickReviewToolbarButtonForTesting(tag: ocrTag)
+                    }
+                    trHost.pickOCRRegionForTesting(
+                        from: CGPoint(x: upperBand.minX, y: upperBand.minY),
+                        to: CGPoint(x: upperBand.maxX, y: upperBand.maxY))
+                    spin(seconds: 30) {
+                        trHost.ocrResultPanelForTesting?.recognizedText
+                            .isEmpty == false
+                    }
+                    spin(seconds: 1) { false }
+                    if let text = trHost.ocrResultPanelForTesting?
+                        .recognizedText, text.contains("[stale-retry-") {
+                        trFailures.append("stale retry landed")
+                    }
+                }
+
+                if trOverlay.session.phase != .reviewing || trCompletions != 0 {
+                    trFailures.append(
+                        "session \(trOverlay.session.phase)/\(trCompletions)")
+                }
+
+                trHost.handleEscapeForTesting()
+                trHost.handleEscapeForTesting()
+                withExtendedLifetime(trOverlay) {}
+                check("sliceB-overlay-ocr-translate-retry",
+                      trFailures.isEmpty,
+                      trFailures.prefix(6).joined(separator: " | "))
+            }
+
             // S5 layout contract. Editing chrome is a vertical rail beside
             // the selection; terminal actions are a horizontal strip below
             // it. Both flip at screen edges and wrap under constrained

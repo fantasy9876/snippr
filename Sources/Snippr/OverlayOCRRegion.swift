@@ -21,6 +21,18 @@ enum OverlayOCRPanel {
     static let copyIdentifier = "overlay.ocr.copy"
     static let closeIdentifier = "overlay.ocr.close"
     static let languageIdentifier = "overlay.ocr.language"
+    static let retryIdentifier = "overlay.ocr.retry"
+
+    /// Retry sits on the language row so the footer still has room for the
+    /// fail reason. Width matches the Copy button; the popup shrinks to fit.
+    static let retryWidth: CGFloat = 72
+
+    static func retryFrame(translating: Bool) -> CGRect {
+        let language = languageFrame(translating: translating)
+        return CGRect(
+            x: language.maxX - retryWidth, y: language.minY,
+            width: retryWidth, height: language.height)
+    }
 
     /// Smallest region worth recognizing. Below this a drag is a stray click,
     /// and Vision on a 3pt strip returns noise the user would have to undo.
@@ -89,6 +101,7 @@ final class OverlayOCRResultView: NSView {
     private let scroll = NSScrollView()
     private let copyButton: NSButton
     private let closeButton: NSButton
+    private let retryButton: NSButton
     private let languagePopup = NSPopUpButton()
     private let statusLabel = NSTextField(labelWithString: "")
 
@@ -111,12 +124,14 @@ final class OverlayOCRResultView: NSView {
 
     init(
         target: AnyObject, copyAction: Selector, closeAction: Selector,
-        languageAction: Selector
+        languageAction: Selector, retryAction: Selector
     ) {
         copyButton = NSButton(
             title: "Copy", target: target, action: copyAction)
         closeButton = NSButton(
             title: "✕", target: target, action: closeAction)
+        retryButton = NSButton(
+            title: "Thử lại", target: target, action: retryAction)
         super.init(frame: CGRect(origin: .zero, size: OverlayOCRPanel.size))
 
         // The overlay's chrome is dark in BOTH system appearances — the same
@@ -191,13 +206,23 @@ final class OverlayOCRResultView: NSView {
         languagePopup.isHidden = true
         addSubview(languagePopup)
 
+        retryButton.bezelStyle = .rounded
+        retryButton.identifier = NSUserInterfaceItemIdentifier(
+            OverlayOCRPanel.retryIdentifier)
+        retryButton.controlSize = .small
+        retryButton.font = .systemFont(ofSize: 11)
+        retryButton.toolTip = "Thử lại bản dịch"
+        retryButton.setAccessibilityLabel("Thử lại bản dịch")
+        retryButton.isHidden = true
+        addSubview(retryButton)
+
         statusLabel.font = .systemFont(ofSize: 11)
         statusLabel.textColor = .secondaryLabelColor
         statusLabel.lineBreakMode = .byTruncatingTail
         addSubview(statusLabel)
 
         layoutContents()
-        hintButtons = [copyButton, closeButton, languagePopup]
+        hintButtons = [copyButton, closeButton, languagePopup, retryButton]
     }
 
     required init?(coder: NSCoder) { fatalError() }
@@ -209,9 +234,23 @@ final class OverlayOCRResultView: NSView {
         setFrameSize(box)
         scroll.frame = OverlayOCRPanel.textFrame(translating: isTranslateMode)
         textView.frame = CGRect(origin: .zero, size: scroll.contentSize)
-        languagePopup.frame = OverlayOCRPanel.languageFrame(
+        let language = OverlayOCRPanel.languageFrame(
             translating: isTranslateMode)
         languagePopup.isHidden = !isTranslateMode
+        let retryVisible = isTranslateMode && !retryButton.isHidden
+        retryButton.isHidden = !retryVisible
+        if retryVisible {
+            let retry = OverlayOCRPanel.retryFrame(translating: isTranslateMode)
+            retryButton.frame = retry
+            languagePopup.frame = CGRect(
+                x: language.minX, y: language.minY,
+                width: retry.minX - language.minX - OverlayOCRPanel.sectionGap,
+                height: language.height)
+        } else {
+            languagePopup.frame = language
+            retryButton.frame = OverlayOCRPanel.retryFrame(
+                translating: isTranslateMode)
+        }
         copyButton.frame = CGRect(
             x: OverlayOCRPanel.contentInset, y: OverlayOCRPanel.contentInset,
             width: 72, height: OverlayOCRPanel.footerHeight)
@@ -251,6 +290,8 @@ final class OverlayOCRResultView: NSView {
         textView.string = ""
         statusLabel.stringValue = "Recognizing…"
         copyButton.isEnabled = false
+        retryButton.isHidden = true
+        layoutContents()
     }
 
     /// The recognition is shown FIRST, even in translate mode: the user gets
@@ -258,6 +299,8 @@ final class OverlayOCRResultView: NSView {
     /// never comes back this is what stays on screen.
     func showTranslating(to language: TranslateService.Language) {
         statusLabel.stringValue = "Đang dịch sang \(language.label)…"
+        retryButton.isHidden = true
+        layoutContents()
     }
 
     func showTranslated(_ text: String, to language: TranslateService.Language) {
@@ -266,15 +309,21 @@ final class OverlayOCRResultView: NSView {
         textView.scrollRangeToVisible(NSRange(location: 0, length: 0))
         statusLabel.stringValue = "Đã dịch sang \(language.label)"
         copyButton.isEnabled = !text.isEmpty
+        retryButton.isHidden = true
+        layoutContents()
     }
 
     /// Fail OPEN: a dead network leaves the recognized text on screen and
     /// copyable. Blanking the panel would throw away work Vision already did.
-    func showTranslateFailed() {
+    /// `reason` is the classified Failure message — not a generic one-liner
+    /// that could have been offline, 429, or HTML in disguise.
+    func showTranslateFailed(_ reason: String) {
         recognizedText = sourceText
         textView.string = sourceText
-        statusLabel.stringValue = "Dịch thất bại — giữ văn bản gốc"
+        statusLabel.stringValue = reason
         copyButton.isEnabled = !sourceText.isEmpty
+        retryButton.isHidden = !isTranslateMode
+        layoutContents()
     }
 
     func show(result: OCRResult) {
@@ -283,6 +332,7 @@ final class OverlayOCRResultView: NSView {
         sourceText = text
         textView.string = text
         textView.scrollRangeToVisible(NSRange(location: 0, length: 0))
+        retryButton.isHidden = true
         if text.isEmpty {
             statusLabel.stringValue = "No text found"
             copyButton.isEnabled = false
@@ -292,6 +342,7 @@ final class OverlayOCRResultView: NSView {
             statusLabel.stringValue = lines == 1 ? "1 line" : "\(lines) lines"
             copyButton.isEnabled = true
         }
+        layoutContents()
     }
 
     var copyButtonIsEnabledForTesting: Bool { copyButton.isEnabled }
@@ -315,7 +366,7 @@ final class OverlayOCRResultView: NSView {
     static let backgroundColorForTesting = NSColor(white: 0.11, alpha: 1)
 
     func control(identifier: String) -> NSButton? {
-        [copyButton, closeButton, languagePopup].first {
+        [copyButton, closeButton, languagePopup, retryButton].first {
             $0.identifier?.rawValue == identifier
         }
     }

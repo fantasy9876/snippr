@@ -10,6 +10,54 @@ enum TranslateService {
         let label: String
     }
 
+    /// Why a translation did not land. The panel keeps the `"Dịch thất bại"`
+    /// prefix so the fail-open gate still matches, then names the class so a
+    /// screenshot tells offline apart from 429, HTML-instead-of-JSON, or a
+    /// hung request. No stack traces — this string is what the user reads.
+    enum Failure: Error, Equatable {
+        case offline
+        case timeout
+        case http(status: Int)
+        case payload(status: Int?)
+        case other
+
+        var userMessage: String {
+            switch self {
+            case .offline:
+                return "Dịch thất bại — mất mạng"
+            case .timeout:
+                return "Dịch thất bại — hết thời gian"
+            case .http(let status)
+                where status == 429 || status == 403 || status == 401:
+                return "Dịch thất bại — bị chặn-giới hạn (HTTP \(status))"
+            case .http(let status):
+                return "Dịch thất bại — HTTP \(status)"
+            case .payload(let status):
+                if let status {
+                    return "Dịch thất bại — dữ liệu lạ (HTTP \(status))"
+                }
+                return "Dịch thất bại — dữ liệu lạ"
+            case .other:
+                return "Dịch thất bại — kiểm tra mạng"
+            }
+        }
+
+        static func classify(_ error: Error) -> Failure {
+            if let failure = error as? Failure { return failure }
+            guard let urlError = error as? URLError else { return .other }
+            switch urlError.code {
+            case .notConnectedToInternet, .networkConnectionLost,
+                 .cannotFindHost, .cannotConnectToHost, .dnsLookupFailed,
+                 .dataNotAllowed, .internationalRoamingOff:
+                return .offline
+            case .timedOut:
+                return .timeout
+            default:
+                return .other
+            }
+        }
+    }
+
     static let languages: [Language] = [
         .init(code: "vi", label: "Tiếng Việt"),
         .init(code: "en", label: "English"),
@@ -22,11 +70,31 @@ enum TranslateService {
         .init(code: "th", label: "ไทย"),
     ]
 
+    /// Cap the wait the user stares at "Đang dịch…". URLSession's default is
+    /// 60s, which looks identical to a hang on a blocked gtx endpoint.
+    static let requestTimeout: TimeInterval = 12
+
     /// Test seam. Gates drive the real translate flow — the button, the panel,
     /// the language popup — without a network call, and without production
     /// growing a second code path they could pass against.
     nonisolated(unsafe) static var translatorOverrideForTesting:
         ((String, String) async throws -> String)?
+
+    /// Shared by the live request and by gates: HTTP ≠ 2xx is a status, a
+    /// 200 that is not the gtx JSON array is a payload, and an empty sentence
+    /// list is the same payload — not a silent success.
+    static func decodeTranslation(data: Data, httpStatus: Int?) throws -> String {
+        if let httpStatus, !(200..<300).contains(httpStatus) {
+            throw Failure.http(status: httpStatus)
+        }
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [Any],
+              let sentences = json.first as? [Any] else {
+            throw Failure.payload(status: httpStatus)
+        }
+        let parts = sentences.compactMap { ($0 as? [Any])?.first as? String }
+        guard !parts.isEmpty else { throw Failure.payload(status: httpStatus) }
+        return parts.joined()
+    }
 
     static func translate(_ text: String, to lang: String) async throws -> String {
         if let override = translatorOverrideForTesting {
@@ -45,18 +113,20 @@ enum TranslateService {
         req.httpMethod = "POST"
         req.setValue("application/x-www-form-urlencoded; charset=utf-8",
                      forHTTPHeaderField: "Content-Type")
+        req.timeoutInterval = requestTimeout
         var allowed = CharacterSet.urlQueryAllowed
         allowed.remove(charactersIn: "+&=?")
         let encoded = text.addingPercentEncoding(withAllowedCharacters: allowed) ?? ""
         req.httpBody = "q=\(encoded)".data(using: .utf8)
-        let (data, _) = try await URLSession.shared.data(for: req)
-        guard let json = try JSONSerialization.jsonObject(with: data) as? [Any],
-              let sentences = json.first as? [Any] else {
-            throw URLError(.cannotParseResponse)
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await URLSession.shared.data(for: req)
+        } catch {
+            throw Failure.classify(error)
         }
-        let parts = sentences.compactMap { ($0 as? [Any])?.first as? String }
-        guard !parts.isEmpty else { throw URLError(.cannotParseResponse) }
-        return parts.joined()
+        let status = (response as? HTTPURLResponse)?.statusCode
+        return try decodeTranslation(data: data, httpStatus: status)
     }
 }
 
@@ -167,7 +237,8 @@ final class TextResultWindow: NSObject, NSWindowDelegate {
                 textView.string = translated
                 statusLabel.stringValue = "Đã dịch sang \(lang.label)"
             } catch {
-                statusLabel.stringValue = "Dịch thất bại — kiểm tra mạng"
+                statusLabel.stringValue =
+                    TranslateService.Failure.classify(error).userMessage
             }
         }
     }

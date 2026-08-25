@@ -885,16 +885,28 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
         _ text: String, to language: TranslateService.Language,
         in panel: OverlayOCRResultView, generation: Int
     ) async {
-        let translated = try? await TranslateService.translate(
-            text, to: language.code)
-        await MainActor.run { [weak self] in
-            guard let self, self.ocrRegionGeneration == generation,
-                  self.ocrResultPanel === panel, !panel.isHidden
-            else { return }
-            if let translated, !translated.isEmpty {
-                panel.showTranslated(translated, to: language)
-            } else {
-                panel.showTranslateFailed()
+        do {
+            let translated = try await TranslateService.translate(
+                text, to: language.code)
+            await MainActor.run { [weak self] in
+                guard let self, self.ocrRegionGeneration == generation,
+                      self.ocrResultPanel === panel, !panel.isHidden
+                else { return }
+                if translated.isEmpty {
+                    panel.showTranslateFailed(
+                        TranslateService.Failure.payload(status: nil)
+                            .userMessage)
+                } else {
+                    panel.showTranslated(translated, to: language)
+                }
+            }
+        } catch {
+            let reason = TranslateService.Failure.classify(error).userMessage
+            await MainActor.run { [weak self] in
+                guard let self, self.ocrRegionGeneration == generation,
+                      self.ocrResultPanel === panel, !panel.isHidden
+                else { return }
+                panel.showTranslateFailed(reason)
             }
         }
     }
@@ -906,7 +918,8 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
                 target: self,
                 copyAction: #selector(ocrResultCopyPressed(_:)),
                 closeAction: #selector(ocrResultClosePressed(_:)),
-                languageAction: #selector(ocrResultLanguageChanged(_:)))
+                languageAction: #selector(ocrResultLanguageChanged(_:)),
+                retryAction: #selector(ocrResultRetryPressed(_:)))
             addSubview(panel, positioned: .above, relativeTo: nil)
             ocrResultPanel = panel
             hoverHint.attach(to: panel.hintButtons)
@@ -977,6 +990,24 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
               panel.isTranslateMode else { return }
         let language = panel.selectedLanguage
         Settings.shared.translateTarget = language.code
+        let source = panel.sourceText
+        guard !source.isEmpty else { return }
+        panel.showTranslating(to: language)
+        ocrRegionGeneration &+= 1
+        let generation = ocrRegionGeneration
+        Task { [weak self] in
+            await self?.translate(
+                source, to: language, in: panel, generation: generation)
+        }
+    }
+
+    /// Same hop as a language change: the recognition, a new generation, the
+    /// live translate path. A dedicated selector so the gate can press the
+    /// real Retry button instead of calling `translate` as a seam.
+    @objc private func ocrResultRetryPressed(_ sender: NSButton) {
+        guard let panel = ocrResultPanel, !panel.isHidden,
+              panel.isTranslateMode else { return }
+        let language = panel.selectedLanguage
         let source = panel.sourceText
         guard !source.isEmpty else { return }
         panel.showTranslating(to: language)
