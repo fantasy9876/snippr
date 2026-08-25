@@ -408,6 +408,11 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
     fileprivate func handleEscape() {
         if isSaving || isFinished { return }
         if hideBackdropMini() { return }
+        // One layer per press, outermost first: the result panel, then the
+        // pick that produced it, and only then the session. Closing the shot
+        // while a panel is open would throw away the text the user is reading.
+        if hideOCRResult() { return }
+        if cancelOCRRegionPicking() { return }
         owner?.finish(.cancelled)
     }
     func handleEscapeForTesting() { handleEscape() }
@@ -511,6 +516,17 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
     private var actionToolbarButtons: [NSButton] = []
     private var toolbarButtons: [NSButton] = []
     private var backdropMini: OverlayBackdropMiniView?
+    /// Region OCR (1.2.16). Picking is a MODE, not a tool: it does not touch
+    /// `annotationSurface.tool`, so the drawing tool the user had selected is
+    /// still selected when the OCR panel closes.
+    private var ocrRegionPicking = false
+    private var ocrRegionAnchor: CGPoint?
+    /// The region being dragged, or the one the visible panel describes.
+    private var ocrRegion: CGRect?
+    private var ocrResultPanel: OverlayOCRResultView?
+    /// Bumped per request so a slow recognition landing after the user has
+    /// picked a NEW region cannot overwrite the newer result.
+    private var ocrRegionGeneration = 0
     let hoverHint = HoverHint()
 
     private static let colorPresets: [NSColor] = [
@@ -658,6 +674,12 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
         for button in toolbarButtons { button.isEnabled = enabled }
         updateHistoryButtons()
         layoutBackdropMini()
+        // The OCR panel rides the SAME relayout as the mini, for the same
+        // reason: dragging or resizing the crop moves the geometry the panel
+        // was placed against. Measuring "does not cover the region" only at
+        // the moment it opens would leave the panel sitting on top of the shot
+        // the first time the user nudges the frame — and the gate green.
+        layoutOCRResult()
     }
 
     private func updateHistoryButtons() {
@@ -740,6 +762,215 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
     }
 
     @discardableResult
+    // MARK: region OCR (1.2.16)
+
+    /// Arms the picker. Not a terminal action and not an edit: nothing is
+    /// committed, no history entry is added, and the session stays in review.
+    fileprivate func beginOCRRegionPicking() {
+        guard isReviewing, areaSelection != nil else { return }
+        hideBackdropMini()
+        hideOCRResult()
+        ocrRegionPicking = true
+        ocrRegionAnchor = nil
+        ocrRegion = nil
+        applyCursor(.crosshair)
+        needsDisplay = true
+    }
+
+    @discardableResult
+    fileprivate func cancelOCRRegionPicking() -> Bool {
+        guard ocrRegionPicking else { return false }
+        ocrRegionPicking = false
+        ocrRegionAnchor = nil
+        ocrRegion = nil
+        // The generation moves so a recognition already in flight cannot open
+        // a panel for a region the user has abandoned.
+        ocrRegionGeneration &+= 1
+        applyCursor(.arrow)
+        needsDisplay = true
+        return true
+    }
+
+    @discardableResult
+    fileprivate func hideOCRResult() -> Bool {
+        guard let panel = ocrResultPanel, !panel.isHidden else { return false }
+        panel.isHidden = true
+        ocrRegion = nil
+        ocrRegionGeneration &+= 1
+        needsDisplay = true
+        return true
+    }
+
+    /// Clamped to the CROP, not to the overlay: OCR outside the frame would
+    /// read pixels that are not part of the capture the user is reviewing.
+    private func clampedOCRRegion(anchor: CGPoint, current: CGPoint) -> CGRect? {
+        guard let crop = areaSelection?.intersection(bounds),
+              crop.width > 0, crop.height > 0 else { return nil }
+        let a = EditableSelectionGeometry.clampedPoint(anchor, to: crop)
+        let b = EditableSelectionGeometry.clampedPoint(current, to: crop)
+        return CGRect(
+            x: min(a.x, b.x), y: min(a.y, b.y),
+            width: abs(a.x - b.x), height: abs(a.y - b.y))
+    }
+
+    private func runOCR(on region: CGRect) {
+        guard let frozen, let owner else { return }
+        // Intersected with the CANONICAL crop — `session.pixelRect`, the rect
+        // the payload actually cropped — not with the fractional
+        // `areaSelection` the pointer is still moving. Quantizing twice, once
+        // here and once there, is how a region ends up a pixel outside the
+        // crop and `cropping(to:)` returns nil.
+        let canonical = owner.session.pixelRect
+        guard canonical.width >= 1, canonical.height >= 1 else { return }
+        let regionPx = imagePixelRect(fromView: region)
+            .intersection(canonical)
+            .integral
+        guard regionPx.width >= 1, regionPx.height >= 1 else { return }
+
+        // The SAME reading the terminal OCR intent takes: the flattened
+        // surface, so a redaction the user drew over a password still hides it
+        // from Vision. Cropping the raw freeze would read straight through it.
+        let source: CGImage?
+        if let surface = annotationSurface, !surface.isEmpty {
+            source = surface.flattened(
+                base: frozen.cgImage, cropPixels: regionPx, extra: [],
+                destinationSpace: nil, omittingSpotlights: false)
+        } else {
+            source = frozen.cgImage.cropping(to: regionPx)?.materialized()
+        }
+        guard let image = source else { return }
+        lastOCRSourceForTesting = image
+
+        let panel = showOCRResult(for: region)
+        panel?.showRecognizing()
+        ocrRegionGeneration &+= 1
+        let generation = ocrRegionGeneration
+        Task { [weak self] in
+            let result = await OCRService.shared.recognize(image)
+            await MainActor.run {
+                guard let self, self.ocrRegionGeneration == generation,
+                      let panel = self.ocrResultPanel, !panel.isHidden
+                else { return }
+                panel.show(result: result)
+            }
+        }
+    }
+
+    @discardableResult
+    private func showOCRResult(for region: CGRect) -> OverlayOCRResultView? {
+        if ocrResultPanel == nil {
+            let panel = OverlayOCRResultView(
+                target: self,
+                copyAction: #selector(ocrResultCopyPressed(_:)),
+                closeAction: #selector(ocrResultClosePressed(_:)))
+            addSubview(panel, positioned: .above, relativeTo: nil)
+            ocrResultPanel = panel
+            hoverHint.attach(to: panel.hintButtons)
+        }
+        guard let panel = ocrResultPanel else { return nil }
+        ocrRegion = region
+        panel.isHidden = false
+        layoutOCRResult()
+        return panel.isHidden ? nil : panel
+    }
+
+    /// Anchored to the REGION and avoiding it: the point of picking a region
+    /// is to read the text beside the pixels it came from.
+    fileprivate func layoutOCRResult() {
+        guard let panel = ocrResultPanel, !panel.isHidden else { return }
+        guard isReviewing, let region = ocrRegion else {
+            panel.isHidden = true
+            return
+        }
+        // The frozen image does not move in view space, so a crop that moves
+        // leaves the recognized pixels where they were — the text stays true.
+        // What it can do is push the region OUT of the capture, and a panel
+        // describing pixels that are no longer part of the shot is a lie.
+        guard let crop = areaSelection?.intersection(bounds),
+              crop.contains(region) else {
+            hideOCRResult()
+            return
+        }
+        let occupied = [reviewToolRail, reviewActionBar].compactMap { bar in
+            bar.flatMap { $0.isHidden ? nil : $0.frame }
+        }
+        if let placed = OverlayToolbarLayout.popover(
+            size: OverlayOCRPanel.size, anchor: region, avoid: region,
+            bounds: bounds, occupied: occupied)
+        {
+            panel.frame = placed.frame
+            panel.isHidden = false
+        } else {
+            panel.isHidden = true
+        }
+    }
+
+    @objc private func ocrResultCopyPressed(_ sender: NSButton) {
+        guard let panel = ocrResultPanel, !panel.isHidden else { return }
+        let text = panel.recognizedText
+        guard !text.isEmpty else { return }
+        let board = NSPasteboard.general
+        board.clearContents()
+        board.setString(text, forType: .string)
+        // Copy closes the panel and says so — but the SESSION lives on. The
+        // owner's whole request was that the shot survives the copy.
+        hideOCRResult()
+        ToastHUD.show("Text copied", symbol: "text.viewfinder")
+    }
+
+    @objc private func ocrResultClosePressed(_ sender: NSButton) {
+        hideOCRResult()
+    }
+
+    var ocrRegionPickingForTesting: Bool { ocrRegionPicking }
+    var ocrRegionForTesting: CGRect? { ocrRegion }
+    var ocrResultPanelFrameForTesting: CGRect? {
+        guard let panel = ocrResultPanel, !panel.isHidden else { return nil }
+        return panel.frame
+    }
+    var ocrResultPanelForTesting: OverlayOCRResultView? {
+        guard let panel = ocrResultPanel, !panel.isHidden else { return nil }
+        return panel
+    }
+    func beginOCRRegionPickingForTesting() { beginOCRRegionPicking() }
+    /// The production relayout, which is what a crop drag triggers. Exposed so
+    /// the gate can prove the panel follows the frame instead of only checking
+    /// where it landed when it opened.
+    func layoutReviewToolbarForTesting() { layoutReviewToolbar() }
+    /// Whether the region OCR will take the FLATTENED branch — the one that
+    /// honours a redaction — rather than cropping the raw freeze.
+    var annotationSurfaceIsEmptyForTesting: Bool {
+        annotationSurface?.isEmpty ?? true
+    }
+    /// The exact bitmap handed to Vision. A gate that only reads the returned
+    /// string cannot tell "the redaction worked" from "the crop was wrong".
+    private(set) var lastOCRSourceForTesting: CGImage?
+    /// Drives the production pick path end to end, the way a drag does.
+    func pickOCRRegionForTesting(from: CGPoint, to: CGPoint) {
+        guard ocrRegionPicking else { return }
+        ocrRegionAnchor = from
+        finishOCRRegionPick(at: to)
+    }
+
+    private func finishOCRRegionPick(at point: CGPoint) {
+        guard ocrRegionPicking, let anchor = ocrRegionAnchor else { return }
+        ocrRegionPicking = false
+        ocrRegionAnchor = nil
+        applyCursor(.arrow)
+        guard let region = clampedOCRRegion(anchor: anchor, current: point),
+              region.width >= OverlayOCRPanel.minimumRegionSide,
+              region.height >= OverlayOCRPanel.minimumRegionSide
+        else {
+            // Too small to be a deliberate region: drop the pick rather than
+            // opening a panel full of noise.
+            ocrRegion = nil
+            needsDisplay = true
+            return
+        }
+        runOCR(on: region)
+        needsDisplay = true
+    }
+
     private func hideBackdropMini() -> Bool {
         guard let mini = backdropMini, !mini.isHidden else { return false }
         mini.isHidden = true
@@ -1033,6 +1264,13 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
     fileprivate func performReviewAction(_ intent: CaptureIntent) {
         hoverHint.hide()
         guard !annotationDragging, areaDrag == nil else { return }
+        // OCR is no longer terminal. The owner asked for Lark's shape: pick a
+        // region, read the text beside it, keep the shot. Translate is
+        // untouched — it still commits and hands off to the result window.
+        if intent == .ocr {
+            beginOCRRegionPicking()
+            return
+        }
         guard let owner, owner.session.acceptsCommits,
               let selection = areaSelection?.intersection(bounds),
               selection.width >= 4, selection.height >= 4,
@@ -1222,6 +1460,7 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
             ctx.stroke(sel.insetBy(dx: -0.75, dy: -0.75))
             drawSelectionHandles(for: sel, in: ctx)
             drawSizeLabel(for: sel)
+            drawOCRRegion(in: ctx)
         } else if mode == .area {
             // crosshair
             ctx.setStrokeColor(NSColor.white.withAlphaComponent(0.7).cgColor)
@@ -1338,6 +1577,20 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
         guard isReviewing, overlayDrawStyle.kind != .none else { return 0 }
         return SliceBBackdrop.cornerRadius(
             documentPoints: rect.size, style: SliceBBackdrop.cornerStyle)
+    }
+
+    /// The region being picked, or the one the open panel describes. Dashed
+    /// and unfilled: it is a reading window, not a mark on the document, and
+    /// filling it would hide the very text the user is aiming at.
+    private func drawOCRRegion(in ctx: CGContext) {
+        guard let region = ocrRegion, region.width > 0, region.height > 0
+        else { return }
+        ctx.saveGState()
+        defer { ctx.restoreGState() }
+        ctx.setStrokeColor(NSColor.systemYellow.cgColor)
+        ctx.setLineWidth(1.5)
+        ctx.setLineDash(phase: 0, lengths: [5, 3])
+        ctx.stroke(region.insetBy(dx: -0.75, dy: -0.75))
     }
 
     private func drawSelectionHandles(for rect: CGRect, in ctx: CGContext) {
@@ -1504,6 +1757,20 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
             hideBackdropMini()
             return
         }
+        // The OCR panel owns clicks that land on it — its buttons and its text
+        // selection — and a click anywhere else dismisses it rather than
+        // reaching the crop underneath and starting a move or a cancel.
+        if let panel = ocrResultPanel, !panel.isHidden {
+            if panel.frame.contains(p) { return }
+            hideOCRResult()
+            return
+        }
+        if ocrRegionPicking {
+            ocrRegionAnchor = p
+            ocrRegion = clampedOCRRegion(anchor: p, current: p)
+            needsDisplay = true
+            return
+        }
         if textEditingActive {
             // While the text field is first responder, a click on the canvas
             // must NOT move/resize the frame or cancel the session — the
@@ -1583,6 +1850,11 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
             needsDisplay = true
             return
         }
+        if ocrRegionPicking, let anchor = ocrRegionAnchor {
+            ocrRegion = clampedOCRRegion(anchor: anchor, current: p)
+            needsDisplay = true
+            return
+        }
         var adjustedReviewCrop = false
         switch areaDrag {
         case .creating(let anchor):
@@ -1619,6 +1891,10 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
         switch mode {
         case .area:
             let p = convert(event.locationInWindow, from: nil)
+            if ocrRegionPicking {
+                finishOCRRegionPick(at: p)
+                return
+            }
             if annotationDragging {
                 // A terminal action may have frozen the document while the
                 // mouse was still down. Finalizing now would add a mark the
@@ -1736,6 +2012,17 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
             showBackdropMini(from: button)
             return
         }
+        // The action keys, read from the SAME catalog entry the button's hint
+        // advertises. They sit after the drag guard and after the digit and D
+        // branches, and before the tool map only for reading order — the two
+        // maps are disjoint, and `sliceB-overlay-action-keys` holds them that
+        // way rather than trusting this ordering to keep them apart.
+        if owner?.session.phase == .reviewing, flags.isEmpty,
+           let key = event.charactersIgnoringModifiers,
+           let intent = OverlayActionCatalog.intent(forShortcutKey: key) {
+            performReviewAction(intent)
+            return
+        }
         if owner?.session.phase == .reviewing,
            flags.isEmpty,
            let key = event.charactersIgnoringModifiers,
@@ -1769,6 +2056,17 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
            event.modifierFlags.contains(.command),
            event.charactersIgnoringModifiers?.lowercased() == "c" {
             performReviewAction(.copy)
+            return true
+        }
+        // ⌘S sits HERE, beside ⌘C, not in keyDown: a command-modified key
+        // reaches the equivalent chain first and would never arrive there.
+        // Save is the one action given a modifier — it opens a sheet and
+        // writes a file, while every bare letter in the catalog is instant.
+        if isReviewing,
+           event.modifierFlags.contains(.command),
+           event.charactersIgnoringModifiers?.lowercased()
+            == OverlayActionCatalog.saveKey {
+            performReviewAction(.save)
             return true
         }
         let flags = event.modifierFlags.intersection(
@@ -2063,6 +2361,26 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
     fileprivate func pixelPoint(fromView p: CGPoint) -> CGPoint {
         let scale = frozen?.scale ?? 1
         return CGPoint(x: p.x * scale, y: p.y * scale)
+    }
+
+    /// View points (bottom-left) → frozen image pixels **TOP-LEFT**, the space
+    /// `session.pixelRect`, `CGImage.cropping(to:)` and
+    /// `AnnotationSurface.flattened(cropPixels:)` all speak.
+    ///
+    /// NOT `pixelPoint(fromView:)` scaled up: that one stays bottom-left for
+    /// the annotation surface. Feeding a bottom-left rect to `cropping(to:)`
+    /// reads the region mirrored about the horizontal axis — the user drags
+    /// over the first line and gets the last one, on an image that otherwise
+    /// looks perfectly correct.
+    fileprivate func imagePixelRect(fromView r: CGRect) -> CGRect {
+        guard let frozen else { return .zero }
+        let scale = frozen.scale
+        let height = CGFloat(frozen.cgImage.height)
+        return CGRect(
+            x: r.minX * scale,
+            y: height - r.maxY * scale,
+            width: r.width * scale,
+            height: r.height * scale)
     }
 
     /// Text-field-first responder precedence (QA invariant: while typing,
