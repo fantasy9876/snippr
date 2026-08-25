@@ -5377,6 +5377,158 @@ enum SelfTest {
                     && session.previewPanelForTesting == nil,
                   "callbacks \(callbacks), active \(String(describing: activeAtCall)), inputs \(String(describing: payloadInputs))")
 
+            // 1.2.17: ✓ Xong stays readable on a never-key nonactivatingPanel.
+            // Arm through production showChrome (same builder run() uses),
+            // look the button up by identifier — not by title string — and
+            // assert under BOTH app appearances. Pinning .darkAqua without
+            // dropping the system bezel would still dim; making the panel
+            // key would "fix" the bezel by stealing focus mid-scroll.
+            // Contrast is title vs the BUTTON FILL, not the container: the
+            // glyph sits on done.layer. Measuring container (white 0.09)
+            // lets a near-white fill (the original unreadable-button bug) pass.
+            do {
+                var chromeFailures: [String] = []
+                let savedAppAppearance = NSApp.appearance
+                defer { NSApp.appearance = savedAppAppearance }
+                if let chromeScreen = NSScreen.main ?? NSScreen.screens.first {
+                // Keep the session in a named local through every click:
+                // the same ARC class of bug as overlay.owner (issue #13)
+                // would look like "button did not finish".
+                let chromeSession = ScrollingCapture(onFinish: { _ in })
+                func lumaOf(_ color: NSColor) -> Int? {
+                    guard let srgb = color.usingColorSpace(.sRGB) else {
+                        return nil
+                    }
+                    return Self.luma((
+                        Int((srgb.redComponent * 255).rounded()),
+                        Int((srgb.greenComponent * 255).rounded()),
+                        Int((srgb.blueComponent * 255).rounded())))
+                }
+                let appearances: [NSAppearance.Name] = [.aqua, .darkAqua]
+                for name in appearances {
+                    NSApp.appearance = NSAppearance(named: name)
+                    chromeSession.showChromeForTesting(
+                        screen: chromeScreen,
+                        rect: CGRect(x: 80, y: 80, width: 240, height: 180))
+                    guard let panel = chromeSession.previewPanelForTesting else {
+                        chromeFailures.append("\(name.rawValue):no-panel")
+                        chromeSession.hideChromeForTesting()
+                        continue
+                    }
+                    panel.contentView?.layoutSubtreeIfNeeded()
+                    if !panel.styleMask.contains(.nonactivatingPanel) {
+                        chromeFailures.append(
+                            "\(name.rawValue):lost-nonactivating")
+                    }
+                    if panel.isKeyWindow {
+                        chromeFailures.append(
+                            "\(name.rawValue):became-key")
+                    }
+                    let container = panel.contentView
+                    let chromeMatch = container?.effectiveAppearance
+                        .bestMatch(from: [.aqua, .darkAqua])
+                    if chromeMatch != .darkAqua {
+                        chromeFailures.append(
+                            "\(name.rawValue):appearance="
+                            + "\(chromeMatch?.rawValue ?? "nil")")
+                    }
+                    // Identifier lookup — a title-string filter that matches
+                    // 0 buttons would pass every contrast assert vacuously.
+                    guard let done = chromeSession.control(
+                        identifier: ScrollingCapture.doneButtonIdentifier)
+                    else {
+                        chromeFailures.append(
+                            "\(name.rawValue):no-done-by-identifier")
+                        chromeSession.hideChromeForTesting()
+                        continue
+                    }
+                    if done.isBordered {
+                        chromeFailures.append(
+                            "\(name.rawValue):bordered-bezel")
+                    }
+                    if done.bezelStyle == .rounded {
+                        chromeFailures.append(
+                            "\(name.rawValue):rounded-bezel")
+                    }
+                    let title = done.attributedTitle
+                    var titleColor: NSColor?
+                    if title.length > 0 {
+                        titleColor = title.attribute(
+                            .foregroundColor, at: 0, effectiveRange: nil
+                        ) as? NSColor
+                    }
+                    guard let titleColor, let titleLuma = lumaOf(titleColor) else {
+                        chromeFailures.append(
+                            "\(name.rawValue):title-not-explicit")
+                        chromeSession.hideChromeForTesting()
+                        continue
+                    }
+                    if titleLuma < 200 {
+                        chromeFailures.append(
+                            "\(name.rawValue):title-luma \(titleLuma)")
+                    }
+                    var containerLuma: Int?
+                    if let cg = container?.layer?.backgroundColor,
+                       let bg = NSColor(cgColor: cg) {
+                        containerLuma = lumaOf(bg)
+                    }
+                    if let containerLuma, containerLuma > 80 {
+                        chromeFailures.append(
+                            "\(name.rawValue):bg-luma \(containerLuma)")
+                    }
+                    if let containerLuma, titleLuma - containerLuma < 120 {
+                        chromeFailures.append(
+                            "\(name.rawValue):container-contrast \(titleLuma)-\(containerLuma)")
+                    }
+                    // Glyph sits on the button fill. A borderless control
+                    // without an explicit fill, or a fill within 120 luma
+                    // of the title, is the unreadable-button bug — catch
+                    // it even if the bezel checks are later deleted.
+                    if !done.isBordered {
+                        var fillLuma: Int?
+                        if let cg = done.layer?.backgroundColor,
+                           let fill = NSColor(cgColor: cg) {
+                            fillLuma = lumaOf(fill)
+                        }
+                        if fillLuma == nil {
+                            chromeFailures.append(
+                                "\(name.rawValue):no-button-fill")
+                        } else if let fillLuma, titleLuma - fillLuma < 120 {
+                            chromeFailures.append(
+                                "\(name.rawValue):fill-contrast \(titleLuma)-\(fillLuma)")
+                        }
+                    }
+                    chromeSession.hideChromeForTesting()
+                    if chromeSession.previewPanelForTesting != nil {
+                        chromeFailures.append(
+                            "\(name.rawValue):panel-leaked")
+                    }
+                }
+                NSApp.appearance = NSAppearance(named: .aqua)
+                chromeSession.showChromeForTesting(
+                    screen: chromeScreen,
+                    rect: CGRect(x: 80, y: 80, width: 240, height: 180))
+                if let done = chromeSession.control(
+                    identifier: ScrollingCapture.doneButtonIdentifier) {
+                    done.performClick(nil)
+                    if !chromeSession.isFinishedForTesting {
+                        chromeFailures.append("click-did-not-finish")
+                    }
+                    if chromeSession.previewPanelForTesting?.isKeyWindow == true {
+                        chromeFailures.append("click-made-key")
+                    }
+                } else {
+                    chromeFailures.append("click:no-done-by-identifier")
+                }
+                chromeSession.hideChromeForTesting()
+                } else {
+                    chromeFailures.append("no-screen")
+                }
+                check("scroll-chrome-done-inactive",
+                      chromeFailures.isEmpty,
+                      chromeFailures.joined(separator: "; "))
+            }
+
             // presenter headless: scrollFinished auto exactly once, no panel.
             let img = CapturedImage(
                 cgImage: makeSolidImage(

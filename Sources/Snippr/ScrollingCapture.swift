@@ -53,6 +53,11 @@ final class ScrollingCapture {
     /// "✓ / Esc để xong" khi Esc đăng ký được, nếu không thì chỉ còn nút ✓.
     private var stopHint: String { escRegistered ? "✓ / Esc để xong" : "bấm ✓ để xong" }
 
+    /// Identifier for the live-preview "✓ Xong" control. Gates look this up
+    /// instead of filtering on the title string — a title match that finds
+    /// zero buttons would go green without exercising the click.
+    static let doneButtonIdentifier = "scroll.chrome.done"
+
     /// Chrome copy: stitcher already prepends on up-scroll; this only tells
     /// the user both directions work. Do not change capture/hotkey behavior.
     nonisolated static var bidirectionalScrollHint: String {
@@ -546,7 +551,33 @@ final class ScrollingCapture {
 
     // test hooks
     func finishForTesting() { finished = true }
+    var isFinishedForTesting: Bool { finished }
     var previewPanelForTesting: NSPanel? { controlPanel }
+
+    /// Production `showChrome` — the same builder `run()` uses. Hide any
+    /// leftover chrome first so a gate can re-arm under both appearances
+    /// without leaking a second panel.
+    func showChromeForTesting(screen: NSScreen, rect: CGRect) {
+        hideChrome()
+        showChrome(screen: screen, rect: rect)
+    }
+
+    func hideChromeForTesting() { hideChrome() }
+
+    func control(identifier: String) -> NSButton? {
+        func walk(_ view: NSView) -> NSButton? {
+            if let button = view as? NSButton,
+               button.identifier?.rawValue == identifier {
+                return button
+            }
+            for child in view.subviews {
+                if let found = walk(child) { return found }
+            }
+            return nil
+        }
+        guard let root = controlPanel?.contentView else { return nil }
+        return walk(root)
+    }
 
     // MARK: chrome (border + control bar — both excluded from capture)
 
@@ -605,8 +636,17 @@ final class ScrollingCapture {
         panel.hasShadow = true
         panel.sharingType = .none
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        // Pin dark chrome so semantic colors in the subtree cannot flip with
+        // the system appearance. The panel stays non-key on purpose: a
+        // scrolling session must not steal focus from the app being captured.
+        // Pinning appearance is therefore not enough for the stop button —
+        // AppKit's rounded bezel draws its inactive (dim) state in a
+        // never-key panel, which is the "✓ Xong tối thui" bug.
+        let darkChrome = NSAppearance(named: .darkAqua)
+        panel.appearance = darkChrome
 
         let container = NSView()
+        container.appearance = darkChrome
         container.wantsLayer = true
         container.layer?.backgroundColor = NSColor(white: 0.09, alpha: 0.94).cgColor
         container.layer?.cornerRadius = 12
@@ -617,10 +657,33 @@ final class ScrollingCapture {
         label.textColor = .white
         progressLabel = label
 
+        let doneFont = NSFont.systemFont(ofSize: 12, weight: .semibold)
         let done = NSButton(title: "✓ Xong", target: self, action: #selector(finishTapped))
-        done.bezelStyle = .rounded
+        // Overlay-toolbar shape: no system bezel, so inactive-window dimming
+        // has nothing to dim. Title color is attributed (not semantic) so it
+        // stays white even if a future caller drops the appearance pin.
+        done.bezelStyle = .regularSquare
+        done.isBordered = false
         done.controlSize = .small
-        done.font = .systemFont(ofSize: 12, weight: .semibold)
+        done.font = doneFont
+        done.contentTintColor = .white
+        done.attributedTitle = NSAttributedString(
+            string: "✓ Xong",
+            attributes: [
+                .foregroundColor: NSColor.white,
+                .font: doneFont,
+            ])
+        done.alignment = .center
+        done.focusRingType = .none
+        done.identifier = NSUserInterfaceItemIdentifier(Self.doneButtonIdentifier)
+        done.setAccessibilityIdentifier(Self.doneButtonIdentifier)
+        done.setAccessibilityLabel("✓ Xong")
+        done.wantsLayer = true
+        done.layer?.backgroundColor = NSColor(white: 0.22, alpha: 1).cgColor
+        done.layer?.cornerRadius = 6
+        done.layer?.masksToBounds = true
+        done.layer?.borderWidth = 1
+        done.layer?.borderColor = NSColor.white.withAlphaComponent(0.35).cgColor
 
         let header = NSStackView(views: [label, done])
         header.orientation = .vertical
@@ -645,6 +708,8 @@ final class ScrollingCapture {
             header.widthAnchor.constraint(equalTo: column.widthAnchor),
             preview.widthAnchor.constraint(equalTo: column.widthAnchor),
             header.heightAnchor.constraint(equalToConstant: headerHeight),
+            done.heightAnchor.constraint(equalToConstant: 24),
+            done.widthAnchor.constraint(greaterThanOrEqualToConstant: 72),
         ])
         panel.contentView = container
         panel.orderFrontRegardless()
