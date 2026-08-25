@@ -2422,6 +2422,7 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
     /// Why the last payload attempt failed, so the toast can name the frame
     /// rather than blame the drawings.
     private(set) var lastPayloadFailure: PayloadFailure = .render
+    var lastPayloadFailureForTesting: PayloadFailure { lastPayloadFailure }
 
     /// The text still being typed, rendered as if it had been committed. Must
     /// mirror `AnnotationSurface.addText` exactly, or the export would differ

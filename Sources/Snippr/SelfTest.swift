@@ -6269,9 +6269,20 @@ enum SelfTest {
                 // Upper half in VIEW coordinates (bottom-left origin), which
                 // is where "TOPMARK" is drawn.
                 let upper = CGRect(x: 60, y: 330, width: 780, height: 210)
-                regionHost.beginOCRRegionPickingForTesting()
+                // Armed through the REAL button, by catalog tag. Calling the
+                // test hook here left the dispatcher untested: deleting the
+                // `.ocr` intercept in `performReviewAction` restored the whole
+                // 1.2.15 terminal behaviour with the suite still green.
+                guard let ocrTag = OverlayActionCatalog.items.firstIndex(
+                    where: { $0.intent == .ocr })
+                else {
+                    ocrFailures.append("no-ocr-catalog-entry")
+                    check("sliceB-overlay-ocr-region", false, "no catalog entry")
+                    return
+                }
+                regionHost.clickReviewToolbarButtonForTesting(tag: ocrTag)
                 if !regionHost.ocrRegionPickingForTesting {
-                    ocrFailures.append("picking-not-armed")
+                    ocrFailures.append("button-did-not-arm-picking")
                 }
                 if regionOverlay.session.phase != .reviewing {
                     ocrFailures.append(
@@ -6353,7 +6364,10 @@ enum SelfTest {
                 // Esc unwinds one layer at a time: panel, then the pick, then
                 // the session. Closing the shot while the text is on screen is
                 // exactly what the owner asked us to stop doing.
-                regionHost.beginOCRRegionPickingForTesting()
+                regionHost.clickReviewToolbarButtonForTesting(tag: ocrTag)
+                if !regionHost.ocrRegionPickingForTesting {
+                    ocrFailures.append("second-arm-failed")
+                }
                 regionHost.handleEscapeForTesting()
                 if regionHost.ocrRegionPickingForTesting {
                     ocrFailures.append("esc-left-picking-armed")
@@ -6396,7 +6410,7 @@ enum SelfTest {
                 redactHost.annotationDragForTesting(
                     from: CGPoint(x: upper.minX - 10, y: upper.minY - 10),
                     to: CGPoint(x: upper.maxX + 10, y: upper.maxY + 10))
-                redactHost.beginOCRRegionPickingForTesting()
+                redactHost.clickReviewToolbarButtonForTesting(tag: ocrTag)
                 redactHost.pickOCRRegionForTesting(
                     from: CGPoint(x: upper.minX, y: upper.minY),
                     to: CGPoint(x: upper.maxX, y: upper.maxY))
@@ -6477,6 +6491,143 @@ enum SelfTest {
                     forShortcutKey: OverlayActionCatalog.saveKey) != .spotlight {
                     keyFailures.append("bare-s-not-spotlight")
                 }
+                // --- the keys have to actually REACH the view.
+                //
+                // The table above is static: deleting the whole action-key
+                // branch from `keyDown` killed E/X/G/F outright and left this
+                // gate green, with the tooltips still advertising them. So
+                // every key is fired at a live host through the real
+                // responder entry points, and the intent is observed at the
+                // router rather than in the catalog.
+                @MainActor func keyEvent(
+                    _ characters: String,
+                    modifiers: NSEvent.ModifierFlags = []
+                ) -> NSEvent? {
+                    NSEvent.keyEvent(
+                        with: .keyDown, location: .zero,
+                        modifierFlags: modifiers, timestamp: 0,
+                        windowNumber: 0, context: nil,
+                        characters: characters,
+                        charactersIgnoringModifiers: characters.lowercased(),
+                        isARepeat: false, keyCode: 0)
+                }
+                let keyFrozen = CapturedImage(
+                    cgImage: makeTestImage(width: 900, height: 600), scale: 1)
+                @MainActor func keyHost(
+                    _ record: @escaping (String) -> Void
+                ) -> (SelectionOverlay, SelectionOverlayView) {
+                    let overlay = SelectionOverlay(
+                        purpose: .areaReview,
+                        inputs: OverlaySessionInputs(
+                            afterShow: true, afterCopy: false, afterSave: false),
+                        completion: { _ in record("finish") })
+                    overlay.routerDependenciesOverride =
+                        CaptureActionRouter.Dependencies(
+                            copyToClipboard: { _ in record("copy") },
+                            autoSave: { _, _ in record("autoSave") },
+                            saveAs: { _, done in
+                                record("saveAs")
+                                done(.cancelled)
+                            },
+                            pin: { _ in record("pin") },
+                            ocrWithMode: { _, translate in
+                                record(translate ? "translate" : "ocr")
+                            },
+                            openEditor: { _ in record("openEditor") },
+                            toast: { _ in }, setLastCapture: { _ in },
+                            setLastAreaRect: { _ in }, logEvent: { _ in })
+                    let view = SelectionOverlayView(
+                        mode: .area, screen: screen, frozen: keyFrozen,
+                        windowList: [], owner: overlay)
+                    view.frame = CGRect(x: 0, y: 0, width: 900, height: 600)
+                    view.selectForTesting(
+                        rect: CGRect(x: 100, y: 100, width: 500, height: 340))
+                    return (overlay, view)
+                }
+
+                // X arms the picker and must NOT reach the router: the whole
+                // point of 1.2.16 is that OCR stopped being terminal.
+                var xEffects: [String] = []
+                let (xOverlay, xView) = keyHost { xEffects.append($0) }
+                if let event = keyEvent("x") { xView.keyDown(with: event) }
+                if !xView.ocrRegionPickingForTesting {
+                    keyFailures.append(
+                        "x-did-not-arm phase="
+                        + String(describing: xOverlay.session.phase)
+                        + " sel=" + String(describing:
+                            xView.areaSelectionForTesting))
+                }
+                if !xEffects.isEmpty {
+                    keyFailures.append("x-routed \(xEffects)")
+                }
+                // And a key arriving mid-drag is swallowed, or a stray letter
+                // during a pen stroke would change what the shot is for.
+                var dragEffects: [String] = []
+                let (dragOverlay, dragView) = keyHost { dragEffects.append($0) }
+                dragView.clickReviewToolbarButtonForTesting(
+                    tag: OverlayAnnotationTool.pen.toolbarTag)
+                dragView.annotationDragForTesting(
+                    from: CGPoint(x: 150, y: 150),
+                    to: CGPoint(x: 300, y: 260),
+                    whileDown: {
+                        if let event = keyEvent("x") {
+                            dragView.keyDown(with: event)
+                        }
+                        if dragView.ocrRegionPickingForTesting {
+                            keyFailures.append("x-armed-mid-drag")
+                        }
+                        if let event = keyEvent("f") {
+                            dragView.keyDown(with: event)
+                        }
+                    })
+                if dragEffects.contains("pin") {
+                    keyFailures.append("f-routed-mid-drag")
+                }
+
+                // Each terminal key closes its own session, so each gets its
+                // own host — reusing one would test only the first.
+                let terminals: [(String, String)] = [
+                    ("e", "openEditor"), ("g", "translate"), ("f", "pin"),
+                ]
+                for (key, expectedEffect) in terminals {
+                    var effects: [String] = []
+                    let (overlay, view) = keyHost { effects.append($0) }
+                    if let event = keyEvent(key) { view.keyDown(with: event) }
+                    if !effects.contains(expectedEffect) {
+                        keyFailures.append(
+                            "\(key)-missed \(expectedEffect) got \(effects)"
+                            + " phase=" + String(describing: overlay.session.phase)
+                            + " payloadFail=" + String(describing:
+                                view.lastPayloadFailureForTesting))
+                    }
+                }
+
+                // ⌘S goes through the equivalent chain, where ⌘C already
+                // lives — from `keyDown` it would never arrive.
+                var saveEffects: [String] = []
+                let (saveOverlay, saveView) = keyHost { saveEffects.append($0) }
+                if let event = keyEvent("s", modifiers: .command) {
+                    _ = saveView.performKeyEquivalent(with: event)
+                }
+                if !saveEffects.contains("saveAs") {
+                    keyFailures.append("cmd-s-missed \(saveEffects)")
+                }
+                // Bare S stays Spotlight: the modifier is what distinguishes
+                // them, and losing that turns a tool key into a save sheet.
+                var bareEffects: [String] = []
+                let (bareOverlay, bareView) = keyHost { bareEffects.append($0) }
+                if let event = keyEvent("s") { bareView.keyDown(with: event) }
+                if bareEffects.contains("saveAs") {
+                    keyFailures.append("bare-s-saved")
+                }
+
+                // `SelectionOverlayView.owner` is WEAK. Binding an overlay to
+                // `_` lets ARC free it before the key is fired, and every
+                // guard that reads `owner` then fails silently — which reads
+                // as "the key is not routed" when the routing is fine.
+                withExtendedLifetime(
+                    [xOverlay, dragOverlay, saveOverlay, bareOverlay]
+                ) {}
                 check("sliceB-overlay-action-keys",
                       keyFailures.isEmpty,
                       keyFailures.prefix(6).joined(separator: " | "))
