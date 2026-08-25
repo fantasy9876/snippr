@@ -6589,18 +6589,32 @@ enum SelfTest {
                         ocrFailures.append(
                             "text cursor \(String(describing: overText))")
                     }
-                    if let copy = panel.control(
-                        identifier: OverlayOCRPanel.copyIdentifier) {
-                        if !copy.isEnabled {
-                            // The pointingHand below only means something over
-                            // a LIVE button; a disabled one must read `.arrow`.
-                            ocrFailures.append("copy-disabled-before-cursor")
-                        }
-                        let overCopy = regionCursor(at: panelPoint(copy.frame))
-                        if overCopy != .pointingHand {
+                    // EVERY control the panel lists, not just Copy — read off
+                    // `hintButtons`, the same list production builds its
+                    // cursor table from. A control added to the panel later
+                    // (1.2.18 adds Retry) is covered by this loop the day it
+                    // lands, instead of waiting for someone to remember to
+                    // write a probe for it.
+                    if panel.hintButtons.isEmpty {
+                        ocrFailures.append("panel-lists-no-controls")
+                    }
+                    for control in panel.hintButtons where !control.isHidden {
+                        let want: AppCursor =
+                            control.isEnabled ? .pointingHand : .arrow
+                        let got = regionCursor(at: panelPoint(control.frame))
+                        if got != want {
+                            let name = control.identifier?.rawValue ?? "?"
                             ocrFailures.append(
-                                "copy cursor \(String(describing: overCopy))")
+                                "\(name) cursor \(String(describing: got))"
+                                + " want \(want)")
                         }
+                    }
+                    if let copy = panel.control(
+                        identifier: OverlayOCRPanel.copyIdentifier),
+                       !copy.isEnabled {
+                        // The loop above only proves something about a LIVE
+                        // Copy if Copy is live at this point.
+                        ocrFailures.append("copy-disabled-before-cursor")
                     }
                     // And the same button once it goes DEAD. Copy is disabled
                     // while a recognition is in flight — production's own
