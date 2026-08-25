@@ -7702,6 +7702,37 @@ enum SelfTest {
                 if firstRetry.isHidden {
                     trFailures.append("retry hidden after offline")
                 }
+                // The merge point of the two 1.2.18 slices. Retry is chrome
+                // that only exists in THIS state — visible after a failure, in
+                // translate mode — so the cursor gates in the plain-OCR panel
+                // case never see it. The panel builds its cursor table from
+                // `hintButtons` and Retry is in that list, but "the mechanism
+                // covers it" is not evidence; this is. A live Retry reads as
+                // pressable, not as the crop's open hand underneath it.
+                if let trFrame = trHost.ocrResultPanelFrameForTesting,
+                   let move = NSEvent.mouseEvent(
+                    with: .mouseMoved,
+                    location: CGPoint(
+                        x: trFrame.minX + firstRetry.frame.midX,
+                        y: trFrame.minY + firstRetry.frame.midY),
+                    modifierFlags: [], timestamp: 0, windowNumber: 0,
+                    context: nil, eventNumber: 0, clickCount: 1, pressure: 1)
+                {
+                    trHost.mouseMoved(with: move)
+                    let overRetry = trHost.currentCursorForTesting
+                    let want: AppCursor =
+                        firstRetry.isEnabled ? .pointingHand : .arrow
+                    if overRetry != want {
+                        trFailures.append(
+                            "retry cursor \(String(describing: overRetry))"
+                            + " want \(want)")
+                    }
+                } else {
+                    // Not seen is a FAIL, not a skip: a panel with no frame or
+                    // an event that would not build takes the probe with it
+                    // and leaves the gate green on nothing.
+                    trFailures.append("retry-cursor-no-frame-or-event")
+                }
 
                 TranslateService.translatorOverrideForTesting = { _, _ in
                     throw TranslateService.Failure.http(status: 429)
