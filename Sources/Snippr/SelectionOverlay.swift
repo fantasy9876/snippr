@@ -868,15 +868,16 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
         return innerBytes <= innerBudget
     }
 
-    /// Popover "Open in Editor…": the crop plus overlay marks as the
-    /// document, the current overlay style as live Backdrop state. Baking
-    /// the frame first would put a second plate around it the moment the
-    /// sidebar changed padding. Spotlight dim is compose-once global
-    /// state, not a local mark — flatten everything except the holes and
-    /// hand the live annotations to the editor so a second hole cannot
-    /// stack darkness. Copy/Save/OCR still bake through `reviewPayload`.
-    /// The toolbar's macwindow action still sends the composed picture —
-    /// that path has no document to carry a style.
+    /// Open in Editor (popover, toolbar macwindow, catalog `.openEditor`):
+    /// the crop plus overlay marks as the document, the current overlay
+    /// style as live Backdrop state. Baking the frame first would put a
+    /// second plate around it the moment the sidebar changed padding.
+    /// Spotlight dim is compose-once global state, not a local mark —
+    /// flatten everything except the holes and hand the live annotations
+    /// to the editor so a second hole cannot stack darkness. Copy/Save/OCR
+    /// still bake through `reviewPayload`. Folding toolbar `.openEditor`
+    /// back into the terminal bake case reintroduces the 1.2.15 stacked
+    /// dim; the handoff gate drives this dispatcher, not only the popover.
     private func openBackdropEditor() {
         hoverHint.hide()
         guard !annotationDragging, areaDrag == nil else { return }
@@ -1027,12 +1028,19 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
     }
 
     /// One review intention = one router commit with the CURRENT crop.
-    /// Terminal lifecycle per QA: Copy commits then closes; Pin/OCR/editor
-    /// tear the overlay down BEFORE presenting; Save keeps the overlay in
-    /// `.saving` and returns to review on cancel/failure.
+    /// Terminal lifecycle per QA: Copy commits then closes; Pin/OCR tear
+    /// the overlay down BEFORE presenting; Open in Editor shares the
+    /// unbaked Spotlight seam below; Save keeps the overlay in `.saving`
+    /// and returns to review on cancel/failure.
     fileprivate func performReviewAction(_ intent: CaptureIntent) {
         hoverHint.hide()
         guard !annotationDragging, areaDrag == nil else { return }
+        // Toolbar macwindow and the catalog `.openEditor` key share this
+        // seam. Baking here is the 1.2.15 stacked-dim bug.
+        if intent == .openEditor {
+            openBackdropEditor()
+            return
+        }
         guard let owner, owner.session.acceptsCommits,
               let selection = areaSelection?.intersection(bounds),
               selection.width >= 4, selection.height >= 4,

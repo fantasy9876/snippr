@@ -18057,6 +18057,139 @@ enum SelfTest {
                         }
                     }
                     overlay.dismissForTesting()
+
+                    // Toolbar macwindow — `performReviewAction(.openEditor)`.
+                    // PR #9 only drove the popover (`openBackdropEditor`).
+                    // The owner clicks this button; Honey's E key routes the
+                    // same catalog intent through this dispatcher, so one
+                    // seam has to cover both. Two overlay holes at dim 0.3,
+                    // then two more in the editor: one dim layer. Reproducing
+                    // 1.2.15 (baked snapshot, empty annotations) must fail.
+                    if OverlayActionCatalog.items.contains(where: {
+                        $0.symbol == "macwindow" && $0.intent == .openEditor
+                    }) == false {
+                        handoffFails.append("catalog-openEditor")
+                    }
+                    var toolbarHandoffs: [EditorHandoff] = []
+                    let toolbarOverlay = SelectionOverlay(
+                        purpose: .areaReview,
+                        inputs: OverlaySessionInputs(
+                            afterShow: true, afterCopy: false,
+                            afterSave: false),
+                        completion: { _ in })
+                    toolbarOverlay.routerDependenciesOverride =
+                        CaptureActionRouter.Dependencies(
+                            copyToClipboard: { _ in },
+                            autoSave: { _, _ in },
+                            saveAs: { _, _ in },
+                            pin: { _ in }, ocr: { _ in },
+                            openEditor: { toolbarHandoffs.append($0) },
+                            toast: { _ in },
+                            setLastCapture: { _ in },
+                            setLastAreaRect: { _ in },
+                            logEvent: { _ in })
+                    let toolbarView = SelectionOverlayView(
+                        mode: .area, screen: screen,
+                        frozen: CapturedImage(
+                            cgImage: frozenImage, scale: 2),
+                        windowList: [], owner: toolbarOverlay)
+                    toolbarView.selectForTesting(
+                        rect: CGRect(x: 80, y: 80, width: 240, height: 180))
+                    let toolbarPx = toolbarOverlay.session.pixelRect
+                    let toolbarOrigin =
+                        EditableSelectionGeometry.annotationOffset(
+                            forPixelCrop: toolbarPx,
+                            imageHeight: CGFloat(frozenImage.height))
+                    if let liveSurface = toolbarView.annotationSurface {
+                        func addHole(
+                            x: CGFloat, y: CGFloat, w: CGFloat, h: CGFloat
+                        ) {
+                            let hole = SpotlightAnnotation(uiScale: 2)
+                            hole.rect = CGRect(
+                                x: toolbarOrigin.x + x,
+                                y: toolbarOrigin.y + y,
+                                width: w, height: h)
+                            hole.baseBounds = CGRect(
+                                x: 0, y: 0,
+                                width: frozenImage.width,
+                                height: frozenImage.height)
+                            hole.dimFraction = 0.3
+                            liveSurface.addAnnotationForTesting(hole)
+                        }
+                        addHole(x: 40, y: 40, w: 50, h: 40)
+                        addHole(x: 110, y: 50, w: 40, h: 30)
+                    } else {
+                        handoffFails.append("toolbar-no-surface")
+                    }
+                    toolbarView.performReviewActionForTesting(.openEditor)
+                    if toolbarHandoffs.count != 1 {
+                        handoffFails.append(
+                            "toolbar-calls \(toolbarHandoffs.count)")
+                    } else {
+                        let handed = toolbarHandoffs[0]
+                        let handedImage = handed.image.cgImage
+                        let dimSample = luma(probe2(handedImage, 8, 8))
+                        if dimSample < 240 {
+                            handoffFails.append(
+                                "toolbar-baked \(dimSample)")
+                        }
+                        if !handed.openPanel {
+                            handoffFails.append("toolbar-open-panel")
+                        }
+                        let spots = handed.annotations
+                            .compactMap { $0 as? SpotlightAnnotation }
+                        if spots.count != 2 {
+                            handoffFails.append(
+                                "toolbar-count \(spots.count)")
+                        }
+                        if spots.contains(where: {
+                            abs($0.dimFraction - 0.3) > 0.0001
+                        }) {
+                            handoffFails.append(
+                                "toolbar-dim \(spots.map { $0.dimFraction })")
+                        }
+                        let wc = EditorWindowController.open(
+                            with: handed.image,
+                            forceFitForTesting: true,
+                            annotations: handed.annotations)
+                        wc.window?.setContentSize(
+                            NSSize(width: 560, height: 420))
+                        let canvas = wc.canvasForTesting
+                        wc.selectTool(.spotlight)
+                        canvas.dragForTesting(
+                            from: CGPoint(x: 20, y: 90),
+                            to: CGPoint(x: 55, y: 115))
+                        canvas.dragForTesting(
+                            from: CGPoint(x: 160, y: 20),
+                            to: CGPoint(x: 200, y: 50))
+                        let live = canvas.annotations
+                            .compactMap { $0 as? SpotlightAnnotation }
+                        if live.count != 4 {
+                            handoffFails.append(
+                                "toolbar-second \(live.count)")
+                        }
+                        if live.contains(where: {
+                            abs($0.dimFraction - 0.3) > 0.0001
+                        }) {
+                            handoffFails.append(
+                                "toolbar-inherit \(live.map { $0.dimFraction })")
+                        }
+                        if let exported = canvas.flattened()?.cgImage {
+                            let outL = luma(probe2(exported, 8, 8))
+                            if outL > 210 {
+                                handoffFails.append(
+                                    "toolbar-not-dimmed \(outL)")
+                            }
+                            if outL < 150 {
+                                handoffFails.append(
+                                    "toolbar-double-dim \(outL)")
+                            }
+                        } else {
+                            handoffFails.append("toolbar-export")
+                        }
+                        wc.window?.close()
+                    }
+                    toolbarOverlay.dismissForTesting()
                 } else {
                     handoffFails.append("no-screen")
                 }
@@ -18064,6 +18197,89 @@ enum SelfTest {
                 check("sliceB-overlay-editor-spotlight-handoff",
                       handoffFails.isEmpty,
                       handoffFails.prefix(8).joined(separator: " | "))
+            }
+
+            // 8e. Editor crop after a live spotlight. `move(by:)` does not
+            //     shift `baseBounds`; crop uses `translateForDocumentChange`
+            //     which defaults to `move`. Visual: one 0.3 layer after a
+            //     non-origin crop, then a second hole inherits. If the dim
+            //     canvas has actually left the new image, this goes red.
+            cropCanvasCheck: do {
+                SliceBCompositor.multipleSpotlightOverrideForTesting = true
+                defer {
+                    SliceBCompositor.multipleSpotlightOverrideForTesting = nil
+                }
+                var cropFails: [String] = []
+                let white = makeSolidImage(
+                    width: 200, height: 120, color: NSColor.white.cgColor)
+                let first = SpotlightAnnotation(uiScale: 1)
+                first.rect = CGRect(x: 50, y: 40, width: 40, height: 30)
+                first.dimFraction = 0.3
+                first.baseBounds = CGRect(
+                    x: 0, y: 0, width: 200, height: 120)
+                let moved = first.copyAnnotation() as? SpotlightAnnotation
+                moved?.move(by: CGPoint(x: 8, y: 0))
+                if moved?.baseBounds != first.baseBounds {
+                    cropFails.append("move-shifted-canvas")
+                }
+                let wc = EditorWindowController.open(
+                    with: CapturedImage(cgImage: white, scale: 1),
+                    forceFitForTesting: true,
+                    annotations: [first])
+                wc.window?.setContentSize(NSSize(width: 560, height: 420))
+                let canvas = wc.canvasForTesting
+                canvas.cropForTesting(
+                    pixels: CGRect(x: 20, y: 20, width: 140, height: 80))
+                if canvas.image.cgImage.width != 140
+                    || canvas.image.cgImage.height != 80 {
+                    cropFails.append(
+                        "crop-size \(canvas.image.cgImage.width)x"
+                            + "\(canvas.image.cgImage.height)")
+                    wc.window?.close()
+                    check("sliceB-editor-spotlight-crop-canvas",
+                          false,
+                          cropFails.joined(separator: " | "))
+                    break cropCanvasCheck
+                }
+                let cropped = canvas.annotations
+                    .compactMap { $0 as? SpotlightAnnotation }
+                if cropped.count != 1 {
+                    cropFails.append("count \(cropped.count)")
+                }
+                wc.selectTool(.spotlight)
+                canvas.dragForTesting(
+                    from: CGPoint(x: 90, y: 20),
+                    to: CGPoint(x: 125, y: 45))
+                let live = canvas.annotations
+                    .compactMap { $0 as? SpotlightAnnotation }
+                if live.count != 2 {
+                    cropFails.append("second \(live.count)")
+                }
+                if live.contains(where: {
+                    abs($0.dimFraction - 0.3) > 0.0001
+                }) {
+                    cropFails.append(
+                        "inherit \(live.map { $0.dimFraction })")
+                }
+                guard let exported = canvas.flattened()?.cgImage else {
+                    cropFails.append("export")
+                    wc.window?.close()
+                    check("sliceB-editor-spotlight-crop-canvas",
+                          false,
+                          cropFails.joined(separator: " | "))
+                    break cropCanvasCheck
+                }
+                let outL = luma(probe2(exported, 4, 4))
+                if outL > 210 {
+                    cropFails.append("not-dimmed \(outL)")
+                }
+                if outL < 150 {
+                    cropFails.append("double-dim \(outL)")
+                }
+                wc.window?.close()
+                check("sliceB-editor-spotlight-crop-canvas",
+                      cropFails.isEmpty,
+                      cropFails.joined(separator: " | "))
             }
 
             // 9. Real key routing + real toolbar + symbol fallback
