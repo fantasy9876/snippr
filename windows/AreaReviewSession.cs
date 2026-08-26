@@ -129,6 +129,38 @@ sealed class AreaReviewSession
         return result;
     }
 
+    /// One REGION of the document, in the frozen image's pixels.
+    ///
+    /// Region OCR reads this, never a crop of `Frozen`. The difference is the
+    /// whole security case: a pixelation the user drew over something private
+    /// lives in the annotations, so cutting the raw freeze reads straight
+    /// through the redaction and hands back the very words they just covered
+    /// — and with no annotations on the picture the two paths return identical
+    /// bytes, so every other assertion stays green while it does.
+    ///
+    /// Composed over the FULL crop and then cut, rather than composed over the
+    /// region: a magnifier or a callout whose source sits outside the region
+    /// still belongs in the picture the region is part of.
+    public Bitmap Semantic(Rectangle region)
+    {
+        var wanted = Rectangle.Intersect(region, PixelRect);
+        if (wanted.Width <= 0 || wanted.Height <= 0)
+        {
+            // Deliberately NOT the whole crop. A region that missed is a
+            // region that recognized nothing; falling back to everything
+            // would read pixels the user did not point at.
+            return new Bitmap(1, 1, PixelFormat.Format32bppArgb);
+        }
+        using var full = Semantic();
+        var local = new Rectangle(
+            wanted.X - PixelRect.X, wanted.Y - PixelRect.Y, wanted.Width, wanted.Height);
+        var result = new Bitmap(local.Width, local.Height, PixelFormat.Format32bppArgb);
+        using var g = Graphics.FromImage(result);
+        g.DrawImage(
+            full, new Rectangle(0, 0, local.Width, local.Height), local, GraphicsUnit.Pixel);
+        return result;
+    }
+
     /// The PICTURE: the document inside its frame.
     public Bitmap Visual()
     {

@@ -81,8 +81,18 @@ enum ReviewCursorKind
 
 static class AreaReviewCursor
 {
-    public static ReviewCursorKind For(Tool tool, CropGrip grip)
+    /// <paramref name="armed"/> is a region OCR pick waiting for its drag.
+    ///
+    /// It answers BEFORE the tool and before the grip, and the whole crop —
+    /// handles included — answers with it. macOS learned this the hard way
+    /// twice: the crosshair set when the mode began was overwritten by the
+    /// crop's own cursor on the next mouse move, and a resize cursor out on
+    /// the handles promised a resize that the armed mouse-down no longer
+    /// performs. While armed, every point is somewhere a region drag may
+    /// begin, so every point says so.
+    public static ReviewCursorKind For(Tool tool, CropGrip grip, bool armed = false)
     {
+        if (armed) return ReviewCursorKind.Cross;
         if (tool == Tool.Text) return ReviewCursorKind.IBeam;
         if (tool != Tool.Select) return ReviewCursorKind.Cross;
         return grip switch

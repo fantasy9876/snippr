@@ -33,6 +33,8 @@ static class Program
         failed += Check("win-backdrop-corner-radius-table", CornerRadiusTable());
         failed += Check("win-chrome-fits-at-every-dpi", ChromeFitsAtEveryDpi());
         failed += Check("win-magnifier-callout-clamped", MagnifierCalloutClamped());
+        failed += Check("win-ocr-region-pick-state", OcrRegionPickState());
+        failed += Check("win-ocr-panel-never-covers-region", OcrPanelPlacementGate());
         if (pending > 0)
             Console.WriteLine($"{pending} PARITY GATE(S) PENDING — not a pass");
         Console.WriteLine(failed == 0
@@ -1100,5 +1102,127 @@ static class Program
         return f;
     }
 
+    /// The region pick as a MODE: armed, dragged, finished or abandoned.
+    ///
+    /// macOS shipped this state living only where it was set — the cursor
+    /// table and the tool router never asked about it — so the mode was
+    /// invisible to everything that decided behaviour. Here it is one object,
+    /// and this gate is what stops a question being answered without it.
+    static List<string> OcrRegionPickState()
+    {
+        var f = new List<string>();
+        var crop = new Rectangle(40, 40, 400, 300);
+        var pick = new OcrRegionPick();
 
+        if (pick.Armed) f.Add("fresh pick is armed");
+        if (pick.Begin(new Point(100, 100), crop)) f.Add("begin worked while disarmed");
+
+        var gen = pick.Generation;
+        pick.Arm(translates: false);
+        if (!pick.Armed) f.Add("arm did not arm");
+        if (pick.Generation == gen) f.Add("arm did not move the generation");
+
+        // Dragged up-and-left: the rectangle is the same either way, and a
+        // negative-width rect recognizes nothing.
+        pick.Begin(new Point(300, 250), crop);
+        pick.Drag(new Point(200, 150), crop);
+        if (pick.Region != new Rectangle(200, 150, 100, 100))
+            f.Add($"backwards drag -> {pick.Region}");
+
+        // Past the crop edge: the pick belongs to the shot, so it clamps.
+        pick.Drag(new Point(9999, 9999), crop);
+        if (pick.Region is { } dragged && !crop.Contains(dragged))
+            f.Add($"drag left the crop -> {dragged}");
+
+        var done = pick.Finish(new Point(9999, 9999), crop);
+        if (done is not { } region) f.Add("finish returned nothing");
+        else if (!crop.Contains(region)) f.Add($"finished outside the crop -> {region}");
+        if (pick.Armed) f.Add("finish left the mode armed");
+
+        // A stray click is not a region — and it must NOT drop the user out
+        // of the mode, or the toolbar shows no sign the mode ever started.
+        pick.Arm(translates: true);
+        if (!pick.Translates) f.Add("translate arm forgot it translates");
+        pick.Begin(new Point(100, 100), crop);
+        if (pick.Finish(new Point(100 + OcrRegionPick.MinimumSide - 1, 104), crop) != null)
+            f.Add("a stray click produced a region");
+        if (!pick.Armed) f.Add("a stray click disarmed the mode");
+
+        var beforeCancel = pick.Generation;
+        if (!pick.Cancel()) f.Add("cancel reported nothing to cancel");
+        if (pick.Armed || pick.Region != null) f.Add("cancel left state behind");
+        if (pick.Generation == beforeCancel)
+            f.Add("cancel did not move the generation");
+        // Only the first Escape has something to unwind; the second belongs to
+        // the session, and the caller tells them apart by this answer.
+        if (pick.Cancel()) f.Add("cancel twice claimed to cancel twice");
+
+        // The armed cursor, from the same table the form reads. Every point is
+        // somewhere a region drag may begin — the crop and its handles
+        // included, because the armed mouse-down no longer resizes anything.
+        foreach (var grip in Enum.GetValues<CropGrip>())
+            foreach (var tool in new[] { Tool.Select, Tool.Text, Tool.Pen })
+            {
+                var got = AreaReviewCursor.For(tool, grip, armed: true);
+                if (got != ReviewCursorKind.Cross)
+                    f.Add($"armed {tool} {grip} -> {got} want Cross");
+            }
+        // And nothing changes when it is NOT armed: the mode may not leak
+        // into the ordinary table.
+        if (AreaReviewCursor.For(Tool.Select, CropGrip.Inside, armed: false)
+            != ReviewCursorKind.SizeAll)
+            f.Add("disarmed select inside is no longer SizeAll");
+        return f;
+    }
+
+    /// The panel sits beside the pixels it read, on top of nothing that
+    /// matters, inside the screen — or it does not appear at all.
+    static List<string> OcrPanelPlacementGate()
+    {
+        var f = new List<string>();
+        var bounds = new Rectangle(0, 0, 1440, 900);
+        var panel = new Size(300, 176);
+        var rail = new RectangleF(0, 300, 44, 300);
+        var strip = new RectangleF(300, 820, 400, 44);
+
+        // Region in the middle: a placement exists, and it obeys all three
+        // rules at once.
+        var region = new Rectangle(400, 300, 320, 120);
+        var placed = OcrPanelPlacement.Place(panel, region, bounds, rail, strip);
+        if (placed is not { } rect) f.Add("no placement for a region in open space");
+        else
+        {
+            if (rect.IntersectsWith(region)) f.Add($"panel covers the region -> {rect}");
+            if (!bounds.Contains(rect)) f.Add($"panel left the surface -> {rect}");
+            if (rect.IntersectsWith(Rectangle.Round(rail))
+                || rect.IntersectsWith(Rectangle.Round(strip)))
+                f.Add($"panel covers the chrome -> {rect}");
+            if (rect.Size != panel) f.Add($"panel was resized -> {rect.Size}");
+        }
+
+        // Region hard against every edge in turn: the panel slides rather than
+        // hanging off the screen, and still never lands on the region.
+        foreach (var corner in new[]
+        {
+            new Rectangle(0, 0, 200, 120),
+            new Rectangle(bounds.Right - 200, 0, 200, 120),
+            new Rectangle(0, bounds.Bottom - 120, 200, 120),
+            new Rectangle(bounds.Right - 200, bounds.Bottom - 120, 200, 120),
+        })
+        {
+            var at = OcrPanelPlacement.Place(panel, corner, bounds);
+            if (at is not { } r) { f.Add($"no placement at {corner}"); continue; }
+            if (!bounds.Contains(r)) f.Add($"{corner} -> {r} off surface");
+            if (r.IntersectsWith(corner)) f.Add($"{corner} -> {r} covers the region");
+        }
+
+        // Nothing fits: null, not a best effort. A panel on the shot or half
+        // off-screen is worse than a panel the caller knows not to show.
+        var tight = new Rectangle(0, 0, 320, 200);
+        if (OcrPanelPlacement.Place(panel, new Rectangle(0, 0, 320, 200), tight) != null)
+            f.Add("a region filling the surface still got a placement");
+        if (OcrPanelPlacement.Place(new Size(2000, 100), region, bounds) != null)
+            f.Add("a panel wider than the surface was placed");
+        return f;
+    }
 }

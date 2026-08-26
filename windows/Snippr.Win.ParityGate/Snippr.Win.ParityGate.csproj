@@ -35,6 +35,12 @@
     <Compile Include="..\Ui\EditorChromeMetrics.cs" Link="EditorChromeMetrics.cs" />
     <Compile Include="..\AreaReviewHitTest.cs" Link="AreaReviewHitTest.cs" />
     <Compile Include="..\AreaReviewCrop.cs" Link="AreaReviewCrop.cs" />
+    <!-- The region pick and the panel placement are deliberately screen-free
+         for exactly this: the mode's state machine and the popover arithmetic
+         are checked on the machine the port is written on, not only on a
+         Windows runner. -->
+    <Compile Include="..\OcrRegionPick.cs" Link="OcrRegionPick.cs" />
+    <Compile Include="..\OcrPanelPlacement.cs" Link="OcrPanelPlacement.cs" />
     <Compile Include="..\EditorActionRouter.cs" Link="EditorActionRouter.cs" />
   </ItemGroup>
 
