@@ -890,8 +890,9 @@ static class TestEntry
                     throw new InvalidOperationException("no panel after the drag");
                 if (!panel.TranslateMode)
                     throw new InvalidOperationException("G opened a plain OCR panel");
-                if (!panel.LanguageVisibleForTesting)
-                    throw new InvalidOperationException("no language row in translate mode");
+                WaitFor(
+                    () => panel.LanguageVisibleForTesting,
+                    "no language row in translate mode", panel);
                 if (panel.Height <= OcrResultPanel.BaseHeight)
                     throw new InvalidOperationException(
                         $"translate panel did not grow ({panel.Height})");
@@ -909,8 +910,15 @@ static class TestEntry
                     throw new InvalidOperationException("the failure blanked the panel");
                 if (!panel.CopyEnabledForTesting)
                     throw new InvalidOperationException("the failure disabled Copy");
-                if (!panel.RetryVisibleForTesting)
-                    throw new InvalidOperationException("no Thử lại after a failure");
+                // WAIT for it, do not loosen the assertion. The status and the
+                // button are set in the same method, but the button's state
+                // reaches the screen through WinForms and can settle a few
+                // milliseconds later — the release build's smoke asserted at
+                // 05:02:12.370 and the button was there by .384. A user does
+                // not see 14ms; an assertion racing the message pump does.
+                WaitFor(
+                    () => panel.RetryVisibleForTesting,
+                    "no Thử lại after a failure", panel);
             });
             Step("translate-panel-retry-uses-the-real-button", () =>
             {
@@ -933,10 +941,15 @@ static class TestEntry
                 if (!panel.RecognizedText.StartsWith("["))
                     throw new InvalidOperationException(
                         $"Copy would take '{panel.RecognizedText}', not the translation");
-                if (panel.RetryVisibleForTesting)
-                    throw new InvalidOperationException(
-                        "Thử lại stayed after success | "
-                        + string.Join(" | ", panel.TraceForTesting));
+                // Same wait, other direction — and it has to be a wait for the
+                // same reason: the button's state reaches the screen through
+                // WinForms, so reading it the instant the status changes is
+                // racing the pump rather than testing the contract. The
+                // contract is that a successful translation stops offering a
+                // retry, which is what this settles on.
+                WaitFor(
+                    () => !panel.RetryVisibleForTesting,
+                    "Thử lại stayed after success", panel);
             });
             Step("translate-panel-language-change-retranslates-the-source", () =>
             {
@@ -1162,6 +1175,35 @@ static class TestEntry
     /// Pumps the UI until <paramref name="done"/> or the deadline. Recognition
     /// and translation are async, so a straight-line assertion after the drag
     /// reads the panel before it has been filled.
+    /// Waits for the thing about to be ASSERTED, and says how long it waited
+    /// when it gives up.
+    ///
+    /// The panel sets its status text and its row visibility in the same
+    /// method, but they land by different means: the status is a Label, the
+    /// row goes through `ApplyRowVisibility`, which does nothing until there
+    /// are handles and is re-applied on `HandleCreated`. Waiting for the fast
+    /// one and asserting the slow one loses eventually — it lost on the
+    /// portable self-contained build, where Thử lại arrived 14ms after the
+    /// assertion asked for it and the very next step used the same button
+    /// successfully.
+    ///
+    /// Waiting for the predicate you are about to assert is a TIGHTENING, not
+    /// a loosening: the wait and the claim become the same sentence. The bound
+    /// is deliberately short so a real regression — the button never appears —
+    /// fails here instead of hiding inside a generous spin, and the elapsed
+    /// time is in the message so nobody has to guess which of the two it was.
+    static void WaitFor(
+        Func<bool> settled, string complaint, OcrResultPanel panel,
+        double seconds = 2)
+    {
+        var start = DateTime.UtcNow;
+        if (Pump(settled, seconds)) return;
+        var waited = (DateTime.UtcNow - start).TotalMilliseconds;
+        throw new InvalidOperationException(
+            $"{complaint} after waiting {waited:F0}ms | "
+            + string.Join(" | ", panel.TraceForTesting));
+    }
+
     static bool Pump(Func<bool> done, double seconds = 20)
     {
         var deadline = DateTime.UtcNow.AddSeconds(seconds);
