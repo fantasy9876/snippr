@@ -1,4 +1,6 @@
 using System.Drawing.Imaging;
+using System.Net.Http;
+using System.Net.Sockets;
 using System.Runtime.InteropServices;
 
 namespace Snippr;
@@ -842,6 +844,180 @@ static class TestEntry
 
         Step("translate-window-reasons-and-source", () => TranslateWindowSmoke());
 
+        // ---------- region OCR + Translate in the panel (W2b) ----------
+        //
+        // A separate surface over a picture with WORDS in it: the checkerboard
+        // above is right for layout and colour and useless here, because every
+        // step below depends on a recognition actually coming back. The
+        // recognizer is real (`ocr: used=en-US` on the runner); only the
+        // network is replaced, through the same override the old window's
+        // gate uses.
+        using (var words = TextPicture())
+        using (var tr = AreaReviewForm.CreateForTesting(
+            new Bitmap(words),
+            new Rectangle(0, 0, words.Width, words.Height),
+            new Rectangle(120, 120, 900, 520)))
+        {
+            var chrome = tr.ChromeForTesting;
+            var crop = tr.SelectionForTesting;
+            // The words sit at 260,250 in the picture; take a band around them.
+            var from = new Point(240, 230);
+            var to = new Point(760, 330);
+            Step("translate-panel-arms-in-translate-mode", () =>
+            {
+                tr.Size = new Size(words.Width, words.Height);
+                Reveal(tr);
+                tr.PlaceToolbarForTesting();
+                Application.DoEvents();
+                // A REAL offline shape: bare `HttpRequestException` carries no
+                // evidence of being offline, and `Classify` correctly reads it
+                // as Other — the first run of this step failed on my fixture,
+                // not on the classifier. A name that will not resolve is what
+                // a disconnected machine actually raises.
+                TranslateService.TranslatorOverrideForTesting =
+                    (_, _) => throw new HttpRequestException(
+                        "no network",
+                        new SocketException((int)SocketError.HostNotFound));
+                if (!tr.PressKeyForTesting(Keys.G))
+                    throw new InvalidOperationException("G was not routed");
+                if (!tr.ArmedForTesting)
+                    throw new InvalidOperationException("G did not arm the pick");
+                SendMouse(chrome, WmLButtonDown, from);
+                SendMouse(chrome, WmMouseMove, to);
+                SendMouse(chrome, WmLButtonUp, to);
+                Application.DoEvents();
+                if (tr.PanelForTesting is not { } panel)
+                    throw new InvalidOperationException("no panel after the drag");
+                if (!panel.TranslateMode)
+                    throw new InvalidOperationException("G opened a plain OCR panel");
+                if (!panel.LanguageVisibleForTesting)
+                    throw new InvalidOperationException("no language row in translate mode");
+                if (panel.Height <= OcrResultPanel.BaseHeight)
+                    throw new InvalidOperationException(
+                        $"translate panel did not grow ({panel.Height})");
+            });
+            Step("translate-panel-fails-open-with-a-reason", () =>
+            {
+                var panel = tr.PanelForTesting
+                    ?? throw new InvalidOperationException("premise: no panel");
+                if (!Pump(() => panel.StatusForTesting.Contains("mất mạng")))
+                    throw new InvalidOperationException(
+                        $"offline status is '{panel.StatusForTesting}'");
+                // Fail OPEN: the recognition stays on screen and copyable, and
+                // the reason is the classifier's, not a shrug.
+                if (panel.TextForTesting.Length == 0)
+                    throw new InvalidOperationException("the failure blanked the panel");
+                if (!panel.CopyEnabledForTesting)
+                    throw new InvalidOperationException("the failure disabled Copy");
+                if (!panel.RetryVisibleForTesting)
+                    throw new InvalidOperationException("no Thử lại after a failure");
+            });
+            Step("translate-panel-retry-uses-the-real-button", () =>
+            {
+                var panel = tr.PanelForTesting
+                    ?? throw new InvalidOperationException("premise: no panel");
+                var source = panel.SourceText;
+                if (source.Length == 0)
+                    throw new InvalidOperationException("nothing was recognized to translate");
+                TranslateService.TranslatorOverrideForTesting =
+                    (text, lang) => Task.FromResult($"[{lang}] {text}");
+                var retry = panel.Controls.Find(OcrResultPanel.RetryName, true).FirstOrDefault()
+                    ?? throw new InvalidOperationException("no control named "
+                        + OcrResultPanel.RetryName);
+                ((Button)retry).PerformClick();
+                if (!Pump(() => panel.StatusForTesting.StartsWith("Đã dịch")))
+                    throw new InvalidOperationException(
+                        $"retry left the status at '{panel.StatusForTesting}'");
+                // Copy follows the screen: after a translation lands, the
+                // clipboard must not still hold the recognition.
+                if (!panel.RecognizedText.StartsWith("["))
+                    throw new InvalidOperationException(
+                        $"Copy would take '{panel.RecognizedText}', not the translation");
+                if (panel.RetryVisibleForTesting)
+                    throw new InvalidOperationException(
+                        "Thử lại stayed after success | "
+                        + string.Join(" | ", panel.TraceForTesting));
+            });
+            Step("translate-panel-language-change-retranslates-the-source", () =>
+            {
+                // The stacked-translation case, for the panel this time: a
+                // second language must translate the RECOGNITION, never the
+                // translation on screen.
+                var panel = tr.PanelForTesting
+                    ?? throw new InvalidOperationException("premise: no panel");
+                var source = panel.SourceText;
+                if (panel.Controls.Find(OcrResultPanel.LanguageName, true).FirstOrDefault()
+                    is not Button chooser)
+                    throw new InvalidOperationException("no language control");
+                if (chooser.Cursor != Cursors.Hand)
+                    throw new InvalidOperationException(
+                        $"the language chooser offers {chooser.Cursor}");
+                var current = panel.SelectedLanguage.Code;
+                var wantCode = TranslateService.Languages
+                    .First(l => l.Code != current).Code;
+                // The same call the menu item makes when it is clicked; the
+                // menu itself is a popup window the smoke cannot press
+                // headlessly, and the item click does nothing else.
+                panel.ChooseLanguageForTesting(wantCode);
+                if (!Pump(() => panel.StatusForTesting.StartsWith("Đã dịch")
+                    && panel.RecognizedText.StartsWith($"[{wantCode}]")))
+                    throw new InvalidOperationException(
+                        $"language change left '{panel.RecognizedText}' "
+                        + $"status '{panel.StatusForTesting}'");
+                var want = $"[{wantCode}] {source}";
+                if (panel.RecognizedText != want)
+                    throw new InvalidOperationException(
+                        $"got '{panel.RecognizedText}' want '{want}' — "
+                        + "the second pass translated the translation");
+            });
+            Step("translate-panel-paints-its-own-colours", () =>
+            {
+                // The same rule as the plain panel, asked of the surface the
+                // plain panel's gate never sees. The language row is the third
+                // control in this project to paint itself from the Windows
+                // theme when told not to — the question has to be asked
+                // wherever a new control appears, not once per project.
+                if (tr.PanelForTesting is not { } panel)
+                    throw new InvalidOperationException("premise: no panel open");
+                using var shot = new Bitmap(tr.Width, tr.Height);
+                tr.DrawToBitmap(shot, new Rectangle(0, 0, shot.Width, shot.Height));
+                var accent = SystemColors.Highlight;
+                var system = SystemColors.Control;
+                // NOT SystemColors.Window: it is white, and this panel draws
+                // white TEXT. Including it turns every antialiased glyph edge
+                // into a false report — the same trap the ✕ glyph set when it
+                // read as accent-blue and measured as ClearType fringing.
+                int bad = 0, dark = 0;
+                string first = "";
+                var frame = panel.Bounds;
+                for (int y = Math.Max(0, frame.Top); y < Math.Min(shot.Height, frame.Bottom); y++)
+                    for (int x = Math.Max(0, frame.Left); x < Math.Min(shot.Width, frame.Right); x++)
+                    {
+                        var c = shot.GetPixel(x, y);
+                        bool near(Color w) =>
+                            Math.Abs(c.R - w.R) <= 8 && Math.Abs(c.G - w.G) <= 8
+                                && Math.Abs(c.B - w.B) <= 8;
+                        if (near(accent) || near(system))
+                        {
+                            bad++;
+                            if (first.Length == 0)
+                                first = $" first@{x},{y}={c.R},{c.G},{c.B}";
+                        }
+                        if (c.R < 60 && c.G < 60 && c.B < 60) dark++;
+                    }
+                Diag.Click("test", $"translate panel {frame} theme-pixels={bad} dark={dark}");
+                if (bad > 0)
+                    throw new InvalidOperationException(
+                        $"{bad}px of system chrome in the translate panel{first}");
+                if (dark * 4 < frame.Width * frame.Height)
+                    throw new InvalidOperationException(
+                        $"the translate panel plate never painted ({dark}px dark)");
+            });
+            Step("translate-panel-shot",
+                () => Capture(tr, Path.Combine(dir, "review-translate-panel.png")));
+            TranslateService.TranslatorOverrideForTesting = null;
+        }
+
         // The summary goes in BEFORE the copy, or the artifact's log stops one
         // line short of the answer — the first run's did.
         Diag.Click("test", $"shot finished failures={failures} dir={dir}");
@@ -964,6 +1140,38 @@ static class TestEntry
         }
         if (!done())
             throw new InvalidOperationException(detail());
+    }
+
+    /// A picture with real WORDS in it, so region OCR has something to
+    /// recognize. The default fixture is a checkerboard: perfect for layout
+    /// and colour, useless for a flow whose next step depends on text coming
+    /// back. The runner does have an en-US recognizer (`ocr: used=en-US` in
+    /// the log), so this is the real chain rather than a seeded one.
+    static Bitmap TextPicture()
+    {
+        var bmp = new Bitmap(1280, 800, PixelFormat.Format32bppArgb);
+        using var g = Graphics.FromImage(bmp);
+        g.Clear(Color.White);
+        using var ink = new SolidBrush(Color.Black);
+        using var font = new Font("Segoe UI", 34f, FontStyle.Bold);
+        g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAliasGridFit;
+        g.DrawString("TOPMARK", font, ink, 260, 250);
+        return bmp;
+    }
+
+    /// Pumps the UI until <paramref name="done"/> or the deadline. Recognition
+    /// and translation are async, so a straight-line assertion after the drag
+    /// reads the panel before it has been filled.
+    static bool Pump(Func<bool> done, double seconds = 20)
+    {
+        var deadline = DateTime.UtcNow.AddSeconds(seconds);
+        while (DateTime.UtcNow < deadline)
+        {
+            Application.DoEvents();
+            if (done()) return true;
+            Thread.Sleep(25);
+        }
+        return done();
     }
 
     static void Reveal(Form form)

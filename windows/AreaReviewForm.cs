@@ -613,6 +613,44 @@ sealed class AreaReviewForm : Form
         if (generation != _pick.Generation) return;
         if (_panel != panel || panel.IsDisposed) return;
         panel.ShowResult(text);
+        if (panel.TranslateMode && text.Length > 0) await TranslateInPanel(panel, generation);
+    }
+
+    /// The SECOND async hop, and it needs its own generation check — not just
+    /// the first. A translation that comes back after the user has picked a
+    /// new region would otherwise land in a panel describing other pixels,
+    /// with nothing on screen to explain it.
+    ///
+    /// Always translates `SourceText`: running a translation through a second
+    /// language compounds its errors, which is the stacked-translation bug the
+    /// old Windows window shipped until #21.
+    async Task TranslateInPanel(OcrResultPanel panel, int generation)
+    {
+        var (code, label) = panel.SelectedLanguage;
+        var source = panel.SourceText;
+        if (source.Length == 0) return;
+        panel.ShowTranslating(label);
+        string? translated = null;
+        string reason = "";
+        try
+        {
+            translated = await TranslateService.TranslateAsync(source, code);
+        }
+        catch (Exception error)
+        {
+            // The reason, not a shrug. One classifier shared with the old
+            // window and with macOS, so a screenshot triages the same way
+            // whichever surface it came from.
+            reason = TranslateService.Failure.Classify(error).UserMessage;
+        }
+        if (generation != _pick.Generation) return;
+        if (_panel != panel || panel.IsDisposed || !panel.Visible) return;
+        if (translated is { Length: > 0 }) panel.ShowTranslated(translated, label);
+        else
+            panel.ShowTranslateFailed(
+                reason.Length > 0
+                    ? reason
+                    : TranslateService.Failure.Payload(null).UserMessage);
     }
 
     OcrResultPanel? ShowPanel(Rectangle region)
@@ -622,12 +660,25 @@ sealed class AreaReviewForm : Form
             var panel = new OcrResultPanel();
             panel.CopyRequested += (_, _) => CopyPanelText();
             panel.CloseRequested += (_, _) => HidePanel();
+            // Retry and a language change take the SAME path a fresh
+            // recognition takes — one call site, so the three cannot drift
+            // into three different ideas of what gets translated.
+            panel.RetryRequested += (_, _) => RetryTranslation();
+            panel.LanguageChanged += (_, code) =>
+            {
+                AppSettings.Current.TranslateTarget = code;
+                AppSettings.Current.Save();
+                RetryTranslation();
+            };
             // A child of the chrome control, which is what covers the surface:
             // WinForms then routes this panel's own clicks and its own cursor
             // to it, and `AreaReviewHitTest` never sees them at all.
             _toolbar.Controls.Add(panel);
             _panel = panel;
         }
+        // BEFORE the placement: translate mode is a taller panel, and the
+        // placement is computed from its size.
+        _panel.SetTranslateMode(_pick.Translates);
         if (!PlacePanel(region)) { HidePanel(); return null; }
         // Emptied BEFORE it is shown. Made visible first, the panel wears the
         // previous region's text for the frame it takes the caller to clear
@@ -663,6 +714,16 @@ sealed class AreaReviewForm : Form
         // different door.
         _pick.DropPending();
         return true;
+    }
+
+    /// Re-runs the translation for the text already on screen. Moves the
+    /// generation first, so a request still in flight cannot land afterwards
+    /// and overwrite the newer one.
+    async void RetryTranslation()
+    {
+        if (_panel is not { Visible: true } panel || !panel.TranslateMode) return;
+        _pick.DropPending();
+        await TranslateInPanel(panel, _pick.Generation);
     }
 
     void CopyPanelText()
