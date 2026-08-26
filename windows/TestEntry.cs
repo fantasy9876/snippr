@@ -734,6 +734,37 @@ static class TestEntry
             });
             Step("review-shot-ocr-panel",
                 () => Capture(review, Path.Combine(dir, "review-ocr-panel.png")));
+            Step("review-panel-close-button-keeps-the-session", () =>
+            {
+                // The real button, found by Name — a lookup by visible text
+                // passes for the wrong reason the day the text changes. Both
+                // buttons close the panel and neither ends the session: the
+                // shot surviving is the whole point of the flow.
+                if (review.PanelForTesting is not { } panel)
+                    throw new InvalidOperationException("premise: no panel open");
+                var close = panel.Controls.Find(OcrResultPanel.CloseName, true)
+                    .FirstOrDefault()
+                    ?? throw new InvalidOperationException("no control named "
+                        + OcrResultPanel.CloseName);
+                ((Button)close).PerformClick();
+                Application.DoEvents();
+                if (review.PanelForTesting != null)
+                    throw new InvalidOperationException("✕ left the panel open");
+                if (!review.Visible)
+                    throw new InvalidOperationException("✕ closed the session");
+                // Re-open for the steps below, through the real drag again.
+                review.PressKeyForTesting(Keys.X);
+                var chrome = review.ChromeForTesting;
+                var crop = review.SelectionForTesting;
+                var from = new Point(crop.X + 30, crop.Y + 30);
+                var to = new Point(crop.X + 30 + crop.Width / 3, crop.Y + 30 + crop.Height / 4);
+                SendMouse(chrome, WmLButtonDown, from);
+                SendMouse(chrome, WmMouseMove, to);
+                SendMouse(chrome, WmLButtonUp, to);
+                Application.DoEvents();
+                if (review.PanelForTesting == null)
+                    throw new InvalidOperationException("could not re-open the panel");
+            });
             Step("review-escape-unwinds-one-layer-at-a-time", () =>
             {
                 // Panel, then pick, then session. Closing the shot while its

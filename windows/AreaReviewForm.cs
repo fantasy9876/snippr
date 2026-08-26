@@ -589,9 +589,10 @@ sealed class AreaReviewForm : Form
     /// through a pixelation the user drew over something private.
     async void RecognizeRegion(Rectangle region)
     {
+        // `ShowPanel` empties the panel before showing it, so the generation
+        // read below is taken after every synchronous step that could move it.
         var panel = ShowPanel(region);
         if (panel == null) return;
-        panel.ShowRecognizing();
         var generation = _pick.Generation;
         string text;
         try
@@ -628,6 +629,10 @@ sealed class AreaReviewForm : Form
             _panel = panel;
         }
         if (!PlacePanel(region)) { HidePanel(); return null; }
+        // Emptied BEFORE it is shown. Made visible first, the panel wears the
+        // previous region's text for the frame it takes the caller to clear
+        // it — text that belongs to pixels the user is no longer pointing at.
+        _panel.ShowRecognizing();
         _panel.Visible = true;
         _panel.BringToFront();
         return _panel;
@@ -651,6 +656,12 @@ sealed class AreaReviewForm : Form
     {
         if (_panel is not { Visible: true } panel) return false;
         panel.Visible = false;
+        // Closing the panel abandons the recognition it was opened for. The
+        // comment on `RecognizeRegion` promises a late result cannot land in a
+        // panel describing other pixels; without this bump the promise held
+        // for a new PICK and not for a close, which is the same window with a
+        // different door.
+        _pick.DropPending();
         return true;
     }
 

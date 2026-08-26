@@ -61,6 +61,16 @@ sealed class OcrRegionPick
         return true;
     }
 
+    /// Abandons whatever is in flight WITHOUT touching the mode.
+    ///
+    /// Closing the panel is the third way a recognition stops mattering, next
+    /// to arming again and cancelling — the user has said they are done with
+    /// that text. Without this the generation stands still while the panel
+    /// goes away, and a result that lands afterwards passes every guard and
+    /// writes into a panel nobody is looking at. macOS bumps in its own
+    /// `hideOCRResult` for exactly this reason; the port dropped the line.
+    public void DropPending() => Generation++;
+
     public bool Begin(Point pointPx, Rectangle crop)
     {
         if (!Armed) return false;

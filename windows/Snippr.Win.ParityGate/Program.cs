@@ -1148,6 +1148,31 @@ static class Program
             f.Add("a stray click produced a region");
         if (!pick.Armed) f.Add("a stray click disarmed the mode");
 
+        // Closing the panel is the THIRD way a recognition stops mattering,
+        // and the one the port dropped: arming again and cancelling both moved
+        // the generation, closing did not, so a result landing after the user
+        // pressed ✕ or Copy passed every guard and wrote into a panel they had
+        // just dismissed. Found by @Honey (c237603d) reviewing #22.
+        pick.Arm(translates: false);
+        pick.Begin(new Point(100, 100), crop);
+        pick.Finish(new Point(300, 250), crop);
+        var afterPick = pick.Generation;
+        pick.DropPending();
+        if (pick.Generation == afterPick)
+            f.Add("closing the panel did not move the generation");
+        // And it abandons the RESULT, not the mode: a close must not re-arm
+        // anything or throw away a region the user is still looking at.
+        if (pick.Armed) f.Add("dropping the pending result armed the mode");
+        pick.Arm(translates: false);
+        var armedThenDropped = pick.Generation;
+        pick.DropPending();
+        if (!pick.Armed) f.Add("dropping the pending result disarmed the mode");
+        if (pick.Generation == armedThenDropped)
+            f.Add("dropping while armed did not move the generation");
+        pick.Cancel();
+
+        pick.Arm(translates: true);
+        pick.Begin(new Point(100, 100), crop);
         var beforeCancel = pick.Generation;
         if (!pick.Cancel()) f.Add("cancel reported nothing to cancel");
         if (pick.Armed || pick.Region != null) f.Add("cancel left state behind");
