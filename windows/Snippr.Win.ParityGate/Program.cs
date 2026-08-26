@@ -1,4 +1,6 @@
 using System.Drawing;
+using System.Net.Http;
+using System.Net.Sockets;
 using Snippr;
 
 namespace Snippr.Tests;
@@ -35,6 +37,8 @@ static class Program
         failed += Check("win-magnifier-callout-clamped", MagnifierCalloutClamped());
         failed += Check("win-ocr-region-pick-state", OcrRegionPickState());
         failed += Check("win-ocr-panel-never-covers-region", OcrPanelPlacementGate());
+        failed += Check("win-translate-failure-kinds", TranslateFailureKinds());
+        failed += Check("win-translate-request-keeps-source", TranslateRequestKeepsSource());
         if (pending > 0)
             Console.WriteLine($"{pending} PARITY GATE(S) PENDING — not a pass");
         Console.WriteLine(failed == 0
@@ -1248,6 +1252,203 @@ static class Program
             f.Add("a region filling the surface still got a placement");
         if (OcrPanelPlacement.Place(new Size(2000, 100), region, bounds) != null)
             f.Add("a panel wider than the surface was placed");
+        return f;
+    }
+
+    /// Tokens, classify, decode-status-before-parse, timeout. Literals here
+    /// match macOS `TranslateService.Failure.userMessage` so a screenshot of
+    /// either platform triages the same way. Asking Failure for the token
+    /// would make any string correct.
+    static List<string> TranslateFailureKinds()
+    {
+        var f = new List<string>();
+        void ExpectToken(string name, string message, string token)
+        {
+            if (!message.StartsWith("Dịch thất bại", StringComparison.Ordinal)
+                || !message.Contains(token, StringComparison.Ordinal))
+                f.Add($"{name} '{message}'");
+        }
+
+        ExpectToken("offline", TranslateService.Failure.Offline().UserMessage, "mất mạng");
+        ExpectToken("timeout", TranslateService.Failure.Timeout().UserMessage, "hết thời gian");
+        var blocked = TranslateService.Failure.Http(429).UserMessage;
+        ExpectToken("429", blocked, "HTTP 429");
+        if (!blocked.Contains("chặn", StringComparison.Ordinal)
+            && !blocked.Contains("giới hạn", StringComparison.Ordinal))
+            f.Add($"429 missing block token '{blocked}'");
+        ExpectToken("503", TranslateService.Failure.Http(503).UserMessage, "HTTP 503");
+        if (TranslateService.Failure.Http(503).UserMessage.Contains("chặn", StringComparison.Ordinal))
+            f.Add("503 treated as blocked");
+        ExpectToken("payload", TranslateService.Failure.Payload(200).UserMessage, "dữ liệu lạ");
+
+        if (TranslateService.RequestTimeout != TimeSpan.FromSeconds(12))
+            f.Add($"timeout named {TranslateService.RequestTimeout}");
+        if (TranslateService.ClientTimeout != TranslateService.RequestTimeout)
+            f.Add($"client timeout {TranslateService.ClientTimeout}");
+
+        if (TranslateService.Failure.Classify(
+                new HttpRequestException(
+                    "no route",
+                    new SocketException((int)SocketError.HostNotFound)))
+            != TranslateService.Failure.Offline())
+            f.Add("classify-offline");
+        if (TranslateService.Failure.Classify(new TimeoutException())
+            != TranslateService.Failure.Timeout())
+            f.Add("classify-timeout");
+        if (TranslateService.Failure.Classify(new TaskCanceledException())
+            != TranslateService.Failure.Timeout())
+            f.Add("classify-cancel");
+        if (TranslateService.Failure.Classify(TranslateService.Failure.Http(503))
+            != TranslateService.Failure.Http(503))
+            f.Add("classify-identity");
+
+        try
+        {
+            TranslateService.DecodeTranslation("<html>blocked</html>", 200);
+            f.Add("html-200-did-not-throw");
+        }
+        catch (TranslateService.Failure fail)
+        {
+            if (fail.Class != TranslateService.Failure.Kind.Payload || fail.Status != 200)
+                f.Add($"html-200 {fail.Class}/{fail.Status}");
+            if (!fail.UserMessage.Contains("dữ liệu lạ", StringComparison.Ordinal))
+                f.Add($"html-200 message '{fail.UserMessage}'");
+        }
+        catch (Exception ex)
+        {
+            f.Add($"html-200 other {ex.GetType().Name}");
+        }
+
+        try
+        {
+            TranslateService.DecodeTranslation("<html>no</html>", 429);
+            f.Add("429-did-not-throw");
+        }
+        catch (TranslateService.Failure fail)
+        {
+            if (fail.Class != TranslateService.Failure.Kind.Http || fail.Status != 429)
+                f.Add($"429 {fail.Class}/{fail.Status}");
+            if (!fail.UserMessage.Contains("HTTP 429", StringComparison.Ordinal))
+                f.Add($"429 message '{fail.UserMessage}'");
+        }
+        catch (Exception ex)
+        {
+            f.Add($"429 other {ex.GetType().Name}");
+        }
+
+        try
+        {
+            TranslateService.DecodeTranslation("", 503);
+            f.Add("503-did-not-throw");
+        }
+        catch (TranslateService.Failure fail)
+        {
+            if (fail.Class != TranslateService.Failure.Kind.Http || fail.Status != 503)
+                f.Add($"503 {fail.Class}/{fail.Status}");
+            if (!fail.UserMessage.Contains("HTTP 503", StringComparison.Ordinal))
+                f.Add($"503 message '{fail.UserMessage}'");
+            if (fail.UserMessage.Contains("chặn", StringComparison.Ordinal))
+                f.Add("503 treated as blocked");
+        }
+        catch (Exception ex)
+        {
+            f.Add($"503 other {ex.GetType().Name}");
+        }
+
+        try
+        {
+            var text = TranslateService.DecodeTranslation(
+                """[[["Xin chào","Hello"]]]""", 200);
+            if (text != "Xin chào") f.Add($"ok payload '{text}'");
+        }
+        catch (Exception ex)
+        {
+            f.Add($"ok payload threw {ex.GetType().Name}");
+        }
+
+        // Every DecodeTranslation shape guard, at HTTP 200: root not an
+        // array, empty array, sentences not an array, empty sentence list.
+        // A 200 that is valid JSON of the wrong shape is Payload — not
+        // Other ("kiểm tra mạng") via an unclassified throw, and not a
+        // silent "".
+        foreach (var (name, body) in new[]
+        {
+            ("object-200", """{"error":{"code":429}}"""),
+            ("empty-array-200", "[]"),
+            ("object-in-array-200", "[{}]"),
+            ("empty-sentences-200", "[[]]"),
+        })
+        {
+            try
+            {
+                TranslateService.DecodeTranslation(body, 200);
+                f.Add($"{name}-did-not-throw");
+            }
+            catch (TranslateService.Failure fail)
+            {
+                if (fail.Class != TranslateService.Failure.Kind.Payload || fail.Status != 200)
+                    f.Add($"{name} {fail.Class}/{fail.Status}");
+                if (!fail.UserMessage.Contains("dữ liệu lạ", StringComparison.Ordinal))
+                    f.Add($"{name} message '{fail.UserMessage}'");
+            }
+            catch (Exception ex)
+            {
+                f.Add($"{name} other {ex.GetType().Name}");
+            }
+        }
+
+        var saved = TranslateService.TranslatorOverrideForTesting;
+        try
+        {
+            TranslateService.TranslatorOverrideForTesting = (_, _) =>
+                throw new HttpRequestException(
+                    "no route",
+                    new SocketException((int)SocketError.HostNotFound));
+            try
+            {
+                TranslateService.TranslateAsync("hello", "vi").GetAwaiter().GetResult();
+                f.Add("translate swallowed");
+            }
+            catch (TranslateService.Failure fail)
+            {
+                if (fail.Class != TranslateService.Failure.Kind.Offline)
+                    f.Add($"translate classified {fail.Class}");
+            }
+            catch (Exception ex)
+            {
+                f.Add($"translate threw {ex.GetType().Name}");
+            }
+        }
+        finally
+        {
+            TranslateService.TranslatorOverrideForTesting = saved;
+        }
+
+        return f;
+    }
+
+    /// Two consecutive translates of different languages must send the OCR
+    /// original, not the previous translation. Empty source is the stacked
+    /// bug — the gate names it so a mutation that drops the field is red.
+    static List<string> TranslateRequestKeepsSource()
+    {
+        var f = new List<string>();
+        const string source = "hello";
+        string Fake(string text, string lang) => $"[{lang}] {text}";
+
+        if (TranslateService.RequestText(source, "[vi] hello") != source)
+            f.Add("request used the displayed text");
+
+        var first = Fake(TranslateService.RequestText(source, source), "vi");
+        if (first != "[vi] hello") f.Add($"first '{first}'");
+        var second = Fake(TranslateService.RequestText(source, first), "en");
+        if (second != "[en] hello") f.Add($"second '{second}'");
+        if (second.Contains("[vi]", StringComparison.Ordinal))
+            f.Add("second translated the translation");
+
+        var stacked = Fake(TranslateService.RequestText("", first), "en");
+        if (stacked != "[en] [vi] hello")
+            f.Add($"empty-source oracle '{stacked}'");
         return f;
     }
 }
