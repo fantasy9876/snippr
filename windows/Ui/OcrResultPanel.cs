@@ -100,7 +100,15 @@ sealed class OcrResultPanel : Control
         b.Text = text;
         b.FlatStyle = FlatStyle.Flat;
         b.FlatAppearance.BorderSize = 0;
+        // Named, not inherited — and `UseVisualStyleBackColor` turned OFF,
+        // which is the half that bites: with visual styles on, a focused
+        // button is painted by the Windows theme in the SYSTEM ACCENT and the
+        // BackColor set right above it is ignored. That is how the first CI
+        // shot of this panel came back with a bright blue ✕ on a dark plate.
+        b.UseVisualStyleBackColor = false;
         b.BackColor = Theme.ChromeRaised;
+        b.FlatAppearance.MouseOverBackColor = Theme.Hover;
+        b.FlatAppearance.MouseDownBackColor = Theme.Pressed;
         b.ForeColor = Color.White;
         b.TabStop = false;
         // The pressable cursor, set once at construction. `Enabled = false`

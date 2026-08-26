@@ -686,6 +686,52 @@ static class TestEntry
                     throw new InvalidOperationException(
                         $"the panel body offers {panel.Cursor}");
             });
+            Step("review-ocr-panel-paints-its-own-colours", () =>
+            {
+                // Found by LOOKING at the first CI shot of this panel: the ✕
+                // came back bright blue on a dark plate. `BackColor` had been
+                // set, but visual styles were still on, so Windows painted the
+                // focused button in the system accent and ignored it — the
+                // same shape of bug as the near-white chrome the step above
+                // guards, and the same shape as the macOS scroll button that
+                // sank into its own panel.
+                //
+                // Sampled from the plate OUTSIDE the text box, because the
+                // text box is deliberately a different dark.
+                if (review.PanelForTesting is not { } panel)
+                    throw new InvalidOperationException("premise: no panel open");
+                using var shot = new Bitmap(review.Width, review.Height);
+                review.DrawToBitmap(shot, new Rectangle(0, 0, shot.Width, shot.Height));
+                var accent = SystemColors.Highlight;
+                var system = SystemColors.Control;
+                int bad = 0, dark = 0;
+                string first = "";
+                var frame = panel.Bounds;
+                for (int y = Math.Max(0, frame.Top); y < Math.Min(shot.Height, frame.Bottom); y++)
+                    for (int x = Math.Max(0, frame.Left); x < Math.Min(shot.Width, frame.Right); x++)
+                    {
+                        var c = shot.GetPixel(x, y);
+                        bool near(Color w) =>
+                            Math.Abs(c.R - w.R) <= 8 && Math.Abs(c.G - w.G) <= 8
+                                && Math.Abs(c.B - w.B) <= 8;
+                        if (near(accent) || near(system))
+                        {
+                            bad++;
+                            if (first.Length == 0)
+                                first = $" first@{x},{y}={c.R},{c.G},{c.B}";
+                        }
+                        if (c.R < 60 && c.G < 60 && c.B < 60) dark++;
+                    }
+                Diag.Click("test", $"panel {frame} theme-pixels={bad} dark={dark}");
+                if (bad > 0)
+                    throw new InvalidOperationException(
+                        $"{bad}px of system chrome in the OCR panel{first}");
+                // Positive premise: without this the check above passes on a
+                // panel that painted nothing at all.
+                if (dark * 4 < frame.Width * frame.Height)
+                    throw new InvalidOperationException(
+                        $"the panel plate never painted ({dark}px dark)");
+            });
             Step("review-shot-ocr-panel",
                 () => Capture(review, Path.Combine(dir, "review-ocr-panel.png")));
             Step("review-escape-unwinds-one-layer-at-a-time", () =>
