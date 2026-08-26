@@ -584,6 +584,164 @@ static class TestEntry
                     throw new InvalidOperationException(
                         $"session corners left at {review.CornersForTesting}, want {before}");
             });
+            // ---------- region OCR (1.2.18 parity) ----------
+            //
+            // Every step below drives the REAL entry points — the catalog key
+            // through `ProcessCmdKey`, and posted mouse messages to the chrome
+            // that owns the surface — because the half these gates exist for
+            // is the routing, not the arithmetic. The state machine and the
+            // placement have their own gates in the parity project, which runs
+            // on the machine the port is written on; these prove the wiring
+            // reaches them.
+            Step("review-ocr-key-arms-a-region-pick", () =>
+            {
+                if (!review.PressKeyForTesting(Keys.X))
+                    throw new InvalidOperationException("X was not routed");
+                if (!review.ArmedForTesting)
+                    throw new InvalidOperationException("X did not arm the pick");
+                // The cursor is the ONLY thing on screen that says a region
+                // can be dragged now — the toolbar has no highlight for this
+                // mode — and it has to survive a mouse move, which is where
+                // macOS lost it. Over the crop AND over a resize handle,
+                // because an armed mouse-down no longer resizes anything.
+                var chrome = review.ChromeForTesting;
+                var crop = review.SelectionForTesting;
+                foreach (var (name, at) in new[]
+                {
+                    ("crop centre", new Point(crop.X + crop.Width / 2, crop.Y + crop.Height / 2)),
+                    ("left edge handle", new Point(crop.Left, crop.Y + crop.Height / 2)),
+                    ("corner handle", new Point(crop.Left, crop.Top)),
+                })
+                {
+                    SendMouse(chrome, WmMouseMove, at);
+                    Application.DoEvents();
+                    if (review.CursorForTesting != Cursors.Cross)
+                        throw new InvalidOperationException(
+                            $"armed cursor over the {name} is "
+                            + $"{review.CursorForTesting}, want Cross");
+                }
+            });
+            Step("review-chrome-click-while-armed-cuts-nothing", () =>
+            {
+                // Windows already gets this right — `AreaReviewHitTest` keeps
+                // chrome clicks off the canvas — and macOS does not, which is
+                // exactly why it is gated here: the day someone rewrites the
+                // hit test, this says so.
+                if (!review.ArmedForTesting)
+                    throw new InvalidOperationException("premise: not armed");
+                var chrome = review.ChromeForTesting;
+                var (rail, _) = review.ChromeRectsForTesting;
+                var onRail = new Point(rail.X + rail.Width / 2, rail.Y + rail.Height / 2);
+                SendMouse(chrome, WmLButtonDown, onRail);
+                SendMouse(chrome, WmLButtonUp, onRail);
+                Application.DoEvents();
+                if (review.PickedRegionForTesting != null)
+                    throw new InvalidOperationException(
+                        $"a click on the rail cut {review.PickedRegionForTesting}");
+                if (!review.ArmedForTesting)
+                    throw new InvalidOperationException(
+                        "a click on the rail dropped the mode");
+            });
+            Step("review-region-pick-opens-a-panel-beside-it", () =>
+            {
+                var chrome = review.ChromeForTesting;
+                var crop = review.SelectionForTesting;
+                var from = new Point(crop.X + 30, crop.Y + 30);
+                var to = new Point(crop.X + 30 + crop.Width / 3, crop.Y + 30 + crop.Height / 4);
+                SendMouse(chrome, WmLButtonDown, from);
+                SendMouse(chrome, WmMouseMove, to);
+                SendMouse(chrome, WmLButtonUp, to);
+                Application.DoEvents();
+                if (review.ArmedForTesting)
+                    throw new InvalidOperationException("a real drag left the mode armed");
+                if (review.PickedRegionForTesting is not { } region)
+                    throw new InvalidOperationException("the drag cut no region");
+                if (review.PanelForTesting is not { } panel)
+                    throw new InvalidOperationException("no panel for the region");
+                // The whole point of picking a region is reading the text
+                // NEXT to the pixels it came from.
+                if (panel.Bounds.IntersectsWith(region))
+                    throw new InvalidOperationException(
+                        $"panel {panel.Bounds} covers the region {region}");
+                if (!review.ClientRectangle.Contains(panel.Bounds))
+                    throw new InvalidOperationException(
+                        $"panel {panel.Bounds} is not on the surface");
+                // Per control, by NAME — a lookup by visible text passes for
+                // the wrong reason the day the text is localised. WinForms
+                // routes the cursor to whichever control owns the point, so
+                // this is where the house rule is checked on this platform.
+                foreach (var control in panel.ControlsForTesting)
+                {
+                    var want = control.Name switch
+                    {
+                        OcrResultPanel.TextName => Cursors.IBeam,
+                        OcrResultPanel.CopyName or OcrResultPanel.CloseName => Cursors.Hand,
+                        _ => Cursors.Default,
+                    };
+                    if (control.Cursor != want)
+                        throw new InvalidOperationException(
+                            $"{control.Name} cursor is {control.Cursor}, want {want}");
+                }
+                if (panel.Cursor != Cursors.Default)
+                    throw new InvalidOperationException(
+                        $"the panel body offers {panel.Cursor}");
+            });
+            Step("review-shot-ocr-panel",
+                () => Capture(review, Path.Combine(dir, "review-ocr-panel.png")));
+            Step("review-escape-unwinds-one-layer-at-a-time", () =>
+            {
+                // Panel, then pick, then session. Closing the shot while its
+                // text is still on screen is what this flow exists to stop.
+                if (review.PanelForTesting == null)
+                    throw new InvalidOperationException("premise: no panel open");
+                review.PressKeyForTesting(Keys.Escape);
+                Application.DoEvents();
+                if (review.PanelForTesting != null)
+                    throw new InvalidOperationException("Escape left the panel open");
+                if (!review.Visible)
+                    throw new InvalidOperationException("Escape closed the session too");
+                review.PressKeyForTesting(Keys.X);
+                if (!review.ArmedForTesting)
+                    throw new InvalidOperationException("could not re-arm");
+                review.PressKeyForTesting(Keys.Escape);
+                Application.DoEvents();
+                if (review.ArmedForTesting)
+                    throw new InvalidOperationException("Escape left the pick armed");
+                if (!review.Visible)
+                    throw new InvalidOperationException("Escape closed the session too early");
+            });
+            Step("review-tool-key-ends-the-pick", () =>
+            {
+                // The flag is not the promise — the DRAG is. Asserting only
+                // the flag would stay green if the mode were cleared but the
+                // mouse-down still routed to the picker.
+                review.PressKeyForTesting(Keys.X);
+                if (!review.ArmedForTesting)
+                    throw new InvalidOperationException("premise: X did not arm");
+                if (!review.PressKeyForTesting(Keys.P))
+                    throw new InvalidOperationException("the pen key was not routed");
+                if (review.ArmedForTesting)
+                    throw new InvalidOperationException("choosing a tool left the pick armed");
+                var chrome = review.ChromeForTesting;
+                var crop = review.SelectionForTesting;
+                int before = review.AnnotationCountForTesting;
+                var from = new Point(crop.X + 50, crop.Y + 50);
+                var to = new Point(crop.X + 150, crop.Y + 130);
+                SendMouse(chrome, WmLButtonDown, from);
+                SendMouse(chrome, WmMouseMove, to);
+                SendMouse(chrome, WmLButtonUp, to);
+                Application.DoEvents();
+                if (review.AnnotationCountForTesting != before + 1)
+                    throw new InvalidOperationException(
+                        "the drag after a tool key drew "
+                        + $"{review.AnnotationCountForTesting - before} marks, want 1");
+                if (review.PickedRegionForTesting != null)
+                    throw new InvalidOperationException(
+                        "the drag after a tool key cut a region as well");
+                review.PressActionForTesting("undo");
+                review.PressToolForTesting("select");
+                Application.DoEvents();
+            });
             Step("review-preset-ocean", () =>
             {
                 review.ApplyPresetForTesting("ocean");

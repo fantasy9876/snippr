@@ -24,6 +24,8 @@ sealed class AreaReviewForm : Form
     TextBox? _textBox;
     TextAnnotation? _editingText;
     Bitmap? _pixelated;
+    readonly OcrRegionPick _pick = new();
+    OcrResultPanel? _panel;
 
     /// What the user asked for, and the picture that goes with it.
     public OverlayAction? ChosenAction { get; private set; }
@@ -71,6 +73,14 @@ sealed class AreaReviewForm : Form
         var msg = new Message();
         return ProcessCmdKey(ref msg, key);
     }
+
+    /// The region pick, for the smoke: whether the mode is on, what it has
+    /// cut, and the panel it opened. Read-only — the smoke arms it through the
+    /// real key and the real button, never through here.
+    internal bool ArmedForTesting => _pick.Armed;
+    internal Rectangle? PickedRegionForTesting => _pick.Region;
+    internal OcrResultPanel? PanelForTesting =>
+        _panel is { Visible: true } panel ? panel : null;
 
     internal (int Rail, int Strip) ChromeCountsForTesting =>
         (_toolbar.RailCount, _toolbar.StripCount);
@@ -395,6 +405,13 @@ sealed class AreaReviewForm : Form
     void SelectTool(Tool tool)
     {
         CommitText();
+        // Choosing a tool states a DIFFERENT intent, so it ends an armed
+        // pick. macOS left the mode up: the toolbar lit the new tool, the
+        // cursor could not tell a pen from an armed pick — both are a cross —
+        // and the drag still cut a region. This is the authoritative point
+        // every route lands on, so cancelling here closes the keyboard, the
+        // button and the programmatic routes at once.
+        _pick.Cancel();
         _tool = tool;
         _toolbar.Hint.HideNow();
         UpdateToolbarState();
@@ -431,6 +448,16 @@ sealed class AreaReviewForm : Form
         var px = e.Location;
         _dragStartPx = px;
         if (e.Button != MouseButtons.Left) return;
+        // Armed answers FIRST, and it answers everywhere: the crop, its
+        // handles and the surround are all places a region drag may begin.
+        // Asking the tool first is how macOS ended up resizing the crop from
+        // inside a mode whose whole purpose was to cut a rectangle out of it.
+        if (_pick.Armed)
+        {
+            _pick.Begin(px, _session.PixelRect);
+            InvalidateSurface(_session.PixelRect);
+            return;
+        }
         // Drawing happens inside the crop; the surround is the picture's
         // outside, where a mark would be clipped away the moment it was made.
         if (!_session.PixelRect.Contains(px) && _tool != Tool.Select) return;
@@ -522,7 +549,8 @@ sealed class AreaReviewForm : Form
     /// The pointer shape that matches (tool, hit). The table lives in
     /// `AreaReviewCursor` so the parity gate can read it; this is only the
     /// WinForms mapping.
-    static Cursor CursorFor(Tool tool, CropGrip grip) => AreaReviewCursor.For(tool, grip) switch
+    static Cursor CursorFor(Tool tool, CropGrip grip, bool armed = false) =>
+        AreaReviewCursor.For(tool, grip, armed) switch
     {
         ReviewCursorKind.IBeam => Cursors.IBeam,
         ReviewCursorKind.SizeNWSE => Cursors.SizeNWSE,
@@ -538,12 +566,118 @@ sealed class AreaReviewForm : Form
         var grip = _tool == Tool.Select
             ? AreaReviewCrop.GripAt(px, _session.PixelRect, HandleSize, ReviewCornerRadius)
             : CropGrip.None;
-        Cursor = CursorFor(_tool, grip);
+        Cursor = CursorFor(_tool, grip, _pick.Armed);
+    }
+
+    // ---------- region OCR ----------
+
+    /// Arms the pick. Not a terminal route and not an edit: nothing is
+    /// committed, no undo entry is added, and the review stays open — the
+    /// whole reason the old `TextResultForm` flow was replaced.
+    void BeginRegionPick(bool translates)
+    {
+        HidePanel();
+        _pick.Arm(translates);
+        ApplyCursor(CurrentPointerClient());
+        InvalidateSurface(_session.PixelRect);
+    }
+
+    /// Recognizes one region and shows it beside itself.
+    ///
+    /// Reads `Semantic(region)` — the document with its marks — and never a
+    /// crop of the frozen desktop. Cutting the freeze would read straight
+    /// through a pixelation the user drew over something private.
+    async void RecognizeRegion(Rectangle region)
+    {
+        var panel = ShowPanel(region);
+        if (panel == null) return;
+        panel.ShowRecognizing();
+        var generation = _pick.Generation;
+        string text;
+        try
+        {
+            using var source = _session.Semantic(region);
+            var result = await OcrService.RecognizeAsync(source);
+            text = result.Text;
+        }
+        catch (Exception ex)
+        {
+            Diag.Click("review", $"region ocr failed: {ex.GetType().Name}");
+            text = "";
+        }
+        // Every await needs its own generation check, not just the first: a
+        // recognition that lands after the user has picked somewhere else
+        // would otherwise fill the panel with text describing other pixels,
+        // with nothing on screen to explain it.
+        if (generation != _pick.Generation) return;
+        if (_panel != panel || panel.IsDisposed) return;
+        panel.ShowResult(text);
+    }
+
+    OcrResultPanel? ShowPanel(Rectangle region)
+    {
+        if (_panel == null)
+        {
+            var panel = new OcrResultPanel();
+            panel.CopyRequested += (_, _) => CopyPanelText();
+            panel.CloseRequested += (_, _) => HidePanel();
+            // A child of the chrome control, which is what covers the surface:
+            // WinForms then routes this panel's own clicks and its own cursor
+            // to it, and `AreaReviewHitTest` never sees them at all.
+            _toolbar.Controls.Add(panel);
+            _panel = panel;
+        }
+        if (!PlacePanel(region)) { HidePanel(); return null; }
+        _panel.Visible = true;
+        _panel.BringToFront();
+        return _panel;
+    }
+
+    /// True when a placement exists. When none does — a region that fills the
+    /// screen, chrome in every candidate — the panel does not appear at all
+    /// rather than covering the very pixels it describes.
+    bool PlacePanel(Rectangle region)
+    {
+        if (_panel == null) return false;
+        var (rail, strip) = ChromeFrames();
+        var placed = OcrPanelPlacement.Place(
+            _panel.Size, region, ClientRectangle, rail, strip);
+        if (placed is not { } frame) return false;
+        _panel.Bounds = frame;
+        return true;
+    }
+
+    bool HidePanel()
+    {
+        if (_panel is not { Visible: true } panel) return false;
+        panel.Visible = false;
+        return true;
+    }
+
+    void CopyPanelText()
+    {
+        if (_panel?.RecognizedText is not { Length: > 0 } text) return;
+        try { Clipboard.SetText(text, TextDataFormat.UnicodeText); } catch { }
+        // Copy closes the panel and says so — but the SESSION lives on. The
+        // shot surviving the copy is the point of the whole flow.
+        HidePanel();
+        ToastForm.Show("Text copied");
     }
 
     void CanvasMouseMove(MouseEventArgs e)
     {
         var px = e.Location;
+        if (_pick.Armed)
+        {
+            // The cursor is re-derived on every move, so the armed answer has
+            // to come from the table rather than from a one-off set when the
+            // mode began — that is precisely the frame-long crosshair macOS
+            // shipped.
+            if (e.Button == MouseButtons.None) ApplyCursor(px);
+            if (_pick.Drag(px, _session.PixelRect))
+                InvalidateSurface(_session.PixelRect);
+            return;
+        }
         if (_grip != CropGrip.None)
         {
             _session.SetSelection(
@@ -590,6 +724,18 @@ sealed class AreaReviewForm : Form
 
     void CanvasMouseUp(MouseEventArgs e)
     {
+        if (_pick.Armed)
+        {
+            var region = _pick.Finish(e.Location, _session.PixelRect);
+            InvalidateSurface(_session.PixelRect);
+            // Null is a stray click, and the mode stays armed on purpose (see
+            // `OcrRegionPick.Finish`): the toolbar shows no sign the mode is
+            // on, so dropping the user out of it silently reads as a dead
+            // button. They simply drag again.
+            if (region is { } picked) RecognizeRegion(picked);
+            ApplyCursor(e.Location);
+            return;
+        }
         if (_grip != CropGrip.None)
         {
             _grip = CropGrip.None;
@@ -688,6 +834,15 @@ sealed class AreaReviewForm : Form
             case OverlayAction.Close:
                 Close();
                 return;
+            // Not terminal any more: both arm a region pick and the review
+            // stays open. Falling through to the export below is the 1.2.15
+            // behaviour — recognize the whole crop, tear the session down.
+            case OverlayAction.Ocr:
+                BeginRegionPick(translates: false);
+                return;
+            case OverlayAction.Translate:
+                BeginRegionPick(translates: true);
+                return;
         }
         // Everything else produces a picture and ends the session. The image
         // is built BEFORE anything is torn down, and a failure leaves the
@@ -725,7 +880,14 @@ sealed class AreaReviewForm : Form
         if (_textBox != null) return base.ProcessCmdKey(ref msg, keyData);
         switch (keyData)
         {
-            case Keys.Escape: Close(); return true;
+            // One layer at a time: the panel, then the pick, then the
+            // session. Closing the shot while its text is still on screen is
+            // exactly what this flow exists to stop doing.
+            case Keys.Escape:
+                if (HidePanel()) return true;
+                if (_pick.Cancel()) { ApplyCursor(CurrentPointerClient()); return true; }
+                Close();
+                return true;
             case Keys.Control | Keys.Z:
                 if (_session.Undo()) RefreshSurface(all: true);
                 return true;
@@ -736,6 +898,11 @@ sealed class AreaReviewForm : Form
             case Keys.Control | Keys.S: Invoke(OverlayAction.Save); return true;
             case Keys.Control | Keys.P: Invoke(OverlayAction.Pin); return true;
             case Keys.E: Invoke(OverlayAction.OpenEditor); return true;
+            // Read from the SAME catalog rows the buttons and their hints use
+            // — a key that routes but is advertised nowhere is undiscoverable,
+            // and a hint naming a key nothing routes is a broken promise.
+            case Keys.X: Invoke(OverlayAction.Ocr); return true;
+            case Keys.G: Invoke(OverlayAction.Translate); return true;
         }
         // Tool keys, host-scoped: a letter that names a tool this surface does
         // not show must do nothing rather than select an invisible tool.

@@ -95,8 +95,8 @@ static class ToolCatalog
         new ActionEntry(OverlayAction.Copy, "Copy to clipboard", "Ctrl+C", "copy", true, true),
         new ActionEntry(OverlayAction.Save, "Save as…", "Ctrl+S", "save", true, true),
         new ActionEntry(OverlayAction.Pin, "Pin to screen", "Ctrl+P", "pin", true, true),
-        new ActionEntry(OverlayAction.Ocr, "Recognize text", "", "ocr", true, true),
-        new ActionEntry(OverlayAction.Translate, "Recognize + translate", "", "translate", true, true),
+        new ActionEntry(OverlayAction.Ocr, "Recognize text", "X", "ocr", true, true),
+        new ActionEntry(OverlayAction.Translate, "Recognize + translate", "G", "translate", true, true),
         // The editor IS the editor: only the review surface can open one.
         new ActionEntry(OverlayAction.OpenEditor, "Open in editor", "E", "editor", false, true),
         new ActionEntry(OverlayAction.Close, "Close", "Esc", "close", true, true),

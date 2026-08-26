@@ -27,6 +27,7 @@ static class Program
         failed += Check("win-backdrop-preview-matches-export", PreviewMatchesExport());
         failed += Check("win-backdrop-corner-radius-pixels", CornerRadiusPixels());
         failed += Check("win-area-review-preview-shows-document", ReviewPreviewShowsDocument());
+        failed += Check("win-region-ocr-reads-the-redaction", RegionOcrReadsTheRedaction());
         failed += Check("win-hover-hint-clamped", HoverHintClamped());
         failed += Check("win-overlay-chrome-paints-its-own-colours", OverlayChromePixels());
         if (pending > 0)
@@ -1028,5 +1029,66 @@ static class Program
         return f;
     }
 
+    /// What region OCR is handed must be the DOCUMENT, marks included — never
+    /// a crop of the frozen desktop.
+    ///
+    /// The security case, and the reason it needs pixels rather than a table:
+    /// a pixelation the user drew over something private lives in the
+    /// annotations, so cutting the freeze reads straight through it and hands
+    /// the recognizer the very words they just covered. With no annotations on
+    /// the picture both paths return identical bytes, which is what makes this
+    /// so easy to get wrong and leave green — hence the second half below,
+    /// which proves the fixture could have told the difference.
+    static List<string> RegionOcrReadsTheRedaction()
+    {
+        var f = new List<string>();
+        using var desktop = CheckeredDocument(
+            600, 500, Color.FromArgb(255, 20, 20, 20), Color.FromArgb(255, 245, 245, 245));
+        var crop = new Rectangle(80, 60, 400, 300);
+        var region = new Rectangle(120, 100, 160, 80);
+        var session = new AreaReviewSession(desktop, crop);
 
+        // Premise: with nothing drawn, the region and the raw freeze agree.
+        // Without this the assertion below passes on a fixture that could
+        // never have disagreed.
+        using (var clean = session.Semantic(region))
+        {
+            if (clean.Width != region.Width || clean.Height != region.Height)
+                f.Add($"region {clean.Width}x{clean.Height} want {region.Size}");
+            int differing = 0;
+            for (int y = 0; y < region.Height; y += 4)
+                for (int x = 0; x < region.Width; x += 4)
+                    if (!Near(At(clean, x, y), At(desktop, region.X + x, region.Y + y), 2))
+                        differing++;
+            if (differing > 0)
+                f.Add($"undrawn region differs from the freeze in {differing} samples");
+        }
+
+        session.Add(new BlurAnnotation { Rect = region });
+        using (var redacted = session.Semantic(region))
+        {
+            int differing = 0, total = 0;
+            for (int y = 0; y < region.Height; y += 4)
+                for (int x = 0; x < region.Width; x += 4)
+                {
+                    total++;
+                    if (!Near(At(redacted, x, y), At(desktop, region.X + x, region.Y + y), 2))
+                        differing++;
+                }
+            // A pixelation of a hard checkerboard changes most of what it
+            // covers; requiring a majority keeps this from passing on a
+            // one-pixel difference at an edge.
+            if (differing * 2 < total)
+                f.Add($"the redaction reached only {differing}/{total} samples");
+        }
+
+        // And the region is the region: a rect outside the crop cannot widen
+        // the read back out to the whole shot.
+        using (var outside = session.Semantic(new Rectangle(0, 0, 10, 10)))
+        {
+            if (outside.Width >= crop.Width || outside.Height >= crop.Height)
+                f.Add($"a region outside the crop returned {outside.Width}x{outside.Height}");
+        }
+        return f;
+    }
 }
