@@ -605,6 +605,8 @@ static class TestEntry
             }
         }
 
+        Step("translate-window-reasons-and-source", () => TranslateWindowSmoke());
+
         // The summary goes in BEFORE the copy, or the artifact's log stops one
         // line short of the answer — the first run's did.
         Diag.Click("test", $"shot finished failures={failures} dir={dir}");
@@ -630,6 +632,100 @@ static class TestEntry
         var c = root;
         while (c.Controls.Count > 0) c = c.Controls[0];
         return c;
+    }
+
+    /// The live translate window: Failure tokens on the status *control*
+    /// (not a field), Retry is a real button looked up by Name, and a second
+    /// language re-translates the original. Without a network.
+    static void TranslateWindowSmoke()
+    {
+        var savedOverride = TranslateService.TranslatorOverrideForTesting;
+        var savedTarget = AppSettings.Current.TranslateTarget;
+        try
+        {
+            TranslateService.TranslatorOverrideForTesting = (text, lang) =>
+                Task.FromResult($"[{lang}] {text}");
+            using var form = TextResultForm.CreateForTesting("hello");
+            Reveal(form);
+
+            var translate = form.ControlNamed("translate") as Button
+                ?? throw new InvalidOperationException("no translate button");
+            var language = form.ControlNamed("language") as ComboBox
+                ?? throw new InvalidOperationException("no language combo");
+            var status = form.ControlNamed("status") as Label
+                ?? throw new InvalidOperationException("no status label");
+            var result = form.ControlNamed("result") as TextBox
+                ?? throw new InvalidOperationException("no result box");
+            var retry = form.ControlNamed("retry") as Button
+                ?? throw new InvalidOperationException("no retry button");
+
+            var firstCode = TranslateService.Languages[language.SelectedIndex].Code;
+            translate.PerformClick();
+            SpinUntil(
+                () => status.Text.StartsWith("Đã dịch", StringComparison.Ordinal),
+                () => $"translate status '{status.Text}'");
+            if (result.Text != $"[{firstCode}] hello")
+                throw new InvalidOperationException(
+                    $"first translate '{result.Text}', want [{firstCode}] hello");
+
+            var other = Array.FindIndex(
+                TranslateService.Languages, l => l.Code != firstCode);
+            if (other < 0)
+                throw new InvalidOperationException("no second language");
+            var otherCode = TranslateService.Languages[other].Code;
+            language.SelectedIndex = other;
+            SpinUntil(
+                () => result.Text.StartsWith($"[{otherCode}]", StringComparison.Ordinal),
+                () => $"language status '{status.Text}' text '{result.Text}'");
+            if (result.Text != $"[{otherCode}] hello")
+                throw new InvalidOperationException(
+                    $"second translate '{result.Text}' — stacked or not from source");
+            if (result.Text.Contains($"[{firstCode}]", StringComparison.Ordinal))
+                throw new InvalidOperationException("second translated the translation");
+
+            TranslateService.TranslatorOverrideForTesting = (_, _) =>
+                throw TranslateService.Failure.Http(429);
+            translate.PerformClick();
+            SpinUntil(
+                () => status.Text.Contains("HTTP 429", StringComparison.Ordinal),
+                () => $"fail status '{status.Text}'");
+            if (!status.Text.Contains("HTTP 429", StringComparison.Ordinal))
+                throw new InvalidOperationException(
+                    $"status control did not show 429: '{status.Text}'");
+            if (!retry.Visible)
+                throw new InvalidOperationException("Retry stayed hidden after fail");
+            if (result.Text != "hello")
+                throw new InvalidOperationException(
+                    $"fail-open left '{result.Text}', want source");
+
+            TranslateService.TranslatorOverrideForTesting = (text, lang) =>
+                Task.FromResult($"[{lang}] {text}");
+            retry.PerformClick();
+            SpinUntil(
+                () => result.Text.StartsWith($"[{otherCode}]", StringComparison.Ordinal),
+                () => $"retry status '{status.Text}' text '{result.Text}'");
+            if (result.Text != $"[{otherCode}] hello")
+                throw new InvalidOperationException(
+                    $"retry '{result.Text}' did not translate the source");
+        }
+        finally
+        {
+            TranslateService.TranslatorOverrideForTesting = savedOverride;
+            AppSettings.Current.TranslateTarget = savedTarget;
+            AppSettings.Current.Save();
+        }
+    }
+
+    static void SpinUntil(Func<bool> done, Func<string> detail, int ms = 4000)
+    {
+        var deadline = DateTime.UtcNow.AddMilliseconds(ms);
+        while (DateTime.UtcNow < deadline && !done())
+        {
+            Application.DoEvents();
+            Thread.Sleep(25);
+        }
+        if (!done())
+            throw new InvalidOperationException(detail());
     }
 
     static void Reveal(Form form)

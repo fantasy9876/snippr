@@ -36,6 +36,9 @@
     <Compile Include="..\AreaReviewHitTest.cs" Link="AreaReviewHitTest.cs" />
     <Compile Include="..\AreaReviewCrop.cs" Link="AreaReviewCrop.cs" />
     <Compile Include="..\EditorActionRouter.cs" Link="EditorActionRouter.cs" />
+    <!-- Translate Failure / Decode / RequestText are numbers and strings, so
+         they run here on Studio. WinForms wiring is the smoke's job. -->
+    <Compile Include="..\TranslateService.cs" Link="TranslateService.cs" />
   </ItemGroup>
 
 </Project>

@@ -1,7 +1,4 @@
 using System.Drawing.Imaging;
-using System.Net.Http;
-using System.Text;
-using System.Text.Json;
 using Windows.Graphics.Imaging;
 using Windows.Media.Ocr;
 
@@ -90,49 +87,18 @@ static class OcrService
     }
 }
 
-// ---------- Translation (Google gtx endpoint — only on explicit user action) ----------
-
-static class TranslateService
-{
-    public static readonly (string Code, string Label)[] Languages =
-    {
-        ("vi", "Tiếng Việt"), ("en", "English"), ("ja", "日本語"), ("ko", "한국어"),
-        ("zh-CN", "中文 (简体)"), ("fr", "Français"), ("de", "Deutsch"),
-        ("es", "Español"), ("th", "ไทย"),
-    };
-
-    static readonly HttpClient Http = new();
-
-    public static async Task<string> TranslateAsync(string text, string lang)
-    {
-        // POST with the text in the body: a GET URL breaks past ~8 KB, which is
-        // exactly the dense/scroll captures where translation matters most
-        var url = "https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl="
-            + Uri.EscapeDataString(lang) + "&dt=t";
-        using var body = new FormUrlEncodedContent(new[]
-        {
-            new KeyValuePair<string, string>("q", text),
-        });
-        using var resp = await Http.PostAsync(url, body);
-        resp.EnsureSuccessStatusCode();
-        var json = await resp.Content.ReadAsStringAsync();
-        using var doc = JsonDocument.Parse(json);
-        var sb = new StringBuilder();
-        foreach (var seg in doc.RootElement[0].EnumerateArray())
-        {
-            sb.Append(seg[0].GetString());
-        }
-        return sb.ToString();
-    }
-}
-
 // ---------- OCR result window: text + language picker + translate + copy ----------
 
 sealed class TextResultForm : Form
 {
-    readonly TextBox _text = new();
-    readonly ComboBox _lang = new();
-    readonly Label _status = new();
+    readonly string _sourceText;
+    readonly TextBox _text = new() { Name = "result" };
+    readonly ComboBox _lang = new() { Name = "language" };
+    readonly Label _status = new() { Name = "status" };
+    readonly Button _translate = new() { Name = "translate", Text = "🌐 Translate" };
+    readonly Button _retry = new() { Name = "retry", Text = "Thử lại" };
+    readonly Button _copy = new() { Name = "copy", Text = "Copy" };
+    int _generation;
 
     public static async void RunOcrFlow(Bitmap image, bool autoTranslate = false)
     {
@@ -169,70 +135,108 @@ sealed class TextResultForm : Form
         if (autoTranslate) f.Translate();
     }
 
+    internal static TextResultForm CreateForTesting(string text) => new(text);
+
     TextResultForm(string text)
     {
+        _sourceText = text ?? "";
         Text = "Recognized Text — Snippr";
         StartPosition = FormStartPosition.CenterScreen;
-        ClientSize = new Size(560, 420);
+        ClientSize = new Size(560, 440);
         MinimumSize = new Size(420, 300);
         Font = new Font("Segoe UI", 11f);
 
         _text.Multiline = true;
         _text.ScrollBars = ScrollBars.Vertical;
-        _text.Text = text;
+        _text.Text = _sourceText;
         _text.Dock = DockStyle.Fill;
         _text.Font = new Font("Segoe UI", 11.5f);
 
-        var bottom = new Panel { Dock = DockStyle.Bottom, Height = 56, Padding = new Padding(10) };
+        var bottom = new Panel { Dock = DockStyle.Bottom, Height = 78, Padding = new Padding(10) };
 
         _lang.DropDownStyle = ComboBoxStyle.DropDownList;
         foreach (var (code, label) in TranslateService.Languages) _lang.Items.Add(label);
         var savedIdx = Array.FindIndex(TranslateService.Languages,
             l => l.Code == AppSettings.Current.TranslateTarget);
         _lang.SelectedIndex = savedIdx >= 0 ? savedIdx : 0;
-        _lang.SetBounds(10, 12, 160, 32);
+        _lang.SetBounds(10, 8, 150, 32);
+        // Attach AFTER SelectedIndex so opening the window does not fire a
+        // translate. Changing the language afterwards re-translates from
+        // the original, same as the mac panel.
+        _lang.SelectedIndexChanged += (_, _) => Translate();
 
-        var translate = new Button { Text = "🌐 Translate", Bounds = new Rectangle(180, 10, 140, 34) };
-        translate.Click += (_, _) => Translate();
+        _translate.Bounds = new Rectangle(168, 6, 130, 34);
+        _translate.Click += (_, _) => Translate();
 
-        _status.AutoSize = true;
-        _status.ForeColor = Color.Gray;
-        _status.Location = new Point(330, 18);
+        _retry.Bounds = new Rectangle(306, 6, 90, 34);
+        _retry.Visible = false;
+        _retry.Click += (_, _) => Translate();
 
-        var copy = new Button
-        {
-            Text = "Copy",
-            Size = new Size(100, 34),
-            Anchor = AnchorStyles.Right | AnchorStyles.Top,
-        };
-        copy.Location = new Point(bottom.Width - 112, 10);
-        copy.Click += (_, _) =>
+        _copy.Size = new Size(100, 34);
+        _copy.Anchor = AnchorStyles.Right | AnchorStyles.Top;
+        _copy.Location = new Point(bottom.Width - 112, 6);
+        _copy.Click += (_, _) =>
         {
             try { Clipboard.SetText(_text.Text); } catch { }
             ToastForm.Show("Text copied");
         };
 
-        bottom.Controls.AddRange(new Control[] { _lang, translate, _status, copy });
+        _status.AutoSize = false;
+        _status.ForeColor = Color.Gray;
+        _status.SetBounds(10, 46, bottom.Width - 20, 24);
+        _status.Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Top;
+
+        bottom.Controls.AddRange(new Control[] { _lang, _translate, _retry, _status, _copy });
         Controls.Add(_text);
         Controls.Add(bottom);
     }
 
-    internal async void Translate()
+    /// Lookup by Name, never by the label. A filter that matches 0 controls
+    /// is a green suite that checked nothing.
+    internal Control? ControlNamed(string name)
+    {
+        var found = Controls.Find(name, searchAllChildren: true);
+        return found.Length == 1 ? found[0] : null;
+    }
+
+    internal void Translate() => _ = TranslateCore();
+
+    async Task TranslateCore()
     {
         var idx = _lang.SelectedIndex;
-        if (idx < 0 || _text.Text.Length == 0) return;
+        if (idx < 0 || _sourceText.Length == 0) return;
         var (code, label) = TranslateService.Languages[idx];
         AppSettings.Current.TranslateTarget = code;
         AppSettings.Current.Save();
+        var gen = ++_generation;
         _status.Text = "Đang dịch…";
+        _retry.Visible = false;
         try
         {
-            _text.Text = await TranslateService.TranslateAsync(_text.Text, code);
+            var translated = await TranslateService.TranslateAsync(
+                TranslateService.RequestText(_sourceText, _text.Text), code);
+            if (gen != _generation) return;
+            if (string.IsNullOrEmpty(translated))
+            {
+                ShowFailure(TranslateService.Failure.Payload(null));
+                return;
+            }
+            _text.Text = translated;
             _status.Text = $"Đã dịch sang {label}";
+            _retry.Visible = false;
         }
-        catch
+        catch (Exception ex)
         {
-            _status.Text = "Dịch thất bại — kiểm tra mạng";
+            if (gen != _generation) return;
+            ShowFailure(TranslateService.Failure.Classify(ex));
         }
+    }
+
+    void ShowFailure(TranslateService.Failure failure)
+    {
+        // Fail open onto the original, not the previous translation.
+        _text.Text = _sourceText;
+        _status.Text = failure.UserMessage;
+        _retry.Visible = true;
     }
 }
