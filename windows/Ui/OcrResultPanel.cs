@@ -1,4 +1,5 @@
 using System.Drawing;
+using System.Runtime.InteropServices;
 
 namespace Snippr;
 
@@ -72,6 +73,10 @@ sealed class OcrResultPanel : Control
         _text.Font = new Font(FontFamily.GenericMonospace, 9f);
         _text.Cursor = Cursors.IBeam;
         Controls.Add(_text);
+        // The handle exists only once the control is parented; ask again then,
+        // because the panel's own handle may already be up by that point.
+        _text.HandleCreated += (_, _) =>
+            SetWindowTheme(_text.Handle, "DarkMode_Explorer", null);
 
         StyleButton(_copy, CopyName, "Copy");
         _copy.Click += (_, _) => CopyRequested?.Invoke(this, EventArgs.Empty);
@@ -115,6 +120,21 @@ sealed class OcrResultPanel : Control
         // makes WinForms ignore it, which is exactly the answer we want: a
         // dead button must not offer a press.
         b.Cursor = Cursors.Hand;
+    }
+
+    /// The text box's scrollbar is drawn by the WINDOWS THEME, not by us, so
+    /// on a dark plate it arrived as a light grey strip — 1864 pixels of
+    /// `SystemColors.Control` the first CI run of the colour gate counted.
+    /// `DarkMode_Explorer` is the documented way to ask uxtheme for the dark
+    /// non-client parts of a control; it is a request, not a guarantee, which
+    /// is why the gate measures the result rather than trusting the call.
+    [DllImport("uxtheme.dll", CharSet = CharSet.Unicode)]
+    static extern int SetWindowTheme(IntPtr hwnd, string? app, string? id);
+
+    protected override void OnHandleCreated(EventArgs e)
+    {
+        base.OnHandleCreated(e);
+        if (_text.IsHandleCreated) SetWindowTheme(_text.Handle, "DarkMode_Explorer", null);
     }
 
     protected override void OnResize(EventArgs e)
