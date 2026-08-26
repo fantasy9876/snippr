@@ -658,6 +658,9 @@ static class TestEntry
                 ?? throw new InvalidOperationException("no result box");
             var retry = form.ControlNamed("retry") as Button
                 ?? throw new InvalidOperationException("no retry button");
+            if (!result.ReadOnly)
+                throw new InvalidOperationException(
+                    "result box is editable — edits would be overwritten by the source");
 
             var firstCode = TranslateService.Languages[language.SelectedIndex].Code;
             translate.PerformClick();

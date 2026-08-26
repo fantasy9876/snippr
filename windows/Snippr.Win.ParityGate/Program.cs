@@ -1215,6 +1215,37 @@ static class Program
             f.Add($"ok payload threw {ex.GetType().Name}");
         }
 
+        // Every DecodeTranslation shape guard, at HTTP 200: root not an
+        // array, empty array, sentences not an array, empty sentence list.
+        // A 200 that is valid JSON of the wrong shape is Payload — not
+        // Other ("kiểm tra mạng") via an unclassified throw, and not a
+        // silent "".
+        foreach (var (name, body) in new[]
+        {
+            ("object-200", """{"error":{"code":429}}"""),
+            ("empty-array-200", "[]"),
+            ("object-in-array-200", "[{}]"),
+            ("empty-sentences-200", "[[]]"),
+        })
+        {
+            try
+            {
+                TranslateService.DecodeTranslation(body, 200);
+                f.Add($"{name}-did-not-throw");
+            }
+            catch (TranslateService.Failure fail)
+            {
+                if (fail.Class != TranslateService.Failure.Kind.Payload || fail.Status != 200)
+                    f.Add($"{name} {fail.Class}/{fail.Status}");
+                if (!fail.UserMessage.Contains("dữ liệu lạ", StringComparison.Ordinal))
+                    f.Add($"{name} message '{fail.UserMessage}'");
+            }
+            catch (Exception ex)
+            {
+                f.Add($"{name} other {ex.GetType().Name}");
+            }
+        }
+
         var saved = TranslateService.TranslatorOverrideForTesting;
         try
         {

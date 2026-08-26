@@ -148,6 +148,11 @@ sealed class TextResultForm : Form
 
         _text.Multiline = true;
         _text.ScrollBars = ScrollBars.Vertical;
+        // Selectable, not editable — same as the mac panel. Translate always
+        // sends `_sourceText`; an editable box would let the user type a
+        // correction and then silently replace it with a translation of the
+        // original.
+        _text.ReadOnly = true;
         _text.Text = _sourceText;
         _text.Dock = DockStyle.Fill;
         _text.Font = new Font("Segoe UI", 11.5f);
