@@ -34,10 +34,18 @@ enum AppServices {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem?
     private var screenParametersObserver: NSObjectProtocol?
+    /// Held for process lifetime. A single `disableAutomaticTermination` at
+    /// the top of launch is not enough: AppKit re-enables after "No windows
+    /// open yet" / "Restoring windows", `_kLSApplicationWouldBeTerminatedByTALKey`
+    /// stays 1, and LaunchServices SIGTERM's the LS-launched instance (~120s).
+    /// https://github.com/fantasy9876/snippr/issues/27
+    private var menubarLifetimeActivity: NSObjectProtocol?
 
     // MARK: lifecycle
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        keepMenubarResident()
+
         let devToolFlags = [
             "--uitest", "--benchmark", "--test-firstopen", "--test-scrollpreview",
             "--test-scrollstitch", "--test-scrollreal", "--test-scrollapp",
@@ -129,6 +137,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if Benchmark.panelHIDTestRequested { Benchmark.runPanelHIDTest() }
         if !isDevTool {
             UpdateChecker.checkOnLaunch()
+        }
+
+        // AppKit pairs its own disable/enable around window restore. Re-assert
+        // after that so the disable-count is not zeroed.
+        keepMenubarResident()
+    }
+
+    /// Opt out of Automatic Termination and hold a process activity so
+    /// LaunchServices cannot SIGTERM an idle LSUIElement after `open`.
+    private func keepMenubarResident() {
+        let info = ProcessInfo.processInfo
+        info.automaticTerminationSupportEnabled = false
+        info.disableAutomaticTermination("menubar utility must stay resident")
+        if menubarLifetimeActivity == nil {
+            menubarLifetimeActivity = info.beginActivity(
+                options: [.automaticTerminationDisabled, .suddenTerminationDisabled],
+                reason: "menubar utility must stay resident")
         }
     }
 
