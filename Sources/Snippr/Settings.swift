@@ -62,12 +62,18 @@ enum ConfirmationStyle: String, CaseIterable {
     }
 }
 
+/// Which recognizers to pin Vision to. Pinning is a promise the picture only
+/// holds one of these scripts: Vision asked for languages the ink is not
+/// written in returns an EMPTY result rather than an error, so a preset that
+/// omits a script reads to the user as "there is no text here". That is why
+/// the default is `auto` — the mode that cannot silently exclude anything.
 enum OCRLanguage: String, CaseIterable {
-    case englishPlus, vietnamesePlus, auto
+    case englishPlus, vietnamesePlus, chinesePlus, auto
     var label: String {
         switch self {
         case .englishPlus: return "English+"
         case .vietnamesePlus: return "Vietnamese+"
+        case .chinesePlus: return "Chinese+"
         case .auto: return "Auto"
         }
     }
@@ -75,6 +81,7 @@ enum OCRLanguage: String, CaseIterable {
         switch self {
         case .englishPlus: return ["en-US", "vi-VN"]
         case .vietnamesePlus: return ["vi-VN", "en-US"]
+        case .chinesePlus: return ["zh-Hans", "zh-Hant", "en-US"]
         case .auto: return []
         }
     }
@@ -278,7 +285,7 @@ final class Settings {
             Keys.afterCropShow: AfterCropShow.editor.rawValue,
             Keys.afterScrollShow: AfterScrollShow.editor.rawValue,
             Keys.hidePreviewMode: HidePreviewMode.manual.rawValue,
-            Keys.ocrLanguage: OCRLanguage.englishPlus.rawValue,
+            Keys.ocrLanguage: OCRLanguage.auto.rawValue,
             Keys.ocrRemoveLineBreaks: false,
             Keys.hideMenubarIcon: false,
             Keys.noSplash: false,
@@ -367,7 +374,10 @@ final class Settings {
     }
 
     var ocrLanguage: OCRLanguage {
-        get { OCRLanguage(rawValue: d.string(forKey: Keys.ocrLanguage) ?? "") ?? .englishPlus }
+        // Unreadable value falls back to `auto`, not to a pinned preset: a
+        // preset that excludes the picture's script fails silently (empty
+        // result), so the safe answer to "I don't know" is "detect it".
+        get { OCRLanguage(rawValue: d.string(forKey: Keys.ocrLanguage) ?? "") ?? .auto }
         set { d.set(newValue.rawValue, forKey: Keys.ocrLanguage) }
     }
 

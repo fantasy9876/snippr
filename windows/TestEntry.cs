@@ -1148,6 +1148,58 @@ static class TestEntry
             TranslateService.TranslatorOverrideForTesting = null;
         }
 
+        // OCR language selection. Asking for a recognizer the picture is not
+        // written in fails silently on both platforms, so the gates are about
+        // what gets ASKED FOR, which is the part a regression can change
+        // without anything on screen looking wrong.
+        Step("ocr-default-preference-is-auto", () =>
+        {
+            // A machine that has never opened Settings. Any pinned preset here
+            // is the Chinese bug again for whatever script it leaves out.
+            var fresh = new AppSettings().OcrPreference;
+            if (fresh != OcrLanguagePreference.Auto)
+                throw new InvalidOperationException(
+                    $"a fresh install would ask for {fresh}, not Auto");
+        });
+        Step("ocr-chinese-preset-asks-for-chinese", () =>
+        {
+            var tags = OcrService.PreferredTags(OcrLanguagePreference.ChinesePlus);
+            if (!tags.SequenceEqual(new[] { "zh-Hans", "zh-Hant", "en-US" }))
+                throw new InvalidOperationException(
+                    "Chinese+ asks for " + string.Join("|", tags));
+        });
+        Step("ocr-region-tag-answers-script-tag", () =>
+        {
+            // Windows spells them zh-Hans-CN / zh-Hant-TW. Treating that as a
+            // fallback would fire a "no recognizer" warning at a user whose
+            // recognizer is exactly the one they asked for.
+            if (!OcrService.Answers("zh-Hans-CN", "zh-Hans"))
+                throw new InvalidOperationException(
+                    "zh-Hans-CN should answer a zh-Hans request");
+            if (OcrService.Answers("en-US", "zh-Hans"))
+                throw new InvalidOperationException(
+                    "en-US must not pass as zh-Hans");
+        });
+        Step("ocr-picker-round-trips-every-preference", () =>
+        {
+            // The picker's order and the saved value are one table now; this
+            // is what stops a fifth preset from silently rewriting someone's
+            // choice on Save.
+            foreach (OcrLanguagePreference pref
+                     in Enum.GetValues<OcrLanguagePreference>())
+            {
+                var back = SettingsForm.OcrPrefForIndex(SettingsForm.OcrIndexFor(pref));
+                if (back != pref)
+                    throw new InvalidOperationException(
+                        $"{pref} round-tripped through the picker as {back}");
+            }
+            if (SettingsForm.OcrChoices.Length
+                != Enum.GetValues<OcrLanguagePreference>().Length)
+                throw new InvalidOperationException(
+                    $"picker offers {SettingsForm.OcrChoices.Length} of "
+                    + $"{Enum.GetValues<OcrLanguagePreference>().Length} preferences");
+        });
+
         // The summary goes in BEFORE the copy, or the artifact's log stops one
         // line short of the answer — the first run's did.
         Diag.Click("test", $"shot finished failures={failures} dir={dir}");

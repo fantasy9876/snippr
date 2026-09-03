@@ -6,7 +6,12 @@ namespace Snippr;
 
 /// Which recognizer the user wants, mirroring macOS's `OCRLanguage`. Stored
 /// by name; see AppSettings.OcrLanguage.
-enum OcrLanguagePreference { EnglishPlus, VietnamesePlus, Auto }
+///
+/// Asking for a recognizer the picture is not written in is silent on both
+/// platforms — macOS Vision returns an empty result, Windows lands on whatever
+/// engine it could build — so the default is `Auto`, the only value that
+/// cannot exclude a script the user never told us about.
+enum OcrLanguagePreference { EnglishPlus, VietnamesePlus, ChinesePlus, Auto }
 
 // ---------- OCR (Windows.Media.Ocr — offline, uses installed language packs) ----------
 
@@ -21,19 +26,41 @@ static class OcrService
     /// The recognizer this build would like, in order of preference, mirroring
     /// macOS's OCRLanguage. `Auto` asks Windows for the user's own profile
     /// languages and accepts whatever that gives.
-    static string[] PreferredTags(OcrLanguagePreference pref) => pref switch
+    /// Windows names its Chinese recognizers by region (`zh-Hans-CN`,
+    /// `zh-Hant-TW`) while macOS names them by script (`zh-Hans`). The short
+    /// script tags are listed here because `EngineFor` also accepts a
+    /// region-qualified match, so one list works whichever way the machine
+    /// spells it.
+    internal static string[] PreferredTags(OcrLanguagePreference pref) => pref switch
     {
         OcrLanguagePreference.EnglishPlus => ["en-US", "vi-VN"],
         OcrLanguagePreference.VietnamesePlus => ["vi-VN", "en-US"],
+        OcrLanguagePreference.ChinesePlus => ["zh-Hans", "zh-Hant", "en-US"],
         _ => [],
     };
 
     static readonly HashSet<string> _warnedLanguages = new();
 
+    /// Exact tag first; a script tag then accepts its region-qualified form
+    /// (`zh-Hans` → `zh-Hans-CN`). The dash is required so `en` cannot swallow
+    /// an unrelated `en…`-prefixed tag by accident.
+    static string? InstalledTagFor(string tag) =>
+        OcrEngine.AvailableRecognizerLanguages
+            .Select(l => l.LanguageTag)
+            .FirstOrDefault(t => string.Equals(t, tag, StringComparison.OrdinalIgnoreCase))
+        ?? OcrEngine.AvailableRecognizerLanguages
+            .Select(l => l.LanguageTag)
+            .FirstOrDefault(t => t.StartsWith(tag + "-", StringComparison.OrdinalIgnoreCase));
+
+    /// True when the recognizer that answered is the one that was asked for,
+    /// allowing the region-qualified spelling of a script tag.
+    internal static bool Answers(string used, string wanted) =>
+        string.Equals(used, wanted, StringComparison.OrdinalIgnoreCase)
+        || used.StartsWith(wanted + "-", StringComparison.OrdinalIgnoreCase);
+
     static OcrEngine? EngineFor(string tag) =>
-        OcrEngine.AvailableRecognizerLanguages.Any(
-            l => string.Equals(l.LanguageTag, tag, StringComparison.OrdinalIgnoreCase))
-            ? OcrEngine.TryCreateFromLanguage(new Windows.Globalization.Language(tag))
+        InstalledTagFor(tag) is string installed
+            ? OcrEngine.TryCreateFromLanguage(new Windows.Globalization.Language(installed))
             : null;
 
     public static async Task<OcrResult> RecognizeAsync(Bitmap bmp)
@@ -69,8 +96,10 @@ static class OcrService
         if (engine == null) return new OcrResult("", "No text recognizer is installed");
 
         string? warning = null;
-        if (wanted.Length > 0
-            && !string.Equals(used, wanted[0], StringComparison.OrdinalIgnoreCase))
+        // Same matching rule as EngineFor: `zh-Hans` answered by `zh-Hans-CN`
+        // is the recognizer that was asked for, not a fallback, and warning
+        // about it would teach the user to ignore a real warning later.
+        if (wanted.Length > 0 && !Answers(used, wanted[0]))
         {
             warning = pref == OcrLanguagePreference.VietnamesePlus
                 ? $"Windows không có gói OCR tiếng Việt — đang đọc bằng {used}"

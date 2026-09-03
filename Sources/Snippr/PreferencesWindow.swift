@@ -579,7 +579,7 @@ struct UploadingTab: View {
 // MARK: - Advanced
 
 struct AdvancedTab: View {
-    @AppStorage(Settings.Keys.ocrLanguage) private var ocrLang = OCRLanguage.englishPlus.rawValue
+    @AppStorage(Settings.Keys.ocrLanguage) private var ocrLang = OCRLanguage.auto.rawValue
     @AppStorage(Settings.Keys.ocrRemoveLineBreaks) private var removeBreaks = false
     @AppStorage(Settings.Keys.hideMenubarIcon) private var hideIcon = false
     @AppStorage(Settings.Keys.noSplash) private var noSplash = false
