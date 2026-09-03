@@ -6852,6 +6852,170 @@ enum SelfTest {
                       armFailures.joined(separator: " | "))
             }
 
+            // --- 1.2.19: Escape leaves the armed TOOL before it leaves the
+            // shot. Pressing T was a one-way door on both surfaces: nothing
+            // took the toolbar back to Select, and Escape skipped the tool
+            // entirely — here it ended the session, in the editor it ran
+            // `escPressed`, which copies and saves before it closes. The layer
+            // is asserted through the real `keyDown`, because a gate calling
+            // `selectAnnotationTool` itself would pass even if `keyDown` never
+            // reached the branch.
+            do {
+                var escFailures: [String] = []
+                var finished = 0
+                let escFrozen = CapturedImage(
+                    cgImage: makeTestImage(width: 900, height: 600), scale: 1)
+                let escOverlay = SelectionOverlay(
+                    purpose: .areaReview,
+                    inputs: OverlaySessionInputs(
+                        afterShow: true, afterCopy: false, afterSave: false),
+                    completion: { _ in finished += 1 })
+                escOverlay.routerDependenciesOverride =
+                    CaptureActionRouter.Dependencies(
+                        copyToClipboard: { _ in
+                            escFailures.append("touched-the-clipboard")
+                        },
+                        autoSave: { _, _ in escFailures.append("saved") },
+                        saveAs: { _, _ in escFailures.append("saved-as") },
+                        pin: { _ in }, ocrWithMode: { _, _ in },
+                        openEditor: { _ in }, toast: { _ in },
+                        setLastCapture: { _ in }, setLastAreaRect: { _ in },
+                        logEvent: { _ in })
+                let escHost = SelectionOverlayView(
+                    mode: .area, screen: screen, frozen: escFrozen,
+                    windowList: [], owner: escOverlay)
+                escHost.frame = CGRect(x: 0, y: 0, width: 900, height: 600)
+                escHost.selectForTesting(
+                    rect: CGRect(x: 40, y: 40, width: 820, height: 520))
+                @MainActor func overlayKey(
+                    _ characters: String, keyCode: UInt16
+                ) -> NSEvent? {
+                    NSEvent.keyEvent(
+                        with: .keyDown, location: .zero, modifierFlags: [],
+                        timestamp: 0, windowNumber: 0, context: nil,
+                        characters: characters,
+                        charactersIgnoringModifiers: characters,
+                        isARepeat: false, keyCode: keyCode)
+                }
+                if let t = overlayKey("t", keyCode: 0) {
+                    escHost.keyDown(with: t)
+                }
+                if escHost.annotationSurface?.tool != .text {
+                    escFailures.append(
+                        "premise-t-armed-"
+                        + String(describing: escHost.annotationSurface?.tool))
+                }
+                if let esc = overlayKey("\u{1b}", keyCode: 53) {
+                    escHost.keyDown(with: esc)
+                }
+                if escHost.annotationSurface?.tool != .select {
+                    escFailures.append(
+                        "esc-left-the-tool-on-"
+                        + String(describing: escHost.annotationSurface?.tool))
+                }
+                if finished != 0 {
+                    escFailures.append("esc-ended-the-session-instead")
+                }
+                // The layer BELOW, and the reason this is a layer rather than a
+                // replacement: once the tool is Select, Escape still cancels.
+                if let esc = overlayKey("\u{1b}", keyCode: 53) {
+                    escHost.keyDown(with: esc)
+                }
+                if finished != 1 {
+                    escFailures.append("second-esc-did-not-cancel \(finished)")
+                }
+                check("sliceB-overlay-escape-returns-to-select",
+                      escFailures.isEmpty,
+                      escFailures.joined(separator: " | "))
+            }
+
+            // --- 1.2.19: the same layer in the editor, plus the two things it
+            // must NOT disturb — the terminal escape from Select, and what
+            // Escape does to text that is still being typed.
+            do {
+                var edFailures: [String] = []
+                var copies = 0
+                var saves = 0
+                let wc = EditorWindowController.open(
+                    with: CapturedImage(
+                        cgImage: makeTestImage(width: 400, height: 300),
+                        scale: 1),
+                    forceFitForTesting: true)
+                wc.terminalDependencies = EditorWindowController
+                    .TerminalDependencies(
+                        copyToClipboard: { _ in copies += 1 },
+                        saveAs: { _, _, _ in },
+                        autoSave: { _, done in saves += 1; done(nil) },
+                        pin: { _ in },
+                        recognize: { _, _ in })
+                let canvas = wc.canvasForTesting
+                @MainActor func editorKey(
+                    _ characters: String, keyCode: UInt16
+                ) -> NSEvent? {
+                    NSEvent.keyEvent(
+                        with: .keyDown, location: .zero, modifierFlags: [],
+                        timestamp: 0, windowNumber: 0, context: nil,
+                        characters: characters,
+                        charactersIgnoringModifiers: characters,
+                        isARepeat: false, keyCode: keyCode)
+                }
+                let styleBefore = Settings.shared.escCopy
+                let saveBefore = Settings.shared.escSave
+                // Escape's terminal step is exercised with BOTH settings on:
+                // if the new layer ever let the press through early it would
+                // show up here as a clipboard write, not just a closed window.
+                Settings.shared.escCopy = true
+                Settings.shared.escSave = false
+                if let t = editorKey("t", keyCode: 0) { canvas.keyDown(with: t) }
+                if canvas.currentTool != .text {
+                    edFailures.append(
+                        "premise-t-armed-\(canvas.currentTool.rawValue)")
+                }
+                if let esc = editorKey("\u{1b}", keyCode: 53) {
+                    canvas.keyDown(with: esc)
+                }
+                if canvas.currentTool != .select {
+                    edFailures.append(
+                        "esc-left-the-tool-on-\(canvas.currentTool.rawValue)")
+                }
+                if wc.window?.isVisible != true {
+                    edFailures.append("esc-closed-the-editor-instead")
+                }
+                if copies != 0 || saves != 0 {
+                    edFailures.append("esc-ran-the-terminal-step \(copies)/\(saves)")
+                }
+                // Crop keeps its own richer layer: it clears the pending
+                // selection on the way out, which the generic layer does not.
+                canvas.currentTool = .crop
+                canvas.setCropSelectionForTesting(
+                    CGRect(x: 10, y: 10, width: 80, height: 60))
+                if let esc = editorKey("\u{1b}", keyCode: 53) {
+                    canvas.keyDown(with: esc)
+                }
+                if canvas.currentTool != .select {
+                    edFailures.append("crop-esc-left-the-tool")
+                }
+                if canvas.hasValidCropSelection {
+                    edFailures.append("crop-esc-kept-the-selection")
+                }
+                // From Select the terminal step runs exactly as before.
+                if let esc = editorKey("\u{1b}", keyCode: 53) {
+                    canvas.keyDown(with: esc)
+                }
+                if copies != 1 {
+                    edFailures.append("esc-on-select-did-not-copy \(copies)")
+                }
+                if wc.window?.isVisible == true {
+                    edFailures.append("esc-on-select-left-the-editor-open")
+                }
+                Settings.shared.escCopy = styleBefore
+                Settings.shared.escSave = saveBefore
+                wc.window?.close()
+                check("editor-escape-returns-to-select-before-leaving",
+                      edFailures.isEmpty,
+                      edFailures.joined(separator: " | "))
+            }
+
             // --- 1.2.16: the action keys and the hints that advertise them
             do {
                 var keyFailures: [String] = []
