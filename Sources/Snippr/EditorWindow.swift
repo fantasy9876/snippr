@@ -2762,6 +2762,16 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
                 (window?.windowController as? EditorWindowController)?.selectTool(.select)
                 return
             }
+            // The same layer Crop already had, for every other tool. Pressing
+            // T was a one-way door: nothing on the keyboard came back, and Esc
+            // skipped the tool entirely for `escPressed`, which copies and
+            // saves before it closes the window. So wanting out of the text
+            // tool cost the whole editor — and wrote the clipboard on the way.
+            // Escape only reaches that terminal step from Select now.
+            if currentTool != .select {
+                (window?.windowController as? EditorWindowController)?.selectTool(.select)
+                return
+            }
             (window?.windowController as? EditorWindowController)?.escPressed()
             return
         }

@@ -409,10 +409,20 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
         if isSaving || isFinished { return }
         if hideBackdropMini() { return }
         // One layer per press, outermost first: the result panel, then the
-        // pick that produced it, and only then the session. Closing the shot
-        // while a panel is open would throw away the text the user is reading.
+        // pick that produced it, then the armed tool, and only then the
+        // session. Closing the shot while a panel is open would throw away the
+        // text the user is reading; ending it because the user wanted out of
+        // the text tool is the same mistake one layer down. Pressing T used to
+        // be a one-way door — nothing took the toolbar back to Select.
         if hideOCRResult() { return }
         if cancelOCRRegionPicking() { return }
+        if isReviewing, let surface = annotationSurface, surface.tool != .select {
+            // `selectAnnotationTool` is the authoritative point: it retints the
+            // toolbar, ends any text entry and re-reads the cursor, so this
+            // layer does not have to repeat any of it.
+            selectAnnotationTool(.select)
+            return
+        }
         owner?.finish(.cancelled)
     }
     func handleEscapeForTesting() { handleEscape() }
