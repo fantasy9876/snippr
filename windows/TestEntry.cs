@@ -841,12 +841,67 @@ static class TestEntry
                 if (!review.Visible)
                     throw new InvalidOperationException("Escape closed the session too early");
             });
+            Step("review-tool-key-ends-the-pick", () =>
+            {
+                // The flag is not the promise — the DRAG is. Asserting only
+                // the flag would stay green if the mode were cleared but the
+                // mouse-down still routed to the picker.
+                review.PressKeyForTesting(Keys.X);
+                if (!review.ArmedForTesting)
+                    throw new InvalidOperationException("premise: X did not arm");
+                if (!review.PressKeyForTesting(Keys.P))
+                    throw new InvalidOperationException("the pen key was not routed");
+                if (review.ArmedForTesting)
+                    throw new InvalidOperationException("choosing a tool left the pick armed");
+                var chrome = review.ChromeForTesting;
+                var crop = review.SelectionForTesting;
+                int before = review.AnnotationCountForTesting;
+                var from = new Point(crop.X + 50, crop.Y + 50);
+                var to = new Point(crop.X + 150, crop.Y + 130);
+                SendMouse(chrome, WmLButtonDown, from);
+                SendMouse(chrome, WmMouseMove, to);
+                SendMouse(chrome, WmLButtonUp, to);
+                Application.DoEvents();
+                if (review.AnnotationCountForTesting != before + 1)
+                    throw new InvalidOperationException(
+                        "the drag after a tool key drew "
+                        + $"{review.AnnotationCountForTesting - before} marks, want 1");
+                if (review.PickedRegionForTesting != null)
+                    throw new InvalidOperationException(
+                        "the drag after a tool key cut a region as well");
+                review.PressActionForTesting("undo");
+                review.PressToolForTesting("select");
+                Application.DoEvents();
+            });
+            Step("review-preset-ocean", () =>
+            {
+                review.ApplyPresetForTesting("ocean");
+                review.Refresh();
+                Application.DoEvents();
+            });
+            Step("review-shot-ocean",
+                () => Capture(review, Path.Combine(dir, "review-ocean.png")));
+            Step("review-undo", () => review.PressActionForTesting("undo"));
+            foreach (var action in RouteDecoration.VisualRoutes
+                .Concat(RouteDecoration.SemanticRoutes))
+            {
+                var route = action;
+                Step($"review-route-{route}", () =>
+                {
+                    using var image = review.RouteImageForTesting(route);
+                    Diag.Click("test", $"review route {route} -> {image.Width}x{image.Height}");
+                });
+            }
+            // LAST two review steps, and they have to stay last. Both press
+            // Escape with a tool armed, which is precisely the press that ends
+            // the session when the tool layer is missing. Run from the middle
+            // of the block they do not just fail — they take the shot down and
+            // every step after them fails for a reason that is not theirs,
+            // which is how a one-line regression reads as six broken gates.
             Step("review-escape-returns-to-select-before-ending-the-session", () =>
             {
-                // The layer this surface was missing. Panel and pick are
-                // already unwound by the step above, so this Escape lands on
-                // the tool — which used to mean it landed on Close() and took
-                // the whole shot with it.
+                // The layer this surface was missing: T armed the text tool
+                // and Escape jumped past it to Close(), taking the whole shot.
                 if (!review.PressKeyForTesting(Keys.T))
                     throw new InvalidOperationException("the text key was not routed");
                 if (review.ToolForTesting != Tool.Text)
@@ -902,57 +957,6 @@ static class TestEntry
                     throw new InvalidOperationException(
                         "the second Escape did not reach the tool layer");
             });
-            Step("review-tool-key-ends-the-pick", () =>
-            {
-                // The flag is not the promise — the DRAG is. Asserting only
-                // the flag would stay green if the mode were cleared but the
-                // mouse-down still routed to the picker.
-                review.PressKeyForTesting(Keys.X);
-                if (!review.ArmedForTesting)
-                    throw new InvalidOperationException("premise: X did not arm");
-                if (!review.PressKeyForTesting(Keys.P))
-                    throw new InvalidOperationException("the pen key was not routed");
-                if (review.ArmedForTesting)
-                    throw new InvalidOperationException("choosing a tool left the pick armed");
-                var chrome = review.ChromeForTesting;
-                var crop = review.SelectionForTesting;
-                int before = review.AnnotationCountForTesting;
-                var from = new Point(crop.X + 50, crop.Y + 50);
-                var to = new Point(crop.X + 150, crop.Y + 130);
-                SendMouse(chrome, WmLButtonDown, from);
-                SendMouse(chrome, WmMouseMove, to);
-                SendMouse(chrome, WmLButtonUp, to);
-                Application.DoEvents();
-                if (review.AnnotationCountForTesting != before + 1)
-                    throw new InvalidOperationException(
-                        "the drag after a tool key drew "
-                        + $"{review.AnnotationCountForTesting - before} marks, want 1");
-                if (review.PickedRegionForTesting != null)
-                    throw new InvalidOperationException(
-                        "the drag after a tool key cut a region as well");
-                review.PressActionForTesting("undo");
-                review.PressToolForTesting("select");
-                Application.DoEvents();
-            });
-            Step("review-preset-ocean", () =>
-            {
-                review.ApplyPresetForTesting("ocean");
-                review.Refresh();
-                Application.DoEvents();
-            });
-            Step("review-shot-ocean",
-                () => Capture(review, Path.Combine(dir, "review-ocean.png")));
-            Step("review-undo", () => review.PressActionForTesting("undo"));
-            foreach (var action in RouteDecoration.VisualRoutes
-                .Concat(RouteDecoration.SemanticRoutes))
-            {
-                var route = action;
-                Step($"review-route-{route}", () =>
-                {
-                    using var image = review.RouteImageForTesting(route);
-                    Diag.Click("test", $"review route {route} -> {image.Width}x{image.Height}");
-                });
-            }
         }
 
         Step("translate-window-reasons-and-source", () => TranslateWindowSmoke());
