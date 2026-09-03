@@ -38,6 +38,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: lifecycle
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // LS-launched menubar instances (including the updater's `open -n`)
+        // are SIGTERM'd after ~2 min idle with no windows. Direct exec is
+        // not LaunchServices-managed and survives. Keep the process resident.
+        // https://github.com/fantasy9876/snippr/issues/27
+        ProcessInfo.processInfo.disableAutomaticTermination("menubar utility must stay resident")
+
         let devToolFlags = [
             "--uitest", "--benchmark", "--test-firstopen", "--test-scrollpreview",
             "--test-scrollstitch", "--test-scrollreal", "--test-scrollapp",
