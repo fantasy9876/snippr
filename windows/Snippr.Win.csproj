@@ -9,7 +9,7 @@
     <RootNamespace>Snippr</RootNamespace>
     <AssemblyName>Snippr</AssemblyName>
     <ApplicationIcon>snippr.ico</ApplicationIcon>
-    <Version>1.2.18</Version>
+    <Version>1.2.20</Version>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <InvariantGlobalization>true</InvariantGlobalization>
