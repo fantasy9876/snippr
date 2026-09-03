@@ -19,12 +19,12 @@ class AppSettings
     /// Stored by name for the same reason the corner style is: an older build
     /// reading a newer file falls back to the default rather than to whatever
     /// number an enum happened to have.
-    public string OcrLanguage { get; set; } = OcrLanguagePreference.EnglishPlus.ToString();
+    public string OcrLanguage { get; set; } = OcrLanguagePreference.Auto.ToString();
 
     public OcrLanguagePreference OcrPreference =>
         Enum.TryParse<OcrLanguagePreference>(OcrLanguage, ignoreCase: true, out var pref)
             ? pref
-            : OcrLanguagePreference.EnglishPlus;
+            : OcrLanguagePreference.Auto;
 
     public BackdropCornerStyle CornerStyle =>
         Enum.TryParse<BackdropCornerStyle>(BackdropCorners, ignoreCase: true, out var style)

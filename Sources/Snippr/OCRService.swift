@@ -19,23 +19,26 @@ struct OCRResult {
 final class OCRService {
     static let shared = OCRService()
 
-    func recognize(_ image: CGImage) async -> OCRResult {
+    /// `languages` is the pin Vision is given; `nil` means "ask Settings",
+    /// which is what production always does. Gates pass it explicitly so a
+    /// preset can be exercised without touching the user's stored preference.
+    func recognize(_ image: CGImage, languages: [String]? = nil) async -> OCRResult {
         await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
-                let result = Self.recognizeSync(image)
+                let result = Self.recognizeSync(image, languages: languages)
                 continuation.resume(returning: result)
             }
         }
     }
 
-    private static func recognizeSync(_ image: CGImage) -> OCRResult {
+    static func recognizeSync(_ image: CGImage, languages: [String]? = nil) -> OCRResult {
         var lines: [String] = []
         var qrPayloads: [String] = []
 
         let textRequest = VNRecognizeTextRequest()
         textRequest.recognitionLevel = .accurate
         textRequest.usesLanguageCorrection = true
-        let langs = Settings.shared.ocrLanguage.visionLanguages
+        let langs = languages ?? Settings.shared.ocrLanguage.visionLanguages
         if !langs.isEmpty {
             textRequest.recognitionLanguages = langs
         } else {

@@ -4762,6 +4762,52 @@ enum SelfTest {
             "ocr-text", recognizedText.uppercased().contains("SNIPPR"),
             "got '\(recognizedText)'")
 
+        // 5b. OCR language pinning ----------------------------------------------------
+        // Vision given a language list the ink is not written in returns an
+        // EMPTY result, not an error, so the app showed "No text or QR found"
+        // over perfectly legible Chinese. These gates pin the whole shape of
+        // that bug and of the fix.
+        func ocrSync(_ image: CGImage, _ langs: [String]) -> String {
+            OCRService.recognizeSync(image, languages: langs).text
+        }
+        let chineseImage = makeTextImage(text: "你好世界", width: 900, height: 240)
+        writePNG(chineseImage, to: "\(outputDir)/ocr-input-chinese.png")
+
+        // The user-visible default. `auto` is the only mode that cannot
+        // silently exclude a script, which is the entire reason it is default.
+        let autoChinese = ocrSync(chineseImage, OCRLanguage.auto.visionLanguages)
+        check("ocr-chinese-under-auto", autoChinese.contains("你好"),
+              "got '\(autoChinese)'")
+
+        let pinnedChinese = ocrSync(chineseImage, OCRLanguage.chinesePlus.visionLanguages)
+        check("ocr-chinese-under-chinese-preset", pinnedChinese.contains("你好"),
+              "got '\(pinnedChinese)'")
+
+        // The bug itself, kept executable. If a future macOS makes an
+        // en/vi pin read Chinese anyway, this goes red — that is the signal to
+        // revisit the preset list, not a regression in Snippr.
+        let englishPinnedChinese = ocrSync(
+            chineseImage, OCRLanguage.englishPlus.visionLanguages)
+        check("ocr-chinese-is-invisible-to-english-preset",
+              !englishPinnedChinese.contains("你好"),
+              "got '\(englishPinnedChinese)'")
+
+        // A machine that has never opened Preferences must land on `auto`.
+        // Read the registration domain, not the effective value: the effective
+        // value on a dev machine may be a preference someone stored by hand,
+        // which would let a wrong default pass unnoticed.
+        let registered = UserDefaults.standard
+            .volatileDomain(forName: UserDefaults.registrationDomain)
+        check("ocr-default-language-is-auto",
+              registered[Settings.Keys.ocrLanguage] as? String
+                  == OCRLanguage.auto.rawValue,
+              "got '\(registered[Settings.Keys.ocrLanguage] as? String ?? "nil")'")
+
+        // Chinese+ has to be reachable from the picker, not just from code.
+        check("ocr-picker-offers-chinese",
+              OCRLanguage.allCases.contains(.chinesePlus),
+              "cases \(OCRLanguage.allCases.map(\.rawValue))")
+
         // 6. Window shot composition ---------------------------------------------------
         let windowShot = CapturedImage(cgImage: makeSolidImage(width: 400, height: 300, color: NSColor.darkGray.cgColor), scale: 2)
         let composedShot = CaptureEngine.composeWindowShot(windowShot, style: .solid, screen: nil)

@@ -224,6 +224,29 @@ sealed class HotkeyBox : TextBox
 
 sealed class SettingsForm : Form
 {
+    /// The OCR picker's order, in one place. Building the list and reading the
+    /// user's choice back out used to be two hand-written switches; a preset
+    /// added to one and not the other silently rewrites the choice on Save,
+    /// and nothing in the UI shows it happened.
+    internal static readonly (string Label, OcrLanguagePreference Pref)[] OcrChoices =
+    [
+        ("English+", OcrLanguagePreference.EnglishPlus),
+        ("Vietnamese+", OcrLanguagePreference.VietnamesePlus),
+        ("Chinese+", OcrLanguagePreference.ChinesePlus),
+        ("Auto", OcrLanguagePreference.Auto),
+    ];
+
+    internal static int OcrIndexFor(OcrLanguagePreference pref)
+    {
+        var i = Array.FindIndex(OcrChoices, c => c.Pref == pref);
+        return i < 0 ? 0 : i;
+    }
+
+    internal static OcrLanguagePreference OcrPrefForIndex(int index) =>
+        index >= 0 && index < OcrChoices.Length
+            ? OcrChoices[index].Pref
+            : OcrLanguagePreference.EnglishPlus;
+
     readonly TextBox _folder = new();
     readonly ComboBox _format = new();
     readonly CheckBox _show = new() { Text = "Show editor" };
@@ -312,19 +335,15 @@ sealed class SettingsForm : Form
         Controls.Add(_corners);
         y += 34;
 
-        // Same three choices as macOS, same names. Windows ships no
-        // Vietnamese recognizer, so Vietnamese+ falls back to English and the
-        // OCR flow says so — the setting is what lets someone ASK, and being
-        // told is the point.
+        // Same four choices as macOS, same names and same order. Windows ships
+        // no Vietnamese recognizer, so Vietnamese+ falls back to English and
+        // the OCR flow says so — the setting is what lets someone ASK, and
+        // being told is the point. Chinese+ and Auto depend on an installed
+        // language pack the same way; the warning path covers both.
         L("OCR language");
         _ocrLang.DropDownStyle = ComboBoxStyle.DropDownList;
-        _ocrLang.Items.AddRange(new object[] { "English+", "Vietnamese+", "Auto" });
-        _ocrLang.SelectedIndex = s.OcrPreference switch
-        {
-            OcrLanguagePreference.VietnamesePlus => 1,
-            OcrLanguagePreference.Auto => 2,
-            _ => 0,
-        };
+        _ocrLang.Items.AddRange(OcrChoices.Select(c => (object)c.Label).ToArray());
+        _ocrLang.SelectedIndex = OcrIndexFor(s.OcrPreference);
         _ocrLang.SetBounds(160, y, 210, 24);
         Controls.Add(_ocrLang);
         y += 34;
@@ -384,12 +403,7 @@ sealed class SettingsForm : Form
             3 => nameof(BackdropCornerStyle.Large),
             _ => nameof(BackdropCornerStyle.Medium),
         };
-        s.OcrLanguage = _ocrLang.SelectedIndex switch
-        {
-            1 => nameof(OcrLanguagePreference.VietnamesePlus),
-            2 => nameof(OcrLanguagePreference.Auto),
-            _ => nameof(OcrLanguagePreference.EnglishPlus),
-        };
+        s.OcrLanguage = OcrPrefForIndex(_ocrLang.SelectedIndex).ToString();
         s.HotkeyFullscreen = _hkFullscreen.Combo;
         s.HotkeyArea = _hkArea.Combo;
         s.HotkeyWindow = _hkWindow.Combo;
