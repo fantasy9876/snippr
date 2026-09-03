@@ -60,6 +60,12 @@ sealed class AreaReviewForm : Form
     internal Control ChromeForTesting => _toolbar;
     internal HoverHint HintForTesting => _toolbar.Hint;
     internal int AnnotationCountForTesting => _session.Annotations.Count;
+    /// Read-only: a gate arms a tool through the real key and reads the result
+    /// here, never the other way round.
+    internal Tool ToolForTesting => _tool;
+    /// The live text box. A gate needs the handle to send it a real key —
+    /// while this is up the form routes nothing itself.
+    internal TextBox? TextBoxForTesting => _textBox;
     internal BackdropCornerStyle CornersForTesting => _session.Corners;
     /// The rectangle the surface was ASKED to cover. Comparing the client
     /// area with the form's own bounds proves nothing: Windows clamps both
@@ -952,12 +958,15 @@ sealed class AreaReviewForm : Form
         if (_textBox != null) return base.ProcessCmdKey(ref msg, keyData);
         switch (keyData)
         {
-            // One layer at a time: the panel, then the pick, then the
-            // session. Closing the shot while its text is still on screen is
-            // exactly what this flow exists to stop doing.
+            // One layer at a time: the panel, then the pick, then the armed
+            // tool, then the session. Closing the shot while its text is still
+            // on screen is exactly what this flow exists to stop doing — and
+            // ending the whole shot because the user wanted out of the text
+            // tool is the same mistake one layer down.
             case Keys.Escape:
                 if (HidePanel()) return true;
                 if (_pick.Cancel()) { ApplyCursor(CurrentPointerClient()); return true; }
+                if (_tool != Tool.Select) { SelectTool(Tool.Select); return true; }
                 Close();
                 return true;
             case Keys.Control | Keys.Z:

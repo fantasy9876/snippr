@@ -33,9 +33,11 @@ static class TestEntry
     [DllImport("user32.dll", EntryPoint = "GetWindowLongPtr")]
     static extern IntPtr GetWindowLongPtr(IntPtr hWnd, int index);
 
+    const int WmKeyDown = 0x0100;
     const int WmMouseMove = 0x0200;
     const int WmLButtonDown = 0x0201;
     const int WmLButtonUp = 0x0202;
+    const int VkEscape = 0x1B;
     const int GwlExStyle = -20;
     const long WsExTopmost = 0x00000008;
 
@@ -47,6 +49,13 @@ static class TestEntry
 
     static void SendMouse(Control target, int message, Point clientPoint) =>
         SendMessage(target.Handle, message, IntPtr.Zero, MouseLParam(clientPoint));
+
+    /// A real WM_KEYDOWN at a specific control, for the one case a form-level
+    /// key router cannot stand in for: while a text box owns the keyboard the
+    /// form hands the key straight to it, so the branch under test lives in
+    /// the box's own handler and nowhere else.
+    static void SendKey(Control target, int virtualKey) =>
+        SendMessage(target.Handle, WmKeyDown, (IntPtr)virtualKey, IntPtr.Zero);
 
     /// True when the arguments asked for a test entry and it has run.
     public static bool Handle(string[] args)
@@ -182,6 +191,49 @@ static class TestEntry
                     Diag.Click("test", $"editor route {route} -> {image.Width}x{image.Height}");
                 });
             }
+            // Escape used to be a one-way exit from the text tool: T armed it
+            // and nothing on the keyboard came back — Escape jumped past the
+            // tool to copy-and-close. Driven through the real key router,
+            // because a gate calling SelectTool itself would stay green if
+            // ProcessCmdKey never reached the branch.
+            Step("editor-escape-returns-to-select", () =>
+            {
+                if (!editor.PressKeyForTesting(Keys.T))
+                    throw new InvalidOperationException("the text key was not routed");
+                if (editor.ToolForTesting != Tool.Text)
+                    throw new InvalidOperationException(
+                        $"premise: T selected {editor.ToolForTesting}, not Text");
+                if (!editor.PressKeyForTesting(Keys.Escape))
+                    throw new InvalidOperationException("Escape was not routed");
+                if (editor.ToolForTesting != Tool.Select)
+                    throw new InvalidOperationException(
+                        $"Escape left the tool on {editor.ToolForTesting}");
+                if (editor.IsDisposed || !editor.Visible)
+                    throw new InvalidOperationException(
+                        "Escape closed the editor instead of returning to Select");
+            });
+            // The layer below, and the reason the one above has to be a layer
+            // rather than a replacement: once the tool IS Select, Escape still
+            // means leave. EscCopy off so this takes the plain-close path
+            // instead of reaching for a clipboard the runner has not got.
+            // LAST editor step — it disposes the form.
+            Step("editor-escape-at-select-still-leaves", () =>
+            {
+                if (editor.ToolForTesting != Tool.Select)
+                    throw new InvalidOperationException(
+                        $"premise: tool is {editor.ToolForTesting}, not Select");
+                bool was = AppSettings.Current.EscCopy;
+                AppSettings.Current.EscCopy = false;
+                try
+                {
+                    editor.PressKeyForTesting(Keys.Escape);
+                    Application.DoEvents();
+                    if (!editor.IsDisposed && editor.Visible)
+                        throw new InvalidOperationException(
+                            "Escape on Select no longer leaves the editor");
+                }
+                finally { AppSettings.Current.EscCopy = was; }
+            });
         }
 
         // Production hands the review surface the VIRTUAL SCREEN and a frozen
@@ -788,6 +840,67 @@ static class TestEntry
                     throw new InvalidOperationException("Escape left the pick armed");
                 if (!review.Visible)
                     throw new InvalidOperationException("Escape closed the session too early");
+            });
+            Step("review-escape-returns-to-select-before-ending-the-session", () =>
+            {
+                // The layer this surface was missing. Panel and pick are
+                // already unwound by the step above, so this Escape lands on
+                // the tool — which used to mean it landed on Close() and took
+                // the whole shot with it.
+                if (!review.PressKeyForTesting(Keys.T))
+                    throw new InvalidOperationException("the text key was not routed");
+                if (review.ToolForTesting != Tool.Text)
+                    throw new InvalidOperationException(
+                        $"premise: T selected {review.ToolForTesting}, not Text");
+                review.PressKeyForTesting(Keys.Escape);
+                Application.DoEvents();
+                if (review.ToolForTesting != Tool.Select)
+                    throw new InvalidOperationException(
+                        $"Escape left the tool on {review.ToolForTesting}");
+                if (!review.Visible)
+                    throw new InvalidOperationException(
+                        "Escape ended the session instead of returning to Select");
+            });
+            Step("review-escape-while-typing-drops-text-and-keeps-the-tool", () =>
+            {
+                // Windows DISCARDS on Escape while macOS commits. That split
+                // is deliberate for now and tracked on its own; this gate is
+                // here so the Escape layering above cannot quietly change it.
+                //
+                // The box is opened by a real click and closed by a real
+                // WM_KEYDOWN — only the typed characters are set directly,
+                // since what is under test is what Escape does to them, not
+                // how they got in.
+                review.PressKeyForTesting(Keys.T);
+                var chrome = review.ChromeForTesting;
+                var crop = review.SelectionForTesting;
+                var at = new Point(crop.X + 60, crop.Y + 60);
+                SendMouse(chrome, WmLButtonDown, at);
+                SendMouse(chrome, WmLButtonUp, at);
+                Application.DoEvents();
+                if (review.TextBoxForTesting is not { } box)
+                    throw new InvalidOperationException(
+                        "premise: clicking with the text tool opened no box");
+                box.Text = "throw me away";
+                int before = review.AnnotationCountForTesting;
+                SendKey(box, VkEscape);
+                Application.DoEvents();
+                if (review.TextBoxForTesting != null)
+                    throw new InvalidOperationException("Escape left the text box open");
+                if (review.AnnotationCountForTesting != before)
+                    throw new InvalidOperationException(
+                        "Escape kept the typed text — Windows is supposed to discard it");
+                if (review.ToolForTesting != Tool.Text)
+                    throw new InvalidOperationException(
+                        $"Escape while typing also dropped the tool to "
+                        + $"{review.ToolForTesting}; it should take two presses");
+                if (!review.Visible)
+                    throw new InvalidOperationException("Escape ended the session");
+                review.PressKeyForTesting(Keys.Escape);
+                Application.DoEvents();
+                if (review.ToolForTesting != Tool.Select)
+                    throw new InvalidOperationException(
+                        "the second Escape did not reach the tool layer");
             });
             Step("review-tool-key-ends-the-pick", () =>
             {

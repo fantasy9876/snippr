@@ -66,6 +66,19 @@ sealed class EditorForm : Form
     /// waiting behind a menu.
     internal void CloseMenusForTesting() => _backdropMenu.Close();
 
+    /// Drives the real key router rather than the handler behind it, so a gate
+    /// proves the key the user presses reaches the branch — the same reason
+    /// the review surface exposes one.
+    internal bool PressKeyForTesting(Keys key)
+    {
+        var msg = new Message();
+        return ProcessCmdKey(ref msg, key);
+    }
+
+    /// Read-only: a gate arms a tool through the real key and reads the result
+    /// here, never the other way round.
+    internal Tool ToolForTesting => _tool;
+
     public static void OpenWith(Bitmap image)
     {
         var f = new EditorForm(image);
@@ -723,6 +736,15 @@ sealed class EditorForm : Form
             case Keys.Control | Keys.Oemplus: ZoomBy(1.25f); return true;
             case Keys.Control | Keys.OemMinus: ZoomBy(0.8f); return true;
             case Keys.Escape:
+                // One layer at a time, the way the review surface unwinds its
+                // panel and pick: a live text box is dismissed above, then an
+                // armed tool goes back to Select, and only a plain Select
+                // reaches the terminal escape. Pressing T used to be a one-way
+                // door — nothing on the keyboard took the user back, and Esc
+                // jumped straight past the tool to copy-and-close. This also
+                // gives Crop the escape macOS gives it, through the generic
+                // layer rather than a case of its own.
+                if (_tool != Tool.Select) { SelectTool(Tool.Select); return true; }
                 // mirrors the macOS escCopy setting; turning it off makes Esc
                 // a plain discard that leaves the clipboard alone
                 if (AppSettings.Current.EscCopy) CopyAndClose(); else Close();
