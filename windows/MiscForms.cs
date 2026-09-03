@@ -242,10 +242,13 @@ sealed class SettingsForm : Form
         return i < 0 ? 0 : i;
     }
 
+    /// An out-of-range index falls back to `Auto`, matching the new default:
+    /// the wrong answer to "I don't know" is a preset that silently excludes
+    /// whatever script the picture is written in.
     internal static OcrLanguagePreference OcrPrefForIndex(int index) =>
         index >= 0 && index < OcrChoices.Length
             ? OcrChoices[index].Pref
-            : OcrLanguagePreference.EnglishPlus;
+            : OcrLanguagePreference.Auto;
 
     readonly TextBox _folder = new();
     readonly ComboBox _format = new();

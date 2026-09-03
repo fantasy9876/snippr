@@ -4808,6 +4808,23 @@ enum SelfTest {
               OCRLanguage.allCases.contains(.chinesePlus),
               "cases \(OCRLanguage.allCases.map(\.rawValue))")
 
+        // The WIRE, not the seam. Every gate above hands `languages` in
+        // explicitly, which leaves the one line production actually runs —
+        // `languages ?? Settings.shared.ocrLanguage.visionLanguages` —
+        // unguarded. A build that stopped reading Settings would pass all of
+        // them while Chinese went back to reading as "no text found": the
+        // exact bug this change exists to fix. So drive it the way a capture
+        // does, through the stored preference and no argument at all.
+        do {
+            let savedOCRLanguage = Settings.shared.ocrLanguage
+            defer { Settings.shared.ocrLanguage = savedOCRLanguage }
+            Settings.shared.ocrLanguage = .chinesePlus
+            let throughSettings = OCRService.recognizeSync(chineseImage).text
+            check("ocr-preset-reaches-vision-through-settings",
+                  throughSettings.contains("你好"),
+                  "got '\(throughSettings)'")
+        }
+
         // 6. Window shot composition ---------------------------------------------------
         let windowShot = CapturedImage(cgImage: makeSolidImage(width: 400, height: 300, color: NSColor.darkGray.cgColor), scale: 2)
         let composedShot = CaptureEngine.composeWindowShot(windowShot, style: .solid, screen: nil)
