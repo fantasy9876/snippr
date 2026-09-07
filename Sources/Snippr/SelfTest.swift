@@ -6992,9 +6992,10 @@ enum SelfTest {
                       escFailures.joined(separator: " | "))
             }
 
-            // --- 1.2.19: the same layer in the editor, plus the two things it
-            // must NOT disturb — the terminal escape from Select, and what
-            // Escape does to text that is still being typed.
+            // --- 1.2.19: the same layer in the editor, plus the terminal
+            // escape from Select. What Escape does to text that is still
+            // being typed is gated by editor-escape-commits-live-field-once
+            // (1.2.21): live field editor + window.sendEvent.
             do {
                 var edFailures: [String] = []
                 var copies = 0
@@ -18761,6 +18762,433 @@ enum SelfTest {
             check("sliceB-text-field-owns-keys",
                   textKeyFailures.isEmpty,
                   textKeyFailures.joined(separator: " | "))
+
+            // --- 1.2.21: Escape while a LIVE field editor is first responder.
+            // sliceB-overlay-escape-returns-to-select (1.2.19) never opened a
+            // field and called keyDown on the view, so it stayed green while
+            // production swallowed Esc. These gates drive window.sendEvent
+            // and fail closed unless the field editor is actually first
+            // responder BEFORE the key — a green without that premise is
+            // the same blind gate as 1.2.19.
+            do {
+                var liveEscFailures: [String] = []
+
+                @discardableResult
+                @MainActor func sendKey(
+                    _ characters: String, keyCode: UInt16,
+                    through window: NSWindow, label: String
+                ) -> Bool {
+                    guard let event = NSEvent.keyEvent(
+                        with: .keyDown, location: .zero,
+                        modifierFlags: [], timestamp: 0,
+                        windowNumber: window.windowNumber, context: nil,
+                        characters: characters,
+                        charactersIgnoringModifiers: characters,
+                        isARepeat: false, keyCode: keyCode)
+                    else {
+                        liveEscFailures.append("\(label):event-nil")
+                        return false
+                    }
+                    window.sendEvent(event)
+                    return true
+                }
+
+                @MainActor func fieldEditorLive(
+                    field: NSTextField, window: NSWindow
+                ) -> NSTextView? {
+                    guard let editor = field.currentEditor() as? NSTextView,
+                          window.firstResponder === editor,
+                          editor === field.currentEditor()
+                    else { return nil }
+                    return editor
+                }
+
+                func uniqueAnnotationCount(_ items: [Annotation]) -> Int {
+                    var seen = Set<ObjectIdentifier>()
+                    for item in items {
+                        seen.insert(ObjectIdentifier(item))
+                    }
+                    return seen.count
+                }
+
+                @MainActor func runOverlayLiveEsc() {
+                    guard let screen = NSScreen.screens.first else {
+                        liveEscFailures.append("overlay:no-screen")
+                        return
+                    }
+                    guard SelectionOverlay.current == nil else {
+                        liveEscFailures.append("overlay:dirty-current")
+                        return
+                    }
+                    var completions = 0
+                    var copies = 0
+                    var saves = 0
+                    let frozen = CapturedImage(
+                        cgImage: makeSolidImage(
+                            width: max(
+                                8, Int(screen.frame.width.rounded(.up))),
+                            height: max(
+                                8, Int(screen.frame.height.rounded(.up))),
+                            color: NSColor.white.cgColor),
+                        scale: 1)
+                    guard let overlay = SelectionOverlay.beginForTesting(
+                        purpose: .areaReview,
+                        inputs: OverlaySessionInputs(
+                            afterShow: true, afterCopy: false,
+                            afterSave: false),
+                        frozen: frozen, screen: screen,
+                        dependencies: CaptureActionRouter.Dependencies(
+                            copyToClipboard: { _ in copies += 1 },
+                            autoSave: { _, _ in saves += 1 },
+                            saveAs: { _, _ in saves += 1 },
+                            pin: { _ in }, ocr: { _ in },
+                            openEditor: { _ in }, toast: { _ in },
+                            setLastCapture: { _ in },
+                            setLastAreaRect: { _ in },
+                            logEvent: { _ in }),
+                        completion: { _ in completions += 1 })
+                    else {
+                        liveEscFailures.append("overlay:no-overlay")
+                        return
+                    }
+                    defer { overlay.dismissForTesting() }
+                    guard let view = overlay.activeReviewViewForTesting,
+                          let window = view.window else {
+                        liveEscFailures.append("overlay:no-real-view")
+                        return
+                    }
+                    let selection = CGRect(
+                        x: 40, y: 40, width: 320, height: 240)
+                    view.selectForTesting(rect: selection)
+                    guard overlay.session.phase == .reviewing,
+                          let surface = view.annotationSurface else {
+                        liveEscFailures.append(
+                            "overlay:not-reviewing phase="
+                            + "\(overlay.session.phase) payloadFail="
+                            + String(describing:
+                                view.lastPayloadFailureForTesting))
+                        return
+                    }
+                    view.clickReviewToolbarButtonForTesting(
+                        tag: OverlayAnnotationTool.text.toolbarTag)
+                    let textPoint = CGPoint(
+                        x: selection.midX, y: selection.midY)
+                    view.annotationDragForTesting(
+                        from: textPoint, to: textPoint)
+                    guard surface.tool == .text,
+                          let field = view.textFieldForTesting,
+                          let editor = fieldEditorLive(
+                            field: field, window: window)
+                    else {
+                        liveEscFailures.append(
+                            "overlay:premise-field-editor-not-live phase="
+                            + "\(overlay.session.phase) firstResponder="
+                            + "\(String(describing: window.firstResponder)) "
+                            + "currentEditor="
+                            + "\(String(describing: view.textFieldForTesting?.currentEditor())) "
+                            + "payloadFail="
+                            + String(describing:
+                                view.lastPayloadFailureForTesting))
+                        return
+                    }
+                    _ = sendKey(
+                        "a", keyCode: 0, through: window,
+                        label: "overlay:type")
+                    guard editor.string == "a" else {
+                        liveEscFailures.append(
+                            "overlay:type-did-not-land text=\(editor.string)")
+                        return
+                    }
+                    let before = surface.annotations.count
+                    _ = sendKey(
+                        "\u{1b}", keyCode: 53, through: window,
+                        label: "overlay:esc1")
+                    let texts = surface.annotations.compactMap {
+                        $0 as? TextAnnotation
+                    }
+                    if view.textFieldForTesting != nil
+                        || field.currentEditor() != nil
+                        || window.firstResponder === editor
+                        || surface.tool != .select
+                        || overlay.session.phase != .reviewing
+                        || completions != 0
+                        || copies != 0 || saves != 0
+                        || surface.annotations.count != before + 1
+                        || uniqueAnnotationCount(surface.annotations)
+                            != surface.annotations.count
+                        || texts.count != 1
+                        || texts.first?.text != "a"
+                        || SelectionOverlay.current !== overlay
+                        || view.window !== window || !window.isVisible {
+                        liveEscFailures.append(
+                            "overlay:esc1 phase=\(overlay.session.phase) "
+                            + "tool=\(surface.tool) count="
+                            + "\(surface.annotations.count) unique="
+                            + "\(uniqueAnnotationCount(surface.annotations)) "
+                            + "field=\(view.textFieldForTesting != nil) "
+                            + "copies=\(copies)/saves=\(saves) "
+                            + "completions=\(completions) payloadFail="
+                            + String(describing:
+                                view.lastPayloadFailureForTesting))
+                    }
+                    if !surface.undo()
+                        || surface.annotations.count != before {
+                        liveEscFailures.append(
+                            "overlay:undo-not-once count="
+                            + "\(surface.annotations.count)")
+                    } else if !surface.redo()
+                        || surface.annotations.count != before + 1 {
+                        liveEscFailures.append("overlay:redo-lost-the-text")
+                    }
+                    _ = sendKey(
+                        "\u{1b}", keyCode: 53, through: window,
+                        label: "overlay:esc2")
+                    if overlay.session.phase != .completed
+                        || completions != 1 {
+                        liveEscFailures.append(
+                            "overlay:esc2 phase=\(overlay.session.phase) "
+                            + "completions=\(completions) payloadFail="
+                            + String(describing:
+                                view.lastPayloadFailureForTesting))
+                    }
+                }
+
+                @MainActor func runPanelLiveEsc() {
+                    guard let screen = NSScreen.screens.first else {
+                        liveEscFailures.append("panel:no-screen")
+                        return
+                    }
+                    guard ScrollResultPanel.current == nil,
+                          SelectionOverlay.current == nil else {
+                        liveEscFailures.append("panel:dirty-current")
+                        return
+                    }
+                    var copies = 0
+                    let panel = ScrollResultPanel.show(
+                        image: CapturedImage(
+                            cgImage: makeSolidImage(
+                                width: 600, height: 400,
+                                color: NSColor.white.cgColor),
+                            scale: 1),
+                        inputs: OverlaySessionInputs(
+                            afterShow: true, afterCopy: false,
+                            afterSave: false),
+                        screen: screen,
+                        dependencies: CaptureActionRouter.Dependencies(
+                            copyToClipboard: { _ in copies += 1 },
+                            autoSave: { _, _ in },
+                            saveAs: { _, _ in },
+                            pin: { _ in }, ocr: { _ in },
+                            openEditor: { _ in }, toast: { _ in },
+                            setLastCapture: { _ in },
+                            setLastAreaRect: { _ in },
+                            logEvent: { _ in }))
+                    defer { panel.dismissForTesting() }
+                    guard let host = panel.annotationHostForTesting else {
+                        liveEscFailures.append("panel:no-host")
+                        return
+                    }
+                    let surface = panel.annotationSurface
+                    panel.clickToolbarButtonForTesting(
+                        tag: OverlayAnnotationTool.text.toolbarTag)
+                    let textPoint = CGPoint(
+                        x: host.bounds.midX, y: host.bounds.midY)
+                    panel.drawWithRealEventsForTesting(
+                        fromView: textPoint, toView: textPoint)
+                    guard surface.tool == .text,
+                          host.textEditingActive,
+                          let field = host.textFieldForTesting,
+                          let editor = fieldEditorLive(
+                            field: field, window: panel)
+                    else {
+                        liveEscFailures.append(
+                            "panel:premise-field-editor-not-live "
+                            + "firstResponder="
+                            + "\(String(describing: panel.firstResponder)) "
+                            + "currentEditor="
+                            + String(describing:
+                                host.textFieldForTesting?.currentEditor()))
+                        return
+                    }
+                    _ = sendKey(
+                        "a", keyCode: 0, through: panel,
+                        label: "panel:type")
+                    guard editor.string == "a" else {
+                        liveEscFailures.append(
+                            "panel:type-did-not-land text=\(editor.string)")
+                        return
+                    }
+                    let before = surface.annotations.count
+                    _ = sendKey(
+                        "\u{1b}", keyCode: 53, through: panel,
+                        label: "panel:esc1")
+                    let texts = surface.annotations.compactMap {
+                        $0 as? TextAnnotation
+                    }
+                    if host.textFieldForTesting != nil
+                        || host.textEditingActive
+                        || panel.firstResponder === editor
+                        || surface.tool != .select
+                        || copies != 0
+                        || !panel.isVisible
+                        || ScrollResultPanel.current !== panel
+                        || surface.annotations.count != before + 1
+                        || uniqueAnnotationCount(surface.annotations)
+                            != surface.annotations.count
+                        || texts.count != 1
+                        || texts.first?.text != "a" {
+                        liveEscFailures.append(
+                            "panel:esc1 tool=\(surface.tool) count="
+                            + "\(surface.annotations.count) unique="
+                            + "\(uniqueAnnotationCount(surface.annotations)) "
+                            + "field=\(host.textFieldForTesting != nil) "
+                            + "visible=\(panel.isVisible) copies=\(copies)")
+                    }
+                    if !surface.undo()
+                        || surface.annotations.count != before {
+                        liveEscFailures.append(
+                            "panel:undo-not-once count="
+                            + "\(surface.annotations.count)")
+                    } else if !surface.redo()
+                        || surface.annotations.count != before + 1 {
+                        liveEscFailures.append("panel:redo-lost-the-text")
+                    }
+                    _ = sendKey(
+                        "\u{1b}", keyCode: 53, through: panel,
+                        label: "panel:esc2")
+                    if panel.isVisible
+                        || ScrollResultPanel.current != nil {
+                        liveEscFailures.append(
+                            "panel:esc2 visible=\(panel.isVisible) current="
+                            + "\(ScrollResultPanel.current != nil)")
+                    }
+                }
+
+                @MainActor func runEditorLiveEsc() {
+                    var copies = 0
+                    var saves = 0
+                    let wc = EditorWindowController.open(
+                        with: CapturedImage(
+                            cgImage: makeTestImage(
+                                width: 400, height: 300),
+                            scale: 1),
+                        forceFitForTesting: true)
+                    wc.terminalDependencies = EditorWindowController
+                        .TerminalDependencies(
+                            copyToClipboard: { _ in copies += 1 },
+                            saveAs: { _, _, _ in },
+                            autoSave: { _, done in saves += 1; done(nil) },
+                            pin: { _ in },
+                            recognize: { _, _ in })
+                    let canvas = wc.canvasForTesting
+                    let styleBefore = Settings.shared.escCopy
+                    let saveBefore = Settings.shared.escSave
+                    Settings.shared.escCopy = true
+                    Settings.shared.escSave = false
+                    defer {
+                        Settings.shared.escCopy = styleBefore
+                        Settings.shared.escSave = saveBefore
+                        wc.window?.close()
+                    }
+                    guard let window = wc.window else {
+                        liveEscFailures.append("editor:no-window")
+                        return
+                    }
+                    canvas.beginTextEditingForTesting(
+                        at: CGPoint(x: 40, y: 120))
+                    wc.documentWrapperForTesting?.layoutSubtreeIfNeeded()
+                    guard let field = canvas.textFieldForTesting else {
+                        liveEscFailures.append(
+                            "editor:premise-no-field")
+                        return
+                    }
+                    guard let editor = fieldEditorLive(
+                        field: field, window: window)
+                    else {
+                        liveEscFailures.append(
+                            "editor:premise-field-editor-not-live "
+                            + "firstResponder="
+                            + "\(String(describing: window.firstResponder)) "
+                            + "currentEditor="
+                            + "\(String(describing: field.currentEditor()))")
+                        return
+                    }
+                    _ = sendKey(
+                        "a", keyCode: 0, through: window,
+                        label: "editor:type")
+                    guard editor.string == "a"
+                            || field.stringValue == "a" else {
+                        liveEscFailures.append(
+                            "editor:type-did-not-land text="
+                            + "\(editor.string)/\(field.stringValue)")
+                        return
+                    }
+                    let before = canvas.annotationRefsForTesting.count
+                    let historyBefore = canvas.historyMutationCountForTesting
+                    _ = sendKey(
+                        "\u{1b}", keyCode: 53, through: window,
+                        label: "editor:esc")
+                    let after = canvas.annotationRefsForTesting
+                    let texts = after.compactMap { $0 as? TextAnnotation }
+                    if canvas.textFieldForTesting != nil
+                        || field.currentEditor() != nil
+                        || window.firstResponder === editor
+                        || wc.window?.isVisible != true
+                        || copies != 0 || saves != 0
+                        || after.count != before + 1
+                        || uniqueAnnotationCount(after) != after.count
+                        || texts.count != 1
+                        || texts.first?.text != "a"
+                        || canvas.historyMutationCountForTesting
+                            != historyBefore + 1 {
+                        liveEscFailures.append(
+                            "editor:esc count=\(after.count) unique="
+                            + "\(uniqueAnnotationCount(after)) history="
+                            + "\(canvas.historyMutationCountForTesting) "
+                            + "field=\(canvas.textFieldForTesting != nil) "
+                            + "visible=\(wc.window?.isVisible == true) "
+                            + "copies=\(copies)/saves=\(saves)")
+                    }
+                    canvas.undoManager?.undo()
+                    if canvas.annotationRefsForTesting.count != before {
+                        liveEscFailures.append(
+                            "editor:undo-not-once count="
+                            + "\(canvas.annotationRefsForTesting.count)")
+                    }
+                    if copies != 0 || saves != 0
+                        || wc.window?.isVisible != true {
+                        liveEscFailures.append(
+                            "editor:terminal-or-closed copies="
+                            + "\(copies)/saves=\(saves) visible="
+                            + "\(wc.window?.isVisible == true)")
+                    }
+                }
+
+                runOverlayLiveEsc()
+                runPanelLiveEsc()
+                runEditorLiveEsc()
+                check("overlay-escape-commits-live-field-once",
+                      !liveEscFailures.contains {
+                          $0.hasPrefix("overlay:")
+                      },
+                      liveEscFailures.filter {
+                          $0.hasPrefix("overlay:")
+                      }.joined(separator: " | "))
+                check("panel-escape-commits-live-field-once",
+                      !liveEscFailures.contains {
+                          $0.hasPrefix("panel:")
+                      },
+                      liveEscFailures.filter {
+                          $0.hasPrefix("panel:")
+                      }.joined(separator: " | "))
+                check("editor-escape-commits-live-field-once",
+                      !liveEscFailures.contains {
+                          $0.hasPrefix("editor:")
+                      },
+                      liveEscFailures.filter {
+                          $0.hasPrefix("editor:")
+                      }.joined(separator: " | "))
+            }
 
             // M. A retained area-review host is inert after its first real
             //    terminal Copy. `finish` cancels redactions BEFORE its
