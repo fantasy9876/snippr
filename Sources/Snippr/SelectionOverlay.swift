@@ -2355,7 +2355,8 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
     var textFieldForTesting: NSTextField? { textField }
 
     private lazy var textFieldDelegate = OverlayTextFieldDelegate(
-        onEnd: { [weak self] in self?.endTextEntry(commit: true) })
+        onEnd: { [weak self] in self?.endTextEntry(commit: true) },
+        onCancel: { [weak self] in self?.handleEscape() })
 
     /// The ONE cursor table for area mode, listed in the order `mouseDown`
     /// consults its branches — later entries win an overlap, which is also
@@ -2742,11 +2743,30 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
 
 /// Ends overlay text editing when the field resigns or Return is pressed —
 /// keeping Return inside the text field instead of the capture-terminal path.
+/// Escape is a separate command: the field editor swallows
+/// `cancelOperation` unless this delegate takes it, which is why Esc in a
+/// live overlay caption did nothing through 1.2.20.
 @MainActor
 final class OverlayTextFieldDelegate: NSObject, NSTextFieldDelegate {
     private let onEnd: @MainActor () -> Void
-    init(onEnd: @escaping @MainActor () -> Void) {
+    private let onCancel: @MainActor () -> Void
+    init(
+        onEnd: @escaping @MainActor () -> Void,
+        onCancel: @escaping @MainActor () -> Void
+    ) {
         self.onEnd = onEnd
+        self.onCancel = onCancel
+    }
+    func control(
+        _ control: NSControl,
+        textView: NSTextView,
+        doCommandBy commandSelector: Selector
+    ) -> Bool {
+        if commandSelector == #selector(NSResponder.cancelOperation(_:)) {
+            onCancel()
+            return true
+        }
+        return false
     }
     func controlTextDidEndEditing(_ obj: Notification) {
         onEnd()

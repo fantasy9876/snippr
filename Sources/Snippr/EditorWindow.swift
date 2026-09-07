@@ -2239,9 +2239,15 @@ final class EditorCanvasView: NSView, RedactionHost, RedactionSurfaceDelegate {
     fileprivate func commitTextEditing() {
         guard let field = textField, let ann = editingTextAnnotation else { return }
         let text = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        field.removeFromSuperview()
+        // Reentrancy: removing a first-responder field resigns it, which
+        // fires controlTextDidEndEditing → onEnd → commitTextEditing AGAIN.
+        // Fail-first 1.2.21 (editor-escape-commits-live-field-once) observed
+        // annotations.count=2 unique=1 history=2 on HEAD. Clear ivars
+        // BEFORE remove so the nested call sees nil — same invariant as
+        // SelectionOverlay.endTextEntry.
         textField = nil
         editingTextAnnotation = nil
+        field.removeFromSuperview()
         if !text.isEmpty {
             registerUndoSnapshot()
             ann.text = text
