@@ -225,6 +225,9 @@ final class ScrollResultPanel: NSPanel {
             guard let self else { return true }
             return self.saving || self.terminalActionClaimed
         }
+        host.onCancelTextEntry = { [weak self] in
+            self?.handleTextFieldEscape()
+        }
         // The surface repaints through the host, weakly, and a spotlight dims
         // the WHOLE source image rather than the visible slice.
         annotationSurface.redactionDelegate = host
@@ -343,6 +346,19 @@ final class ScrollResultPanel: NSPanel {
                 break
             }
         }
+    }
+
+    /// Esc while the caption field editor is first responder: commit (if
+    /// any) and return to Select in one press, same ladder as the area
+    /// overlay. The panel's own Esc keyDown never sees this key — the
+    /// field editor owns it — so without this hook the press is swallowed.
+    private func handleTextFieldEscape() {
+        if saving || terminalActionClaimed { return }
+        if annotationSurface.tool != .select {
+            selectAnnotationTool(.select)
+            return
+        }
+        annotationHost?.commitActiveTextEntry()
     }
 
     private func selectAnnotationTool(_ tool: OverlayAnnotationTool) {
@@ -654,6 +670,9 @@ final class AnnotationHostView: NSView, RedactionSurfaceDelegate {
     /// is frozen — the exported state must be exactly what the user saw when
     /// they pressed Save.
     var isLocked: @MainActor () -> Bool = { false }
+    /// Panel-owned: Esc in the live field must commit and return to Select
+    /// rather than dismiss. Wired by `ScrollResultPanel` after construction.
+    var onCancelTextEntry: (@MainActor () -> Void)?
 
     init(
         frame: CGRect, surface: AnnotationSurface, baseImage: CGImage,
@@ -847,7 +866,14 @@ final class AnnotationHostView: NSView, RedactionSurfaceDelegate {
     private var textField: NSTextField?
     private var textPixelOrigin: CGPoint = .zero
     private lazy var fieldDelegate = OverlayTextFieldDelegate(
-        onEnd: { [weak self] in self?.hostEndTextEntry(commit: true) })
+        onEnd: { [weak self] in self?.hostEndTextEntry(commit: true) },
+        onCancel: { [weak self] in
+            if let onCancel = self?.onCancelTextEntry {
+                onCancel()
+            } else {
+                self?.hostEndTextEntry(commit: true)
+            }
+        })
 
     var textEditingActive: Bool {
         guard let field = textField else { return false }
