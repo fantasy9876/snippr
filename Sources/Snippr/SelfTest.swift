@@ -19116,8 +19116,10 @@ enum SelfTest {
                     _ = sendKey(
                         "a", keyCode: 0, through: window,
                         label: "editor:type")
-                    guard editor.string == "a"
-                            || field.stringValue == "a" else {
+                    // Same as overlay/panel: editor.string only.
+                    // field.stringValue would pass when the key skipped
+                    // the live field editor — the seam this gate holds.
+                    guard editor.string == "a" else {
                         liveEscFailures.append(
                             "editor:type-did-not-land text="
                             + "\(editor.string)/\(field.stringValue)")
