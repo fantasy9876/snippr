@@ -111,7 +111,9 @@ sealed class ScrollShotSession
                 _registeredHotkeyIds.Add(spec.Id);
         }
         var failedIds = ScrollStopHookPolicy.FailedSpecIds(_registeredHotkeyIds);
-        if (failedIds.Length > 0)
+        // N6w: no sync ⇒ End() cannot Post off the hook proc (W-H3). Skip the
+        // LL fallback; RegisterHotKey still consumes what it got.
+        if (failedIds.Length > 0 && ScrollStopInvoke.CanInstallHook(_sync))
         {
             _stopHook = LowLevelScrollStopHook.TryInstall(
                 ApplyStop, failedIds, Native.GetAsyncKeyState);

@@ -1641,9 +1641,10 @@ static class Program
         if (ran != 1) f.Add("ui path did not run inline");
         if (sync.Posts != 0) f.Add("ui path posted");
 
-        ran = 0;
-        ScrollStopInvoke.Run(marshal: true, null, () => ran++);
-        if (ran != 1) f.Add("marshal true with no sync did not run");
+        if (ScrollStopInvoke.CanInstallHook(null))
+            f.Add("N6w null sync still allows a hook");
+        if (!ScrollStopInvoke.CanInstallHook(sync))
+            f.Add("N6w FakeSync cannot install a hook");
         return f;
     }
 

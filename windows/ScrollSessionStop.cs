@@ -193,6 +193,8 @@ public static class ScrollStopInvoke
     public const bool HookMarshals = true;
     public const bool UiMarshals = false;
 
+    public static bool CanInstallHook(SynchronizationContext? sync) => sync != null;
+
     public static void Run(bool marshal, SynchronizationContext? sync, Action go)
     {
         if (marshal && sync != null) sync.Post(_ => go(), null);
