@@ -26,13 +26,21 @@ final class ScrollingCapture {
     private var originScreen: NSScreen?
     private var finalized = false
     nonisolated(unsafe) private var finished = false
+    nonisolated(unsafe) private var cancelled = false
+    nonisolated(unsafe) private var quickCopyRequested = false
     private var borderWindow: NSWindow?
     private var controlPanel: NSPanel?
     private var progressLabel: NSTextField?
     var previewView: ScrollPreviewView?
     private var escLocalMonitor: Any?
-    private var escHotkeyRef: EventHotKeyRef?
-    private var escRegistered = false
+    private var sessionHotkeyRefs: [EventHotKeyRef] = []
+    private var hotkeysRegistered = false
+
+    enum StopAction {
+        case cancel
+        case finish
+        case quickCopy
+    }
 
     /// A single capture backend for a session. Keeping the fallback state
     /// explicit also prevents frames from two backends (which can differ by a
@@ -58,8 +66,14 @@ final class ScrollingCapture {
         return stitcher.canAccept(frame)
     }
 
-    /// "✓ / Esc để xong" khi Esc đăng ký được, nếu không thì chỉ còn nút ✓.
-    private var stopHint: String { escRegistered ? "✓ / Esc để xong" : "bấm ✓ để xong" }
+    /// Live hint when the session hotkeys registered; otherwise only ✓.
+    private var stopHint: String { Self.sessionStopHint(hotkeysRegistered: hotkeysRegistered) }
+
+    nonisolated static func sessionStopHint(hotkeysRegistered: Bool) -> String {
+        hotkeysRegistered
+            ? "Enter/✓ xong · ⌘C copy · Esc hủy"
+            : "bấm ✓ để xong"
+    }
 
     /// Identifier for the live-preview "✓ Xong" control. Gates look this up
     /// instead of filtering on the title string — a title match that finds
@@ -119,9 +133,18 @@ final class ScrollingCapture {
         removeStop()
         hideChrome()
         if ScrollingCapture.active === self { ScrollingCapture.active = nil }
+        let screen = originScreen ?? NSScreen.main ?? NSScreen.screens.first
+        if cancelled {
+            EventLog.append("scroll cancelled")
+            ToastHUD.show("Đã hủy chụp cuộn", symbol: "xmark.circle.fill")
+            onFinish(ScrollFinish(
+                image: nil, inputs: sessionInputs, screen: screen,
+                cancelled: true))
+            return
+        }
         onFinish(ScrollFinish(
-            image: image, inputs: sessionInputs,
-            screen: originScreen ?? NSScreen.main ?? NSScreen.screens.first))
+            image: image, inputs: sessionInputs, screen: screen,
+            quickCopy: quickCopyRequested))
     }
 
     func finalizeForTesting(image: CapturedImage?) {
@@ -130,8 +153,8 @@ final class ScrollingCapture {
 
     func run(screen: NSScreen, rect: CGRect) async {
         originScreen = screen
-        showChrome(screen: screen, rect: rect)
         installStop()
+        showChrome(screen: screen, rect: rect)
         defer {
             // safety net only — finalizeSession is the real teardown and has
             // already run on every exit path; these are idempotent
@@ -521,15 +544,35 @@ final class ScrollingCapture {
     // MARK: stop signals (Esc works globally via Carbon — no Accessibility needed)
 
     private func installStop() {
-        let hotKeyID = EventHotKeyID(signature: OSType(0x534E4553) /* 'SNES' */, id: Self.escHotkeyID)
-        let status = RegisterEventHotKey(
-            UInt32(kVK_Escape), 0, hotKeyID, GetApplicationEventTarget(), 0, &escHotkeyRef)
-        escRegistered = status == noErr && escHotkeyRef != nil
-        if !escRegistered {
-            NSLog("Snippr: could not register global Esc for scrolling capture (status \(status))")
+        // Consume, not observe: focus sits in the app being scrolled, so
+        // Enter/⌘C/Esc must not also fire there (submit a form, copy its
+        // selection, dismiss a sheet). Carbon RegisterEventHotKey swallows
+        // the chord; the local monitor returns nil. Unregister at teardown.
+        let specs: [(UInt32, UInt32, UInt32)] = [
+            (UInt32(kVK_Escape), 0, Self.escHotkeyID),
+            (UInt32(kVK_Return), 0, Self.returnHotkeyID),
+            (UInt32(kVK_ANSI_KeypadEnter), 0, Self.keypadEnterHotkeyID),
+            (UInt32(kVK_ANSI_C), UInt32(cmdKey), Self.copyHotkeyID),
+        ]
+        var registered = 0
+        for (keyCode, modifiers, id) in specs {
+            var ref: EventHotKeyRef?
+            let hotKeyID = EventHotKeyID(
+                signature: OSType(0x534E4553) /* 'SNES' */, id: id)
+            let status = RegisterEventHotKey(
+                keyCode, modifiers, hotKeyID,
+                GetApplicationEventTarget(), 0, &ref)
+            if status == noErr, let ref {
+                sessionHotkeyRefs.append(ref)
+                registered += 1
+            } else {
+                NSLog("Snippr: could not register scroll hotkey id=\(id) (status \(status))")
+            }
         }
+        hotkeysRegistered = registered > 0
         HotkeyManager.shared.auxHandler = { [weak self] id in
-            if id == Self.escHotkeyID { self?.finished = true }
+            guard let self, let action = Self.stopAction(forHotkeyID: id) else { return }
+            self.applyStopAction(action)
         }
         escLocalMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard let self else { return event }
@@ -537,24 +580,62 @@ final class ScrollingCapture {
         }
     }
 
-    /// Production key interpreter used by the local monitor (and, after the
-    /// session hotkeys land, by the Carbon auxHandler mapping). Gates
+    nonisolated static func stopAction(forHotkeyID id: UInt32) -> StopAction? {
+        switch id {
+        case escHotkeyID: return .cancel
+        case returnHotkeyID, keypadEnterHotkeyID: return .finish
+        case copyHotkeyID: return .quickCopy
+        default: return nil
+        }
+    }
+
+    static func stopAction(for event: NSEvent) -> StopAction? {
+        let chord = event.modifierFlags.intersection([.command, .option, .control])
+        switch event.keyCode {
+        case UInt16(kVK_Escape) where chord.isEmpty:
+            return .cancel
+        case UInt16(kVK_Return), UInt16(kVK_ANSI_KeypadEnter):
+            return chord.isEmpty ? .finish : nil
+        case UInt16(kVK_ANSI_C)
+            where event.modifierFlags.contains(.command)
+                && !event.modifierFlags.contains(.option)
+                && !event.modifierFlags.contains(.control)
+                && !event.modifierFlags.contains(.shift):
+            return .quickCopy
+        default:
+            return nil
+        }
+    }
+
+    private func applyStopAction(_ action: StopAction) {
+        switch action {
+        case .cancel:
+            cancelled = true
+            finished = true
+        case .finish:
+            finished = true
+        case .quickCopy:
+            quickCopyRequested = true
+            finished = true
+        }
+    }
+
+    /// Production key interpreter used by the local monitor. Carbon IDs
+    /// map through `stopAction(forHotkeyID:)` onto the same actions. Gates
     /// construct a real NSEvent and call this — not `finishForTesting`.
     @discardableResult
     func handleSessionKeyEvent(_ event: NSEvent) -> Bool {
-        if event.keyCode == UInt16(kVK_Escape) {
-            finished = true
-            return true
-        }
-        return false
+        guard let action = Self.stopAction(for: event) else { return false }
+        applyStopAction(action)
+        return true
     }
 
     private func removeStop() {
-        if let ref = escHotkeyRef {
+        for ref in sessionHotkeyRefs {
             UnregisterEventHotKey(ref)
-            escHotkeyRef = nil
         }
-        escRegistered = false
+        sessionHotkeyRefs.removeAll()
+        hotkeysRegistered = false
         HotkeyManager.shared.auxHandler = nil
         if let m = escLocalMonitor {
             NSEvent.removeMonitor(m)
@@ -683,9 +764,11 @@ final class ScrollingCapture {
         container.layer?.cornerRadius = 12
 
         let label = NSTextField(wrappingLabelWithString:
-            "\(Self.bidirectionalScrollHint) · ảnh ghép hiện tại đây")
+            "\(Self.bidirectionalScrollHint) · \(stopHint)")
         label.font = .systemFont(ofSize: 11.5, weight: .semibold)
         label.textColor = .white
+        label.identifier = NSUserInterfaceItemIdentifier(Self.hintLabelIdentifier)
+        label.setAccessibilityIdentifier(Self.hintLabelIdentifier)
         progressLabel = label
 
         let doneFont = NSFont.systemFont(ofSize: 12, weight: .semibold)

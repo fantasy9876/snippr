@@ -34,7 +34,24 @@ enum ScrollResultPresenter {
         dependencies: CaptureActionRouter.Dependencies? = nil,
         afterScrollShow: AfterScrollShow = Settings.shared.afterScrollShow
     ) {
+        if finish.cancelled { return }
         guard let image = finish.image else { return }
+        if finish.quickCopy {
+            // Snapshot-at-begin: force copy, skip Editor/panel, keep afterSave.
+            var inputs = finish.inputs
+            inputs.afterCopy = true
+            inputs.afterShow = false
+            var deps = dependencies ?? .live
+            if !inputs.afterSave {
+                let baseToast = deps.toast
+                deps.toast = { _ in baseToast("Đã copy") }
+            }
+            CaptureActionRouter.commit(
+                image, source: .scrollResult, intent: .scrollFinished,
+                inputs: inputs, finalGlobalRect: nil,
+                dependencies: deps)
+            return
+        }
         // No screen = no presentation possible. The router must then treat
         // the commit as HEADLESS (effective afterShow=false, same
         // copy/save snapshot): with afterShow=true it would suppress the
