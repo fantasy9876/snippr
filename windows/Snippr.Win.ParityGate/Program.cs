@@ -39,6 +39,7 @@ static class Program
         failed += Check("win-ocr-panel-never-covers-region", OcrPanelPlacementGate());
         failed += Check("win-translate-failure-kinds", TranslateFailureKinds());
         failed += Check("win-translate-request-keeps-source", TranslateRequestKeepsSource());
+        failed += Check("win-scroll-session-stop-semantics", ScrollSessionStopSemantics());
         if (pending > 0)
             Console.WriteLine($"{pending} PARITY GATE(S) PENDING — not a pass");
         Console.WriteLine(failed == 0
@@ -1449,6 +1450,85 @@ static class Program
         var stacked = Fake(TranslateService.RequestText("", first), "en");
         if (stacked != "[en] [vi] hello")
             f.Add($"empty-source oracle '{stacked}'");
+        return f;
+    }
+
+    /// Honey H2: Windows Esc used to Finish the stitch ("✓ / Esc để xong").
+    /// macOS 1.2.22 maps Esc→cancel, Enter→finish, ⌘C→quickcopy. This gate
+    /// pins the Windows table to the same meanings (Ctrl+C instead of ⌘C)
+    /// so the platforms cannot diverge silently again.
+    ///
+    /// The expected rows are literals independent of the production table:
+    /// swapping Esc/Return IDs in `ScrollSessionStop.Specs` must go red.
+    static List<string> ScrollSessionStopSemantics()
+    {
+        var f = new List<string>();
+        var want = new (uint Vk, uint Mods, int Id)[]
+        {
+            (0x1B, 0, 1000),
+            (0x0D, 0, 1001),
+            (0x43, 0x0002, 1002),
+        };
+        if (ScrollSessionStop.Specs.Length != want.Length)
+            f.Add($"spec count {ScrollSessionStop.Specs.Length} want {want.Length}");
+        for (int i = 0; i < want.Length && i < ScrollSessionStop.Specs.Length; i++)
+        {
+            var got = ScrollSessionStop.Specs[i];
+            if (got.Vk != want[i].Vk || got.Mods != want[i].Mods || got.Id != want[i].Id)
+                f.Add($"spec[{i}] ({got.Vk},{got.Mods},{got.Id}) want {want[i]}");
+        }
+
+        if (ScrollSessionStop.ForHotkeyId(1000) != ScrollStopAction.Cancel)
+            f.Add("Esc id is not cancel");
+        if (ScrollSessionStop.ForHotkeyId(1001) != ScrollStopAction.Finish)
+            f.Add("Return id is not finish");
+        if (ScrollSessionStop.ForHotkeyId(1002) != ScrollStopAction.QuickCopy)
+            f.Add("Ctrl+C id is not quickcopy");
+        if (ScrollSessionStop.ForKey(0x1B, 0) == ScrollStopAction.Finish)
+            f.Add("H2 Esc still finishes");
+        if (ScrollSessionStop.ForKey(0x1B, 0) != ScrollStopAction.Cancel)
+            f.Add("Esc key is not cancel");
+        if (ScrollSessionStop.ForKey(0x0D, 0) != ScrollStopAction.Finish)
+            f.Add("Enter key is not finish");
+        if (ScrollSessionStop.ForKey(0x43, 0x0002) != ScrollStopAction.QuickCopy)
+            f.Add("Ctrl+C key is not quickcopy");
+        if (ScrollSessionStop.ForKey(0x1B, ScrollSessionStop.ModShift) != null)
+            f.Add("Shift+Esc should miss (mods=0)");
+        if (ScrollSessionStop.ForKey(0x0D, ScrollSessionStop.ModShift) != null)
+            f.Add("Shift+Enter should miss");
+        if (ScrollSessionStop.ForKey(0x43, 0) != null)
+            f.Add("C without Ctrl should miss");
+
+        var hint = ScrollSessionStop.SessionStopHint(true);
+        if (hint != "Enter/✓ xong · Ctrl+C copy · Esc hủy")
+            f.Add($"hint '{hint}'");
+        if (hint.Contains("Esc để xong", StringComparison.Ordinal))
+            f.Add("hint still says Esc finishes");
+        var fallback = ScrollSessionStop.SessionStopHint(false);
+        if (fallback != "bấm ✓ để xong")
+            f.Add($"fallback hint '{fallback}'");
+
+        var qcSave = ScrollSessionStop.EffectiveActions(true, false, true, true);
+        if (!qcSave.Copy || qcSave.Show || !qcSave.Save)
+            f.Add($"quickcopy+save {qcSave.Copy}/{qcSave.Show}/{qcSave.Save}");
+        var qc = ScrollSessionStop.EffectiveActions(true, false, true, false);
+        if (!qc.Copy || qc.Show || qc.Save)
+            f.Add($"quickcopy {qc.Copy}/{qc.Show}/{qc.Save}");
+        var normal = ScrollSessionStop.EffectiveActions(false, false, true, false);
+        if (normal.Copy || !normal.Show || normal.Save)
+            f.Add($"finish snapshot {normal.Copy}/{normal.Show}/{normal.Save}");
+
+        var flags = new ScrollStopFlags();
+        ScrollSessionStop.Apply(ScrollStopAction.QuickCopy, ref flags);
+        ScrollSessionStop.Apply(ScrollStopAction.Cancel, ref flags);
+        if (!flags.Cancelled || !flags.QuickCopy || !flags.Finished)
+            f.Add("cancel after quickcopy dropped a flag");
+
+        var progress = ScrollSessionStop.StitchingProgressText(1234, true);
+        if (!progress.Contains("cuộn tiếp · ", StringComparison.Ordinal))
+            f.Add($"progress missing cuộn tiếp '{progress}'");
+        if (progress.Contains("xong Esc", StringComparison.Ordinal))
+            f.Add($"progress still has xong next to Esc '{progress}'");
         return f;
     }
 }
