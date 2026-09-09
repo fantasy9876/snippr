@@ -174,14 +174,16 @@ public sealed class ScrollStopMachine
     }
 }
 
-/// Named finish flags so swapping two bools is a compile error (Honey N8w).
+/// Named finish flags so swapping two bools is a compile error (Honey N8w)
+/// and omitting one is too (Honey P3) — `required` refuses the implicit
+/// `false` that used to swallow a forgotten QuickCopy (Sol's survivor).
 public readonly struct ScrollFinishInputs
 {
-    public bool Cancelled { get; init; }
-    public bool QuickCopy { get; init; }
-    public bool AfterCopy { get; init; }
-    public bool AfterShow { get; init; }
-    public bool AfterSave { get; init; }
+    public required bool Cancelled { get; init; }
+    public required bool QuickCopy { get; init; }
+    public required bool AfterCopy { get; init; }
+    public required bool AfterShow { get; init; }
+    public required bool AfterSave { get; init; }
 }
 
 /// Dispatch helper. LL hook must marshal (`true`); timer / ✓ / WM_HOTKEY run

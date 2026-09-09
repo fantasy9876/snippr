@@ -201,26 +201,37 @@ sealed class TrayContext : ApplicationContext
     void StartScrollShot()
     {
         if (CaptureBusy) return;
-        ScrollShotSession.Begin(finish =>
-        {
-            var actions = ScrollStopMachine.RouteFinish(new ScrollFinishInputs
-            {
-                Cancelled = finish.Cancelled,
-                QuickCopy = finish.QuickCopy,
-                AfterCopy = finish.AfterCopy,
-                AfterShow = finish.AfterShow,
-                AfterSave = finish.AfterSave,
-            });
-            if (actions is not { } route)
-            {
-                finish.Image?.Dispose();
-                if (finish.Cancelled) ToastForm.Show("Đã hủy chụp cuộn");
-                return;
-            }
-            if (finish.Image == null) return;
-            HandleResult(finish.Image, route.Copy, route.Show, route.Save);
-        });
+        ScrollShotSession.Begin(OnScrollFinished);
     }
+
+    /// Production finish callback. `--test-shot` calls this with the finish
+    /// the live session just produced — same method the tray registers.
+    internal static void OnScrollFinished(ScrollShotFinish finish)
+    {
+        ScrollFinishCalledForTesting = true;
+        LastScrollRouteForTesting = ScrollStopMachine.RouteFinish(new ScrollFinishInputs
+        {
+            Cancelled = finish.Cancelled,
+            QuickCopy = finish.QuickCopy,
+            AfterCopy = finish.AfterCopy,
+            AfterShow = finish.AfterShow,
+            AfterSave = finish.AfterSave,
+        });
+        if (LastScrollRouteForTesting is not { } route)
+        {
+            finish.Image?.Dispose();
+            if (finish.Cancelled) ToastForm.Show("Đã hủy chụp cuộn");
+            return;
+        }
+        if (finish.Image == null) return;
+        HandleResult(finish.Image, route.Copy, route.Show, route.Save);
+    }
+
+    /// Observation of `OnScrollFinished`. Reset by smoke before each session
+    /// so a skipped callback cannot reuse the last route — Esc's success is
+    /// a null route, which would otherwise look the same as "never called".
+    internal static bool ScrollFinishCalledForTesting { get; set; }
+    internal static ScrollFinishActions? LastScrollRouteForTesting { get; set; }
 
     void RecognizeTextArea()
     {
@@ -318,7 +329,7 @@ sealed class TrayContext : ApplicationContext
         HandleResult(shot, s.AfterCopy, s.AfterShow, s.AfterSave);
     }
 
-    void HandleResult(Bitmap shot, bool afterCopy, bool afterShow, bool afterSave)
+    static void HandleResult(Bitmap shot, bool afterCopy, bool afterShow, bool afterSave)
     {
         var actions = new List<string>();
         bool preserved = false; // the shot reached the clipboard, a file, or the editor
