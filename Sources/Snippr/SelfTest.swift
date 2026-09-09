@@ -2028,7 +2028,7 @@ enum SelfTest {
                     let composesBefore = segmented.fullComposeCount
                     let materializesBefore = MaterializeSpy.count
                     session.applyStitchOutcome(
-                        outcome, stitcher: segmented, stopHint: "test")
+                        outcome, stitcher: segmented)
                     if segmented.fullComposeCount != composesBefore
                         || MaterializeSpy.count != materializesBefore {
                         previewSpyClean = false
@@ -2101,7 +2101,7 @@ enum SelfTest {
                     let outcome = segmented.append(frame)
                     if case .appended = outcome { appends += 1 }
                     session.applyStitchOutcome(
-                        outcome, stitcher: segmented, stopHint: "test")
+                        outcome, stitcher: segmented)
                 }
                 let wantRows = Int(CGFloat(620) * 400.0 / 5120.0)
                 let incremental = session.previewImageForTesting?.height ?? -1
@@ -2170,7 +2170,7 @@ enum SelfTest {
                     }
                     let outcome = segmented.append(frame)
                     session.applyStitchOutcome(
-                        outcome, stitcher: segmented, stopHint: "test")
+                        outcome, stitcher: segmented)
                     if isLast, case .moved = outcome {} else if isLast {
                         allExact = false // blink frame must be a retrace
                     }
@@ -2251,7 +2251,7 @@ enum SelfTest {
                         let outcome = segmented.append(frame)
                         if case .startedSegment = outcome { sawSegment = true }
                         session.applyStitchOutcome(
-                            outcome, stitcher: segmented, stopHint: "test")
+                            outcome, stitcher: segmented)
                     }
                     let omitBefore = segmented.totalHeight
                     guard sawSegment,
@@ -2273,7 +2273,7 @@ enum SelfTest {
                         expectedOutcome = false
                     }
                     session.applyStitchOutcome(
-                        outcome, stitcher: segmented, stopHint: "test")
+                        outcome, stitcher: segmented)
                     // totalHeight must have grown by the outcome's rows PLUS
                     // the restored header — that surplus is the revocation.
                     let revoked = segmented.totalHeight - omitBefore
@@ -2380,7 +2380,7 @@ enum SelfTest {
                     default: break
                     }
                     session.applyStitchOutcome(
-                        outcome, stitcher: segmented, stopHint: "test")
+                        outcome, stitcher: segmented)
                 }
                 let incremental = session.previewImageForTesting?.height ?? -1
                 let rebuilt = segmented.previewWindowImage(
@@ -5758,6 +5758,26 @@ enum SelfTest {
                         fire: .nsEvent(ret), show: .editor, label: "", into: &g1)
                     runEnterFinish(
                         fire: .nsEvent(ret), show: .panel, label: "", into: &g1)
+                    // M11: keypad Enter reached `stopAction(for:)` through no
+                    // gate at all — only the Carbon ID path was covered, so
+                    // dropping `kVK_ANSI_KeypadEnter` from the NSEvent table
+                    // stayed green while the key went dead whenever a Snippr
+                    // window was key. A real keypad event carries .numericPad.
+                    if let keypad = sessionKey(
+                        "\u{3}", keyCode: UInt16(kVK_ANSI_KeypadEnter),
+                        modifiers: .numericPad
+                    ) {
+                        if keypad.keyCode != UInt16(kVK_ANSI_KeypadEnter)
+                            || !keypad.modifierFlags.contains(.numericPad) {
+                            g1.append(
+                                "premise-keypad-malformed key=\(keypad.keyCode)")
+                        }
+                        runEnterFinish(
+                            fire: .nsEvent(keypad), show: .editor,
+                            label: "keypad-nsevent", into: &g1)
+                    } else {
+                        g1.append("keypad-event-nil")
+                    }
                     check("enter-finishes-scroll-session",
                           g1.isEmpty, g1.joined(separator: "; "))
                 }
@@ -5849,15 +5869,26 @@ enum SelfTest {
                     if esc.keyCode != 53 {
                         g2.append("premise-event-malformed key=\(esc.keyCode)")
                     }
+                    // N5: `if let … , cond` swallows a nil event — the
+                    // assertion would vanish silently. Guard like the plain
+                    // Esc case above.
                     if let shiftEsc = sessionKey(
                         "\u{1b}", keyCode: 53, modifiers: .shift
-                    ), ScrollingCapture.stopAction(for: shiftEsc) != nil {
-                        g2.append("shift-esc-consumed")
+                    ) {
+                        if ScrollingCapture.stopAction(for: shiftEsc) != nil {
+                            g2.append("shift-esc-consumed")
+                        }
+                    } else {
+                        g2.append("shift-esc-event-nil")
                     }
                     if let shiftRet = sessionKey(
                         "\r", keyCode: 36, modifiers: .shift
-                    ), ScrollingCapture.stopAction(for: shiftRet) != nil {
-                        g2.append("shift-return-consumed")
+                    ) {
+                        if ScrollingCapture.stopAction(for: shiftRet) != nil {
+                            g2.append("shift-return-consumed")
+                        }
+                    } else {
+                        g2.append("shift-return-event-nil")
                     }
                     runEscCancel(fire: .nsEvent(esc), label: "", into: &g2)
                     check("esc-cancels-scroll-no-result",
@@ -6039,16 +6070,47 @@ enum SelfTest {
                     if !progress.contains("cuộn tiếp · \(wantHotkey)") {
                         g4.append("progress:\(progress)")
                     }
-                    session.updateProgressForTesting(progress)
-                    if liveLabel.stringValue != progress {
-                        g4.append(
-                            "progress-label \(liveLabel.stringValue)")
-                    }
                     let up = ScrollingCapture.stitchingProgressText(
                         points: 1234, connectingUp: true,
                         hotkeysRegistered: true)
                     if !up.contains("(nối lên trên) — cuộn tiếp · \(wantHotkey)") {
                         g4.append("progress-up:\(up)")
+                    }
+                    // M10: the PRODUCTION call site must compose the live
+                    // line. Pushing a string the gate built through a
+                    // `updateProgressForTesting(_ text:)` write seam only
+                    // proved the label plumbing — reverting `applyStitchOutcome`
+                    // to the old inline "…, xong \(stopHint)" stayed green.
+                    // Drive the same function the capture loop calls and read
+                    // the rendered chrome.
+                    let stitchFrame = makeSolidImage(
+                        width: 40, height: 120, color: NSColor.systemTeal.cgColor)
+                    let segmented = SegmentedVerticalStitcher(
+                        first: stitchFrame, scale: 1)
+                    session.startPreviewForTesting(with: stitchFrame)
+                    let points = Int(CGFloat(segmented.totalHeight) / segmented.scale)
+                    session.applyStitchOutcome(.appended(0), stitcher: segmented)
+                    let wantAppended = ScrollingCapture.stitchingProgressText(
+                        points: points, connectingUp: false,
+                        hotkeysRegistered: true)
+                    if liveLabel.stringValue != wantAppended {
+                        g4.append("appended-call-site:\(liveLabel.stringValue)")
+                    }
+                    session.applyStitchOutcome(.prepended(0), stitcher: segmented)
+                    let wantPrepended = ScrollingCapture.stitchingProgressText(
+                        points: points, connectingUp: true,
+                        hotkeysRegistered: true)
+                    if liveLabel.stringValue != wantPrepended {
+                        g4.append("prepended-call-site:\(liveLabel.stringValue)")
+                    }
+                    // Literal guard on the RENDERED text, so the call-site
+                    // assertion can still fail if the formatter is changed
+                    // to match a bad call site.
+                    for rendered in [wantAppended, wantPrepended] {
+                        if rendered.contains(", xong ")
+                            || rendered.contains("xong Enter") {
+                            g4.append("rendered-xong-prefix:\(rendered)")
+                        }
                     }
                     session.removeStopForTesting()
                     session.hideChromeForTesting()

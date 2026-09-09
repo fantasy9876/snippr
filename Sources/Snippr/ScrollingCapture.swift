@@ -295,9 +295,7 @@ final class ScrollingCapture {
             if changed {
                 lastHash = hash
                 if let s = stitcher {
-                    applyStitchOutcome(
-                        s.append(frame.cgImage), stitcher: s,
-                        stopHint: stopHint)
+                    applyStitchOutcome(s.append(frame.cgImage), stitcher: s)
                     if CGFloat(s.totalHeight) >= maxHeightPx { break }
                 } else {
                     stitcher = SegmentedVerticalStitcher(
@@ -419,8 +417,7 @@ final class ScrollingCapture {
     /// with spies on full composes and pixel materializations.
     func applyStitchOutcome(
         _ outcome: SegmentedVerticalStitcher.AppendOutcome,
-        stitcher s: SegmentedVerticalStitcher,
-        stopHint: String
+        stitcher s: SegmentedVerticalStitcher
     ) {
         switch outcome {
         case let .appended(rows):
@@ -684,7 +681,6 @@ final class ScrollingCapture {
     func lastInstallAttemptedSpecsForTesting() -> [(UInt32, UInt32, UInt32)] {
         lastInstallAttemptedSpecs
     }
-    func updateProgressForTesting(_ text: String) { updateProgress(text) }
 
     func chromeView(identifier: String) -> NSView? {
         func walk(_ view: NSView) -> NSView? {
