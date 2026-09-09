@@ -6089,29 +6089,33 @@ enum SelfTest {
                         first: stitchFrame, scale: 1)
                     session.startPreviewForTesting(with: stitchFrame)
                     let points = Int(CGFloat(segmented.totalHeight) / segmented.scale)
-                    session.applyStitchOutcome(.appended(0), stitcher: segmented)
-                    let wantAppended = ScrollingCapture.stitchingProgressText(
-                        points: points, connectingUp: false,
-                        hotkeysRegistered: true)
-                    if liveLabel.stringValue != wantAppended {
-                        g4.append("appended-call-site:\(liveLabel.stringValue)")
-                    }
-                    session.applyStitchOutcome(.prepended(0), stitcher: segmented)
-                    let wantPrepended = ScrollingCapture.stitchingProgressText(
-                        points: points, connectingUp: true,
-                        hotkeysRegistered: true)
-                    if liveLabel.stringValue != wantPrepended {
-                        g4.append("prepended-call-site:\(liveLabel.stringValue)")
-                    }
-                    // Literal guard on the RENDERED text, so the call-site
-                    // assertion can still fail if the formatter is changed
-                    // to match a bad call site.
-                    for rendered in [wantAppended, wantPrepended] {
-                        if rendered.contains(", xong ")
-                            || rendered.contains("xong Enter") {
-                            g4.append("rendered-xong-prefix:\(rendered)")
+                    // Two independent questions about the SAME rendered
+                    // string: does the call site produce what the formatter
+                    // says, and is the text itself free of the "xong … Esc"
+                    // shape? Checking the second on the expected value would
+                    // only re-test the formatter — it has to read the label,
+                    // or it cannot fail when both sides drift together.
+                    func checkRendered(want: String, _ tag: String) {
+                        if liveLabel.stringValue != want {
+                            g4.append("\(tag)-call-site:\(liveLabel.stringValue)")
+                        }
+                        if liveLabel.stringValue.contains(", xong ")
+                            || liveLabel.stringValue.contains("xong Enter") {
+                            g4.append("\(tag)-rendered-xong:\(liveLabel.stringValue)")
                         }
                     }
+                    session.applyStitchOutcome(.appended(0), stitcher: segmented)
+                    checkRendered(
+                        want: ScrollingCapture.stitchingProgressText(
+                            points: points, connectingUp: false,
+                            hotkeysRegistered: true),
+                        "appended")
+                    session.applyStitchOutcome(.prepended(0), stitcher: segmented)
+                    checkRendered(
+                        want: ScrollingCapture.stitchingProgressText(
+                            points: points, connectingUp: true,
+                            hotkeysRegistered: true),
+                        "prepended")
                     session.removeStopForTesting()
                     session.hideChromeForTesting()
                     check("scroll-session-stop-hint",
