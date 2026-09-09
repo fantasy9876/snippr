@@ -9,7 +9,25 @@ import Carbon.HIToolbox
 final class ScrollingCapture {
     static var active: ScrollingCapture?
 
-    static let escHotkeyID: UInt32 = 999
+    nonisolated static let escHotkeyID: UInt32 = 999
+    nonisolated static let returnHotkeyID: UInt32 = 1000
+    nonisolated static let keypadEnterHotkeyID: UInt32 = 1001
+    nonisolated static let copyHotkeyID: UInt32 = 1002
+
+    /// Physical key → Carbon hotkey ID for the live scroll session.
+    /// `installStop()` registers exactly this table; gates read it so a
+    /// swap of Esc/Return IDs cannot hide behind the auxHandler seam.
+    nonisolated static let sessionHotkeySpecs: [(UInt32, UInt32, UInt32)] = [
+        (UInt32(kVK_Escape), 0, escHotkeyID),
+        (UInt32(kVK_Return), 0, returnHotkeyID),
+        (UInt32(kVK_ANSI_KeypadEnter), 0, keypadEnterHotkeyID),
+        (UInt32(kVK_ANSI_C), UInt32(cmdKey), copyHotkeyID),
+    ]
+
+    /// Identifier for the live-preview hint label. Gates look this up
+    /// instead of scanning title strings — a substring match that finds
+    /// zero labels would go green without reading the chrome.
+    static let hintLabelIdentifier = "scroll.chrome.hint"
 
     private let onFinish: @MainActor (ScrollFinish) -> Void
     /// Snapshotted at begin(): a Settings change while the user scrolls must
@@ -18,13 +36,24 @@ final class ScrollingCapture {
     private var originScreen: NSScreen?
     private var finalized = false
     nonisolated(unsafe) private var finished = false
+    nonisolated(unsafe) private var cancelled = false
+    nonisolated(unsafe) private var quickCopyRequested = false
     private var borderWindow: NSWindow?
     private var controlPanel: NSPanel?
     private var progressLabel: NSTextField?
     var previewView: ScrollPreviewView?
     private var escLocalMonitor: Any?
-    private var escHotkeyRef: EventHotKeyRef?
-    private var escRegistered = false
+    private var sessionHotkeyRefs: [EventHotKeyRef] = []
+    private var hotkeysRegistered = false
+    /// Specs `installStop()` actually walked. Gates compare this to
+    /// `sessionHotkeySpecs` so a local duplicate table cannot hide a swap.
+    private var lastInstallAttemptedSpecs: [(UInt32, UInt32, UInt32)] = []
+
+    enum StopAction {
+        case cancel
+        case finish
+        case quickCopy
+    }
 
     /// A single capture backend for a session. Keeping the fallback state
     /// explicit also prevents frames from two backends (which can differ by a
@@ -50,8 +79,24 @@ final class ScrollingCapture {
         return stitcher.canAccept(frame)
     }
 
-    /// "✓ / Esc để xong" khi Esc đăng ký được, nếu không thì chỉ còn nút ✓.
-    private var stopHint: String { escRegistered ? "✓ / Esc để xong" : "bấm ✓ để xong" }
+    /// Live hint when the session hotkeys registered; otherwise only ✓.
+    private var stopHint: String { Self.sessionStopHint(hotkeysRegistered: hotkeysRegistered) }
+
+    nonisolated static func sessionStopHint(hotkeysRegistered: Bool) -> String {
+        hotkeysRegistered
+            ? "Enter/✓ xong · ⌘C copy · Esc hủy"
+            : "bấm ✓ để xong"
+    }
+
+    /// Live stitching line. Do not prefix with "xong " — that sat next to
+    /// "Esc hủy" and read as if Esc still finished the capture.
+    nonisolated static func stitchingProgressText(
+        points: Int, connectingUp: Bool, hotkeysRegistered: Bool
+    ) -> String {
+        let suffix = connectingUp ? " (nối lên trên)" : ""
+        return "Đã ghép \(points) pt\(suffix) — cuộn tiếp · "
+            + sessionStopHint(hotkeysRegistered: hotkeysRegistered)
+    }
 
     /// Identifier for the live-preview "✓ Xong" control. Gates look this up
     /// instead of filtering on the title string — a title match that finds
@@ -111,9 +156,18 @@ final class ScrollingCapture {
         removeStop()
         hideChrome()
         if ScrollingCapture.active === self { ScrollingCapture.active = nil }
+        let screen = originScreen ?? NSScreen.main ?? NSScreen.screens.first
+        if cancelled {
+            EventLog.append("scroll cancelled")
+            ToastHUD.show("Đã hủy chụp cuộn", symbol: "xmark.circle.fill")
+            onFinish(ScrollFinish(
+                image: nil, inputs: sessionInputs, screen: screen,
+                cancelled: true))
+            return
+        }
         onFinish(ScrollFinish(
-            image: image, inputs: sessionInputs,
-            screen: originScreen ?? NSScreen.main ?? NSScreen.screens.first))
+            image: image, inputs: sessionInputs, screen: screen,
+            quickCopy: quickCopyRequested))
     }
 
     func finalizeForTesting(image: CapturedImage?) {
@@ -122,8 +176,8 @@ final class ScrollingCapture {
 
     func run(screen: NSScreen, rect: CGRect) async {
         originScreen = screen
-        showChrome(screen: screen, rect: rect)
         installStop()
+        showChrome(screen: screen, rect: rect)
         defer {
             // safety net only — finalizeSession is the real teardown and has
             // already run on every exit path; these are idempotent
@@ -195,7 +249,7 @@ final class ScrollingCapture {
                     captureFailures = 0
                     backendNeedsHandshake = stitcher != nil
                     stitcher?.prepareForBackendTransition()
-                    updateProgress("Đang dùng chế độ tương thích — cuộn tiếp, xong \(stopHint)")
+                    updateProgress("Đang dùng chế độ tương thích — cuộn tiếp · \(stopHint)")
                     NSLog("Snippr: sourceRect capture failed repeatedly — switching to full-display crop")
                 } else if captureFailures > 10 {
                     break
@@ -390,16 +444,20 @@ final class ScrollingCapture {
                 appendPreview(s.lastSlice)
             }
             updateProgress(
-                "Đã ghép \(Int(CGFloat(s.totalHeight) / s.scale)) pt "
-                + "— cuộn tiếp, xong \(stopHint)")
+                Self.stitchingProgressText(
+                    points: Int(CGFloat(s.totalHeight) / s.scale),
+                    connectingUp: false,
+                    hotkeysRegistered: hotkeysRegistered))
         case .prepended:
             // Always rebuild: the incremental paste-on-top path cannot
             // represent separators or completed segments above the current
             // one, and the bounded window render is cheap.
             rebuildPreview(from: s, pinToTop: true)
             updateProgress(
-                "Đã ghép \(Int(CGFloat(s.totalHeight) / s.scale)) pt "
-                + "(nối lên trên) — cuộn tiếp, xong \(stopHint)")
+                Self.stitchingProgressText(
+                    points: Int(CGFloat(s.totalHeight) / s.scale),
+                    connectingUp: true,
+                    hotkeysRegistered: hotkeysRegistered))
         case .moved:
             // A retrace adds no rows, but an accepted frame can still revoke
             // a header omit and raise totalHeight — resync the preview at the
@@ -513,31 +571,99 @@ final class ScrollingCapture {
     // MARK: stop signals (Esc works globally via Carbon — no Accessibility needed)
 
     private func installStop() {
-        let hotKeyID = EventHotKeyID(signature: OSType(0x534E4553) /* 'SNES' */, id: Self.escHotkeyID)
-        let status = RegisterEventHotKey(
-            UInt32(kVK_Escape), 0, hotKeyID, GetApplicationEventTarget(), 0, &escHotkeyRef)
-        escRegistered = status == noErr && escHotkeyRef != nil
-        if !escRegistered {
-            NSLog("Snippr: could not register global Esc for scrolling capture (status \(status))")
+        // Consume, not observe: focus sits in the app being scrolled, so
+        // Enter/⌘C/Esc must not also fire there (submit a form, copy its
+        // selection, dismiss a sheet). Carbon RegisterEventHotKey swallows
+        // the chord; the local monitor returns nil. Unregister at teardown.
+        lastInstallAttemptedSpecs = []
+        var registered = 0
+        for spec in Self.sessionHotkeySpecs {
+            lastInstallAttemptedSpecs.append(spec)
+            let (keyCode, modifiers, id) = spec
+            var ref: EventHotKeyRef?
+            let hotKeyID = EventHotKeyID(
+                signature: OSType(0x534E4553) /* 'SNES' */, id: id)
+            let status = RegisterEventHotKey(
+                keyCode, modifiers, hotKeyID,
+                GetApplicationEventTarget(), 0, &ref)
+            if status == noErr, let ref {
+                sessionHotkeyRefs.append(ref)
+                registered += 1
+            } else {
+                NSLog("Snippr: could not register scroll hotkey id=\(id) (status \(status))")
+            }
         }
+        hotkeysRegistered = registered > 0
         HotkeyManager.shared.auxHandler = { [weak self] id in
-            if id == Self.escHotkeyID { self?.finished = true }
+            guard let self, let action = Self.stopAction(forHotkeyID: id) else { return }
+            self.applyStopAction(action)
         }
         escLocalMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            if event.keyCode == UInt16(kVK_Escape) {
-                self?.finished = true
-                return nil
-            }
-            return event
+            guard let self else { return event }
+            return self.handleSessionKeyEvent(event) ? nil : event
         }
     }
 
-    private func removeStop() {
-        if let ref = escHotkeyRef {
-            UnregisterEventHotKey(ref)
-            escHotkeyRef = nil
+    nonisolated static func stopAction(forHotkeyID id: UInt32) -> StopAction? {
+        switch id {
+        case escHotkeyID: return .cancel
+        case returnHotkeyID, keypadEnterHotkeyID: return .finish
+        case copyHotkeyID: return .quickCopy
+        default: return nil
         }
-        escRegistered = false
+    }
+
+    static func stopAction(for event: NSEvent) -> StopAction? {
+        // Include .shift so Shift+Esc/Return match Carbon (modifiers=0)
+        // and ⌘C, which already rejected shift.
+        let chord = event.modifierFlags.intersection(
+            [.command, .option, .control, .shift])
+        switch event.keyCode {
+        case UInt16(kVK_Escape) where chord.isEmpty:
+            return .cancel
+        case UInt16(kVK_Return), UInt16(kVK_ANSI_KeypadEnter):
+            return chord.isEmpty ? .finish : nil
+        case UInt16(kVK_ANSI_C)
+            where event.modifierFlags.contains(.command)
+                && !event.modifierFlags.contains(.option)
+                && !event.modifierFlags.contains(.control)
+                && !event.modifierFlags.contains(.shift):
+            return .quickCopy
+        default:
+            return nil
+        }
+    }
+
+    private func applyStopAction(_ action: StopAction) {
+        switch action {
+        case .cancel:
+            cancelled = true
+            finished = true
+        case .finish:
+            finished = true
+        case .quickCopy:
+            quickCopyRequested = true
+            finished = true
+        }
+    }
+
+    /// Production key interpreter used by the local monitor. Carbon IDs
+    /// map through `stopAction(forHotkeyID:)` onto the same actions. NSEvent
+    /// gates call this with a real event; Carbon gates fire `auxHandler`
+    /// with the registered hotkey IDs — not `finishForTesting`.
+    @discardableResult
+    func handleSessionKeyEvent(_ event: NSEvent) -> Bool {
+        guard let action = Self.stopAction(for: event) else { return false }
+        applyStopAction(action)
+        return true
+    }
+
+    private func removeStop() {
+        for ref in sessionHotkeyRefs {
+            UnregisterEventHotKey(ref)
+        }
+        sessionHotkeyRefs.removeAll()
+        hotkeysRegistered = false
         HotkeyManager.shared.auxHandler = nil
         if let m = escLocalMonitor {
             NSEvent.removeMonitor(m)
@@ -553,6 +679,24 @@ final class ScrollingCapture {
     func finishForTesting() { finished = true }
     var isFinishedForTesting: Bool { finished }
     var previewPanelForTesting: NSPanel? { controlPanel }
+    func installStopForTesting() { installStop() }
+    func removeStopForTesting() { removeStop() }
+    func lastInstallAttemptedSpecsForTesting() -> [(UInt32, UInt32, UInt32)] {
+        lastInstallAttemptedSpecs
+    }
+    func updateProgressForTesting(_ text: String) { updateProgress(text) }
+
+    func chromeView(identifier: String) -> NSView? {
+        func walk(_ view: NSView) -> NSView? {
+            if view.identifier?.rawValue == identifier { return view }
+            for child in view.subviews {
+                if let found = walk(child) { return found }
+            }
+            return nil
+        }
+        guard let root = controlPanel?.contentView else { return nil }
+        return walk(root)
+    }
 
     /// Production `showChrome` — the same builder `run()` uses. Hide any
     /// leftover chrome first so a gate can re-arm under both appearances
@@ -652,9 +796,11 @@ final class ScrollingCapture {
         container.layer?.cornerRadius = 12
 
         let label = NSTextField(wrappingLabelWithString:
-            "\(Self.bidirectionalScrollHint) · ảnh ghép hiện tại đây")
+            "\(Self.bidirectionalScrollHint) · \(stopHint)")
         label.font = .systemFont(ofSize: 11.5, weight: .semibold)
         label.textColor = .white
+        label.identifier = NSUserInterfaceItemIdentifier(Self.hintLabelIdentifier)
+        label.setAccessibilityIdentifier(Self.hintLabelIdentifier)
         progressLabel = label
 
         let doneFont = NSFont.systemFont(ofSize: 12, weight: .semibold)

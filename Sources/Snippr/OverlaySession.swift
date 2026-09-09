@@ -130,6 +130,13 @@ struct ScrollFinish {
     /// nil only in screenless/headless environments — presentation is
     /// skipped there, but the payload must never crash constructing itself.
     var screen: NSScreen?
+    /// Esc during the scrolling session: chrome is gone, no stitch is
+    /// committed, lastCapture is untouched. Distinct from a nil-image
+    /// failure (region invalid / no frames).
+    var cancelled: Bool = false
+    /// ⌘C during the scrolling session: commit copy (+ snapshotted
+    /// afterSave) and skip Editor/panel.
+    var quickCopy: Bool = false
 }
 
 // MARK: - Action router
