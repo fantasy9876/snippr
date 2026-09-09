@@ -43,6 +43,7 @@ static class Program
         failed += Check("win-scroll-stop-machine", ScrollStopMachineGate());
         failed += Check("win-scroll-hook-policy", ScrollStopHookPolicyGate());
         failed += Check("win-scroll-stop-invoke", ScrollStopInvokeGate());
+        failed += Check("win-scroll-tray-route", ScrollTrayRouteGate());
         if (pending > 0)
             Console.WriteLine($"{pending} PARITY GATE(S) PENDING — not a pass");
         Console.WriteLine(failed == 0
@@ -1643,6 +1644,32 @@ static class Program
         ran = 0;
         ScrollStopInvoke.Run(marshal: true, null, () => ran++);
         if (ran != 1) f.Add("marshal true with no sync did not run");
+        return f;
+    }
+
+    /// Sol survivor: TrayContext skipped Present and called
+    /// EffectiveActions(quickCopy: false). Production now routes through
+    /// RouteFinish so that mutation loses Ctrl+C force-copy and cancel-null.
+    static List<string> ScrollTrayRouteGate()
+    {
+        var f = new List<string>();
+        if (ScrollStopMachine.RouteFinish(true, false, false, true, false) != null)
+            f.Add("cancel still routed");
+
+        if (ScrollStopMachine.RouteFinish(false, true, false, true, true) is not { } qcSave)
+            f.Add("Ctrl+C+save null");
+        else if (!qcSave.Copy || qcSave.Show || !qcSave.Save)
+            f.Add($"Ctrl+C opened editor {qcSave.Copy}/{qcSave.Show}/{qcSave.Save}");
+
+        if (ScrollStopMachine.RouteFinish(false, true, false, true, false) is not { } qc)
+            f.Add("Ctrl+C null");
+        else if (!qc.Copy || qc.Show || qc.Save)
+            f.Add($"Ctrl+C lost force-copy {qc.Copy}/{qc.Show}/{qc.Save}");
+
+        if (ScrollStopMachine.RouteFinish(false, false, false, true, false) is not { } enter)
+            f.Add("enter null");
+        else if (enter.Copy || !enter.Show || enter.Save)
+            f.Add($"enter route {enter.Copy}/{enter.Show}/{enter.Save}");
         return f;
     }
 }

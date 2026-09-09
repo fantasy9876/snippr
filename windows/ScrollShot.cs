@@ -96,8 +96,7 @@ sealed class ScrollShotSession
         if (failedIds.Length > 0)
         {
             _stopHook = LowLevelScrollStopHook.TryInstall(
-                ScrollStopInvoke.Bind(ApplyStop, ScrollStopInvoke.HookMarshals),
-                failedIds, Native.GetAsyncKeyState);
+                ApplyStop, failedIds, Native.GetAsyncKeyState);
         }
         _hotkeysRegistered = _registeredHotkeyIds.Count > 0 || _stopHook != null;
     }
@@ -387,12 +386,14 @@ sealed class LowLevelScrollStopHook : IDisposable
         _proc = Callback;
     }
 
+    /// Always binds `HookMarshals` — the caller cannot pick UiMarshals (N7w).
     public static LowLevelScrollStopHook? TryInstall(
-        Action<ScrollStopAction> onAction,
+        Action<ScrollStopAction, bool> applyStop,
         int[] hookedIds,
         Func<int, short> getAsyncKeyState)
     {
         if (hookedIds.Length == 0) return null;
+        var onAction = ScrollStopInvoke.Bind(applyStop, ScrollStopInvoke.HookMarshals);
         var hook = new LowLevelScrollStopHook(onAction, hookedIds, getAsyncKeyState);
         hook._hook = Native.SetWindowsHookExW(
             Native.WH_KEYBOARD_LL, hook._proc, Native.GetModuleHandleW(null), 0);

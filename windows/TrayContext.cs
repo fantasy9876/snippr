@@ -203,14 +203,9 @@ sealed class TrayContext : ApplicationContext
         if (CaptureBusy) return;
         ScrollShotSession.Begin(finish =>
         {
-            var flags = new ScrollStopFlags
-            {
-                Finished = true,
-                Cancelled = finish.Cancelled,
-                QuickCopy = finish.QuickCopy,
-            };
-            var actions = ScrollStopMachine.Present(
-                flags, finish.AfterCopy, finish.AfterShow, finish.AfterSave);
+            var actions = ScrollStopMachine.RouteFinish(
+                finish.Cancelled, finish.QuickCopy,
+                finish.AfterCopy, finish.AfterShow, finish.AfterSave);
             if (actions is not { } route)
             {
                 finish.Image?.Dispose();
