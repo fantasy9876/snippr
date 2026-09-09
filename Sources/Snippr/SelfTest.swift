@@ -5592,6 +5592,342 @@ enum SelfTest {
                       chromeFailures.joined(separator: "; "))
             }
 
+            // 1.2.22: Enter finishes, Esc cancels, ⌘C quick-copies. Gates
+            // drive the production key interpreter with a real NSEvent
+            // (premise: keyCode + modifiers) — finishForTesting is not
+            // the dispatcher. Present/commit is the same finalizeSession
+            // path run() takes after the capture loop sees `finished`.
+            do {
+                let stitch = CapturedImage(
+                    cgImage: makeSolidImage(
+                        width: 48, height: 64, color: NSColor.systemOrange.cgColor),
+                    scale: 1)
+                let quick = CapturedImage(
+                    cgImage: makeSolidImage(
+                        width: 36, height: 90, color: NSColor.systemTeal.cgColor),
+                    scale: 1)
+
+                @MainActor func sessionKey(
+                    _ characters: String, keyCode: UInt16,
+                    modifiers: NSEvent.ModifierFlags = []
+                ) -> NSEvent? {
+                    NSEvent.keyEvent(
+                        with: .keyDown, location: .zero,
+                        modifierFlags: modifiers, timestamp: 0,
+                        windowNumber: 0, context: nil,
+                        characters: characters,
+                        charactersIgnoringModifiers: characters,
+                        isARepeat: false, keyCode: keyCode)
+                }
+
+                final class ScrollKeySpy {
+                    var copies: [CapturedImage] = []
+                    var saves = 0
+                    var editors = 0
+                    var toasts: [String] = []
+                    var lastCaptures = 0
+                    var logs = 0
+                }
+
+                @MainActor func deps(_ spy: ScrollKeySpy) -> CaptureActionRouter.Dependencies {
+                    CaptureActionRouter.Dependencies(
+                        copyToClipboard: { spy.copies.append($0) },
+                        autoSave: { _, done in
+                            spy.saves += 1
+                            done(nil)
+                        },
+                        saveAs: { _, _ in },
+                        pin: { _ in }, ocr: { _ in },
+                        openEditor: { _ in spy.editors += 1 },
+                        toast: { spy.toasts.append($0) },
+                        setLastCapture: { _ in spy.lastCaptures += 1 },
+                        setLastAreaRect: { _ in },
+                        logEvent: { _ in spy.logs += 1 })
+                }
+
+                // G1: Return through the key interpreter finishes the
+                // session and presents per afterScrollShow — not hardcoded
+                // Editor. Premise: the event really is Return.
+                g1Enter: do {
+                    var g1: [String] = []
+                    guard let ret = sessionKey("\r", keyCode: 36) else {
+                        g1.append("event-nil")
+                        check("enter-finishes-scroll-session", false,
+                              g1.joined(separator: "; "))
+                        break g1Enter
+                    }
+                    if ret.keyCode != 36 || ret.characters != "\r" {
+                        g1.append("premise-event-malformed key=\(ret.keyCode)")
+                    }
+                    let spyEd = ScrollKeySpy()
+                    var finishCount = 0
+                    let sessionEd = ScrollingCapture(
+                        inputs: OverlaySessionInputs(
+                            afterShow: true, afterCopy: true, afterSave: false),
+                        onFinish: { finish in
+                            finishCount += 1
+                            ScrollResultPresenter.present(
+                                finish, dependencies: deps(spyEd),
+                                afterScrollShow: .editor)
+                        })
+                    ScrollingCapture.active = sessionEd
+                    sessionEd.installStopForTesting()
+                    _ = sessionEd.handleSessionKeyEvent(ret)
+                    if !sessionEd.isFinishedForTesting {
+                        g1.append("return-did-not-finish")
+                    } else {
+                        sessionEd.finalizeForTesting(image: stitch)
+                        if finishCount != 1 { g1.append("finish-count \(finishCount)") }
+                        if spyEd.editors != 1 { g1.append("editor-opens \(spyEd.editors)") }
+                        if spyEd.copies.count != 1 { g1.append("copies \(spyEd.copies.count)") }
+                        if ScrollResultPanel.current != nil {
+                            g1.append("opened-panel-on-editor-setting")
+                        }
+                        if ScrollingCapture.active != nil { g1.append("active-leaked") }
+                    }
+                    sessionEd.removeStopForTesting()
+                    sessionEd.hideChromeForTesting()
+                    if ScrollingCapture.active === sessionEd {
+                        ScrollingCapture.active = nil
+                    }
+
+                    let spyPanel = ScrollKeySpy()
+                    guard let ret2 = sessionKey("\r", keyCode: 36) else {
+                        g1.append("event-nil-panel")
+                        check("enter-finishes-scroll-session", false,
+                              g1.joined(separator: "; "))
+                        break g1Enter
+                    }
+                    let sessionPanel = ScrollingCapture(
+                        inputs: OverlaySessionInputs(
+                            afterShow: true, afterCopy: true, afterSave: false),
+                        onFinish: { finish in
+                            ScrollResultPresenter.present(
+                                finish, dependencies: deps(spyPanel),
+                                afterScrollShow: .panel)
+                        })
+                    ScrollingCapture.active = sessionPanel
+                    sessionPanel.installStopForTesting()
+                    _ = sessionPanel.handleSessionKeyEvent(ret2)
+                    if !sessionPanel.isFinishedForTesting {
+                        g1.append("return-did-not-finish-panel")
+                    } else {
+                        sessionPanel.finalizeForTesting(image: stitch)
+                        if spyPanel.editors != 0 {
+                            g1.append("hardcoded-editor \(spyPanel.editors)")
+                        }
+                        if ScrollResultPanel.current == nil {
+                            g1.append("panel-not-opened")
+                        }
+                    }
+                    ScrollResultPanel.current?.dismissForTesting()
+                    sessionPanel.removeStopForTesting()
+                    sessionPanel.hideChromeForTesting()
+                    if ScrollingCapture.active === sessionPanel {
+                        ScrollingCapture.active = nil
+                    }
+                    check("enter-finishes-scroll-session",
+                          g1.isEmpty, g1.joined(separator: "; "))
+                }
+
+                // G2: Esc cancels — no commit, no editor/panel, active nil,
+                // pasteboard unchanged. Premise: the event really is Esc.
+                // finalizeSession still runs (same as the capture loop
+                // exiting); cancel must discard the stitch.
+                g2Esc: do {
+                    var g2: [String] = []
+                    guard let esc = sessionKey("\u{1b}", keyCode: 53) else {
+                        g2.append("event-nil")
+                        check("esc-cancels-scroll-no-result", false,
+                              g2.joined(separator: "; "))
+                        break g2Esc
+                    }
+                    if esc.keyCode != 53 {
+                        g2.append("premise-event-malformed key=\(esc.keyCode)")
+                    }
+                    let styleBefore = Settings.shared.confirmationStyle
+                    Settings.shared.confirmationStyle = .custom
+                    defer { Settings.shared.confirmationStyle = styleBefore }
+                    let pb = NSPasteboard.general
+                    pb.setString("SENTINEL-SCROLL-ESC", forType: .string)
+                    let beforeCount = pb.changeCount
+                    let spy = ScrollKeySpy()
+                    var cancelledFinish = 0
+                    let session = ScrollingCapture(
+                        inputs: OverlaySessionInputs(
+                            afterShow: true, afterCopy: true, afterSave: true),
+                        onFinish: { finish in
+                            cancelledFinish += 1
+                            ScrollResultPresenter.present(
+                                finish, dependencies: deps(spy),
+                                afterScrollShow: .editor)
+                        })
+                    ScrollingCapture.active = session
+                    session.installStopForTesting()
+                    let hud = ToastHUD.recordingMessagesForTesting {
+                        _ = session.handleSessionKeyEvent(esc)
+                        session.finalizeForTesting(image: stitch)
+                    }
+                    if cancelledFinish != 1 { g2.append("finish-count \(cancelledFinish)") }
+                    if spy.copies.isEmpty == false { g2.append("copied \(spy.copies.count)") }
+                    if spy.saves != 0 { g2.append("saved \(spy.saves)") }
+                    if spy.editors != 0 { g2.append("opened-editor \(spy.editors)") }
+                    if spy.lastCaptures != 0 { g2.append("lastCapture \(spy.lastCaptures)") }
+                    if ScrollResultPanel.current != nil { g2.append("opened-panel") }
+                    if ScrollingCapture.active != nil { g2.append("active-still-set") }
+                    if pb.string(forType: .string) != "SENTINEL-SCROLL-ESC" {
+                        g2.append("pasteboard-changed")
+                    }
+                    if pb.changeCount != beforeCount {
+                        g2.append("pasteboard-changeCount \(pb.changeCount)/\(beforeCount)")
+                    }
+                    if !hud.messages.contains("Đã hủy chụp cuộn") {
+                        g2.append("hud-missing \(hud.messages)")
+                    }
+                    session.removeStopForTesting()
+                    session.hideChromeForTesting()
+                    if ScrollingCapture.active === session {
+                        ScrollingCapture.active = nil
+                    }
+                    check("esc-cancels-scroll-no-result",
+                          g2.isEmpty, g2.joined(separator: "; "))
+                }
+
+                // G3: ⌘C quick-copies the stitch, exactly one commit, no
+                // editor/panel. afterSave follows the begin() snapshot.
+                g3Copy: do {
+                    var g3: [String] = []
+                    guard let cmdc = sessionKey(
+                        "c", keyCode: 8, modifiers: .command
+                    ) else {
+                        g3.append("event-nil")
+                        check("cmdc-quickcopy", false, g3.joined(separator: "; "))
+                        break g3Copy
+                    }
+                    if cmdc.keyCode != 8
+                        || !cmdc.modifierFlags.contains(.command) {
+                        g3.append(
+                            "premise-event-malformed key=\(cmdc.keyCode) mods=\(cmdc.modifierFlags.rawValue)")
+                    }
+
+                    @MainActor func runQuickCopy(afterSave: Bool, label: String) {
+                        let spy = ScrollKeySpy()
+                        var finishCount = 0
+                        let session = ScrollingCapture(
+                            inputs: OverlaySessionInputs(
+                                afterShow: true, afterCopy: false,
+                                afterSave: afterSave),
+                            onFinish: { finish in
+                                finishCount += 1
+                                ScrollResultPresenter.present(
+                                    finish, dependencies: deps(spy),
+                                    afterScrollShow: .editor)
+                            })
+                        ScrollingCapture.active = session
+                        session.installStopForTesting()
+                        _ = session.handleSessionKeyEvent(cmdc)
+                        if !session.isFinishedForTesting {
+                            g3.append("\(label):cmdc-did-not-stop")
+                        } else {
+                            session.finalizeForTesting(image: quick)
+                            if finishCount != 1 {
+                                g3.append("\(label):finish-count \(finishCount)")
+                            }
+                            if spy.copies.count != 1 {
+                                g3.append("\(label):copies \(spy.copies.count)")
+                            } else {
+                                let got = spy.copies[0]
+                                if got.cgImage.width != 36
+                                    || got.cgImage.height != 90 {
+                                    g3.append(
+                                        "\(label):px \(got.cgImage.width)x\(got.cgImage.height)")
+                                }
+                            }
+                            if spy.editors != 0 {
+                                g3.append("\(label):opened-editor \(spy.editors)")
+                            }
+                            if ScrollResultPanel.current != nil {
+                                g3.append("\(label):opened-panel")
+                            }
+                            if spy.lastCaptures != 1 {
+                                g3.append("\(label):lastCapture \(spy.lastCaptures)")
+                            }
+                            let wantSaves = afterSave ? 1 : 0
+                            if spy.saves != wantSaves {
+                                g3.append("\(label):saves \(spy.saves) want \(wantSaves)")
+                            }
+                            if !afterSave && !spy.toasts.contains("Đã copy") {
+                                g3.append("\(label):hud-missing \(spy.toasts)")
+                            }
+                            if ScrollingCapture.active != nil {
+                                g3.append("\(label):active-leaked")
+                            }
+                        }
+                        ScrollResultPanel.current?.dismissForTesting()
+                        session.removeStopForTesting()
+                        session.hideChromeForTesting()
+                        if ScrollingCapture.active === session {
+                            ScrollingCapture.active = nil
+                        }
+                    }
+                    runQuickCopy(afterSave: false, label: "copy-only")
+                    runQuickCopy(afterSave: true, label: "copy+save")
+                    check("cmdc-quickcopy", g3.isEmpty, g3.joined(separator: "; "))
+                }
+
+                // G4: new hint in chrome, both hotkey and fallback branches.
+                // Identifier lookup — a title scan that matches 0 labels
+                // would pass the contains() checks vacuously.
+                g4Hint: do {
+                    var g4: [String] = []
+                    let wantHotkey = "Enter/✓ xong · ⌘C copy · Esc hủy"
+                    let wantFallback = "bấm ✓ để xong"
+                    guard let chromeScreen = NSScreen.main ?? NSScreen.screens.first else {
+                        g4.append("no-screen")
+                        check("scroll-session-stop-hint", false,
+                              g4.joined(separator: "; "))
+                        break g4Hint
+                    }
+                    let session = ScrollingCapture(onFinish: { _ in })
+                    session.showChromeForTesting(
+                        screen: chromeScreen,
+                        rect: CGRect(x: 80, y: 80, width: 240, height: 180))
+                    guard let fallbackLabel = session.chromeView(
+                        identifier: ScrollingCapture.hintLabelIdentifier
+                    ) as? NSTextField else {
+                        g4.append("fallback:no-hint-by-identifier")
+                        session.hideChromeForTesting()
+                        check("scroll-session-stop-hint", false,
+                              g4.joined(separator: "; "))
+                        break g4Hint
+                    }
+                    if !fallbackLabel.stringValue.contains(wantFallback) {
+                        g4.append("fallback:\(fallbackLabel.stringValue)")
+                    }
+                    session.installStopForTesting()
+                    session.showChromeForTesting(
+                        screen: chromeScreen,
+                        rect: CGRect(x: 80, y: 80, width: 240, height: 180))
+                    guard let liveLabel = session.chromeView(
+                        identifier: ScrollingCapture.hintLabelIdentifier
+                    ) as? NSTextField else {
+                        g4.append("hotkey:no-hint-by-identifier")
+                        session.removeStopForTesting()
+                        session.hideChromeForTesting()
+                        check("scroll-session-stop-hint", false,
+                              g4.joined(separator: "; "))
+                        break g4Hint
+                    }
+                    if !liveLabel.stringValue.contains(wantHotkey) {
+                        g4.append("hotkey:\(liveLabel.stringValue)")
+                    }
+                    session.removeStopForTesting()
+                    session.hideChromeForTesting()
+                    check("scroll-session-stop-hint",
+                          g4.isEmpty, g4.joined(separator: "; "))
+                }
+            }
+
             // presenter headless: scrollFinished auto exactly once, no panel.
             let img = CapturedImage(
                 cgImage: makeSolidImage(

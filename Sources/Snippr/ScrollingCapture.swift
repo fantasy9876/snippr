@@ -10,6 +10,14 @@ final class ScrollingCapture {
     static var active: ScrollingCapture?
 
     static let escHotkeyID: UInt32 = 999
+    static let returnHotkeyID: UInt32 = 1000
+    static let keypadEnterHotkeyID: UInt32 = 1001
+    static let copyHotkeyID: UInt32 = 1002
+
+    /// Identifier for the live-preview hint label. Gates look this up
+    /// instead of scanning title strings — a substring match that finds
+    /// zero labels would go green without reading the chrome.
+    static let hintLabelIdentifier = "scroll.chrome.hint"
 
     private let onFinish: @MainActor (ScrollFinish) -> Void
     /// Snapshotted at begin(): a Settings change while the user scrolls must
@@ -524,12 +532,21 @@ final class ScrollingCapture {
             if id == Self.escHotkeyID { self?.finished = true }
         }
         escLocalMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            if event.keyCode == UInt16(kVK_Escape) {
-                self?.finished = true
-                return nil
-            }
-            return event
+            guard let self else { return event }
+            return self.handleSessionKeyEvent(event) ? nil : event
         }
+    }
+
+    /// Production key interpreter used by the local monitor (and, after the
+    /// session hotkeys land, by the Carbon auxHandler mapping). Gates
+    /// construct a real NSEvent and call this — not `finishForTesting`.
+    @discardableResult
+    func handleSessionKeyEvent(_ event: NSEvent) -> Bool {
+        if event.keyCode == UInt16(kVK_Escape) {
+            finished = true
+            return true
+        }
+        return false
     }
 
     private func removeStop() {
@@ -553,6 +570,20 @@ final class ScrollingCapture {
     func finishForTesting() { finished = true }
     var isFinishedForTesting: Bool { finished }
     var previewPanelForTesting: NSPanel? { controlPanel }
+    func installStopForTesting() { installStop() }
+    func removeStopForTesting() { removeStop() }
+
+    func chromeView(identifier: String) -> NSView? {
+        func walk(_ view: NSView) -> NSView? {
+            if view.identifier?.rawValue == identifier { return view }
+            for child in view.subviews {
+                if let found = walk(child) { return found }
+            }
+            return nil
+        }
+        guard let root = controlPanel?.contentView else { return nil }
+        return walk(root)
+    }
 
     /// Production `showChrome` — the same builder `run()` uses. Hide any
     /// leftover chrome first so a gate can re-arm under both appearances
