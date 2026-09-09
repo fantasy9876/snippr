@@ -621,8 +621,9 @@ final class ScrollingCapture {
     }
 
     /// Production key interpreter used by the local monitor. Carbon IDs
-    /// map through `stopAction(forHotkeyID:)` onto the same actions. Gates
-    /// construct a real NSEvent and call this — not `finishForTesting`.
+    /// map through `stopAction(forHotkeyID:)` onto the same actions. NSEvent
+    /// gates call this with a real event; Carbon gates fire `auxHandler`
+    /// with the registered hotkey IDs — not `finishForTesting`.
     @discardableResult
     func handleSessionKeyEvent(_ event: NSEvent) -> Bool {
         guard let action = Self.stopAction(for: event) else { return false }
