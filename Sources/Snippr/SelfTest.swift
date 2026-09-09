@@ -5730,10 +5730,10 @@ enum SelfTest {
                           g1.isEmpty, g1.joined(separator: "; "))
                 }
 
-                // G2: Esc cancels — no commit, no editor/panel, active nil,
-                // pasteboard unchanged. Premise: the event really is Esc.
-                // finalizeSession still runs (same as the capture loop
-                // exiting); cancel must discard the stitch.
+                // G2: Esc cancels — no commit, no editor/panel, active nil.
+                // Copy/save are asserted through the router spy (the same
+                // sink as overlay OCR): NSPasteboard.general is shared with
+                // the operator and Universal Clipboard. Premise: Esc event.
                 g2Esc: do {
                     var g2: [String] = []
                     guard let esc = sessionKey("\u{1b}", keyCode: 53) else {
@@ -5748,9 +5748,6 @@ enum SelfTest {
                     let styleBefore = Settings.shared.confirmationStyle
                     Settings.shared.confirmationStyle = .custom
                     defer { Settings.shared.confirmationStyle = styleBefore }
-                    let pb = NSPasteboard.general
-                    pb.setString("SENTINEL-SCROLL-ESC", forType: .string)
-                    let beforeCount = pb.changeCount
                     let spy = ScrollKeySpy()
                     var cancelledFinish = 0
                     let session = ScrollingCapture(
@@ -5775,12 +5772,6 @@ enum SelfTest {
                     if spy.lastCaptures != 0 { g2.append("lastCapture \(spy.lastCaptures)") }
                     if ScrollResultPanel.current != nil { g2.append("opened-panel") }
                     if ScrollingCapture.active != nil { g2.append("active-still-set") }
-                    if pb.string(forType: .string) != "SENTINEL-SCROLL-ESC" {
-                        g2.append("pasteboard-changed")
-                    }
-                    if pb.changeCount != beforeCount {
-                        g2.append("pasteboard-changeCount \(pb.changeCount)/\(beforeCount)")
-                    }
                     if !hud.messages.contains("Đã hủy chụp cuộn") {
                         g2.append("hud-missing \(hud.messages)")
                     }
