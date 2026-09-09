@@ -85,7 +85,7 @@ sealed class ScrollShotSession
         _hotkeyWindow.HotkeyPressed += id =>
         {
             if (ScrollSessionStop.ForHotkeyId(id) is { } action)
-                ApplyStop(action);
+                ApplyStop(action, ScrollStopInvoke.UiMarshals);
         };
         foreach (var spec in ScrollSessionStop.Specs)
         {
@@ -96,22 +96,20 @@ sealed class ScrollShotSession
         if (failedIds.Length > 0)
         {
             _stopHook = LowLevelScrollStopHook.TryInstall(
-                ApplyStop, failedIds, Native.GetAsyncKeyState);
+                ScrollStopInvoke.Bind(ApplyStop, ScrollStopInvoke.HookMarshals),
+                failedIds, Native.GetAsyncKeyState);
         }
         _hotkeysRegistered = _registeredHotkeyIds.Count > 0 || _stopHook != null;
     }
 
-    void ApplyStop(ScrollStopAction action)
+    void ApplyStop(ScrollStopAction action, bool marshal)
     {
         void go()
         {
             if (!_stop.ApplyStop(action)) return;
             End();
         }
-        // Stay inline on the UI thread so MaxHeightPx teardown is not delayed
-        // a message (Honey N5w). The LL hook is the path that must marshal.
-        if (_sync == null || SynchronizationContext.Current == _sync) go();
-        else _sync.Post(_ => go(), null);
+        ScrollStopInvoke.Run(marshal, _sync, go);
     }
 
     void CaptureTick()
@@ -149,7 +147,7 @@ sealed class ScrollShotSession
             _label.Text = "  " + ScrollSessionStop.StitchingProgressText(
                 _stitcher.TotalHeight, _hotkeysRegistered);
             if (_stitcher.TotalHeight >= MaxHeightPx)
-                ApplyStop(ScrollStopAction.Finish);
+                ApplyStop(ScrollStopAction.Finish, ScrollStopInvoke.UiMarshals);
         }
         else
         {
@@ -290,7 +288,7 @@ sealed class ScrollShotSession
             Font = new Font("Segoe UI", 10f, FontStyle.Bold),
         };
         done.FlatAppearance.BorderSize = 0;
-        done.Click += (_, _) => ApplyStop(ScrollStopAction.Finish);
+        done.Click += (_, _) => ApplyStop(ScrollStopAction.Finish, ScrollStopInvoke.UiMarshals);
         _preview.Bounds = new Rectangle(10, 88, panelW - 20, panelH - 98);
         panel.Controls.Add(_label);
         panel.Controls.Add(done);

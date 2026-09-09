@@ -125,7 +125,8 @@ public static class ScrollSessionStop
 /// so Route() matches TrayContext.
 public sealed class ScrollStopMachine
 {
-    public ScrollStopFlags Flags;
+    ScrollStopFlags _flags;
+    public ScrollStopFlags Flags => _flags;
     public bool AfterCopy { get; }
     public bool AfterShow { get; }
     public bool AfterSave { get; }
@@ -140,15 +141,15 @@ public sealed class ScrollStopMachine
     /// Returns false when the session already ended (second key is ignored).
     public bool ApplyStop(ScrollStopAction action)
     {
-        if (Flags.Finished) return false;
-        ScrollSessionStop.Apply(action, ref Flags);
+        if (_flags.Finished) return false;
+        ScrollSessionStop.Apply(action, ref _flags);
         return true;
     }
 
-    public bool ShouldCompose => Flags.Finished && !Flags.Cancelled;
+    public bool ShouldCompose => _flags.Finished && !_flags.Cancelled;
 
     public ScrollFinishActions? Route() =>
-        Present(Flags, AfterCopy, AfterShow, AfterSave);
+        Present(_flags, AfterCopy, AfterShow, AfterSave);
 
     public static ScrollFinishActions? Present(
         ScrollStopFlags flags, bool afterCopy, bool afterShow, bool afterSave)
@@ -157,6 +158,26 @@ public sealed class ScrollStopMachine
         return ScrollSessionStop.EffectiveActions(
             flags.QuickCopy, afterCopy, afterShow, afterSave);
     }
+}
+
+/// Dispatch helper. LL hook must marshal (`true`); timer / ✓ / WM_HOTKEY run
+/// inline (`false`). Do not infer from `SynchronizationContext.Current` — the
+/// hook proc runs on the installing (UI) thread, so that check is always true
+/// and End() would run inside the hook (Honey W-H3).
+public static class ScrollStopInvoke
+{
+    public const bool HookMarshals = true;
+    public const bool UiMarshals = false;
+
+    public static void Run(bool marshal, SynchronizationContext? sync, Action go)
+    {
+        if (marshal && sync != null) sync.Post(_ => go(), null);
+        else go();
+    }
+
+    public static Action<ScrollStopAction> Bind(
+        Action<ScrollStopAction, bool> apply, bool marshal)
+        => action => apply(action, marshal);
 }
 
 /// LL-hook policy. Only specs that failed `RegisterHotKey` are hooked, and

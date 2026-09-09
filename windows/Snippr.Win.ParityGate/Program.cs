@@ -42,6 +42,7 @@ static class Program
         failed += Check("win-scroll-session-stop-semantics", ScrollSessionStopSemantics());
         failed += Check("win-scroll-stop-machine", ScrollStopMachineGate());
         failed += Check("win-scroll-hook-policy", ScrollStopHookPolicyGate());
+        failed += Check("win-scroll-stop-invoke", ScrollStopInvokeGate());
         if (pending > 0)
             Console.WriteLine($"{pending} PARITY GATE(S) PENDING — not a pass");
         Console.WriteLine(failed == 0
@@ -1605,6 +1606,43 @@ static class Program
         var hookedAll = new[] { 1000, 1001, 1002 };
         if (ScrollStopHookPolicy.Interpret(0x1B, 0, hookedAll) != ScrollStopAction.Cancel)
             f.Add("all-hooked Esc is not cancel");
+        return f;
+    }
+
+    /// Honey W-H3: LL hook must Post; timer/✓ run inline. A FakeSync that
+    /// records Post (and does not run the callback) proves marshal:true does
+    /// not execute End inside the hook proc.
+    sealed class FakeSync : SynchronizationContext
+    {
+        public int Posts;
+        public override void Post(SendOrPostCallback d, object? state) => Posts++;
+    }
+
+    static List<string> ScrollStopInvokeGate()
+    {
+        var f = new List<string>();
+        var seen = new List<bool>();
+        void apply(ScrollStopAction _, bool marshal) => seen.Add(marshal);
+        ScrollStopInvoke.Bind(apply, ScrollStopInvoke.HookMarshals)(ScrollStopAction.Cancel);
+        ScrollStopInvoke.Bind(apply, ScrollStopInvoke.UiMarshals)(ScrollStopAction.Finish);
+        if (seen.Count != 2 || seen[0] != true || seen[1] != false)
+            f.Add($"bind marshal {string.Join(",", seen)} want true,false");
+
+        var sync = new FakeSync();
+        int ran = 0;
+        ScrollStopInvoke.Run(marshal: true, sync, () => ran++);
+        if (ran != 0) f.Add("W-H3 hook path ran inline");
+        if (sync.Posts != 1) f.Add($"hook path posts {sync.Posts} want 1");
+
+        ran = 0;
+        sync.Posts = 0;
+        ScrollStopInvoke.Run(marshal: false, sync, () => ran++);
+        if (ran != 1) f.Add("ui path did not run inline");
+        if (sync.Posts != 0) f.Add("ui path posted");
+
+        ran = 0;
+        ScrollStopInvoke.Run(marshal: true, null, () => ran++);
+        if (ran != 1) f.Add("marshal true with no sync did not run");
         return f;
     }
 }
