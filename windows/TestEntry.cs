@@ -1148,6 +1148,101 @@ static class TestEntry
             TranslateService.TranslatorOverrideForTesting = null;
         }
 
+        // Scroll session stop: live session through HandleSessionHotkey
+        // (same method HotkeyPressed invokes) then TrayContext.OnScrollFinished
+        // (same method StartScrollShot registers). Does NOT cover real
+        // WM_HOTKEY from HotkeyWindow.WndProc or the WH_KEYBOARD_LL fallback.
+        // Shift+Esc is the local parity table (win-scroll-session-stop-semantics),
+        // not a smoke step — ForKey is not session behavior.
+        ScrollShotFinish DriveScroll(
+            int hotkeyId,
+            (bool AfterCopy, bool AfterShow, bool AfterSave) after)
+        {
+            SweepScrollUi();
+            TrayContext.ScrollFinishCalledForTesting = false;
+            TrayContext.LastScrollRouteForTesting = null;
+            ScrollShotFinish? got = null;
+            var rect = new Rectangle(40, 40, 120, 90);
+            var savePrev = AppSettings.Current.SaveFolder;
+            AppSettings.Current.SaveFolder = Path.Combine(dir, "scroll-smoke-saves");
+            try
+            {
+                ScrollShotSession.BeginForTesting(
+                    rect, after,
+                    f =>
+                    {
+                        got = f;
+                        TrayContext.OnScrollFinished(f);
+                    });
+                Application.DoEvents();
+                var session = ScrollShotSession.ActiveForTesting
+                    ?? throw new InvalidOperationException("scroll session did not start");
+                try
+                {
+                    session.DeliverHotkeyForTesting(hotkeyId);
+                    Application.DoEvents();
+                }
+                finally
+                {
+                    if (ScrollShotSession.IsActive)
+                        ScrollShotSession.ActiveForTesting
+                            ?.DeliverHotkeyForTesting(ScrollSessionStop.ReturnId);
+                    Application.DoEvents();
+                }
+                if (ScrollShotSession.IsActive)
+                    throw new InvalidOperationException("scroll session still active");
+                if (!TrayContext.ScrollFinishCalledForTesting)
+                    throw new InvalidOperationException("OnScrollFinished was not called");
+                return got ?? throw new InvalidOperationException("scroll session produced no finish");
+            }
+            finally
+            {
+                AppSettings.Current.SaveFolder = savePrev;
+            }
+        }
+
+        Step("scroll-esc-cancels", () =>
+        {
+            var finish = DriveScroll(
+                ScrollSessionStop.EscId,
+                (AfterCopy: false, AfterShow: true, AfterSave: false));
+            if (!finish.Cancelled)
+                throw new InvalidOperationException("Esc did not cancel");
+            if (TrayContext.LastScrollRouteForTesting != null)
+                throw new InvalidOperationException("Esc still routed a result");
+            SweepScrollUi();
+        });
+        Step("scroll-enter-finishes-to-show", () =>
+        {
+            var finish = DriveScroll(
+                ScrollSessionStop.ReturnId,
+                (AfterCopy: false, AfterShow: true, AfterSave: false));
+            if (finish.Cancelled || finish.QuickCopy)
+                throw new InvalidOperationException(
+                    $"Enter cancelled={finish.Cancelled} quickCopy={finish.QuickCopy}");
+            if (TrayContext.LastScrollRouteForTesting is not { } route)
+                throw new InvalidOperationException("Enter produced no route");
+            if (route.Copy || !route.Show || route.Save)
+                throw new InvalidOperationException(
+                    $"Enter route copy={route.Copy} show={route.Show} save={route.Save}");
+            SweepScrollUi();
+        });
+        Step("scroll-ctrlc-quickcopies", () =>
+        {
+            var finish = DriveScroll(
+                ScrollSessionStop.CopyId,
+                (AfterCopy: false, AfterShow: true, AfterSave: true));
+            if (!finish.QuickCopy || finish.Cancelled)
+                throw new InvalidOperationException(
+                    $"Ctrl+C cancelled={finish.Cancelled} quickCopy={finish.QuickCopy}");
+            if (TrayContext.LastScrollRouteForTesting is not { } route)
+                throw new InvalidOperationException("Ctrl+C produced no route");
+            if (!route.Copy || route.Show || !route.Save)
+                throw new InvalidOperationException(
+                    $"Ctrl+C opened editor copy={route.Copy} show={route.Show} save={route.Save}");
+            SweepScrollUi();
+        });
+
         // OCR language selection. Asking for a recognizer the picture is not
         // written in fails silently on both platforms, so the gates are about
         // what gets ASKED FOR, which is the part a regression can change
@@ -1392,6 +1487,19 @@ static class TestEntry
         form.Location = new Point(-32000, -32000);
         form.Show();
         form.Refresh();
+        Application.DoEvents();
+    }
+
+    static void SweepScrollUi()
+    {
+        var open = new List<Form>();
+        foreach (Form f in Application.OpenForms)
+            if (f is EditorForm or ToastForm) open.Add(f);
+        foreach (var f in open)
+        {
+            f.Close();
+            f.Dispose();
+        }
         Application.DoEvents();
     }
 

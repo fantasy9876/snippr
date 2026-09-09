@@ -162,18 +162,28 @@ public sealed class ScrollStopMachine
     /// Production finish callback (TrayContext). QuickCopy from the Ctrl+C
     /// hotkey must reach Present — hardcoding `EffectiveActions(quickCopy:
     /// false)` is Sol's surviving mutation and must go red.
-    public static ScrollFinishActions? RouteFinish(
-        bool cancelled, bool quickCopy,
-        bool afterCopy, bool afterShow, bool afterSave)
+    public static ScrollFinishActions? RouteFinish(ScrollFinishInputs inputs)
     {
         var flags = new ScrollStopFlags
         {
             Finished = true,
-            Cancelled = cancelled,
-            QuickCopy = quickCopy,
+            Cancelled = inputs.Cancelled,
+            QuickCopy = inputs.QuickCopy,
         };
-        return Present(flags, afterCopy, afterShow, afterSave);
+        return Present(flags, inputs.AfterCopy, inputs.AfterShow, inputs.AfterSave);
     }
+}
+
+/// Named finish flags so swapping two bools is a compile error (Honey N8w)
+/// and omitting one is too (Honey P3) — `required` refuses the implicit
+/// `false` that used to swallow a forgotten QuickCopy (Sol's survivor).
+public readonly struct ScrollFinishInputs
+{
+    public required bool Cancelled { get; init; }
+    public required bool QuickCopy { get; init; }
+    public required bool AfterCopy { get; init; }
+    public required bool AfterShow { get; init; }
+    public required bool AfterSave { get; init; }
 }
 
 /// Dispatch helper. LL hook must marshal (`true`); timer / ✓ / WM_HOTKEY run
@@ -184,6 +194,8 @@ public static class ScrollStopInvoke
 {
     public const bool HookMarshals = true;
     public const bool UiMarshals = false;
+
+    public static bool CanInstallHook(SynchronizationContext? sync) => sync != null;
 
     public static void Run(bool marshal, SynchronizationContext? sync, Action go)
     {

@@ -1641,9 +1641,10 @@ static class Program
         if (ran != 1) f.Add("ui path did not run inline");
         if (sync.Posts != 0) f.Add("ui path posted");
 
-        ran = 0;
-        ScrollStopInvoke.Run(marshal: true, null, () => ran++);
-        if (ran != 1) f.Add("marshal true with no sync did not run");
+        if (ScrollStopInvoke.CanInstallHook(null))
+            f.Add("N6w null sync still allows a hook");
+        if (!ScrollStopInvoke.CanInstallHook(sync))
+            f.Add("N6w FakeSync cannot install a hook");
         return f;
     }
 
@@ -1653,20 +1654,36 @@ static class Program
     static List<string> ScrollTrayRouteGate()
     {
         var f = new List<string>();
-        if (ScrollStopMachine.RouteFinish(true, false, false, true, false) != null)
+        if (ScrollStopMachine.RouteFinish(new ScrollFinishInputs
+            {
+                Cancelled = true, QuickCopy = false, AfterCopy = false,
+                AfterShow = false, AfterSave = false,
+            }) != null)
             f.Add("cancel still routed");
 
-        if (ScrollStopMachine.RouteFinish(false, true, false, true, true) is not { } qcSave)
+        if (ScrollStopMachine.RouteFinish(new ScrollFinishInputs
+            {
+                Cancelled = false, QuickCopy = true, AfterCopy = false,
+                AfterShow = true, AfterSave = true,
+            }) is not { } qcSave)
             f.Add("Ctrl+C+save null");
         else if (!qcSave.Copy || qcSave.Show || !qcSave.Save)
             f.Add($"Ctrl+C opened editor {qcSave.Copy}/{qcSave.Show}/{qcSave.Save}");
 
-        if (ScrollStopMachine.RouteFinish(false, true, false, true, false) is not { } qc)
+        if (ScrollStopMachine.RouteFinish(new ScrollFinishInputs
+            {
+                Cancelled = false, QuickCopy = true, AfterCopy = false,
+                AfterShow = true, AfterSave = false,
+            }) is not { } qc)
             f.Add("Ctrl+C null");
         else if (!qc.Copy || qc.Show || qc.Save)
             f.Add($"Ctrl+C lost force-copy {qc.Copy}/{qc.Show}/{qc.Save}");
 
-        if (ScrollStopMachine.RouteFinish(false, false, false, true, false) is not { } enter)
+        if (ScrollStopMachine.RouteFinish(new ScrollFinishInputs
+            {
+                Cancelled = false, QuickCopy = false, AfterCopy = false,
+                AfterShow = true, AfterSave = false,
+            }) is not { } enter)
             f.Add("enter null");
         else if (enter.Copy || !enter.Show || enter.Save)
             f.Add($"enter route {enter.Copy}/{enter.Show}/{enter.Save}");

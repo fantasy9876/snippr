@@ -57,6 +57,28 @@ sealed class ScrollShotSession
         _active = new ScrollShotSession(rect, onFinish, snapshot);
     }
 
+    /// Skip the area picker. Used by `--test-shot` on the Windows runner.
+    internal static void BeginForTesting(
+        Rectangle rect,
+        (bool AfterCopy, bool AfterShow, bool AfterSave) snapshot,
+        Action<ScrollShotFinish> onFinish)
+    {
+        if (_active != null)
+            throw new InvalidOperationException("a scroll session is already active");
+        _active = new ScrollShotSession(rect, onFinish, snapshot);
+    }
+
+    internal static ScrollShotSession? ActiveForTesting => _active;
+
+    /// Same path as `WM_HOTKEY`: id → ForHotkeyId → ApplyStop(UiMarshals).
+    internal void DeliverHotkeyForTesting(int id) => HandleSessionHotkey(id);
+
+    void HandleSessionHotkey(int id)
+    {
+        if (ScrollSessionStop.ForHotkeyId(id) is { } action)
+            ApplyStop(action, ScrollStopInvoke.UiMarshals);
+    }
+
     ScrollShotSession(
         Rectangle rect,
         Action<ScrollShotFinish> onFinish,
@@ -82,18 +104,16 @@ sealed class ScrollShotSession
         // the chord (same job as macOS Carbon). A consuming LL hook fills
         // any ID that failed to register.
         _hotkeyWindow = new HotkeyWindow();
-        _hotkeyWindow.HotkeyPressed += id =>
-        {
-            if (ScrollSessionStop.ForHotkeyId(id) is { } action)
-                ApplyStop(action, ScrollStopInvoke.UiMarshals);
-        };
+        _hotkeyWindow.HotkeyPressed += HandleSessionHotkey;
         foreach (var spec in ScrollSessionStop.Specs)
         {
             if (Native.RegisterHotKey(_hotkeyWindow.Handle, spec.Id, spec.Mods, spec.Vk))
                 _registeredHotkeyIds.Add(spec.Id);
         }
         var failedIds = ScrollStopHookPolicy.FailedSpecIds(_registeredHotkeyIds);
-        if (failedIds.Length > 0)
+        // N6w: no sync ⇒ End() cannot Post off the hook proc (W-H3). Skip the
+        // LL fallback; RegisterHotKey still consumes what it got.
+        if (failedIds.Length > 0 && ScrollStopInvoke.CanInstallHook(_sync))
         {
             _stopHook = LowLevelScrollStopHook.TryInstall(
                 ApplyStop, failedIds, Native.GetAsyncKeyState);
