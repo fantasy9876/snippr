@@ -162,18 +162,26 @@ public sealed class ScrollStopMachine
     /// Production finish callback (TrayContext). QuickCopy from the Ctrl+C
     /// hotkey must reach Present — hardcoding `EffectiveActions(quickCopy:
     /// false)` is Sol's surviving mutation and must go red.
-    public static ScrollFinishActions? RouteFinish(
-        bool cancelled, bool quickCopy,
-        bool afterCopy, bool afterShow, bool afterSave)
+    public static ScrollFinishActions? RouteFinish(ScrollFinishInputs inputs)
     {
         var flags = new ScrollStopFlags
         {
             Finished = true,
-            Cancelled = cancelled,
-            QuickCopy = quickCopy,
+            Cancelled = inputs.Cancelled,
+            QuickCopy = inputs.QuickCopy,
         };
-        return Present(flags, afterCopy, afterShow, afterSave);
+        return Present(flags, inputs.AfterCopy, inputs.AfterShow, inputs.AfterSave);
     }
+}
+
+/// Named finish flags so swapping two bools is a compile error (Honey N8w).
+public readonly struct ScrollFinishInputs
+{
+    public bool Cancelled { get; init; }
+    public bool QuickCopy { get; init; }
+    public bool AfterCopy { get; init; }
+    public bool AfterShow { get; init; }
+    public bool AfterSave { get; init; }
 }
 
 /// Dispatch helper. LL hook must marshal (`true`); timer / ✓ / WM_HOTKEY run

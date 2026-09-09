@@ -1148,6 +1148,97 @@ static class TestEntry
             TranslateService.TranslatorOverrideForTesting = null;
         }
 
+        // Scroll session stop: drive the LIVE session through the same
+        // WM_HOTKEY path (id → ForHotkeyId → ApplyStop). Parity gates on
+        // Studio cannot compile ScrollShot/TrayContext; this is the seam
+        // those four review rounds had to read by hand.
+        ScrollShotFinish DriveScroll(int hotkeyId, bool afterCopy, bool afterShow, bool afterSave)
+        {
+            ScrollShotFinish? got = null;
+            var rect = new Rectangle(40, 40, 120, 90);
+            ScrollShotSession.BeginForTesting(
+                rect, (afterCopy, afterShow, afterSave),
+                f => { got = f; f.Image?.Dispose(); });
+            Application.DoEvents();
+            var session = ScrollShotSession.ActiveForTesting
+                ?? throw new InvalidOperationException("scroll session did not start");
+            try
+            {
+                session.DeliverHotkeyForTesting(hotkeyId);
+                Application.DoEvents();
+            }
+            finally
+            {
+                if (ScrollShotSession.IsActive)
+                    ScrollShotSession.ActiveForTesting
+                        ?.DeliverHotkeyForTesting(ScrollSessionStop.ReturnId);
+                Application.DoEvents();
+            }
+            if (ScrollShotSession.IsActive)
+                throw new InvalidOperationException("scroll session still active");
+            return got ?? throw new InvalidOperationException("scroll session produced no finish");
+        }
+
+        Step("scroll-esc-cancels", () =>
+        {
+            var finish = DriveScroll(ScrollSessionStop.EscId, false, true, false);
+            if (!finish.Cancelled)
+                throw new InvalidOperationException("Esc did not cancel");
+            if (ScrollStopMachine.RouteFinish(new ScrollFinishInputs
+                {
+                    Cancelled = finish.Cancelled,
+                    QuickCopy = finish.QuickCopy,
+                    AfterCopy = finish.AfterCopy,
+                    AfterShow = finish.AfterShow,
+                    AfterSave = finish.AfterSave,
+                }) != null)
+                throw new InvalidOperationException("Esc still routed a result");
+        });
+        Step("scroll-enter-finishes-to-show", () =>
+        {
+            var finish = DriveScroll(ScrollSessionStop.ReturnId, false, true, false);
+            if (finish.Cancelled || finish.QuickCopy)
+                throw new InvalidOperationException(
+                    $"Enter cancelled={finish.Cancelled} quickCopy={finish.QuickCopy}");
+            if (ScrollStopMachine.RouteFinish(new ScrollFinishInputs
+                {
+                    Cancelled = finish.Cancelled,
+                    QuickCopy = finish.QuickCopy,
+                    AfterCopy = finish.AfterCopy,
+                    AfterShow = finish.AfterShow,
+                    AfterSave = finish.AfterSave,
+                }) is not { } route)
+                throw new InvalidOperationException("Enter produced no route");
+            if (route.Copy || !route.Show || route.Save)
+                throw new InvalidOperationException(
+                    $"Enter route copy={route.Copy} show={route.Show} save={route.Save}");
+        });
+        Step("scroll-ctrlc-quickcopies", () =>
+        {
+            var finish = DriveScroll(ScrollSessionStop.CopyId, false, true, true);
+            if (!finish.QuickCopy || finish.Cancelled)
+                throw new InvalidOperationException(
+                    $"Ctrl+C cancelled={finish.Cancelled} quickCopy={finish.QuickCopy}");
+            if (ScrollStopMachine.RouteFinish(new ScrollFinishInputs
+                {
+                    Cancelled = finish.Cancelled,
+                    QuickCopy = finish.QuickCopy,
+                    AfterCopy = finish.AfterCopy,
+                    AfterShow = finish.AfterShow,
+                    AfterSave = finish.AfterSave,
+                }) is not { } route)
+                throw new InvalidOperationException("Ctrl+C produced no route");
+            if (!route.Copy || route.Show || !route.Save)
+                throw new InvalidOperationException(
+                    $"Ctrl+C opened editor copy={route.Copy} show={route.Show} save={route.Save}");
+        });
+        Step("scroll-shift-esc-is-not-a-stop", () =>
+        {
+            if (ScrollSessionStop.ForKey(
+                    ScrollSessionStop.VkEscape, ScrollSessionStop.ModShift) != null)
+                throw new InvalidOperationException("Shift+Esc must not be a stop chord");
+        });
+
         // OCR language selection. Asking for a recognizer the picture is not
         // written in fails silently on both platforms, so the gates are about
         // what gets ASKED FOR, which is the part a regression can change

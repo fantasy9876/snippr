@@ -1653,20 +1653,22 @@ static class Program
     static List<string> ScrollTrayRouteGate()
     {
         var f = new List<string>();
-        if (ScrollStopMachine.RouteFinish(true, false, false, true, false) != null)
+        if (ScrollStopMachine.RouteFinish(new ScrollFinishInputs { Cancelled = true }) != null)
             f.Add("cancel still routed");
 
-        if (ScrollStopMachine.RouteFinish(false, true, false, true, true) is not { } qcSave)
+        if (ScrollStopMachine.RouteFinish(new ScrollFinishInputs
+            { QuickCopy = true, AfterShow = true, AfterSave = true }) is not { } qcSave)
             f.Add("Ctrl+C+save null");
         else if (!qcSave.Copy || qcSave.Show || !qcSave.Save)
             f.Add($"Ctrl+C opened editor {qcSave.Copy}/{qcSave.Show}/{qcSave.Save}");
 
-        if (ScrollStopMachine.RouteFinish(false, true, false, true, false) is not { } qc)
+        if (ScrollStopMachine.RouteFinish(new ScrollFinishInputs
+            { QuickCopy = true, AfterShow = true }) is not { } qc)
             f.Add("Ctrl+C null");
         else if (!qc.Copy || qc.Show || qc.Save)
             f.Add($"Ctrl+C lost force-copy {qc.Copy}/{qc.Show}/{qc.Save}");
 
-        if (ScrollStopMachine.RouteFinish(false, false, false, true, false) is not { } enter)
+        if (ScrollStopMachine.RouteFinish(new ScrollFinishInputs { AfterShow = true }) is not { } enter)
             f.Add("enter null");
         else if (enter.Copy || !enter.Show || enter.Save)
             f.Add($"enter route {enter.Copy}/{enter.Show}/{enter.Save}");
