@@ -1,4 +1,5 @@
 import AppKit
+import Carbon.HIToolbox
 import ImageIO
 import Vision
 
@@ -5848,6 +5849,16 @@ enum SelfTest {
                     if esc.keyCode != 53 {
                         g2.append("premise-event-malformed key=\(esc.keyCode)")
                     }
+                    if let shiftEsc = sessionKey(
+                        "\u{1b}", keyCode: 53, modifiers: .shift
+                    ), ScrollingCapture.stopAction(for: shiftEsc) != nil {
+                        g2.append("shift-esc-consumed")
+                    }
+                    if let shiftRet = sessionKey(
+                        "\r", keyCode: 36, modifiers: .shift
+                    ), ScrollingCapture.stopAction(for: shiftRet) != nil {
+                        g2.append("shift-return-consumed")
+                    }
                     runEscCancel(fire: .nsEvent(esc), label: "", into: &g2)
                     check("esc-cancels-scroll-no-result",
                           g2.isEmpty, g2.joined(separator: "; "))
@@ -6018,10 +6029,74 @@ enum SelfTest {
                     if !liveLabel.stringValue.contains(wantHotkey) {
                         g4.append("hotkey:\(liveLabel.stringValue)")
                     }
+                    let progress = ScrollingCapture.stitchingProgressText(
+                        points: 1234, connectingUp: false,
+                        hotkeysRegistered: true)
+                    if progress.contains(", xong ")
+                        || progress.contains("xong Enter") {
+                        g4.append("progress-xong-prefix \(progress)")
+                    }
+                    if !progress.contains("cuộn tiếp · \(wantHotkey)") {
+                        g4.append("progress:\(progress)")
+                    }
+                    session.updateProgressForTesting(progress)
+                    if liveLabel.stringValue != progress {
+                        g4.append(
+                            "progress-label \(liveLabel.stringValue)")
+                    }
+                    let up = ScrollingCapture.stitchingProgressText(
+                        points: 1234, connectingUp: true,
+                        hotkeysRegistered: true)
+                    if !up.contains("(nối lên trên) — cuộn tiếp · \(wantHotkey)") {
+                        g4.append("progress-up:\(up)")
+                    }
                     session.removeStopForTesting()
                     session.hideChromeForTesting()
                     check("scroll-session-stop-hint",
                           g4.isEmpty, g4.joined(separator: "; "))
+                }
+
+                // H1: keyCode → hotkeyID table is the front of the Carbon
+                // chain. M9 swapped esc/return IDs here and the auxHandler
+                // gates stayed green. Fail-first: that swap must FAIL this.
+                gHotkeySpecs: do {
+                    var hs: [String] = []
+                    let want: [(UInt32, UInt32, UInt32)] = [
+                        (UInt32(kVK_Escape), 0, ScrollingCapture.escHotkeyID),
+                        (UInt32(kVK_Return), 0, ScrollingCapture.returnHotkeyID),
+                        (UInt32(kVK_ANSI_KeypadEnter), 0,
+                         ScrollingCapture.keypadEnterHotkeyID),
+                        (UInt32(kVK_ANSI_C), UInt32(cmdKey),
+                         ScrollingCapture.copyHotkeyID),
+                    ]
+                    func sameSpecs(
+                        _ a: [(UInt32, UInt32, UInt32)],
+                        _ b: [(UInt32, UInt32, UInt32)]
+                    ) -> Bool {
+                        a.count == b.count && zip(a, b).allSatisfy {
+                            $0.0 == $1.0 && $0.1 == $1.1 && $0.2 == $1.2
+                        }
+                    }
+                    if ScrollingCapture.sessionHotkeySpecs.count != 4 {
+                        hs.append(
+                            "count \(ScrollingCapture.sessionHotkeySpecs.count)")
+                    }
+                    if !sameSpecs(ScrollingCapture.sessionHotkeySpecs, want) {
+                        hs.append(
+                            "table \(ScrollingCapture.sessionHotkeySpecs)")
+                    }
+                    let session = ScrollingCapture(onFinish: { _ in })
+                    session.installStopForTesting()
+                    let installed = session.lastInstallAttemptedSpecsForTesting()
+                    if !sameSpecs(installed, want) {
+                        hs.append("installStop \(installed)")
+                    }
+                    if installed.count != 4 {
+                        hs.append("installStop-count \(installed.count)")
+                    }
+                    session.removeStopForTesting()
+                    check("scroll-session-hotkey-specs",
+                          hs.isEmpty, hs.joined(separator: "; "))
                 }
             }
 

@@ -9,10 +9,20 @@ import Carbon.HIToolbox
 final class ScrollingCapture {
     static var active: ScrollingCapture?
 
-    static let escHotkeyID: UInt32 = 999
-    static let returnHotkeyID: UInt32 = 1000
-    static let keypadEnterHotkeyID: UInt32 = 1001
-    static let copyHotkeyID: UInt32 = 1002
+    nonisolated static let escHotkeyID: UInt32 = 999
+    nonisolated static let returnHotkeyID: UInt32 = 1000
+    nonisolated static let keypadEnterHotkeyID: UInt32 = 1001
+    nonisolated static let copyHotkeyID: UInt32 = 1002
+
+    /// Physical key → Carbon hotkey ID for the live scroll session.
+    /// `installStop()` registers exactly this table; gates read it so a
+    /// swap of Esc/Return IDs cannot hide behind the auxHandler seam.
+    nonisolated static let sessionHotkeySpecs: [(UInt32, UInt32, UInt32)] = [
+        (UInt32(kVK_Escape), 0, escHotkeyID),
+        (UInt32(kVK_Return), 0, returnHotkeyID),
+        (UInt32(kVK_ANSI_KeypadEnter), 0, keypadEnterHotkeyID),
+        (UInt32(kVK_ANSI_C), UInt32(cmdKey), copyHotkeyID),
+    ]
 
     /// Identifier for the live-preview hint label. Gates look this up
     /// instead of scanning title strings — a substring match that finds
@@ -35,6 +45,9 @@ final class ScrollingCapture {
     private var escLocalMonitor: Any?
     private var sessionHotkeyRefs: [EventHotKeyRef] = []
     private var hotkeysRegistered = false
+    /// Specs `installStop()` actually walked. Gates compare this to
+    /// `sessionHotkeySpecs` so a local duplicate table cannot hide a swap.
+    private var lastInstallAttemptedSpecs: [(UInt32, UInt32, UInt32)] = []
 
     enum StopAction {
         case cancel
@@ -73,6 +86,16 @@ final class ScrollingCapture {
         hotkeysRegistered
             ? "Enter/✓ xong · ⌘C copy · Esc hủy"
             : "bấm ✓ để xong"
+    }
+
+    /// Live stitching line. Do not prefix with "xong " — that sat next to
+    /// "Esc hủy" and read as if Esc still finished the capture.
+    nonisolated static func stitchingProgressText(
+        points: Int, connectingUp: Bool, hotkeysRegistered: Bool
+    ) -> String {
+        let suffix = connectingUp ? " (nối lên trên)" : ""
+        return "Đã ghép \(points) pt\(suffix) — cuộn tiếp · "
+            + sessionStopHint(hotkeysRegistered: hotkeysRegistered)
     }
 
     /// Identifier for the live-preview "✓ Xong" control. Gates look this up
@@ -226,7 +249,7 @@ final class ScrollingCapture {
                     captureFailures = 0
                     backendNeedsHandshake = stitcher != nil
                     stitcher?.prepareForBackendTransition()
-                    updateProgress("Đang dùng chế độ tương thích — cuộn tiếp, xong \(stopHint)")
+                    updateProgress("Đang dùng chế độ tương thích — cuộn tiếp · \(stopHint)")
                     NSLog("Snippr: sourceRect capture failed repeatedly — switching to full-display crop")
                 } else if captureFailures > 10 {
                     break
@@ -421,16 +444,20 @@ final class ScrollingCapture {
                 appendPreview(s.lastSlice)
             }
             updateProgress(
-                "Đã ghép \(Int(CGFloat(s.totalHeight) / s.scale)) pt "
-                + "— cuộn tiếp, xong \(stopHint)")
+                Self.stitchingProgressText(
+                    points: Int(CGFloat(s.totalHeight) / s.scale),
+                    connectingUp: false,
+                    hotkeysRegistered: hotkeysRegistered))
         case .prepended:
             // Always rebuild: the incremental paste-on-top path cannot
             // represent separators or completed segments above the current
             // one, and the bounded window render is cheap.
             rebuildPreview(from: s, pinToTop: true)
             updateProgress(
-                "Đã ghép \(Int(CGFloat(s.totalHeight) / s.scale)) pt "
-                + "(nối lên trên) — cuộn tiếp, xong \(stopHint)")
+                Self.stitchingProgressText(
+                    points: Int(CGFloat(s.totalHeight) / s.scale),
+                    connectingUp: true,
+                    hotkeysRegistered: hotkeysRegistered))
         case .moved:
             // A retrace adds no rows, but an accepted frame can still revoke
             // a header omit and raise totalHeight — resync the preview at the
@@ -548,14 +575,11 @@ final class ScrollingCapture {
         // Enter/⌘C/Esc must not also fire there (submit a form, copy its
         // selection, dismiss a sheet). Carbon RegisterEventHotKey swallows
         // the chord; the local monitor returns nil. Unregister at teardown.
-        let specs: [(UInt32, UInt32, UInt32)] = [
-            (UInt32(kVK_Escape), 0, Self.escHotkeyID),
-            (UInt32(kVK_Return), 0, Self.returnHotkeyID),
-            (UInt32(kVK_ANSI_KeypadEnter), 0, Self.keypadEnterHotkeyID),
-            (UInt32(kVK_ANSI_C), UInt32(cmdKey), Self.copyHotkeyID),
-        ]
+        lastInstallAttemptedSpecs = []
         var registered = 0
-        for (keyCode, modifiers, id) in specs {
+        for spec in Self.sessionHotkeySpecs {
+            lastInstallAttemptedSpecs.append(spec)
+            let (keyCode, modifiers, id) = spec
             var ref: EventHotKeyRef?
             let hotKeyID = EventHotKeyID(
                 signature: OSType(0x534E4553) /* 'SNES' */, id: id)
@@ -590,7 +614,10 @@ final class ScrollingCapture {
     }
 
     static func stopAction(for event: NSEvent) -> StopAction? {
-        let chord = event.modifierFlags.intersection([.command, .option, .control])
+        // Include .shift so Shift+Esc/Return match Carbon (modifiers=0)
+        // and ⌘C, which already rejected shift.
+        let chord = event.modifierFlags.intersection(
+            [.command, .option, .control, .shift])
         switch event.keyCode {
         case UInt16(kVK_Escape) where chord.isEmpty:
             return .cancel
@@ -654,6 +681,10 @@ final class ScrollingCapture {
     var previewPanelForTesting: NSPanel? { controlPanel }
     func installStopForTesting() { installStop() }
     func removeStopForTesting() { removeStop() }
+    func lastInstallAttemptedSpecsForTesting() -> [(UInt32, UInt32, UInt32)] {
+        lastInstallAttemptedSpecs
+    }
+    func updateProgressForTesting(_ text: String) { updateProgress(text) }
 
     func chromeView(identifier: String) -> NSView? {
         func walk(_ view: NSView) -> NSView? {
