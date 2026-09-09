@@ -40,6 +40,8 @@ static class Program
         failed += Check("win-translate-failure-kinds", TranslateFailureKinds());
         failed += Check("win-translate-request-keeps-source", TranslateRequestKeepsSource());
         failed += Check("win-scroll-session-stop-semantics", ScrollSessionStopSemantics());
+        failed += Check("win-scroll-stop-machine", ScrollStopMachineGate());
+        failed += Check("win-scroll-hook-policy", ScrollStopHookPolicyGate());
         if (pending > 0)
             Console.WriteLine($"{pending} PARITY GATE(S) PENDING — not a pass");
         Console.WriteLine(failed == 0
@@ -1529,6 +1531,80 @@ static class Program
             f.Add($"progress missing cuộn tiếp '{progress}'");
         if (progress.Contains("xong Esc", StringComparison.Ordinal))
             f.Add($"progress still has xong next to Esc '{progress}'");
+        return f;
+    }
+
+    /// Honey W-H1: drive the production ApplyStop machine. W2 (Finished=true
+    /// without Apply) makes Esc compose+show and Ctrl+C show instead of copy.
+    static List<string> ScrollStopMachineGate()
+    {
+        var f = new List<string>();
+
+        var esc = new ScrollStopMachine(afterCopy: false, afterShow: true, afterSave: false);
+        if (!esc.ApplyStop(ScrollStopAction.Cancel)) f.Add("esc ApplyStop returned false");
+        if (!esc.Flags.Cancelled || !esc.Flags.Finished) f.Add("esc flags");
+        if (esc.ShouldCompose) f.Add("W2 Esc still composes");
+        if (esc.Route() != null) f.Add("W2 Esc still routes to presenter");
+        if (esc.ApplyStop(ScrollStopAction.Finish)) f.Add("second key after esc was accepted");
+
+        var enter = new ScrollStopMachine(false, true, false);
+        enter.ApplyStop(ScrollStopAction.Finish);
+        if (!enter.ShouldCompose) f.Add("enter did not compose");
+        if (enter.Route() is not { } enterRoute)
+            f.Add("enter route null");
+        else if (enterRoute.Copy || !enterRoute.Show || enterRoute.Save)
+            f.Add($"enter route {enterRoute.Copy}/{enterRoute.Show}/{enterRoute.Save}");
+
+        var copy = new ScrollStopMachine(false, true, true);
+        copy.ApplyStop(ScrollStopAction.QuickCopy);
+        if (!copy.ShouldCompose) f.Add("quickcopy did not compose");
+        if (copy.Route() is not { } copyRoute)
+            f.Add("W2 Ctrl+C opened editor (null route)");
+        else if (!copyRoute.Copy || copyRoute.Show || !copyRoute.Save)
+            f.Add($"W2 Ctrl+C opened editor {copyRoute.Copy}/{copyRoute.Show}/{copyRoute.Save}");
+
+        var copyNoSave = new ScrollStopMachine(false, true, false);
+        copyNoSave.ApplyStop(ScrollStopAction.QuickCopy);
+        if (copyNoSave.Route() is not { } c2)
+            f.Add("quickcopy no-save null");
+        else if (!c2.Copy || c2.Show || c2.Save)
+            f.Add($"quickcopy no-save {c2.Copy}/{c2.Show}/{c2.Save}");
+
+        return f;
+    }
+
+    /// Honey W-H2: hook only failed specs; modifiers from a physical-state
+    /// reader. Ctrl with mods=0 must not match; Shift+Esc must not cancel on
+    /// a Copy-only hook (RegisterHotKey still owns Esc).
+    static List<string> ScrollStopHookPolicyGate()
+    {
+        var f = new List<string>();
+        short CtrlDown(int vk) =>
+            vk == ScrollSessionStop.VkControl ? unchecked((short)0x8000) : (short)0;
+        if (ScrollStopHookPolicy.ModsFromKeyState(CtrlDown) != ScrollSessionStop.ModControl)
+            f.Add("ctrl async state did not set ModControl");
+        if (ScrollStopHookPolicy.ModsFromKeyState(_ => 0) != 0)
+            f.Add("idle async state was not 0");
+
+        var failed = ScrollStopHookPolicy.FailedSpecIds(new[] { 1000, 1001 });
+        if (failed.Length != 1 || failed[0] != 1002)
+            f.Add($"failed specs [{string.Join(",", failed)}] want [1002]");
+        var noneFailed = ScrollStopHookPolicy.FailedSpecIds(new[] { 1000, 1001, 1002 });
+        if (noneFailed.Length != 0) f.Add("all-registered still wants a hook");
+
+        var hookedCopy = (IReadOnlyCollection<int>)failed;
+        if (ScrollStopHookPolicy.Interpret(0x43, 0, hookedCopy) != null)
+            f.Add("Ctrl+C leaked through hook with mods=0");
+        if (ScrollStopHookPolicy.Interpret(0x43, 0x0002, hookedCopy) != ScrollStopAction.QuickCopy)
+            f.Add("hooked Ctrl+C did not quickcopy");
+        if (ScrollStopHookPolicy.Interpret(0x1B, 0, hookedCopy) != null)
+            f.Add("hook stole Esc that RegisterHotKey still owns");
+        if (ScrollStopHookPolicy.Interpret(0x1B, ScrollSessionStop.ModShift, hookedCopy) != null)
+            f.Add("Shift+Esc cancelled via Copy-only hook");
+
+        var hookedAll = new[] { 1000, 1001, 1002 };
+        if (ScrollStopHookPolicy.Interpret(0x1B, 0, hookedAll) != ScrollStopAction.Cancel)
+            f.Add("all-hooked Esc is not cancel");
         return f;
     }
 }

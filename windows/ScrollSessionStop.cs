@@ -113,4 +113,96 @@ public static class ScrollSessionStop
     /// if Esc still finished the capture (macOS H3).
     public static string StitchingProgressText(int pixels, bool hotkeysRegistered) =>
         $"Đã ghép {pixels}px — cuộn tiếp · " + SessionStopHint(hotkeysRegistered);
+
+    public const int VkShift = 0x10;
+    public const int VkControl = 0x11;
+    public const int VkMenu = 0x12;
+}
+
+/// Production stop path. `ScrollShot.ApplyStop` is a thin marshal onto
+/// `ApplyStop` here; the parity gate drives this object so W2 (Finished=true
+/// without `Apply`) cannot stay green. Snapshot-at-begin lives on the machine
+/// so Route() matches TrayContext.
+public sealed class ScrollStopMachine
+{
+    public ScrollStopFlags Flags;
+    public bool AfterCopy { get; }
+    public bool AfterShow { get; }
+    public bool AfterSave { get; }
+
+    public ScrollStopMachine(bool afterCopy, bool afterShow, bool afterSave)
+    {
+        AfterCopy = afterCopy;
+        AfterShow = afterShow;
+        AfterSave = afterSave;
+    }
+
+    /// Returns false when the session already ended (second key is ignored).
+    public bool ApplyStop(ScrollStopAction action)
+    {
+        if (Flags.Finished) return false;
+        ScrollSessionStop.Apply(action, ref Flags);
+        return true;
+    }
+
+    public bool ShouldCompose => Flags.Finished && !Flags.Cancelled;
+
+    public ScrollFinishActions? Route() =>
+        Present(Flags, AfterCopy, AfterShow, AfterSave);
+
+    public static ScrollFinishActions? Present(
+        ScrollStopFlags flags, bool afterCopy, bool afterShow, bool afterSave)
+    {
+        if (!flags.Finished || flags.Cancelled) return null;
+        return ScrollSessionStop.EffectiveActions(
+            flags.QuickCopy, afterCopy, afterShow, afterSave);
+    }
+}
+
+/// LL-hook policy. Only specs that failed `RegisterHotKey` are hooked, and
+/// modifiers come from a physical-state reader (`GetAsyncKeyState`), not the
+/// installing thread's message queue (`GetKeyState`).
+public static class ScrollStopHookPolicy
+{
+    public static uint ModsFromKeyState(Func<int, short> getKey)
+    {
+        uint mods = 0;
+        if ((getKey(ScrollSessionStop.VkControl) & 0x8000) != 0)
+            mods |= ScrollSessionStop.ModControl;
+        if ((getKey(ScrollSessionStop.VkShift) & 0x8000) != 0)
+            mods |= ScrollSessionStop.ModShift;
+        if ((getKey(ScrollSessionStop.VkMenu) & 0x8000) != 0)
+            mods |= ScrollSessionStop.ModAlt;
+        return mods;
+    }
+
+    public static int[] FailedSpecIds(IReadOnlyCollection<int> registeredIds)
+    {
+        var failed = new List<int>();
+        foreach (var spec in ScrollSessionStop.Specs)
+        {
+            bool registered = false;
+            foreach (var id in registeredIds)
+            {
+                if (id == spec.Id) { registered = true; break; }
+            }
+            if (!registered) failed.Add(spec.Id);
+        }
+        return failed.ToArray();
+    }
+
+    /// Null unless this chord belongs to a spec we were asked to hook.
+    public static ScrollStopAction? Interpret(
+        uint vk, uint mods, IReadOnlyCollection<int> hookedIds)
+    {
+        foreach (var spec in ScrollSessionStop.Specs)
+        {
+            if (spec.Vk != vk || spec.Mods != mods) continue;
+            foreach (var id in hookedIds)
+            {
+                if (id == spec.Id) return ScrollSessionStop.ForHotkeyId(spec.Id);
+            }
+        }
+        return null;
+    }
 }

@@ -203,16 +203,22 @@ sealed class TrayContext : ApplicationContext
         if (CaptureBusy) return;
         ScrollShotSession.Begin(finish =>
         {
-            if (finish.Cancelled)
+            var flags = new ScrollStopFlags
+            {
+                Finished = true,
+                Cancelled = finish.Cancelled,
+                QuickCopy = finish.QuickCopy,
+            };
+            var actions = ScrollStopMachine.Present(
+                flags, finish.AfterCopy, finish.AfterShow, finish.AfterSave);
+            if (actions is not { } route)
             {
                 finish.Image?.Dispose();
-                ToastForm.Show("Đã hủy chụp cuộn");
+                if (finish.Cancelled) ToastForm.Show("Đã hủy chụp cuộn");
                 return;
             }
             if (finish.Image == null) return;
-            var actions = ScrollSessionStop.EffectiveActions(
-                finish.QuickCopy, finish.AfterCopy, finish.AfterShow, finish.AfterSave);
-            HandleResult(finish.Image, actions.Copy, actions.Show, actions.Save);
+            HandleResult(finish.Image, route.Copy, route.Show, route.Save);
         });
     }
 

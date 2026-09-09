@@ -17,9 +17,7 @@ sealed class ScrollShotSession
 
     readonly Rectangle _rect; // virtual-screen coords
     readonly Action<ScrollShotFinish> _onFinish;
-    readonly bool _afterCopy;
-    readonly bool _afterShow;
-    readonly bool _afterSave;
+    readonly ScrollStopMachine _stop;
     readonly List<Form> _chrome = new();
     Form? _panel;
     bool _panelOverlapsRect;
@@ -39,7 +37,6 @@ sealed class ScrollShotSession
     Bitmap? _probe; // reused capture buffer — no per-tick allocation
     WinStitcher? _stitcher;
     int _lastHash;
-    ScrollStopFlags _flags;
 
     const int MaxHeightPx = 20000;
 
@@ -67,9 +64,7 @@ sealed class ScrollShotSession
     {
         _rect = rect;
         _onFinish = onFinish;
-        _afterCopy = snapshot.AfterCopy;
-        _afterShow = snapshot.AfterShow;
-        _afterSave = snapshot.AfterSave;
+        _stop = new ScrollStopMachine(snapshot.AfterCopy, snapshot.AfterShow, snapshot.AfterSave);
         _sync = SynchronizationContext.Current;
         BuildChrome();
         InstallStop();
@@ -97,9 +92,11 @@ sealed class ScrollShotSession
             if (Native.RegisterHotKey(_hotkeyWindow.Handle, spec.Id, spec.Mods, spec.Vk))
                 _registeredHotkeyIds.Add(spec.Id);
         }
-        if (_registeredHotkeyIds.Count < ScrollSessionStop.Specs.Length)
+        var failedIds = ScrollStopHookPolicy.FailedSpecIds(_registeredHotkeyIds);
+        if (failedIds.Length > 0)
         {
-            _stopHook = LowLevelScrollStopHook.TryInstall(ApplyStop);
+            _stopHook = LowLevelScrollStopHook.TryInstall(
+                ApplyStop, failedIds, Native.GetAsyncKeyState);
         }
         _hotkeysRegistered = _registeredHotkeyIds.Count > 0 || _stopHook != null;
     }
@@ -108,17 +105,18 @@ sealed class ScrollShotSession
     {
         void go()
         {
-            if (_flags.Finished) return;
-            ScrollSessionStop.Apply(action, ref _flags);
+            if (!_stop.ApplyStop(action)) return;
             End();
         }
-        if (_sync != null) _sync.Post(_ => go(), null);
-        else go();
+        // Stay inline on the UI thread so MaxHeightPx teardown is not delayed
+        // a message (Honey N5w). The LL hook is the path that must marshal.
+        if (_sync == null || SynchronizationContext.Current == _sync) go();
+        else _sync.Post(_ => go(), null);
     }
 
     void CaptureTick()
     {
-        if (_flags.Finished) return;
+        if (_stop.Flags.Finished) return;
         _probe ??= new Bitmap(_rect.Width, _rect.Height, PixelFormat.Format24bppRgb);
 
         // Last-resort safety: when the panel had to overlap the rect (tiny
@@ -201,7 +199,7 @@ sealed class ScrollShotSession
 
     void End()
     {
-        if (!_flags.Finished) return;
+        if (!_stop.Flags.Finished) return;
         _timer.Stop();
         _timer.Dispose();
         _stopHook?.Dispose();
@@ -220,7 +218,7 @@ sealed class ScrollShotSession
         _active = null;
 
         Bitmap? result = null;
-        if (!_flags.Cancelled)
+        if (_stop.ShouldCompose)
             result = _stitcher?.Compose();
         _stitcher?.Dispose();
         _stitcher = null;
@@ -232,11 +230,11 @@ sealed class ScrollShotSession
         _onFinish(new ScrollShotFinish
         {
             Image = result,
-            Cancelled = _flags.Cancelled,
-            QuickCopy = _flags.QuickCopy,
-            AfterCopy = _afterCopy,
-            AfterShow = _afterShow,
-            AfterSave = _afterSave,
+            Cancelled = _stop.Flags.Cancelled,
+            QuickCopy = _stop.Flags.QuickCopy,
+            AfterCopy = _stop.AfterCopy,
+            AfterShow = _stop.AfterShow,
+            AfterSave = _stop.AfterSave,
         });
     }
 
@@ -356,8 +354,9 @@ sealed class ScrollShotSession
     }
 }
 
-/// Result of a scroll session. `Cancelled` wins over `QuickCopy` if both
-/// flags are set (Esc after Ctrl+C still discards).
+/// Result of a scroll session. Windows Ends on the first key, so Cancelled
+/// and QuickCopy are not both set in one session (unlike macOS, where flags
+/// can race before finalize).
 sealed class ScrollShotFinish
 {
     public Bitmap? Image;
@@ -369,23 +368,34 @@ sealed class ScrollShotFinish
 }
 
 /// Low-level keyboard hook that CONSUMES matching session keys (returns 1)
-/// so the scrolled app does not also submit / copy / dismiss. Fallback when
-/// RegisterHotKey could not take every spec.
+/// so the scrolled app does not also submit / copy / dismiss. Installed only
+/// for specs `RegisterHotKey` failed; modifiers come from GetAsyncKeyState.
 sealed class LowLevelScrollStopHook : IDisposable
 {
     IntPtr _hook;
     readonly Native.LowLevelKeyboardProc _proc; // field keeps the delegate alive
     readonly Action<ScrollStopAction> _onAction;
+    readonly int[] _hookedIds;
+    readonly Func<int, short> _getAsyncKeyState;
 
-    LowLevelScrollStopHook(Action<ScrollStopAction> onAction)
+    LowLevelScrollStopHook(
+        Action<ScrollStopAction> onAction,
+        int[] hookedIds,
+        Func<int, short> getAsyncKeyState)
     {
         _onAction = onAction;
+        _hookedIds = hookedIds;
+        _getAsyncKeyState = getAsyncKeyState;
         _proc = Callback;
     }
 
-    public static LowLevelScrollStopHook? TryInstall(Action<ScrollStopAction> onAction)
+    public static LowLevelScrollStopHook? TryInstall(
+        Action<ScrollStopAction> onAction,
+        int[] hookedIds,
+        Func<int, short> getAsyncKeyState)
     {
-        var hook = new LowLevelScrollStopHook(onAction);
+        if (hookedIds.Length == 0) return null;
+        var hook = new LowLevelScrollStopHook(onAction, hookedIds, getAsyncKeyState);
         hook._hook = Native.SetWindowsHookExW(
             Native.WH_KEYBOARD_LL, hook._proc, Native.GetModuleHandleW(null), 0);
         return hook._hook != IntPtr.Zero ? hook : null;
@@ -397,14 +407,8 @@ sealed class LowLevelScrollStopHook : IDisposable
             || wParam == (IntPtr)Native.WM_SYSKEYDOWN))
         {
             int vk = System.Runtime.InteropServices.Marshal.ReadInt32(lParam);
-            uint mods = 0;
-            if ((Native.GetKeyState(Native.VK_CONTROL) & 0x8000) != 0)
-                mods |= ScrollSessionStop.ModControl;
-            if ((Native.GetKeyState(Native.VK_SHIFT) & 0x8000) != 0)
-                mods |= ScrollSessionStop.ModShift;
-            if ((Native.GetKeyState(Native.VK_MENU) & 0x8000) != 0)
-                mods |= ScrollSessionStop.ModAlt;
-            if (ScrollSessionStop.ForKey((uint)vk, mods) is { } action)
+            uint mods = ScrollStopHookPolicy.ModsFromKeyState(_getAsyncKeyState);
+            if (ScrollStopHookPolicy.Interpret((uint)vk, mods, _hookedIds) is { } action)
             {
                 _onAction(action);
                 return (IntPtr)1; // consume
