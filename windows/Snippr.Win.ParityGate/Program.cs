@@ -39,6 +39,11 @@ static class Program
         failed += Check("win-ocr-panel-never-covers-region", OcrPanelPlacementGate());
         failed += Check("win-translate-failure-kinds", TranslateFailureKinds());
         failed += Check("win-translate-request-keeps-source", TranslateRequestKeepsSource());
+        failed += Check("win-scroll-session-stop-semantics", ScrollSessionStopSemantics());
+        failed += Check("win-scroll-stop-machine", ScrollStopMachineGate());
+        failed += Check("win-scroll-hook-policy", ScrollStopHookPolicyGate());
+        failed += Check("win-scroll-stop-invoke", ScrollStopInvokeGate());
+        failed += Check("win-scroll-tray-route", ScrollTrayRouteGate());
         if (pending > 0)
             Console.WriteLine($"{pending} PARITY GATE(S) PENDING — not a pass");
         Console.WriteLine(failed == 0
@@ -1449,6 +1454,222 @@ static class Program
         var stacked = Fake(TranslateService.RequestText("", first), "en");
         if (stacked != "[en] [vi] hello")
             f.Add($"empty-source oracle '{stacked}'");
+        return f;
+    }
+
+    /// Honey H2: Windows Esc used to Finish the stitch ("✓ / Esc để xong").
+    /// macOS 1.2.22 maps Esc→cancel, Enter→finish, ⌘C→quickcopy. This gate
+    /// pins the Windows table to the same meanings (Ctrl+C instead of ⌘C)
+    /// so the platforms cannot diverge silently again.
+    ///
+    /// The expected rows are literals independent of the production table:
+    /// swapping Esc/Return IDs in `ScrollSessionStop.Specs` must go red.
+    static List<string> ScrollSessionStopSemantics()
+    {
+        var f = new List<string>();
+        var want = new (uint Vk, uint Mods, int Id)[]
+        {
+            (0x1B, 0, 1000),
+            (0x0D, 0, 1001),
+            (0x43, 0x0002, 1002),
+        };
+        if (ScrollSessionStop.Specs.Length != want.Length)
+            f.Add($"spec count {ScrollSessionStop.Specs.Length} want {want.Length}");
+        for (int i = 0; i < want.Length && i < ScrollSessionStop.Specs.Length; i++)
+        {
+            var got = ScrollSessionStop.Specs[i];
+            if (got.Vk != want[i].Vk || got.Mods != want[i].Mods || got.Id != want[i].Id)
+                f.Add($"spec[{i}] ({got.Vk},{got.Mods},{got.Id}) want {want[i]}");
+        }
+
+        if (ScrollSessionStop.ForHotkeyId(1000) != ScrollStopAction.Cancel)
+            f.Add("Esc id is not cancel");
+        if (ScrollSessionStop.ForHotkeyId(1001) != ScrollStopAction.Finish)
+            f.Add("Return id is not finish");
+        if (ScrollSessionStop.ForHotkeyId(1002) != ScrollStopAction.QuickCopy)
+            f.Add("Ctrl+C id is not quickcopy");
+        if (ScrollSessionStop.ForKey(0x1B, 0) == ScrollStopAction.Finish)
+            f.Add("H2 Esc still finishes");
+        if (ScrollSessionStop.ForKey(0x1B, 0) != ScrollStopAction.Cancel)
+            f.Add("Esc key is not cancel");
+        if (ScrollSessionStop.ForKey(0x0D, 0) != ScrollStopAction.Finish)
+            f.Add("Enter key is not finish");
+        if (ScrollSessionStop.ForKey(0x43, 0x0002) != ScrollStopAction.QuickCopy)
+            f.Add("Ctrl+C key is not quickcopy");
+        if (ScrollSessionStop.ForKey(0x1B, ScrollSessionStop.ModShift) != null)
+            f.Add("Shift+Esc should miss (mods=0)");
+        if (ScrollSessionStop.ForKey(0x0D, ScrollSessionStop.ModShift) != null)
+            f.Add("Shift+Enter should miss");
+        if (ScrollSessionStop.ForKey(0x43, 0) != null)
+            f.Add("C without Ctrl should miss");
+
+        var hint = ScrollSessionStop.SessionStopHint(true);
+        if (hint != "Enter/✓ xong · Ctrl+C copy · Esc hủy")
+            f.Add($"hint '{hint}'");
+        if (hint.Contains("Esc để xong", StringComparison.Ordinal))
+            f.Add("hint still says Esc finishes");
+        var fallback = ScrollSessionStop.SessionStopHint(false);
+        if (fallback != "bấm ✓ để xong")
+            f.Add($"fallback hint '{fallback}'");
+
+        var qcSave = ScrollSessionStop.EffectiveActions(true, false, true, true);
+        if (!qcSave.Copy || qcSave.Show || !qcSave.Save)
+            f.Add($"quickcopy+save {qcSave.Copy}/{qcSave.Show}/{qcSave.Save}");
+        var qc = ScrollSessionStop.EffectiveActions(true, false, true, false);
+        if (!qc.Copy || qc.Show || qc.Save)
+            f.Add($"quickcopy {qc.Copy}/{qc.Show}/{qc.Save}");
+        var normal = ScrollSessionStop.EffectiveActions(false, false, true, false);
+        if (normal.Copy || !normal.Show || normal.Save)
+            f.Add($"finish snapshot {normal.Copy}/{normal.Show}/{normal.Save}");
+
+        var flags = new ScrollStopFlags();
+        ScrollSessionStop.Apply(ScrollStopAction.QuickCopy, ref flags);
+        ScrollSessionStop.Apply(ScrollStopAction.Cancel, ref flags);
+        if (!flags.Cancelled || !flags.QuickCopy || !flags.Finished)
+            f.Add("cancel after quickcopy dropped a flag");
+
+        var progress = ScrollSessionStop.StitchingProgressText(1234, true);
+        if (!progress.Contains("cuộn tiếp · ", StringComparison.Ordinal))
+            f.Add($"progress missing cuộn tiếp '{progress}'");
+        if (progress.Contains("xong Esc", StringComparison.Ordinal))
+            f.Add($"progress still has xong next to Esc '{progress}'");
+        return f;
+    }
+
+    /// Honey W-H1: drive the production ApplyStop machine. W2 (Finished=true
+    /// without Apply) makes Esc compose+show and Ctrl+C show instead of copy.
+    static List<string> ScrollStopMachineGate()
+    {
+        var f = new List<string>();
+
+        var esc = new ScrollStopMachine(afterCopy: false, afterShow: true, afterSave: false);
+        if (!esc.ApplyStop(ScrollStopAction.Cancel)) f.Add("esc ApplyStop returned false");
+        if (!esc.Flags.Cancelled || !esc.Flags.Finished) f.Add("esc flags");
+        if (esc.ShouldCompose) f.Add("W2 Esc still composes");
+        if (esc.Route() != null) f.Add("W2 Esc still routes to presenter");
+        if (esc.ApplyStop(ScrollStopAction.Finish)) f.Add("second key after esc was accepted");
+
+        var enter = new ScrollStopMachine(false, true, false);
+        enter.ApplyStop(ScrollStopAction.Finish);
+        if (!enter.ShouldCompose) f.Add("enter did not compose");
+        if (enter.Route() is not { } enterRoute)
+            f.Add("enter route null");
+        else if (enterRoute.Copy || !enterRoute.Show || enterRoute.Save)
+            f.Add($"enter route {enterRoute.Copy}/{enterRoute.Show}/{enterRoute.Save}");
+
+        var copy = new ScrollStopMachine(false, true, true);
+        copy.ApplyStop(ScrollStopAction.QuickCopy);
+        if (!copy.ShouldCompose) f.Add("quickcopy did not compose");
+        if (copy.Route() is not { } copyRoute)
+            f.Add("W2 Ctrl+C opened editor (null route)");
+        else if (!copyRoute.Copy || copyRoute.Show || !copyRoute.Save)
+            f.Add($"W2 Ctrl+C opened editor {copyRoute.Copy}/{copyRoute.Show}/{copyRoute.Save}");
+
+        var copyNoSave = new ScrollStopMachine(false, true, false);
+        copyNoSave.ApplyStop(ScrollStopAction.QuickCopy);
+        if (copyNoSave.Route() is not { } c2)
+            f.Add("quickcopy no-save null");
+        else if (!c2.Copy || c2.Show || c2.Save)
+            f.Add($"quickcopy no-save {c2.Copy}/{c2.Show}/{c2.Save}");
+
+        return f;
+    }
+
+    /// Honey W-H2: hook only failed specs; modifiers from a physical-state
+    /// reader. Ctrl with mods=0 must not match; Shift+Esc must not cancel on
+    /// a Copy-only hook (RegisterHotKey still owns Esc).
+    static List<string> ScrollStopHookPolicyGate()
+    {
+        var f = new List<string>();
+        short CtrlDown(int vk) =>
+            vk == ScrollSessionStop.VkControl ? unchecked((short)0x8000) : (short)0;
+        if (ScrollStopHookPolicy.ModsFromKeyState(CtrlDown) != ScrollSessionStop.ModControl)
+            f.Add("ctrl async state did not set ModControl");
+        if (ScrollStopHookPolicy.ModsFromKeyState(_ => 0) != 0)
+            f.Add("idle async state was not 0");
+
+        var failed = ScrollStopHookPolicy.FailedSpecIds(new[] { 1000, 1001 });
+        if (failed.Length != 1 || failed[0] != 1002)
+            f.Add($"failed specs [{string.Join(",", failed)}] want [1002]");
+        var noneFailed = ScrollStopHookPolicy.FailedSpecIds(new[] { 1000, 1001, 1002 });
+        if (noneFailed.Length != 0) f.Add("all-registered still wants a hook");
+
+        var hookedCopy = (IReadOnlyCollection<int>)failed;
+        if (ScrollStopHookPolicy.Interpret(0x43, 0, hookedCopy) != null)
+            f.Add("Ctrl+C leaked through hook with mods=0");
+        if (ScrollStopHookPolicy.Interpret(0x43, 0x0002, hookedCopy) != ScrollStopAction.QuickCopy)
+            f.Add("hooked Ctrl+C did not quickcopy");
+        if (ScrollStopHookPolicy.Interpret(0x1B, 0, hookedCopy) != null)
+            f.Add("hook stole Esc that RegisterHotKey still owns");
+        if (ScrollStopHookPolicy.Interpret(0x1B, ScrollSessionStop.ModShift, hookedCopy) != null)
+            f.Add("Shift+Esc cancelled via Copy-only hook");
+
+        var hookedAll = new[] { 1000, 1001, 1002 };
+        if (ScrollStopHookPolicy.Interpret(0x1B, 0, hookedAll) != ScrollStopAction.Cancel)
+            f.Add("all-hooked Esc is not cancel");
+        return f;
+    }
+
+    /// Honey W-H3: LL hook must Post; timer/✓ run inline. A FakeSync that
+    /// records Post (and does not run the callback) proves marshal:true does
+    /// not execute End inside the hook proc.
+    sealed class FakeSync : SynchronizationContext
+    {
+        public int Posts;
+        public override void Post(SendOrPostCallback d, object? state) => Posts++;
+    }
+
+    static List<string> ScrollStopInvokeGate()
+    {
+        var f = new List<string>();
+        var seen = new List<bool>();
+        void apply(ScrollStopAction _, bool marshal) => seen.Add(marshal);
+        ScrollStopInvoke.Bind(apply, ScrollStopInvoke.HookMarshals)(ScrollStopAction.Cancel);
+        ScrollStopInvoke.Bind(apply, ScrollStopInvoke.UiMarshals)(ScrollStopAction.Finish);
+        if (seen.Count != 2 || seen[0] != true || seen[1] != false)
+            f.Add($"bind marshal {string.Join(",", seen)} want true,false");
+
+        var sync = new FakeSync();
+        int ran = 0;
+        ScrollStopInvoke.Run(marshal: true, sync, () => ran++);
+        if (ran != 0) f.Add("W-H3 hook path ran inline");
+        if (sync.Posts != 1) f.Add($"hook path posts {sync.Posts} want 1");
+
+        ran = 0;
+        sync.Posts = 0;
+        ScrollStopInvoke.Run(marshal: false, sync, () => ran++);
+        if (ran != 1) f.Add("ui path did not run inline");
+        if (sync.Posts != 0) f.Add("ui path posted");
+
+        ran = 0;
+        ScrollStopInvoke.Run(marshal: true, null, () => ran++);
+        if (ran != 1) f.Add("marshal true with no sync did not run");
+        return f;
+    }
+
+    /// Sol survivor: TrayContext skipped Present and called
+    /// EffectiveActions(quickCopy: false). Production now routes through
+    /// RouteFinish so that mutation loses Ctrl+C force-copy and cancel-null.
+    static List<string> ScrollTrayRouteGate()
+    {
+        var f = new List<string>();
+        if (ScrollStopMachine.RouteFinish(true, false, false, true, false) != null)
+            f.Add("cancel still routed");
+
+        if (ScrollStopMachine.RouteFinish(false, true, false, true, true) is not { } qcSave)
+            f.Add("Ctrl+C+save null");
+        else if (!qcSave.Copy || qcSave.Show || !qcSave.Save)
+            f.Add($"Ctrl+C opened editor {qcSave.Copy}/{qcSave.Show}/{qcSave.Save}");
+
+        if (ScrollStopMachine.RouteFinish(false, true, false, true, false) is not { } qc)
+            f.Add("Ctrl+C null");
+        else if (!qc.Copy || qc.Show || qc.Save)
+            f.Add($"Ctrl+C lost force-copy {qc.Copy}/{qc.Show}/{qc.Save}");
+
+        if (ScrollStopMachine.RouteFinish(false, false, false, true, false) is not { } enter)
+            f.Add("enter null");
+        else if (enter.Copy || !enter.Show || enter.Save)
+            f.Add($"enter route {enter.Copy}/{enter.Show}/{enter.Save}");
         return f;
     }
 }

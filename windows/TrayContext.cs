@@ -201,9 +201,19 @@ sealed class TrayContext : ApplicationContext
     void StartScrollShot()
     {
         if (CaptureBusy) return;
-        ScrollShotSession.Begin(bmp =>
+        ScrollShotSession.Begin(finish =>
         {
-            if (bmp != null) HandleResult(bmp);
+            var actions = ScrollStopMachine.RouteFinish(
+                finish.Cancelled, finish.QuickCopy,
+                finish.AfterCopy, finish.AfterShow, finish.AfterSave);
+            if (actions is not { } route)
+            {
+                finish.Image?.Dispose();
+                if (finish.Cancelled) ToastForm.Show("Đã hủy chụp cuộn");
+                return;
+            }
+            if (finish.Image == null) return;
+            HandleResult(finish.Image, route.Copy, route.Show, route.Save);
         });
     }
 
@@ -300,15 +310,20 @@ sealed class TrayContext : ApplicationContext
     void HandleResult(Bitmap shot)
     {
         var s = AppSettings.Current;
+        HandleResult(shot, s.AfterCopy, s.AfterShow, s.AfterSave);
+    }
+
+    void HandleResult(Bitmap shot, bool afterCopy, bool afterShow, bool afterSave)
+    {
         var actions = new List<string>();
         bool preserved = false; // the shot reached the clipboard, a file, or the editor
 
-        if (s.AfterCopy)
+        if (afterCopy)
         {
             if (TryCopyImage(shot)) { actions.Add("copied"); preserved = true; }
             else actions.Add("clipboard busy");
         }
-        if (s.AfterSave)
+        if (afterSave)
         {
             if (CaptureUtil.SaveToFolder(shot) is string path)
             {
@@ -321,7 +336,7 @@ sealed class TrayContext : ApplicationContext
             }
         }
 
-        if (s.AfterShow)
+        if (afterShow)
         {
             EditorForm.OpenWith(shot);
             return;

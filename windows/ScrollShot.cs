@@ -16,7 +16,8 @@ sealed class ScrollShotSession
     public static bool IsActive => _active != null;
 
     readonly Rectangle _rect; // virtual-screen coords
-    readonly Action<Bitmap?> _onFinish;
+    readonly Action<ScrollShotFinish> _onFinish;
+    readonly ScrollStopMachine _stop;
     readonly List<Form> _chrome = new();
     Form? _panel;
     bool _panelOverlapsRect;
@@ -28,58 +29,45 @@ sealed class ScrollShotSession
         Font = new Font("Segoe UI", 10.5f, FontStyle.Bold),
     };
     readonly System.Windows.Forms.Timer _timer = new();
-    LowLevelEscHook? _escHook;
-    HotkeyWindow? _escHotkeyWindow;
-    bool _escAvailable;
+    readonly SynchronizationContext? _sync;
+    LowLevelScrollStopHook? _stopHook;
+    HotkeyWindow? _hotkeyWindow;
+    readonly List<int> _registeredHotkeyIds = new();
+    bool _hotkeysRegistered;
     Bitmap? _probe; // reused capture buffer — no per-tick allocation
     WinStitcher? _stitcher;
     int _lastHash;
-    bool _finished;
 
-    const int EscId = 99;
     const int MaxHeightPx = 20000;
 
-    string StopHint => _escAvailable ? "✓ / Esc để xong" : "bấm ✓ để xong";
+    string StopHint => ScrollSessionStop.SessionStopHint(_hotkeysRegistered);
 
-    public static void Begin(Action<Bitmap?> onFinish)
+    public static void Begin(Action<ScrollShotFinish> onFinish)
     {
         if (_active != null) return;
+        var s = AppSettings.Current;
+        var snapshot = (s.AfterCopy, s.AfterShow, s.AfterSave);
         var (shot, rect) = OverlayForm.SelectArea();
         shot?.Dispose(); // only the rect is needed; frames come from the timer
         if (rect.Width < 40 || rect.Height < 60)
         {
-            onFinish(null);
+            onFinish(new ScrollShotFinish { AfterCopy = snapshot.AfterCopy, AfterShow = snapshot.AfterShow, AfterSave = snapshot.AfterSave });
             return;
         }
-        _active = new ScrollShotSession(rect, onFinish);
+        _active = new ScrollShotSession(rect, onFinish, snapshot);
     }
 
-    ScrollShotSession(Rectangle rect, Action<Bitmap?> onFinish)
+    ScrollShotSession(
+        Rectangle rect,
+        Action<ScrollShotFinish> onFinish,
+        (bool AfterCopy, bool AfterShow, bool AfterSave) snapshot)
     {
         _rect = rect;
         _onFinish = onFinish;
+        _stop = new ScrollStopMachine(snapshot.AfterCopy, snapshot.AfterShow, snapshot.AfterSave);
+        _sync = SynchronizationContext.Current;
         BuildChrome();
-
-        // Preferred stop signal: a low-level keyboard hook that OBSERVES Esc
-        // without consuming it, so the app the user is scrolling still gets
-        // the keypress. Falls back to a global hotkey (which does consume Esc)
-        // only when the hook can't be installed.
-        var sync = SynchronizationContext.Current;
-        _escHook = LowLevelEscHook.TryInstall(() =>
-        {
-            if (sync != null) sync.Post(_ => Finish(), null);
-            else Finish();
-        });
-        if (_escHook != null)
-        {
-            _escAvailable = true;
-        }
-        else
-        {
-            _escHotkeyWindow = new HotkeyWindow();
-            _escHotkeyWindow.HotkeyPressed += id => { if (id == EscId) Finish(); };
-            _escAvailable = Native.RegisterHotKey(_escHotkeyWindow.Handle, EscId, 0, 0x1B /* VK_ESCAPE */);
-        }
+        InstallStop();
         _label.Text = $"  Cuộn từ từ — ảnh ghép hiện bên dưới · {StopHint}";
 
         _timer.Interval = 180;
@@ -87,9 +75,45 @@ sealed class ScrollShotSession
         _timer.Start();
     }
 
+    void InstallStop()
+    {
+        // Consume, not observe: focus sits in the app being scrolled, so
+        // Enter/Ctrl+C/Esc must not also fire there. RegisterHotKey swallows
+        // the chord (same job as macOS Carbon). A consuming LL hook fills
+        // any ID that failed to register.
+        _hotkeyWindow = new HotkeyWindow();
+        _hotkeyWindow.HotkeyPressed += id =>
+        {
+            if (ScrollSessionStop.ForHotkeyId(id) is { } action)
+                ApplyStop(action, ScrollStopInvoke.UiMarshals);
+        };
+        foreach (var spec in ScrollSessionStop.Specs)
+        {
+            if (Native.RegisterHotKey(_hotkeyWindow.Handle, spec.Id, spec.Mods, spec.Vk))
+                _registeredHotkeyIds.Add(spec.Id);
+        }
+        var failedIds = ScrollStopHookPolicy.FailedSpecIds(_registeredHotkeyIds);
+        if (failedIds.Length > 0)
+        {
+            _stopHook = LowLevelScrollStopHook.TryInstall(
+                ApplyStop, failedIds, Native.GetAsyncKeyState);
+        }
+        _hotkeysRegistered = _registeredHotkeyIds.Count > 0 || _stopHook != null;
+    }
+
+    void ApplyStop(ScrollStopAction action, bool marshal)
+    {
+        void go()
+        {
+            if (!_stop.ApplyStop(action)) return;
+            End();
+        }
+        ScrollStopInvoke.Run(marshal, _sync, go);
+    }
+
     void CaptureTick()
     {
-        if (_finished) return;
+        if (_stop.Flags.Finished) return;
         _probe ??= new Bitmap(_rect.Width, _rect.Height, PixelFormat.Format24bppRgb);
 
         // Last-resort safety: when the panel had to overlap the rect (tiny
@@ -119,8 +143,10 @@ sealed class ScrollShotSession
         else if (_stitcher.Append(bmp))
         {
             AddPreviewSlice(_stitcher.LastSlice);
-            _label.Text = $"  Đã ghép {_stitcher.TotalHeight}px — {StopHint}";
-            if (_stitcher.TotalHeight >= MaxHeightPx) Finish();
+            _label.Text = "  " + ScrollSessionStop.StitchingProgressText(
+                _stitcher.TotalHeight, _hotkeysRegistered);
+            if (_stitcher.TotalHeight >= MaxHeightPx)
+                ApplyStop(ScrollStopAction.Finish, ScrollStopInvoke.UiMarshals);
         }
         else
         {
@@ -168,26 +194,29 @@ sealed class ScrollShotSession
         _preview.Invalidate();
     }
 
-    void Finish()
+    void End()
     {
-        if (_finished) return;
-        _finished = true;
+        if (!_stop.Flags.Finished) return;
         _timer.Stop();
         _timer.Dispose();
-        _escHook?.Dispose();
-        _escHook = null;
-        if (_escHotkeyWindow != null)
+        _stopHook?.Dispose();
+        _stopHook = null;
+        if (_hotkeyWindow != null)
         {
-            Native.UnregisterHotKey(_escHotkeyWindow.Handle, EscId);
-            _escHotkeyWindow.Dispose();
-            _escHotkeyWindow = null;
+            foreach (var id in _registeredHotkeyIds)
+                Native.UnregisterHotKey(_hotkeyWindow.Handle, id);
+            _registeredHotkeyIds.Clear();
+            _hotkeyWindow.Dispose();
+            _hotkeyWindow = null;
         }
         foreach (var f in _chrome) f.Close();
         _chrome.Clear();
         _panel = null;
         _active = null;
 
-        var result = _stitcher?.Compose();
+        Bitmap? result = null;
+        if (_stop.ShouldCompose)
+            result = _stitcher?.Compose();
         _stitcher?.Dispose();
         _stitcher = null;
         _probe?.Dispose();
@@ -195,7 +224,15 @@ sealed class ScrollShotSession
         _previewComposite?.Dispose();
         _previewComposite = null;
         _preview.Composite = null;
-        _onFinish(result);
+        _onFinish(new ScrollShotFinish
+        {
+            Image = result,
+            Cancelled = _stop.Flags.Cancelled,
+            QuickCopy = _stop.Flags.QuickCopy,
+            AfterCopy = _stop.AfterCopy,
+            AfterShow = _stop.AfterShow,
+            AfterSave = _stop.AfterSave,
+        });
     }
 
     void BuildChrome()
@@ -250,7 +287,7 @@ sealed class ScrollShotSession
             Font = new Font("Segoe UI", 10f, FontStyle.Bold),
         };
         done.FlatAppearance.BorderSize = 0;
-        done.Click += (_, _) => Finish();
+        done.Click += (_, _) => ApplyStop(ScrollStopAction.Finish, ScrollStopInvoke.UiMarshals);
         _preview.Bounds = new Rectangle(10, 88, panelW - 20, panelH - 98);
         panel.Controls.Add(_label);
         panel.Controls.Add(done);
@@ -314,23 +351,50 @@ sealed class ScrollShotSession
     }
 }
 
-/// Low-level keyboard hook that fires on Esc WITHOUT consuming the keystroke,
-/// so the application being scrolled still receives it.
-sealed class LowLevelEscHook : IDisposable
+/// Result of a scroll session. Windows Ends on the first key, so Cancelled
+/// and QuickCopy are not both set in one session (unlike macOS, where flags
+/// can race before finalize).
+sealed class ScrollShotFinish
+{
+    public Bitmap? Image;
+    public bool Cancelled;
+    public bool QuickCopy;
+    public bool AfterCopy;
+    public bool AfterShow;
+    public bool AfterSave;
+}
+
+/// Low-level keyboard hook that CONSUMES matching session keys (returns 1)
+/// so the scrolled app does not also submit / copy / dismiss. Installed only
+/// for specs `RegisterHotKey` failed; modifiers come from GetAsyncKeyState.
+sealed class LowLevelScrollStopHook : IDisposable
 {
     IntPtr _hook;
     readonly Native.LowLevelKeyboardProc _proc; // field keeps the delegate alive
-    readonly Action _onEsc;
+    readonly Action<ScrollStopAction> _onAction;
+    readonly int[] _hookedIds;
+    readonly Func<int, short> _getAsyncKeyState;
 
-    LowLevelEscHook(Action onEsc)
+    LowLevelScrollStopHook(
+        Action<ScrollStopAction> onAction,
+        int[] hookedIds,
+        Func<int, short> getAsyncKeyState)
     {
-        _onEsc = onEsc;
+        _onAction = onAction;
+        _hookedIds = hookedIds;
+        _getAsyncKeyState = getAsyncKeyState;
         _proc = Callback;
     }
 
-    public static LowLevelEscHook? TryInstall(Action onEsc)
+    /// Always binds `HookMarshals` — the caller cannot pick UiMarshals (N7w).
+    public static LowLevelScrollStopHook? TryInstall(
+        Action<ScrollStopAction, bool> applyStop,
+        int[] hookedIds,
+        Func<int, short> getAsyncKeyState)
     {
-        var hook = new LowLevelEscHook(onEsc);
+        if (hookedIds.Length == 0) return null;
+        var onAction = ScrollStopInvoke.Bind(applyStop, ScrollStopInvoke.HookMarshals);
+        var hook = new LowLevelScrollStopHook(onAction, hookedIds, getAsyncKeyState);
         hook._hook = Native.SetWindowsHookExW(
             Native.WH_KEYBOARD_LL, hook._proc, Native.GetModuleHandleW(null), 0);
         return hook._hook != IntPtr.Zero ? hook : null;
@@ -342,7 +406,12 @@ sealed class LowLevelEscHook : IDisposable
             || wParam == (IntPtr)Native.WM_SYSKEYDOWN))
         {
             int vk = System.Runtime.InteropServices.Marshal.ReadInt32(lParam);
-            if (vk == 0x1B /* VK_ESCAPE */) _onEsc();
+            uint mods = ScrollStopHookPolicy.ModsFromKeyState(_getAsyncKeyState);
+            if (ScrollStopHookPolicy.Interpret((uint)vk, mods, _hookedIds) is { } action)
+            {
+                _onAction(action);
+                return (IntPtr)1; // consume
+            }
         }
         return Native.CallNextHookEx(_hook, nCode, wParam, lParam);
     }
