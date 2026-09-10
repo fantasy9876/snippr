@@ -6033,36 +6033,115 @@ enum SelfTest {
 
                 do {
                     var lit: [String] = []
-                    if CaptureCopy.stopHintHotkey(.english) != enStopHotkey {
-                        lit.append("en-hotkey \(CaptureCopy.stopHintHotkey(.english))")
+                    func pin(_ name: String, _ got: String, _ want: String) {
+                        if got != want { lit.append("\(name) \(got)") }
                     }
-                    if CaptureCopy.stopHintHotkey(.vietnamese) != viStopHotkey {
-                        lit.append("vi-hotkey \(CaptureCopy.stopHintHotkey(.vietnamese))")
-                    }
-                    if CaptureCopy.stopHintFallback(.english) != enStopFallback {
-                        lit.append("en-fallback \(CaptureCopy.stopHintFallback(.english))")
-                    }
-                    if CaptureCopy.stopHintFallback(.vietnamese) != viStopFallback {
-                        lit.append("vi-fallback \(CaptureCopy.stopHintFallback(.vietnamese))")
-                    }
-                    if CaptureCopy.doneButton(.english) != enDone {
-                        lit.append("en-done \(CaptureCopy.doneButton(.english))")
-                    }
-                    if CaptureCopy.doneButton(.vietnamese) != viDone {
-                        lit.append("vi-done \(CaptureCopy.doneButton(.vietnamese))")
-                    }
-                    if CaptureCopy.scrollCancelled(.english) != enCancel {
-                        lit.append("en-cancel \(CaptureCopy.scrollCancelled(.english))")
-                    }
-                    if CaptureCopy.scrollCancelled(.vietnamese) != viCancel {
-                        lit.append("vi-cancel \(CaptureCopy.scrollCancelled(.vietnamese))")
-                    }
-                    if CaptureCopy.copied(.english) != enCopied {
-                        lit.append("en-copied \(CaptureCopy.copied(.english))")
-                    }
-                    if CaptureCopy.copied(.vietnamese) != viCopied {
-                        lit.append("vi-copied \(CaptureCopy.copied(.vietnamese))")
-                    }
+                    pin("en-hotkey", CaptureCopy.stopHintHotkey(.english), enStopHotkey)
+                    pin("vi-hotkey", CaptureCopy.stopHintHotkey(.vietnamese), viStopHotkey)
+                    pin("en-fallback", CaptureCopy.stopHintFallback(.english), enStopFallback)
+                    pin("vi-fallback", CaptureCopy.stopHintFallback(.vietnamese), viStopFallback)
+                    pin("en-done", CaptureCopy.doneButton(.english), enDone)
+                    pin("vi-done", CaptureCopy.doneButton(.vietnamese), viDone)
+                    pin("en-cancel", CaptureCopy.scrollCancelled(.english), enCancel)
+                    pin("vi-cancel", CaptureCopy.scrollCancelled(.vietnamese), viCancel)
+                    pin("en-copied", CaptureCopy.copied(.english), enCopied)
+                    pin("vi-copied", CaptureCopy.copied(.vietnamese), viCopied)
+                    pin("en-shot-copied", CaptureCopy.screenshotCopied(.english),
+                        "Screenshot copied")
+                    pin("vi-shot-copied", CaptureCopy.screenshotCopied(.vietnamese),
+                        "Đã copy")
+                    pin("en-shot-clipboard",
+                        CaptureCopy.screenshotCopiedToClipboard(.english),
+                        "Screenshot copied to clipboard")
+                    pin("vi-shot-clipboard",
+                        CaptureCopy.screenshotCopiedToClipboard(.vietnamese),
+                        "Đã copy vào clipboard")
+                    pin("en-copied-word", CaptureCopy.toastCopiedWord(.english), "copied")
+                    pin("vi-copied-word", CaptureCopy.toastCopiedWord(.vietnamese), "đã copy")
+                    pin("en-saved-word", CaptureCopy.toastSavedWord("x.png", .english),
+                        "saved x.png")
+                    pin("vi-saved-word", CaptureCopy.toastSavedWord("x.png", .vietnamese),
+                        "đã lưu x.png")
+                    pin("en-save-failed-frag", CaptureCopy.toastSaveFailed(.english),
+                        "save failed")
+                    pin("vi-save-failed-frag", CaptureCopy.toastSaveFailed(.vietnamese),
+                        "lưu thất bại")
+                    pin("en-save-failed-copied",
+                        CaptureCopy.toastSaveFailedCopied(.english),
+                        "save failed — copied instead")
+                    pin("vi-save-failed-copied",
+                        CaptureCopy.toastSaveFailedCopied(.vietnamese),
+                        "lưu thất bại — đã copy vào clipboard")
+                    pin("en-saved-file", CaptureCopy.savedFile("x.png", .english),
+                        "Saved x.png")
+                    pin("vi-saved-file", CaptureCopy.savedFile("x.png", .vietnamese),
+                        "Đã lưu x.png")
+                    pin("en-save-failed", CaptureCopy.saveFailed(.english), "Save failed")
+                    pin("vi-save-failed", CaptureCopy.saveFailed(.vietnamese), "Lưu thất bại")
+                    pin("en-export-failed",
+                        CaptureCopy.exportAnnotatedFailed(.english),
+                        "Couldn't export the annotated image — try again")
+                    pin("vi-export-failed",
+                        CaptureCopy.exportAnnotatedFailed(.vietnamese),
+                        "Không xuất được ảnh có nét vẽ — thử lại")
+                    pin("en-region-gone", CaptureCopy.savedRegionGone(.english),
+                        "The saved region is no longer on screen — pick it again")
+                    pin("vi-region-gone", CaptureCopy.savedRegionGone(.vietnamese),
+                        "Vùng đã lưu không còn trên màn hình — chọn lại nhé")
+                    pin("en-backdrop-too-big",
+                        CaptureCopy.selectionTooLargeForBackdrop(.english),
+                        "Selection too large for Backdrop")
+                    pin("vi-backdrop-too-big",
+                        CaptureCopy.selectionTooLargeForBackdrop(.vietnamese),
+                        "Vùng chọn quá lớn cho Backdrop")
+                    pin("en-backdrop-build",
+                        CaptureCopy.backdropBuildFailed(.english),
+                        "Couldn't build the Backdrop — try another preset")
+                    pin("vi-backdrop-build",
+                        CaptureCopy.backdropBuildFailed(.vietnamese),
+                        "Không dựng được nền Backdrop — thử preset khác")
+                    pin("en-region-small", CaptureCopy.regionTooSmall(.english),
+                        "Region too small for scrolling capture — pick an area taller than 60 pt")
+                    pin("vi-region-small", CaptureCopy.regionTooSmall(.vietnamese),
+                        "Vùng quá nhỏ cho chụp cuộn — chọn vùng cao hơn 60 pt")
+                    pin("en-bidir", CaptureCopy.bidirectional(.english),
+                        "Scroll up or down — stitching works both ways")
+                    pin("vi-bidir", CaptureCopy.bidirectional(.vietnamese),
+                        "Cuộn lên hoặc xuống — stitcher nối cả hai chiều")
+                    pin("en-nomatch", CaptureCopy.noMatch(.english),
+                        "No match — scroll a bit slower")
+                    pin("vi-nomatch", CaptureCopy.noMatch(.vietnamese),
+                        "Chưa khớp được — cuộn chậm lại một chút")
+                    pin("en-waiting", CaptureCopy.waitingFirstFrame(.english),
+                        "Waiting for the first frame…")
+                    pin("vi-waiting", CaptureCopy.waitingFirstFrame(.vietnamese),
+                        "Chờ khung hình đầu tiên…")
+                    pin("en-compat", CaptureCopy.compatibilityMode(.english),
+                        "Using compatibility mode — keep scrolling · ")
+                    pin("vi-compat", CaptureCopy.compatibilityMode(.vietnamese),
+                        "Đang dùng chế độ tương thích — cuộn tiếp · ")
+                    pin("en-retrace", CaptureCopy.retrace(12, .english),
+                        "Scrolling through captured area — 12 pt")
+                    pin("vi-retrace", CaptureCopy.retrace(12, .vietnamese),
+                        "Đang cuộn qua vùng đã chụp — 12 pt")
+                    pin("en-lost", CaptureCopy.lostSegment(2, .english),
+                        "Missed a stretch from scrolling too fast — recording segment 2; a bright bar marks the gap")
+                    pin("vi-lost", CaptureCopy.lostSegment(2, .vietnamese),
+                        "Mất một đoạn do cuộn quá nhanh — đang ghi đoạn 2; vạch sáng đánh dấu chỗ thiếu")
+                    pin("en-backend-sync", CaptureCopy.backendSync(.english),
+                        "Syncing compatibility mode — scroll slowly to reconnect")
+                    pin("vi-backend-sync", CaptureCopy.backendSync(.vietnamese),
+                        "Đang đồng bộ chế độ tương thích — cuộn chậm để nối tiếp")
+                    pin("en-backend-seg", CaptureCopy.backendNewSegment(2, .english),
+                        "Capture mode changed and started segment 2; a bright bar marks the gap")
+                    pin("vi-backend-seg", CaptureCopy.backendNewSegment(2, .vietnamese),
+                        "Đã đổi chế độ chụp và bắt đầu đoạn 2; vạch sáng đánh dấu chỗ thiếu")
+                    pin("en-summary",
+                        CaptureCopy.screenshotSummary(["copied", "saved x.png"], .english),
+                        "Screenshot copied · saved x.png")
+                    pin("vi-summary",
+                        CaptureCopy.screenshotSummary(["đã copy", "đã lưu x.png"], .vietnamese),
+                        "Ảnh đã copy · đã lưu x.png")
                     let d = UserDefaults.standard
                     let prevLang = d.object(forKey: Settings.Keys.uiLanguage)
                     d.removeObject(forKey: Settings.Keys.uiLanguage)
@@ -16912,7 +16991,7 @@ enum SelfTest {
                     y: selection.minY + screen.frame.minY,
                     width: selection.width, height: selection.height)
                 let expectedFailureToast =
-                    "Không xuất được ảnh có nét vẽ — thử lại"
+                    "Couldn't export the annotated image — try again"
                 let failureEffect = "toast:\(expectedFailureToast)"
                 let savedEffect = "toast:Saved area-save-lock.png"
                 let failedTrace = [failureEffect]

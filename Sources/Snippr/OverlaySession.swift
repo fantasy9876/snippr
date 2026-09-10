@@ -373,22 +373,24 @@ struct CaptureActionRouter {
                 let announce = !reviewing
                 deps.autoSave(snapshot) { url in
                     guard announce else { return }
-                    var toasts: [String] = copied ? ["copied"] : []
+                    var toasts: [String] = copied ? [CaptureCopy.toastCopiedWord()] : []
                     if let url {
-                        toasts.append("saved \(url.lastPathComponent)")
+                        toasts.append(CaptureCopy.toastSavedWord(url.lastPathComponent))
                     } else {
                         if !copied { deps.copyToClipboard(snapshot) }
-                        toasts.append(copied ? "save failed" : "save failed — copied instead")
+                        toasts.append(copied
+                            ? CaptureCopy.toastSaveFailed()
+                            : CaptureCopy.toastSaveFailedCopied())
                     }
-                    deps.toast("Screenshot \(toasts.joined(separator: " · "))")
+                    deps.toast(CaptureCopy.screenshotSummary(toasts))
                 }
             } else if !reviewing {
                 if copied {
-                    deps.toast("Screenshot copied")
+                    deps.toast(CaptureCopy.screenshotCopied())
                 } else {
                     // nothing configured, nothing shown — rescue the shot
                     deps.copyToClipboard(snapshot)
-                    deps.toast("Screenshot copied to clipboard")
+                    deps.toast(CaptureCopy.screenshotCopiedToClipboard())
                 }
             }
             if recordRectOnComplete, !reviewing { recordAreaRect() }
@@ -412,7 +414,7 @@ struct CaptureActionRouter {
         case .copy:
             deps.setLastCapture(remembered)
             deps.copyToClipboard(snapshot)
-            deps.toast("Screenshot copied")
+            deps.toast(CaptureCopy.screenshotCopied())
             recordAreaRect()
             return .completed
 
@@ -429,7 +431,7 @@ struct CaptureActionRouter {
                 switch outcome {
                 case let .saved(url):
                     deps.setLastCapture(remembered)
-                    deps.toast("Saved \(url.lastPathComponent)")
+                    deps.toast(CaptureCopy.savedFile(url.lastPathComponent))
                     recordAreaRect()
                     resolution?(.completed)
                 case .cancelled:
@@ -437,7 +439,7 @@ struct CaptureActionRouter {
                     // action, so no lastAreaRect write
                     resolution?(.cancelled)
                 case .failed:
-                    deps.toast("Save failed")
+                    deps.toast(CaptureCopy.saveFailed())
                     resolution?(.failed)
                 }
             }

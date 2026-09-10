@@ -114,13 +114,6 @@ enum CaptureCopy {
         }
     }
 
-    static func scrollSlowly(_ lang: UILanguage = .resolved) -> String {
-        switch lang {
-        case .english: return "Scroll slowly — the stitch appears below"
-        case .vietnamese: return "Cuộn từ từ — ảnh ghép hiện bên dưới"
-        }
-    }
-
     static func compatibilityMode(_ lang: UILanguage = .resolved) -> String {
         switch lang {
         case .english: return "Using compatibility mode — keep scrolling · "
@@ -206,7 +199,50 @@ enum CaptureCopy {
     static func toastSaveFailedCopied(_ lang: UILanguage = .resolved) -> String {
         switch lang {
         case .english: return "save failed — copied instead"
-        case .vietnamese: return "lưu thất bại — đã copy thay"
+        case .vietnamese: return "lưu thất bại — đã copy vào clipboard"
+        }
+    }
+
+    /// Sentence-initial save toast (router `.save`), not the "saved x.png" fragment.
+    static func savedFile(_ filename: String, _ lang: UILanguage = .resolved) -> String {
+        switch lang {
+        case .english: return "Saved \(filename)"
+        case .vietnamese: return "Đã lưu \(filename)"
+        }
+    }
+
+    static func saveFailed(_ lang: UILanguage = .resolved) -> String {
+        switch lang {
+        case .english: return "Save failed"
+        case .vietnamese: return "Lưu thất bại"
+        }
+    }
+
+    static func exportAnnotatedFailed(_ lang: UILanguage = .resolved) -> String {
+        switch lang {
+        case .english: return "Couldn't export the annotated image — try again"
+        case .vietnamese: return "Không xuất được ảnh có nét vẽ — thử lại"
+        }
+    }
+
+    static func savedRegionGone(_ lang: UILanguage = .resolved) -> String {
+        switch lang {
+        case .english: return "The saved region is no longer on screen — pick it again"
+        case .vietnamese: return "Vùng đã lưu không còn trên màn hình — chọn lại nhé"
+        }
+    }
+
+    static func selectionTooLargeForBackdrop(_ lang: UILanguage = .resolved) -> String {
+        switch lang {
+        case .english: return "Selection too large for Backdrop"
+        case .vietnamese: return "Vùng chọn quá lớn cho Backdrop"
+        }
+    }
+
+    static func backdropBuildFailed(_ lang: UILanguage = .resolved) -> String {
+        switch lang {
+        case .english: return "Couldn't build the Backdrop — try another preset"
+        case .vietnamese: return "Không dựng được nền Backdrop — thử preset khác"
         }
     }
 }

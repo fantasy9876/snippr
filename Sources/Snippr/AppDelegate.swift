@@ -423,7 +423,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         })
         let visible = screen.map { $0.frame.intersection(global) } ?? .null
         guard let screen, visible.width >= 4, visible.height >= 4 else {
-            ToastHUD.show("Vùng đã lưu không còn trên màn hình — chọn lại nhé", symbol: "rectangle.dashed")
+            ToastHUD.show(CaptureCopy.savedRegionGone(), symbol: "rectangle.dashed")
             captureArea()
             return
         }

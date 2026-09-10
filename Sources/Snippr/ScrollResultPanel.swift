@@ -594,9 +594,9 @@ final class ScrollResultPanel: NSPanel {
         guard let image = exportSnapshot else {
             // fail-closed: keep the panel (and the drawings) alive
             if let toast = dependencies?.toast {
-                toast("Không xuất được ảnh có nét vẽ — thử lại")
+                toast(CaptureCopy.exportAnnotatedFailed())
             } else {
-                ToastHUD.show("Không xuất được ảnh có nét vẽ — thử lại")
+                ToastHUD.show(CaptureCopy.exportAnnotatedFailed())
             }
             return
         }
