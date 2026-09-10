@@ -104,15 +104,15 @@ public static class ScrollSessionStop
         return new ScrollFinishActions(afterCopy, afterShow, afterSave);
     }
 
-    public static string SessionStopHint(bool hotkeysRegistered) =>
-        hotkeysRegistered
-            ? "Enter/✓ xong · Ctrl+C copy · Esc hủy"
-            : "bấm ✓ để xong";
+    public static string SessionStopHint(
+        bool hotkeysRegistered, UILanguage language) =>
+        CaptureCopy.StopHint(hotkeysRegistered, language);
 
-    /// Do not prefix with "xong " — that sat next to "Esc hủy" and read as
-    /// if Esc still finished the capture (macOS H3).
-    public static string StitchingProgressText(int pixels, bool hotkeysRegistered) =>
-        $"Đã ghép {pixels}px — cuộn tiếp · " + SessionStopHint(hotkeysRegistered);
+    /// Do not prefix with "xong " / "done " — that sat next to "Esc hủy"
+    /// and read as if Esc still finished the capture (macOS H3).
+    public static string StitchingProgressText(
+        int pixels, bool hotkeysRegistered, UILanguage language) =>
+        CaptureCopy.StitchingProgress(pixels, hotkeysRegistered, language);
 
     public const int VkShift = 0x10;
     public const int VkControl = 0x11;

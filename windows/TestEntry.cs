@@ -1295,6 +1295,39 @@ static class TestEntry
                     + $"{Enum.GetValues<OcrLanguagePreference>().Length} preferences");
         });
 
+        // Language setting is live wiring, not a source needle. A covering
+        // assignment after the RequiredSeams line still leaves ParityGate
+        // green; these steps read CaptureCopy.Current after Program.Main
+        // bound Resolve, so that override goes red here (Honey S1).
+        Step("ui-language-follows-settings", () =>
+        {
+            var prev = AppSettings.Current.UiLanguage;
+            try
+            {
+                AppSettings.Current.UiLanguage = UILanguageUtil.VietnameseCode;
+                if (CaptureCopy.Current != UILanguage.Vietnamese)
+                    throw new InvalidOperationException(
+                        $"Current stayed {CaptureCopy.Current} after Settings=vi");
+                var toast = CaptureCopy.NoWindowFound(CaptureCopy.Current);
+                if (toast == CaptureCopy.NoWindowFound(UILanguage.English))
+                    throw new InvalidOperationException(
+                        "toast stayed English while Settings=vi");
+                if (toast != "Không tìm thấy cửa sổ")
+                    throw new InvalidOperationException($"toast '{toast}'");
+            }
+            finally
+            {
+                AppSettings.Current.UiLanguage = prev;
+            }
+        });
+        Step("ui-language-fresh-default-is-english", () =>
+        {
+            var fresh = new AppSettings();
+            if (UILanguageUtil.Parse(fresh.UiLanguage) != UILanguage.English)
+                throw new InvalidOperationException(
+                    $"a fresh install would start in {fresh.UiLanguage}, not en");
+        });
+
         // The summary goes in BEFORE the copy, or the artifact's log stops one
         // line short of the answer — the first run's did.
         Diag.Click("test", $"shot finished failures={failures} dir={dir}");

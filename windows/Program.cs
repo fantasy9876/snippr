@@ -13,6 +13,9 @@ static class Program
         // the only witness to a click that went nowhere.
         Diag.Install();
 
+        CaptureCopy.Resolve = static () =>
+            UILanguageUtil.Parse(AppSettings.Current.UiLanguage);
+
         // Test entries run without the single-instance mutex on purpose: they
         // are for a runner or an owner who already has Snippr in the tray, and
         // refusing to start would defeat the point.

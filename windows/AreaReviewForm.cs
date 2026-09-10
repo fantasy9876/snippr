@@ -932,7 +932,7 @@ sealed class AreaReviewForm : Form
         }
         catch (Exception)
         {
-            ToastForm.Show("Không dựng được ảnh — thử lại");
+            ToastForm.Show(CaptureCopy.ExportAnnotatedFailed(CaptureCopy.Current));
             return;
         }
         ChosenAction = action;

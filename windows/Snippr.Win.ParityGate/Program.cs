@@ -44,6 +44,9 @@ static class Program
         failed += Check("win-scroll-hook-policy", ScrollStopHookPolicyGate());
         failed += Check("win-scroll-stop-invoke", ScrollStopInvokeGate());
         failed += Check("win-scroll-tray-route", ScrollTrayRouteGate());
+        failed += Check("win-capture-copy-literals", CaptureCopyLiterals());
+        failed += Check("win-capture-copy-source-scan", CaptureCopySourceScanGate());
+        failed += Check("win-ui-language-seams", UiLanguageSeams());
         if (pending > 0)
             Console.WriteLine($"{pending} PARITY GATE(S) PENDING — not a pass");
         Console.WriteLine(failed == 0
@@ -1503,14 +1506,21 @@ static class Program
         if (ScrollSessionStop.ForKey(0x43, 0) != null)
             f.Add("C without Ctrl should miss");
 
-        var hint = ScrollSessionStop.SessionStopHint(true);
-        if (hint != "Enter/✓ xong · Ctrl+C copy · Esc hủy")
-            f.Add($"hint '{hint}'");
-        if (hint.Contains("Esc để xong", StringComparison.Ordinal))
+        const string enStopHotkey = "Enter/✓ done · Ctrl+C copy · Esc cancel";
+        const string viStopHotkey = "Enter/✓ xong · Ctrl+C copy · Esc hủy";
+        const string enStopFallback = "click ✓ to finish";
+        const string viStopFallback = "bấm ✓ để xong";
+        var hintEn = ScrollSessionStop.SessionStopHint(true, UILanguage.English);
+        if (hintEn != enStopHotkey) f.Add($"en hint '{hintEn}'");
+        var hintVi = ScrollSessionStop.SessionStopHint(true, UILanguage.Vietnamese);
+        if (hintVi != viStopHotkey) f.Add($"vi hint '{hintVi}'");
+        if (hintEn.Contains("Esc để xong", StringComparison.Ordinal)
+            || hintVi.Contains("Esc để xong", StringComparison.Ordinal))
             f.Add("hint still says Esc finishes");
-        var fallback = ScrollSessionStop.SessionStopHint(false);
-        if (fallback != "bấm ✓ để xong")
-            f.Add($"fallback hint '{fallback}'");
+        if (ScrollSessionStop.SessionStopHint(false, UILanguage.English) != enStopFallback)
+            f.Add($"en fallback '{ScrollSessionStop.SessionStopHint(false, UILanguage.English)}'");
+        if (ScrollSessionStop.SessionStopHint(false, UILanguage.Vietnamese) != viStopFallback)
+            f.Add($"vi fallback '{ScrollSessionStop.SessionStopHint(false, UILanguage.Vietnamese)}'");
 
         var qcSave = ScrollSessionStop.EffectiveActions(true, false, true, true);
         if (!qcSave.Copy || qcSave.Show || !qcSave.Save)
@@ -1528,11 +1538,19 @@ static class Program
         if (!flags.Cancelled || !flags.QuickCopy || !flags.Finished)
             f.Add("cancel after quickcopy dropped a flag");
 
-        var progress = ScrollSessionStop.StitchingProgressText(1234, true);
-        if (!progress.Contains("cuộn tiếp · ", StringComparison.Ordinal))
-            f.Add($"progress missing cuộn tiếp '{progress}'");
-        if (progress.Contains("xong Esc", StringComparison.Ordinal))
-            f.Add($"progress still has xong next to Esc '{progress}'");
+        var progressEn = ScrollSessionStop.StitchingProgressText(1234, true, UILanguage.English);
+        if (!progressEn.Contains("keep scrolling · ", StringComparison.Ordinal))
+            f.Add($"en progress missing keep scrolling '{progressEn}'");
+        if (progressEn.Contains(", done ", StringComparison.Ordinal)
+            || progressEn.Contains("done Enter", StringComparison.Ordinal))
+            f.Add($"en progress xong-prefix '{progressEn}'");
+        var progressVi = ScrollSessionStop.StitchingProgressText(1234, true, UILanguage.Vietnamese);
+        if (!progressVi.Contains("cuộn tiếp · ", StringComparison.Ordinal))
+            f.Add($"vi progress missing cuộn tiếp '{progressVi}'");
+        if (progressVi.Contains("xong Esc", StringComparison.Ordinal)
+            || progressVi.Contains(", xong ", StringComparison.Ordinal)
+            || progressVi.Contains("xong Enter", StringComparison.Ordinal))
+            f.Add($"vi progress still has xong next to Esc '{progressVi}'");
         return f;
     }
 
@@ -1689,4 +1707,172 @@ static class Program
             f.Add($"enter route {enter.Copy}/{enter.Show}/{enter.Save}");
         return f;
     }
+
+    /// Frozen EN/VI literals — independent of CaptureCopy so editing one
+    /// table cell turns this red (Pollen mutation). Windows uses Ctrl+C and
+    /// `px`; default language is English.
+    static List<string> CaptureCopyLiterals()
+    {
+        var f = new List<string>();
+        void Pin(string name, string got, string want)
+        {
+            if (got != want) f.Add($"{name} {got}");
+        }
+
+        const string enStopHotkey = "Enter/✓ done · Ctrl+C copy · Esc cancel";
+        const string viStopHotkey = "Enter/✓ xong · Ctrl+C copy · Esc hủy";
+        Pin("en-hotkey", CaptureCopy.StopHintHotkey(UILanguage.English), enStopHotkey);
+        Pin("vi-hotkey", CaptureCopy.StopHintHotkey(UILanguage.Vietnamese), viStopHotkey);
+        Pin("en-fallback", CaptureCopy.StopHintFallback(UILanguage.English), "click ✓ to finish");
+        Pin("vi-fallback", CaptureCopy.StopHintFallback(UILanguage.Vietnamese), "bấm ✓ để xong");
+        Pin("en-done", CaptureCopy.DoneButton(UILanguage.English), "✓ Done");
+        Pin("vi-done", CaptureCopy.DoneButton(UILanguage.Vietnamese), "✓ Xong");
+        Pin("en-cancel", CaptureCopy.ScrollCancelled(UILanguage.English), "Scrolling capture cancelled");
+        Pin("vi-cancel", CaptureCopy.ScrollCancelled(UILanguage.Vietnamese), "Đã hủy chụp cuộn");
+        Pin("en-copied", CaptureCopy.Copied(UILanguage.English), "Copied");
+        Pin("vi-copied", CaptureCopy.Copied(UILanguage.Vietnamese), "Đã copy");
+        Pin("en-shot-copied", CaptureCopy.ScreenshotCopied(UILanguage.English), "Screenshot copied");
+        Pin("vi-shot-copied", CaptureCopy.ScreenshotCopied(UILanguage.Vietnamese), "Đã copy");
+        Pin("en-shot-clipboard", CaptureCopy.ScreenshotCopiedToClipboard(UILanguage.English),
+            "Screenshot copied to clipboard");
+        Pin("vi-shot-clipboard", CaptureCopy.ScreenshotCopiedToClipboard(UILanguage.Vietnamese),
+            "Đã copy vào clipboard");
+        Pin("en-copied-word", CaptureCopy.ToastCopiedWord(UILanguage.English), "copied");
+        Pin("vi-copied-word", CaptureCopy.ToastCopiedWord(UILanguage.Vietnamese), "đã copy");
+        Pin("en-saved-word", CaptureCopy.ToastSavedWord("x.png", UILanguage.English), "saved x.png");
+        Pin("vi-saved-word", CaptureCopy.ToastSavedWord("x.png", UILanguage.Vietnamese), "đã lưu x.png");
+        Pin("en-save-failed-frag", CaptureCopy.ToastSaveFailed(UILanguage.English), "save failed");
+        Pin("vi-save-failed-frag", CaptureCopy.ToastSaveFailed(UILanguage.Vietnamese), "lưu thất bại");
+        Pin("en-save-failed-copied", CaptureCopy.ToastSaveFailedCopied(UILanguage.English),
+            "save failed — copied instead");
+        Pin("vi-save-failed-copied", CaptureCopy.ToastSaveFailedCopied(UILanguage.Vietnamese),
+            "lưu thất bại — đã copy vào clipboard");
+        Pin("en-saved-file", CaptureCopy.SavedFile("x.png", UILanguage.English), "Saved x.png");
+        Pin("vi-saved-file", CaptureCopy.SavedFile("x.png", UILanguage.Vietnamese), "Đã lưu x.png");
+        Pin("en-save-failed", CaptureCopy.SaveFailed(UILanguage.English), "Save failed");
+        Pin("vi-save-failed", CaptureCopy.SaveFailed(UILanguage.Vietnamese), "Lưu thất bại");
+        Pin("en-export-failed", CaptureCopy.ExportAnnotatedFailed(UILanguage.English),
+            "Couldn't export the annotated image — try again");
+        Pin("vi-export-failed", CaptureCopy.ExportAnnotatedFailed(UILanguage.Vietnamese),
+            "Không xuất được ảnh có nét vẽ — thử lại");
+        Pin("en-region-gone", CaptureCopy.SavedRegionGone(UILanguage.English),
+            "The saved region is no longer on screen — pick it again");
+        Pin("vi-region-gone", CaptureCopy.SavedRegionGone(UILanguage.Vietnamese),
+            "Vùng đã lưu không còn trên màn hình — chọn lại nhé");
+        Pin("en-backdrop-too-big", CaptureCopy.SelectionTooLargeForBackdrop(UILanguage.English),
+            "Selection too large for Backdrop");
+        Pin("vi-backdrop-too-big", CaptureCopy.SelectionTooLargeForBackdrop(UILanguage.Vietnamese),
+            "Vùng chọn quá lớn cho Backdrop");
+        Pin("en-backdrop-build", CaptureCopy.BackdropBuildFailed(UILanguage.English),
+            "Couldn't build the Backdrop — try another preset");
+        Pin("vi-backdrop-build", CaptureCopy.BackdropBuildFailed(UILanguage.Vietnamese),
+            "Không dựng được nền Backdrop — thử preset khác");
+        Pin("en-region-small", CaptureCopy.RegionTooSmall(UILanguage.English),
+            "Region too small for scrolling capture — pick an area taller than 60 px");
+        Pin("vi-region-small", CaptureCopy.RegionTooSmall(UILanguage.Vietnamese),
+            "Vùng quá nhỏ cho chụp cuộn — chọn vùng cao hơn 60 px");
+        Pin("en-bidir", CaptureCopy.Bidirectional(UILanguage.English),
+            "Scroll up or down — stitching works both ways");
+        Pin("vi-bidir", CaptureCopy.Bidirectional(UILanguage.Vietnamese),
+            "Cuộn lên hoặc xuống — stitcher nối cả hai chiều");
+        Pin("en-nomatch", CaptureCopy.NoMatch(UILanguage.English),
+            "No match — scroll a bit slower");
+        Pin("vi-nomatch", CaptureCopy.NoMatch(UILanguage.Vietnamese),
+            "Chưa khớp được — cuộn chậm lại một chút");
+        Pin("en-waiting", CaptureCopy.WaitingFirstFrame(UILanguage.English),
+            "Waiting for the first frame…");
+        Pin("vi-waiting", CaptureCopy.WaitingFirstFrame(UILanguage.Vietnamese),
+            "Chờ khung hình đầu tiên…");
+        Pin("en-compat", CaptureCopy.CompatibilityMode(UILanguage.English),
+            "Using compatibility mode — keep scrolling · ");
+        Pin("vi-compat", CaptureCopy.CompatibilityMode(UILanguage.Vietnamese),
+            "Đang dùng chế độ tương thích — cuộn tiếp · ");
+        Pin("en-retrace", CaptureCopy.Retrace(12, UILanguage.English),
+            "Scrolling through captured area — 12 px");
+        Pin("vi-retrace", CaptureCopy.Retrace(12, UILanguage.Vietnamese),
+            "Đang cuộn qua vùng đã chụp — 12 px");
+        Pin("en-lost", CaptureCopy.LostSegment(2, UILanguage.English),
+            "Missed a stretch from scrolling too fast — recording segment 2; a bright bar marks the gap");
+        Pin("vi-lost", CaptureCopy.LostSegment(2, UILanguage.Vietnamese),
+            "Mất một đoạn do cuộn quá nhanh — đang ghi đoạn 2; vạch sáng đánh dấu chỗ thiếu");
+        Pin("en-backend-sync", CaptureCopy.BackendSync(UILanguage.English),
+            "Syncing compatibility mode — scroll slowly to reconnect");
+        Pin("vi-backend-sync", CaptureCopy.BackendSync(UILanguage.Vietnamese),
+            "Đang đồng bộ chế độ tương thích — cuộn chậm để nối tiếp");
+        Pin("en-backend-seg", CaptureCopy.BackendNewSegment(2, UILanguage.English),
+            "Capture mode changed and started segment 2; a bright bar marks the gap");
+        Pin("vi-backend-seg", CaptureCopy.BackendNewSegment(2, UILanguage.Vietnamese),
+            "Đã đổi chế độ chụp và bắt đầu đoạn 2; vạch sáng đánh dấu chỗ thiếu");
+        Pin("en-summary",
+            CaptureCopy.ScreenshotSummary(["copied", "saved x.png"], UILanguage.English),
+            "Screenshot copied · saved x.png");
+        Pin("vi-summary",
+            CaptureCopy.ScreenshotSummary(["đã copy", "đã lưu x.png"], UILanguage.Vietnamese),
+            "Ảnh đã copy · đã lưu x.png");
+        Pin("en-no-prev-area", CaptureCopy.NoPreviousArea(UILanguage.English),
+            "No previous area — use Capture Area first");
+        Pin("vi-no-prev-area", CaptureCopy.NoPreviousArea(UILanguage.Vietnamese),
+            "Chưa có vùng đã lưu — chụp một vùng trước đã");
+        Pin("en-screen-rec", CaptureCopy.ScreenRecordingNeeded(UILanguage.English),
+            "Screen Recording permission needed — enable Snippr in System Settings");
+        Pin("vi-screen-rec", CaptureCopy.ScreenRecordingNeeded(UILanguage.Vietnamese),
+            "Cần quyền Screen Recording — bật Snippr trong Cài đặt hệ thống");
+        Pin("en-capture-failed", CaptureCopy.CaptureFailed(UILanguage.English), "Capture failed");
+        Pin("vi-capture-failed", CaptureCopy.CaptureFailed(UILanguage.Vietnamese), "Chụp thất bại");
+        Pin("en-no-window", CaptureCopy.NoWindowFound(UILanguage.English), "No window found");
+        Pin("vi-no-window", CaptureCopy.NoWindowFound(UILanguage.Vietnamese), "Không tìm thấy cửa sổ");
+        Pin("en-scroll-slowly", CaptureCopy.ScrollSlowly(UILanguage.English),
+            "Scroll slowly — the stitch appears below");
+        Pin("vi-scroll-slowly", CaptureCopy.ScrollSlowly(UILanguage.Vietnamese),
+            "Cuộn từ từ — ảnh ghép hiện bên dưới");
+        Pin("en-clip-busy", CaptureCopy.ClipboardBusy(UILanguage.English),
+            "Clipboard is busy — try again in a moment");
+        Pin("vi-clip-busy", CaptureCopy.ClipboardBusy(UILanguage.Vietnamese),
+            "Clipboard đang bận — thử lại sau giây lát");
+        Pin("en-clip-busy-word", CaptureCopy.ClipboardBusyWord(UILanguage.English), "clipboard busy");
+        Pin("vi-clip-busy-word", CaptureCopy.ClipboardBusyWord(UILanguage.Vietnamese), "clipboard bận");
+        Pin("en-clip-busy-saved", CaptureCopy.ClipboardBusySaved("x.png", UILanguage.English),
+            "Clipboard busy — saved x.png");
+        Pin("vi-clip-busy-saved", CaptureCopy.ClipboardBusySaved("x.png", UILanguage.Vietnamese),
+            "Clipboard bận — đã lưu x.png");
+        Pin("en-copy-save-fail", CaptureCopy.CopySaveFailedOpenEditor(UILanguage.English),
+            "Couldn't copy or save — opening the editor");
+        Pin("vi-copy-save-fail", CaptureCopy.CopySaveFailedOpenEditor(UILanguage.Vietnamese),
+            "Không copy/lưu được — mở editor");
+
+        Pin("en-progress",
+            CaptureCopy.StitchingProgress(1234, true, UILanguage.English),
+            "Stitched 1234 px — keep scrolling · " + enStopHotkey);
+        Pin("vi-progress",
+            CaptureCopy.StitchingProgress(1234, true, UILanguage.Vietnamese),
+            "Đã ghép 1234 px — cuộn tiếp · " + viStopHotkey);
+        Pin("en-progress-up",
+            CaptureCopy.StitchingProgressUp(1234, true, UILanguage.English),
+            "Stitched 1234 px (connecting upward) — keep scrolling · " + enStopHotkey);
+        Pin("vi-progress-up",
+            CaptureCopy.StitchingProgressUp(1234, true, UILanguage.Vietnamese),
+            "Đã ghép 1234 px (nối lên trên) — cuộn tiếp · " + viStopHotkey);
+
+        if (UILanguageUtil.Parse(null) != UILanguage.English)
+            f.Add($"default-parse-null {UILanguageUtil.Parse(null)}");
+        if (UILanguageUtil.Parse("") != UILanguage.English)
+            f.Add("default-parse-empty");
+        if (UILanguageUtil.Parse("garbage") != UILanguage.English)
+            f.Add("default-parse-garbage");
+        if (UILanguageUtil.Parse("VI") != UILanguage.Vietnamese)
+            f.Add("parse-VI");
+        if (CaptureCopy.Current != UILanguage.English)
+            f.Add($"default-resolved {CaptureCopy.Current}");
+        if (UILanguageUtil.MenuLabel(UILanguage.English) != "English")
+            f.Add("menu-en");
+        if (UILanguageUtil.MenuLabel(UILanguage.Vietnamese) != "Tiếng Việt")
+            f.Add("menu-vi");
+        return f;
+    }
+
+    static List<string> CaptureCopySourceScanGate() =>
+        CaptureCopySourceScan.Hits(CaptureCopySourceScan.WindowsDirectory());
+
+    static List<string> UiLanguageSeams() =>
+        CaptureCopySourceScan.SeamHits(CaptureCopySourceScan.WindowsDirectory());
 }

@@ -259,6 +259,8 @@ sealed class SettingsForm : Form
     readonly CheckBox _escCopy = new() { Text = "Esc in editor copies image, then closes" };
     readonly ComboBox _corners = new();
     readonly ComboBox _ocrLang = new();
+    readonly RadioButton _langEn = new() { AutoSize = true };
+    readonly RadioButton _langVi = new() { AutoSize = true };
     readonly HotkeyBox _hkFullscreen = new();
     readonly HotkeyBox _hkArea = new();
     readonly HotkeyBox _hkWindow = new();
@@ -270,7 +272,6 @@ sealed class SettingsForm : Form
         MaximizeBox = false;
         MinimizeBox = false;
         StartPosition = FormStartPosition.CenterScreen;
-        ClientSize = new Size(460, 518);
         Font = new Font("Segoe UI", 9.5f);
 
         var s = AppSettings.Current;
@@ -282,6 +283,17 @@ sealed class SettingsForm : Form
             Controls.Add(l);
             return l;
         }
+
+        L("Language");
+        _langEn.Text = UILanguageUtil.MenuLabel(UILanguage.English);
+        _langVi.Text = UILanguageUtil.MenuLabel(UILanguage.Vietnamese);
+        var lang = UILanguageUtil.Parse(s.UiLanguage);
+        _langEn.Checked = lang != UILanguage.Vietnamese;
+        _langVi.Checked = lang == UILanguage.Vietnamese;
+        _langEn.SetBounds(160, y, 110, 24);
+        _langVi.SetBounds(280, y, 140, 24);
+        Controls.AddRange(new Control[] { _langEn, _langVi });
+        y += 40;
 
         L("Screenshots folder");
         _folder.Text = s.SaveFolder;
@@ -379,12 +391,14 @@ sealed class SettingsForm : Form
         HotkeyRow("Area screenshot", _hkArea, s.HotkeyArea);
         HotkeyRow("Window screenshot", _hkWindow, s.HotkeyWindow);
 
-        var ok = new Button { Text = "Save", DialogResult = DialogResult.OK, Bounds = new Rectangle(250, 440, 80, 28) };
-        var cancel = new Button { Text = "Cancel", DialogResult = DialogResult.Cancel, Bounds = new Rectangle(340, 440, 80, 28) };
+        y += 16;
+        var ok = new Button { Text = "Save", DialogResult = DialogResult.OK, Bounds = new Rectangle(250, y, 80, 28) };
+        var cancel = new Button { Text = "Cancel", DialogResult = DialogResult.Cancel, Bounds = new Rectangle(340, y, 80, 28) };
         AcceptButton = ok;
         CancelButton = cancel;
         Controls.Add(ok);
         Controls.Add(cancel);
+        ClientSize = new Size(460, y + 48);
 
         ok.Click += (_, _) => Apply();
     }
@@ -407,6 +421,7 @@ sealed class SettingsForm : Form
             _ => nameof(BackdropCornerStyle.Medium),
         };
         s.OcrLanguage = OcrPrefForIndex(_ocrLang.SelectedIndex).ToString();
+        s.UiLanguage = _langVi.Checked ? UILanguageUtil.VietnameseCode : UILanguageUtil.EnglishCode;
         s.HotkeyFullscreen = _hkFullscreen.Combo;
         s.HotkeyArea = _hkArea.Combo;
         s.HotkeyWindow = _hkWindow.Combo;
