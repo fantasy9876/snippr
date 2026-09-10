@@ -245,4 +245,34 @@ enum CaptureCopy {
         case .vietnamese: return "Không dựng được nền Backdrop — thử preset khác"
         }
     }
+
+    static func noPreviousArea(_ lang: UILanguage = .resolved) -> String {
+        switch lang {
+        case .english: return "No previous area — use Capture Area first"
+        case .vietnamese: return "Chưa có vùng trước — hãy chọn vùng trước đã"
+        }
+    }
+
+    static func screenRecordingNeeded(_ lang: UILanguage = .resolved) -> String {
+        switch lang {
+        case .english:
+            return "Screen Recording permission needed — enable Snippr in System Settings"
+        case .vietnamese:
+            return "Cần quyền Screen Recording — bật Snippr trong Cài đặt Hệ thống"
+        }
+    }
+
+    static func captureFailed(_ lang: UILanguage = .resolved) -> String {
+        switch lang {
+        case .english: return "Capture failed"
+        case .vietnamese: return "Chụp thất bại"
+        }
+    }
+
+    static func noWindowFound(_ lang: UILanguage = .resolved) -> String {
+        switch lang {
+        case .english: return "No window found"
+        case .vietnamese: return "Không tìm thấy cửa sổ"
+        }
+    }
 }

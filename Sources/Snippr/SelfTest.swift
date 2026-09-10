@@ -6142,6 +6142,22 @@ enum SelfTest {
                     pin("vi-summary",
                         CaptureCopy.screenshotSummary(["đã copy", "đã lưu x.png"], .vietnamese),
                         "Ảnh đã copy · đã lưu x.png")
+                    pin("en-no-prev-area", CaptureCopy.noPreviousArea(.english),
+                        "No previous area — use Capture Area first")
+                    pin("vi-no-prev-area", CaptureCopy.noPreviousArea(.vietnamese),
+                        "Chưa có vùng trước — hãy chọn vùng trước đã")
+                    pin("en-screen-rec", CaptureCopy.screenRecordingNeeded(.english),
+                        "Screen Recording permission needed — enable Snippr in System Settings")
+                    pin("vi-screen-rec", CaptureCopy.screenRecordingNeeded(.vietnamese),
+                        "Cần quyền Screen Recording — bật Snippr trong Cài đặt Hệ thống")
+                    pin("en-capture-failed", CaptureCopy.captureFailed(.english),
+                        "Capture failed")
+                    pin("vi-capture-failed", CaptureCopy.captureFailed(.vietnamese),
+                        "Chụp thất bại")
+                    pin("en-no-window", CaptureCopy.noWindowFound(.english),
+                        "No window found")
+                    pin("vi-no-window", CaptureCopy.noWindowFound(.vietnamese),
+                        "Không tìm thấy cửa sổ")
                     let d = UserDefaults.standard
                     let prevLang = d.object(forKey: Settings.Keys.uiLanguage)
                     d.removeObject(forKey: Settings.Keys.uiLanguage)
@@ -6154,6 +6170,13 @@ enum SelfTest {
                     }
                     if let prevLang { d.set(prevLang, forKey: Settings.Keys.uiLanguage) }
                     check("capture-copy-literals", lit.isEmpty, lit.joined(separator: "; "))
+                }
+
+                do {
+                    let hits = CaptureCopySourceScan.hits(
+                        in: CaptureCopySourceScan.sourceDirectory())
+                    check("capture-copy-source-scan", hits.isEmpty,
+                          hits.joined(separator: "; "))
                 }
 
                 // G4: chrome + call site, both languages. Identifier lookup —
@@ -6226,7 +6249,9 @@ enum SelfTest {
                             points: 1234, connectingUp: false,
                             hotkeysRegistered: true, language: lang)
                         if progress.contains(", xong ")
-                            || progress.contains("xong Enter") {
+                            || progress.contains("xong Enter")
+                            || progress.contains(", done ")
+                            || progress.contains("done Enter") {
                             g4.append("\(tag)-progress-xong-prefix \(progress)")
                         }
                         if !progress.contains("\(keep)\(wantHotkey)") {
@@ -6249,7 +6274,9 @@ enum SelfTest {
                                 g4.append("\(tag)-\(renderedTag)-call-site:\(liveLabel.stringValue)")
                             }
                             if liveLabel.stringValue.contains(", xong ")
-                                || liveLabel.stringValue.contains("xong Enter") {
+                                || liveLabel.stringValue.contains("xong Enter")
+                                || liveLabel.stringValue.contains(", done ")
+                                || liveLabel.stringValue.contains("done Enter") {
                                 g4.append("\(tag)-\(renderedTag)-rendered-xong:\(liveLabel.stringValue)")
                             }
                         }

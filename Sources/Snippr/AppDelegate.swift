@@ -20,12 +20,12 @@ enum AppServices {
 
     static func handleCaptureError(_ error: Error) {
         if case CaptureError.permission = error {
-            ToastHUD.show("Screen Recording permission needed — enable Snippr in System Settings", symbol: "exclamationmark.shield.fill", duration: 5)
+            ToastHUD.show(CaptureCopy.screenRecordingNeeded(), symbol: "exclamationmark.shield.fill", duration: 5)
             openScreenRecordingSettings()
         } else if case CaptureError.cancelled = error {
             // silent
         } else {
-            ToastHUD.show("Capture failed", symbol: "exclamationmark.triangle.fill")
+            ToastHUD.show(CaptureCopy.captureFailed(), symbol: "exclamationmark.triangle.fill")
         }
     }
 }
@@ -411,7 +411,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func repeatAreaCapture() {
         guard let global = Settings.shared.lastAreaRect else {
-            ToastHUD.show("No previous area — use Capture Area first", symbol: "rectangle.dashed")
+            ToastHUD.show(CaptureCopy.noPreviousArea(), symbol: "rectangle.dashed")
             captureArea()
             return
         }
@@ -447,7 +447,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func captureActiveWindow() {
         guard let info = CaptureEngine.frontmostWindow() else {
-            ToastHUD.show("No window found", symbol: "macwindow")
+            ToastHUD.show(CaptureCopy.noWindowFound(), symbol: "macwindow")
             return
         }
         captureWindow(info)
