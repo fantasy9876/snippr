@@ -84,13 +84,6 @@ static class CaptureCopySourceScan
         "new Button",
     ];
 
-    static readonly string[] ScanMarkers =
-    [
-        "ToastForm.Show(",
-        ".Text =",
-        "new Button",
-    ];
-
     public static string WindowsDirectory([CallerFilePath] string file = "")
     {
         var dir = Path.GetDirectoryName(file)
@@ -182,7 +175,7 @@ static class CaptureCopySourceScan
         {
             int bestIdx = -1;
             string? bestMarker = null;
-            foreach (var marker in ScanMarkers)
+            foreach (var marker in DiscoveryMarkers)
             {
                 var idx = stripped.IndexOf(marker, searchFrom, StringComparison.Ordinal);
                 if (idx < 0) continue;
