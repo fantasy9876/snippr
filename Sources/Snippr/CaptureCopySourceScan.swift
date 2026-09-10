@@ -4,12 +4,51 @@ import Foundation
 /// did not go through `CaptureCopy`. Closes the "human grep another leftover"
 /// loop (Honey G2) so the Win port inherits the same net.
 enum CaptureCopySourceScan {
-    static let captureFlowFiles = [
+    static let scannedFiles = [
         "AppDelegate.swift",
         "ScrollingCapture.swift",
         "ScrollResultPanel.swift",
         "OverlaySession.swift",
         "SelectionOverlay.swift",
+    ]
+
+    /// Files that contain a discovery marker but are out of this slice.
+    static let excludedFiles: [(file: String, reason: String)] = [
+        ("EditorWindow.swift",
+         "editor chrome, not capture-flow"),
+        ("UpdateChecker.swift",
+         "updater toasts, not capture-result"),
+        ("TranslateWindow.swift",
+         "OCR/translate — out of i18n slice; splash/OCR joint decision with Windows"),
+        ("OCRService.swift",
+         "OCR — out of i18n slice, same group as TranslateWindow"),
+        ("OverlayOCRRegion.swift",
+         "OCR panel chrome, same OCR group"),
+        ("HUDs.swift",
+         "toast implementation and pin-copy, not capture-flow routing"),
+        ("HoverHint.swift",
+         "hover chrome, not capture-result"),
+        ("Annotations.swift",
+         "drawing labels (numbers/callouts), not capture-result toasts"),
+        ("SelfTest.swift",
+         "independent pin literals, not production copy"),
+        ("UITest.swift",
+         "UI test harness, not production copy"),
+        ("CaptureCopySourceScan.swift",
+         "scanner tables, not production copy"),
+    ]
+
+    /// Honey N6: channels the scanner does not look at. A new user-facing
+    /// channel must join the marker list or land here with a reason.
+    static let unscannedChannels: [(marker: String, reason: String)] = [
+        ("NSMenuItem(title:",
+         "menu titles stay English this slice; capture-result toasts are ToastHUD.show"),
+        (".toolTip =",
+         "hover chrome, not capture-result"),
+        ("setAccessibilityLabel(",
+         "accessibility labels, not capture-result"),
+        ("setAccessibilityTitle(",
+         "accessibility, not capture-result"),
     ]
 
     /// Out-of-slice or non-result toasts. Exact match — a prefix must not
@@ -30,19 +69,73 @@ enum CaptureCopySourceScan {
          "eyedropper / Slice A measure, not capture-result"),
     ]
 
-    static func sourceDirectory(fromFile file: String = #file) -> URL {
-        URL(fileURLWithPath: file).deletingLastPathComponent()
+    static let discoveryMarkers = [
+        "ToastHUD.show(",
+        "updateProgress(",
+        ".stringValue =",
+        "NSTextField(wrappingLabelWithString:",
+        "NSButton(title:",
+        "NSAttributedString(string:",
+    ]
+
+    /// Evaluated in this file, not at the call site — a default `#filePath`
+    /// argument would follow SelfTest.swift (same folder today) or a
+    /// throwaway driver (not).
+    private static let scanFilePath = #filePath
+
+    static func sourceDirectory() -> URL {
+        URL(fileURLWithPath: scanFilePath).deletingLastPathComponent()
     }
 
     static func hits(in sourceDir: URL) -> [String] {
         var found: [String] = []
-        for name in captureFlowFiles {
-            let url = sourceDir.appendingPathComponent(name)
+        for (marker, reason) in unscannedChannels {
+            if marker.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                found.append("n6-empty-marker")
+            }
+            if reason.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                found.append("n6-empty-reason:\(marker)")
+            }
+        }
+        for (file, reason) in excludedFiles {
+            if reason.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                found.append("n7-empty-reason:\(file)")
+            }
+        }
+        for (_, reason) in allowlist {
+            if reason.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                found.append("allowlist-empty-reason")
+            }
+        }
+
+        let scanned = Set(scannedFiles)
+        let excluded = Set(excludedFiles.map(\.file))
+
+        let files = (try? FileManager.default.contentsOfDirectory(
+            at: sourceDir,
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles])) ?? []
+        for url in files {
+            guard url.pathExtension == "swift" else { continue }
+            let name = url.lastPathComponent
             guard let text = try? String(contentsOf: url, encoding: .utf8) else {
                 found.append("\(name):unreadable")
                 continue
             }
-            found.append(contentsOf: scan(file: name, source: text))
+            guard discoveryMarkers.contains(where: { text.contains($0) }) else { continue }
+            if excluded.contains(name) { continue }
+            if scanned.contains(name) {
+                found.append(contentsOf: scan(file: name, source: text))
+                continue
+            }
+            found.append("\(name):has-marker-not-listed")
+        }
+
+        for name in scannedFiles {
+            let url = sourceDir.appendingPathComponent(name)
+            if !FileManager.default.fileExists(atPath: url.path) {
+                found.append("\(name):missing")
+            }
         }
         return found
     }
