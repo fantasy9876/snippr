@@ -113,10 +113,74 @@ jobs:
           if ($null -eq $code) { throw '--test-shot produced no exit code' }
           if ($code -ne 0) { throw "--test-shot failed $code step(s)" }
 
+      # Honey covering-line: keep the RequiredSeams needle, assign English
+      # afterwards. ParityGate stays green; smoke must fail
+      # ui-language-follows-settings. Same idea as PR #35's smoke fail-first,
+      # runnable here because this job is already on windows-latest.
+      - name: Covering-line mutation must fail smoke
+        shell: pwsh
+        run: |
+          $prog = 'windows/Program.cs'
+          $needle = 'UILanguageUtil.Parse(AppSettings.Current.UiLanguage)'
+          $hitLine = Select-String -Path $prog -Pattern $needle -SimpleMatch
+          if (-not $hitLine) { throw 'Resolve needle missing — cannot mutate' }
+          $lines = [System.Collections.Generic.List[string]]::new()
+          foreach ($line in [System.IO.File]::ReadAllLines($prog)) {
+            $lines.Add($line)
+            if ($line.Contains($needle)) {
+              $lines.Add('        CaptureCopy.Resolve = static () => UILanguage.English;')
+            }
+          }
+          [System.IO.File]::WriteAllLines($prog, $lines)
+          Write-Host '== mutated Program.cs (covering line)'
+          Select-String -Path $prog -Pattern 'CaptureCopy.Resolve' | ForEach-Object { Write-Host $_.Line }
+          try {
+            Write-Host '== ParityGate must stay green (needle still present)'
+            & dotnet run --project windows/Snippr.Win.ParityGate/Snippr.Win.ParityGate.csproj `
+              -c Release -f net8.0 --no-launch-profile
+            if ($LASTEXITCODE -ne 0) { throw "ParityGate went red on covering-line (want green): $LASTEXITCODE" }
+
+            Write-Host '== rebuild app'
+            & dotnet build windows/Snippr.Win.csproj -c Release --nologo
+            if ($LASTEXITCODE -ne 0) { throw 'mutated app build failed' }
+
+            $exe = Get-ChildItem -Recurse -Path windows/bin/Release -Filter Snippr.exe |
+              Where-Object { $_.FullName -notlike '*publish*' } | Select-Object -First 1
+            $out = Join-Path $pwd 'smoke-covering-line'
+            New-Item -ItemType Directory -Force $out | Out-Null
+            $p = Start-Process -FilePath $exe.FullName `
+              -ArgumentList @('--test-shot', $out) `
+              -Wait -PassThru -NoNewWindow
+            $code = $p.ExitCode
+            Write-Host "covering-line test-shot exit=$code"
+            foreach ($name in @('click.log', 'crash.log')) {
+              $path = Join-Path $out $name
+              if (Test-Path $path) {
+                Write-Host "===== covering-line $name ====="
+                Get-Content $path | Select-Object -Last 80 | ForEach-Object { Write-Host $_ }
+              }
+            }
+            if ($null -eq $code -or $code -eq 0) {
+              throw 'covering-line mutation left smoke green — S1 still uncaught'
+            }
+            $crash = Join-Path $out 'crash.log'
+            $caught = (Test-Path $crash) -and
+              (Select-String -Path $crash -Pattern 'ui-language-follows-settings' -Quiet)
+            if (-not $caught) {
+              throw "smoke failed $code step(s) but not ui-language-follows-settings"
+            }
+            Write-Host 'covering-line caught by ui-language-follows-settings'
+          }
+          finally {
+            git checkout -- $prog
+          }
+
       - name: Upload smoke shots
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: windows-ci-smoke
           if-no-files-found: warn
-          path: smoke-out/
+          path: |
+            smoke-out/
+            smoke-covering-line/

@@ -77,10 +77,14 @@ static class CaptureCopySourceScan
          "tray tooltip version string, not capture-result copy"),
     ];
 
-    /// Production assignments in files ParityGate cannot compile. Same net as
-    /// capture-copy-source-scan: the gate reads the source text. Mutating the
-    /// wiring (Sol S1/S2) removes a required needle and goes red. Add a row
-    /// when a new seam lives outside the gate's compile set (Honey family).
+    /// Windows-only. ParityGate cannot compile WinForms (`Program.cs`,
+    /// `AppSettings.cs`), so these needles pin the *text* of the production
+    /// assignment — not its effect. A covering line after the needle still
+    /// matches and stays green; `--test-shot` `ui-language-follows-settings`
+    /// / `ui-language-fresh-default-is-english` assert the effect. Do not
+    /// port this table to macOS: mac already asserts behaviour in SelfTest
+    /// (`UILanguage.resolved` after deleting the key) and has no `Resolve`
+    /// delegate. A new Windows seam the gate cannot compile is one more row.
     static readonly (string File, string Needle, string Reason)[] RequiredSeams =
     [
         ("Program.cs",
