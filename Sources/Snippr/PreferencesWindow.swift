@@ -272,8 +272,21 @@ struct GeneralTab: View {
     @State private var backdropPresets = BackdropPresetStore.load()
     @State private var autoApplyPreset = Settings.shared.backdropAutoApplyPreset ?? ""
 
+    @AppStorage(Settings.Keys.uiLanguage) private var uiLanguage = UILanguage.english.rawValue
+
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
+            Row(label: "Language") {
+                Picker("", selection: $uiLanguage) {
+                    ForEach(UILanguage.allCases, id: \.rawValue) { lang in
+                        Text(lang.menuLabel).tag(lang.rawValue)
+                    }
+                }
+                .pickerStyle(.radioGroup)
+                .horizontalRadioGroupLayout()
+                .labelsHidden()
+                .accessibilityIdentifier("settings.uiLanguage")
+            }
             backdropAutoApplySection
             Row(label: "Spotlight") {
                 Toggle("Allow multiple Spotlight regions", isOn: $multipleSpotlight)

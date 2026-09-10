@@ -552,15 +552,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let announce = !plan.opensEditor
             SaveService.shared.save(framed) { url in
                 guard announce else { return }
-                var toasts: [String] = copied ? ["copied"] : []
+                var toasts: [String] = copied ? [CaptureCopy.toastCopiedWord()] : []
                 if let url {
-                    toasts.append("saved \(url.lastPathComponent)")
+                    toasts.append(CaptureCopy.toastSavedWord(url.lastPathComponent))
                 } else {
                     // the only configured action failed — rescue the shot
                     if !copied { SaveService.shared.copyToClipboard(framed) }
-                    toasts.append(copied ? "save failed" : "save failed — copied instead")
+                    toasts.append(copied
+                        ? CaptureCopy.toastSaveFailed()
+                        : CaptureCopy.toastSaveFailedCopied())
                 }
-                ToastHUD.show("Screenshot \(toasts.joined(separator: " · "))")
+                ToastHUD.show(CaptureCopy.screenshotSummary(toasts))
             }
         }
 
@@ -577,11 +579,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if s.afterSave {
                 // toast arrives from the save completion above
             } else if copied {
-                ToastHUD.show("Screenshot copied")
+                ToastHUD.show(CaptureCopy.screenshotCopied())
             } else {
                 // nothing configured — at least copy so the shot isn't lost
                 SaveService.shared.copyToClipboard(framed)
-                ToastHUD.show("Screenshot copied to clipboard")
+                ToastHUD.show(CaptureCopy.screenshotCopiedToClipboard())
             }
         }
     }

@@ -5844,7 +5844,7 @@ enum SelfTest {
                     if ScrollingCapture.active != nil {
                         g2.append(tagged(label, "active-still-set"))
                     }
-                    if !hud.messages.contains("Đã hủy chụp cuộn") {
+                    if !hud.messages.contains("Scrolling capture cancelled") {
                         g2.append(tagged(label, "hud-missing \(hud.messages)"))
                     }
                     session.removeStopForTesting()
@@ -5957,7 +5957,7 @@ enum SelfTest {
                         if spy.saves != wantSaves {
                             g3.append("\(label):saves \(spy.saves) want \(wantSaves)")
                         }
-                        if !afterSave && !spy.toasts.contains("Đã copy") {
+                        if !afterSave && !spy.toasts.contains("Copied") {
                             g3.append("\(label):hud-missing \(spy.toasts)")
                         }
                         if ScrollingCapture.active != nil {
@@ -6014,110 +6014,190 @@ enum SelfTest {
                           g3c.isEmpty, g3c.joined(separator: "; "))
                 }
 
-                // G4: new hint in chrome, both hotkey and fallback branches.
-                // Identifier lookup — a title scan that matches 0 labels
-                // would pass the contains() checks vacuously.
+                // Frozen EN/VI literals — independent of CaptureCopy so
+                // editing one table cell turns this red (Pollen mutation).
+                let enStopHotkey = "Enter/✓ done · ⌘C copy · Esc cancel"
+                let viStopHotkey = "Enter/✓ xong · ⌘C copy · Esc hủy"
+                let enStopFallback = "click ✓ to finish"
+                let viStopFallback = "bấm ✓ để xong"
+                let enKeep = "keep scrolling · "
+                let viKeep = "cuộn tiếp · "
+                let enUp = "(connecting upward) — keep scrolling · "
+                let viUp = "(nối lên trên) — cuộn tiếp · "
+                let enDone = "✓ Done"
+                let viDone = "✓ Xong"
+                let enCancel = "Scrolling capture cancelled"
+                let viCancel = "Đã hủy chụp cuộn"
+                let enCopied = "Copied"
+                let viCopied = "Đã copy"
+
+                do {
+                    var lit: [String] = []
+                    if CaptureCopy.stopHintHotkey(.english) != enStopHotkey {
+                        lit.append("en-hotkey \(CaptureCopy.stopHintHotkey(.english))")
+                    }
+                    if CaptureCopy.stopHintHotkey(.vietnamese) != viStopHotkey {
+                        lit.append("vi-hotkey \(CaptureCopy.stopHintHotkey(.vietnamese))")
+                    }
+                    if CaptureCopy.stopHintFallback(.english) != enStopFallback {
+                        lit.append("en-fallback \(CaptureCopy.stopHintFallback(.english))")
+                    }
+                    if CaptureCopy.stopHintFallback(.vietnamese) != viStopFallback {
+                        lit.append("vi-fallback \(CaptureCopy.stopHintFallback(.vietnamese))")
+                    }
+                    if CaptureCopy.doneButton(.english) != enDone {
+                        lit.append("en-done \(CaptureCopy.doneButton(.english))")
+                    }
+                    if CaptureCopy.doneButton(.vietnamese) != viDone {
+                        lit.append("vi-done \(CaptureCopy.doneButton(.vietnamese))")
+                    }
+                    if CaptureCopy.scrollCancelled(.english) != enCancel {
+                        lit.append("en-cancel \(CaptureCopy.scrollCancelled(.english))")
+                    }
+                    if CaptureCopy.scrollCancelled(.vietnamese) != viCancel {
+                        lit.append("vi-cancel \(CaptureCopy.scrollCancelled(.vietnamese))")
+                    }
+                    if CaptureCopy.copied(.english) != enCopied {
+                        lit.append("en-copied \(CaptureCopy.copied(.english))")
+                    }
+                    if CaptureCopy.copied(.vietnamese) != viCopied {
+                        lit.append("vi-copied \(CaptureCopy.copied(.vietnamese))")
+                    }
+                    let d = UserDefaults.standard
+                    let prevLang = d.object(forKey: Settings.Keys.uiLanguage)
+                    d.removeObject(forKey: Settings.Keys.uiLanguage)
+                    if UILanguage.resolved != .english {
+                        lit.append("default-resolved \(UILanguage.resolved)")
+                    }
+                    if ScrollingCapture.sessionStopHint(hotkeysRegistered: true)
+                        != enStopHotkey {
+                        lit.append("default-hint \(ScrollingCapture.sessionStopHint(hotkeysRegistered: true))")
+                    }
+                    if let prevLang { d.set(prevLang, forKey: Settings.Keys.uiLanguage) }
+                    check("capture-copy-literals", lit.isEmpty, lit.joined(separator: "; "))
+                }
+
+                // G4: chrome + call site, both languages. Identifier lookup —
+                // a title scan that matches 0 labels would pass vacuously.
                 g4Hint: do {
                     var g4: [String] = []
-                    let wantHotkey = "Enter/✓ xong · ⌘C copy · Esc hủy"
-                    let wantFallback = "bấm ✓ để xong"
                     guard let chromeScreen = NSScreen.main ?? NSScreen.screens.first else {
                         g4.append("no-screen")
                         check("scroll-session-stop-hint", false,
                               g4.joined(separator: "; "))
                         break g4Hint
                     }
-                    let session = ScrollingCapture(onFinish: { _ in })
-                    session.showChromeForTesting(
-                        screen: chromeScreen,
-                        rect: CGRect(x: 80, y: 80, width: 240, height: 180))
-                    guard let fallbackLabel = session.chromeView(
-                        identifier: ScrollingCapture.hintLabelIdentifier
-                    ) as? NSTextField else {
-                        g4.append("fallback:no-hint-by-identifier")
-                        session.hideChromeForTesting()
-                        check("scroll-session-stop-hint", false,
-                              g4.joined(separator: "; "))
-                        break g4Hint
+                    let d = UserDefaults.standard
+                    let prevLang = d.object(forKey: Settings.Keys.uiLanguage)
+                    defer {
+                        if let prevLang {
+                            d.set(prevLang, forKey: Settings.Keys.uiLanguage)
+                        } else {
+                            d.removeObject(forKey: Settings.Keys.uiLanguage)
+                        }
                     }
-                    if !fallbackLabel.stringValue.contains(wantFallback) {
-                        g4.append("fallback:\(fallbackLabel.stringValue)")
-                    }
-                    session.installStopForTesting()
-                    session.showChromeForTesting(
-                        screen: chromeScreen,
-                        rect: CGRect(x: 80, y: 80, width: 240, height: 180))
-                    guard let liveLabel = session.chromeView(
-                        identifier: ScrollingCapture.hintLabelIdentifier
-                    ) as? NSTextField else {
-                        g4.append("hotkey:no-hint-by-identifier")
+
+                    @MainActor func runLang(
+                        _ lang: UILanguage, tag: String,
+                        wantHotkey: String, wantFallback: String,
+                        keep: String, upMark: String, wantDone: String
+                    ) {
+                        d.set(lang.rawValue, forKey: Settings.Keys.uiLanguage)
+                        let session = ScrollingCapture(onFinish: { _ in })
+                        session.showChromeForTesting(
+                            screen: chromeScreen,
+                            rect: CGRect(x: 80, y: 80, width: 240, height: 180))
+                        guard let fallbackLabel = session.chromeView(
+                            identifier: ScrollingCapture.hintLabelIdentifier
+                        ) as? NSTextField else {
+                            g4.append("\(tag)-fallback:no-hint-by-identifier")
+                            session.hideChromeForTesting()
+                            return
+                        }
+                        if !fallbackLabel.stringValue.contains(wantFallback) {
+                            g4.append("\(tag)-fallback:\(fallbackLabel.stringValue)")
+                        }
+                        session.installStopForTesting()
+                        session.showChromeForTesting(
+                            screen: chromeScreen,
+                            rect: CGRect(x: 80, y: 80, width: 240, height: 180))
+                        guard let liveLabel = session.chromeView(
+                            identifier: ScrollingCapture.hintLabelIdentifier
+                        ) as? NSTextField else {
+                            g4.append("\(tag)-hotkey:no-hint-by-identifier")
+                            session.removeStopForTesting()
+                            session.hideChromeForTesting()
+                            return
+                        }
+                        if !liveLabel.stringValue.contains(wantHotkey) {
+                            g4.append("\(tag)-hotkey:\(liveLabel.stringValue)")
+                        }
+                        if let done = session.control(
+                            identifier: ScrollingCapture.doneButtonIdentifier
+                        ) {
+                            let shown = done.attributedTitle.string.isEmpty
+                                ? done.title : done.attributedTitle.string
+                            if shown != wantDone {
+                                g4.append("\(tag)-done:\(shown)")
+                            }
+                        } else {
+                            g4.append("\(tag)-done:missing")
+                        }
+                        let progress = ScrollingCapture.stitchingProgressText(
+                            points: 1234, connectingUp: false,
+                            hotkeysRegistered: true, language: lang)
+                        if progress.contains(", xong ")
+                            || progress.contains("xong Enter") {
+                            g4.append("\(tag)-progress-xong-prefix \(progress)")
+                        }
+                        if !progress.contains("\(keep)\(wantHotkey)") {
+                            g4.append("\(tag)-progress:\(progress)")
+                        }
+                        let up = ScrollingCapture.stitchingProgressText(
+                            points: 1234, connectingUp: true,
+                            hotkeysRegistered: true, language: lang)
+                        if !up.contains("\(upMark)\(wantHotkey)") {
+                            g4.append("\(tag)-progress-up:\(up)")
+                        }
+                        let stitchFrame = makeSolidImage(
+                            width: 40, height: 120, color: NSColor.systemTeal.cgColor)
+                        let segmented = SegmentedVerticalStitcher(
+                            first: stitchFrame, scale: 1)
+                        session.startPreviewForTesting(with: stitchFrame)
+                        let points = Int(CGFloat(segmented.totalHeight) / segmented.scale)
+                        func checkRendered(want: String, _ renderedTag: String) {
+                            if liveLabel.stringValue != want {
+                                g4.append("\(tag)-\(renderedTag)-call-site:\(liveLabel.stringValue)")
+                            }
+                            if liveLabel.stringValue.contains(", xong ")
+                                || liveLabel.stringValue.contains("xong Enter") {
+                                g4.append("\(tag)-\(renderedTag)-rendered-xong:\(liveLabel.stringValue)")
+                            }
+                        }
+                        session.applyStitchOutcome(.appended(0), stitcher: segmented)
+                        checkRendered(
+                            want: ScrollingCapture.stitchingProgressText(
+                                points: points, connectingUp: false,
+                                hotkeysRegistered: true, language: lang),
+                            "appended")
+                        session.applyStitchOutcome(.prepended(0), stitcher: segmented)
+                        checkRendered(
+                            want: ScrollingCapture.stitchingProgressText(
+                                points: points, connectingUp: true,
+                                hotkeysRegistered: true, language: lang),
+                            "prepended")
                         session.removeStopForTesting()
                         session.hideChromeForTesting()
-                        check("scroll-session-stop-hint", false,
-                              g4.joined(separator: "; "))
-                        break g4Hint
                     }
-                    if !liveLabel.stringValue.contains(wantHotkey) {
-                        g4.append("hotkey:\(liveLabel.stringValue)")
-                    }
-                    let progress = ScrollingCapture.stitchingProgressText(
-                        points: 1234, connectingUp: false,
-                        hotkeysRegistered: true)
-                    if progress.contains(", xong ")
-                        || progress.contains("xong Enter") {
-                        g4.append("progress-xong-prefix \(progress)")
-                    }
-                    if !progress.contains("cuộn tiếp · \(wantHotkey)") {
-                        g4.append("progress:\(progress)")
-                    }
-                    let up = ScrollingCapture.stitchingProgressText(
-                        points: 1234, connectingUp: true,
-                        hotkeysRegistered: true)
-                    if !up.contains("(nối lên trên) — cuộn tiếp · \(wantHotkey)") {
-                        g4.append("progress-up:\(up)")
-                    }
-                    // M10: the PRODUCTION call site must compose the live
-                    // line. Pushing a string the gate built through a
-                    // `updateProgressForTesting(_ text:)` write seam only
-                    // proved the label plumbing — reverting `applyStitchOutcome`
-                    // to the old inline "…, xong \(stopHint)" stayed green.
-                    // Drive the same function the capture loop calls and read
-                    // the rendered chrome.
-                    let stitchFrame = makeSolidImage(
-                        width: 40, height: 120, color: NSColor.systemTeal.cgColor)
-                    let segmented = SegmentedVerticalStitcher(
-                        first: stitchFrame, scale: 1)
-                    session.startPreviewForTesting(with: stitchFrame)
-                    let points = Int(CGFloat(segmented.totalHeight) / segmented.scale)
-                    // Two independent questions about the SAME rendered
-                    // string: does the call site produce what the formatter
-                    // says, and is the text itself free of the "xong … Esc"
-                    // shape? Checking the second on the expected value would
-                    // only re-test the formatter — it has to read the label,
-                    // or it cannot fail when both sides drift together.
-                    func checkRendered(want: String, _ tag: String) {
-                        if liveLabel.stringValue != want {
-                            g4.append("\(tag)-call-site:\(liveLabel.stringValue)")
-                        }
-                        if liveLabel.stringValue.contains(", xong ")
-                            || liveLabel.stringValue.contains("xong Enter") {
-                            g4.append("\(tag)-rendered-xong:\(liveLabel.stringValue)")
-                        }
-                    }
-                    session.applyStitchOutcome(.appended(0), stitcher: segmented)
-                    checkRendered(
-                        want: ScrollingCapture.stitchingProgressText(
-                            points: points, connectingUp: false,
-                            hotkeysRegistered: true),
-                        "appended")
-                    session.applyStitchOutcome(.prepended(0), stitcher: segmented)
-                    checkRendered(
-                        want: ScrollingCapture.stitchingProgressText(
-                            points: points, connectingUp: true,
-                            hotkeysRegistered: true),
-                        "prepended")
-                    session.removeStopForTesting()
-                    session.hideChromeForTesting()
+
+                    runLang(
+                        .english, tag: "en",
+                        wantHotkey: enStopHotkey, wantFallback: enStopFallback,
+                        keep: enKeep, upMark: enUp, wantDone: enDone)
+                    runLang(
+                        .vietnamese, tag: "vi",
+                        wantHotkey: viStopHotkey, wantFallback: viStopFallback,
+                        keep: viKeep, upMark: viUp, wantDone: viDone)
                     check("scroll-session-stop-hint",
                           g4.isEmpty, g4.joined(separator: "; "))
                 }
@@ -10285,12 +10365,18 @@ enum SelfTest {
 
         // MARK: slice A — picker / ruler / guides / resize / scroll hint
         do {
-            let hint = SliceAHotkeys.bidirectionalScrollHint.lowercased()
+            let enHint = "Scroll up or down — stitching works both ways"
+            let viHint = "Cuộn lên hoặc xuống — stitcher nối cả hai chiều"
+            let resolved = SliceAHotkeys.bidirectionalScrollHint
             check("sliceA-scroll-hint-bidirectional",
-                  hint.contains("lên") && hint.contains("xuống")
-                    && ScrollingCapture.bidirectionalScrollHint
-                        == SliceAHotkeys.bidirectionalScrollHint,
-                  hint)
+                  CaptureCopy.bidirectional(.english) == enHint
+                    && CaptureCopy.bidirectional(.vietnamese) == viHint
+                    && resolved == enHint
+                    && enHint.lowercased().contains("up")
+                    && enHint.lowercased().contains("down")
+                    && viHint.contains("lên") && viHint.contains("xuống")
+                    && ScrollingCapture.bidirectionalScrollHint == resolved,
+                  resolved)
 
             check("sliceA-overlay-actions-untouched",
                   OverlayActionCatalog.items.map(\.intent)

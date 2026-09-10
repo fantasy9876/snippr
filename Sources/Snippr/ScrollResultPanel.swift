@@ -44,7 +44,7 @@ enum ScrollResultPresenter {
             var deps = dependencies ?? .live
             if !inputs.afterSave {
                 let baseToast = deps.toast
-                deps.toast = { _ in baseToast("Đã copy") }
+                deps.toast = { _ in baseToast(CaptureCopy.copied()) }
             }
             CaptureActionRouter.commit(
                 image, source: .scrollResult, intent: .scrollFinished,
