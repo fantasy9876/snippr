@@ -49,6 +49,9 @@
          only, so H2 (Esc=cancel vs finish) is caught on Studio, not only on
          a Windows runner. -->
     <Compile Include="..\ScrollSessionStop.cs" Link="ScrollSessionStop.cs" />
+    <!-- Capture-flow copy table. Numbers and strings only, so EN/VI pins and
+         the source-scan run on Studio, not only on a Windows runner. -->
+    <Compile Include="..\CaptureCopy.cs" Link="CaptureCopy.cs" />
   </ItemGroup>
 
 </Project>

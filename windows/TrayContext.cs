@@ -162,14 +162,14 @@ sealed class TrayContext : ApplicationContext
         switch (action)
         {
             case OverlayAction.Copy:
-                if (TryCopyImage(image)) ToastForm.Show("Copied to clipboard");
-                else ToastForm.Show("Clipboard đang bận — thử lại sau giây lát");
+                if (TryCopyImage(image)) ToastForm.Show(CaptureCopy.ScreenshotCopied());
+                else ToastForm.Show(CaptureCopy.ClipboardBusy());
                 image.Dispose();
                 break;
             case OverlayAction.Save:
                 if (CaptureUtil.SaveToFolder(image) is string path)
-                    ToastForm.Show($"Saved {Path.GetFileName(path)}");
-                else ToastForm.Show("Save failed");
+                    ToastForm.Show(CaptureCopy.SavedFile(Path.GetFileName(path)));
+                else ToastForm.Show(CaptureCopy.SaveFailed());
                 image.Dispose();
                 break;
             case OverlayAction.Pin:
@@ -194,7 +194,7 @@ sealed class TrayContext : ApplicationContext
     {
         if (CaptureBusy) return;
         var shot = CaptureUtil.ActiveWindow();
-        if (shot == null) { ToastForm.Show("No window found"); return; }
+        if (shot == null) { ToastForm.Show(CaptureCopy.NoWindowFound()); return; }
         HandleResult(shot);
     }
 
@@ -220,7 +220,7 @@ sealed class TrayContext : ApplicationContext
         if (LastScrollRouteForTesting is not { } route)
         {
             finish.Image?.Dispose();
-            if (finish.Cancelled) ToastForm.Show("Đã hủy chụp cuộn");
+            if (finish.Cancelled) ToastForm.Show(CaptureCopy.ScrollCancelled(finish.UiLanguage));
             return;
         }
         if (finish.Image == null) return;
@@ -271,7 +271,7 @@ sealed class TrayContext : ApplicationContext
         // no longer on any monitor — used to crash inside Bitmap.Clone
         if (CaptureUtil.Rect(rect) is not Bitmap shot)
         {
-            ToastForm.Show("Vùng đã lưu không còn trên màn hình — chọn lại nhé");
+            ToastForm.Show(CaptureCopy.SavedRegionGone());
             CaptureArea();
             return;
         }
@@ -334,21 +334,22 @@ sealed class TrayContext : ApplicationContext
         var actions = new List<string>();
         bool preserved = false; // the shot reached the clipboard, a file, or the editor
 
+        var lang = CaptureCopy.Current;
         if (afterCopy)
         {
-            if (TryCopyImage(shot)) { actions.Add("copied"); preserved = true; }
-            else actions.Add("clipboard busy");
+            if (TryCopyImage(shot)) { actions.Add(CaptureCopy.ToastCopiedWord(lang)); preserved = true; }
+            else actions.Add(CaptureCopy.ClipboardBusyWord(lang));
         }
         if (afterSave)
         {
             if (CaptureUtil.SaveToFolder(shot) is string path)
             {
-                actions.Add($"saved {Path.GetFileName(path)}");
+                actions.Add(CaptureCopy.ToastSavedWord(Path.GetFileName(path), lang));
                 preserved = true;
             }
             else
             {
-                actions.Add("save failed"); // don't hide a partial failure
+                actions.Add(CaptureCopy.ToastSaveFailed(lang)); // don't hide a partial failure
             }
         }
 
@@ -364,24 +365,24 @@ sealed class TrayContext : ApplicationContext
             // shot instead of disposing it behind a toast
             if (actions.Count == 0 && TryCopyImage(shot))
             {
-                ToastForm.Show("Screenshot copied to clipboard");
+                ToastForm.Show(CaptureCopy.ScreenshotCopiedToClipboard(lang));
                 shot.Dispose();
                 return;
             }
             if (CaptureUtil.SaveToFolder(shot) is string saved)
             {
-                ToastForm.Show($"Clipboard bận — đã lưu {Path.GetFileName(saved)}");
+                ToastForm.Show(CaptureCopy.ClipboardBusySaved(Path.GetFileName(saved), lang));
                 shot.Dispose();
                 return;
             }
             // absolute last resort: clipboard AND disk failed — open the
             // editor so the capture is never destroyed with no artifact
-            ToastForm.Show("Không copy/lưu được — mở editor");
+            ToastForm.Show(CaptureCopy.CopySaveFailedOpenEditor(lang));
             EditorForm.OpenWith(shot);
             return;
         }
 
-        ToastForm.Show("Screenshot " + string.Join(" · ", actions));
+        ToastForm.Show(CaptureCopy.ScreenshotSummary(actions, lang));
         shot.Dispose();
     }
 

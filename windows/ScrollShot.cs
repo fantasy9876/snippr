@@ -34,27 +34,35 @@ sealed class ScrollShotSession
     HotkeyWindow? _hotkeyWindow;
     readonly List<int> _registeredHotkeyIds = new();
     bool _hotkeysRegistered;
+    readonly UILanguage _language;
     Bitmap? _probe; // reused capture buffer — no per-tick allocation
     WinStitcher? _stitcher;
     int _lastHash;
 
     const int MaxHeightPx = 20000;
 
-    string StopHint => ScrollSessionStop.SessionStopHint(_hotkeysRegistered);
+    string StopHint => ScrollSessionStop.SessionStopHint(_hotkeysRegistered, _language);
 
     public static void Begin(Action<ScrollShotFinish> onFinish)
     {
         if (_active != null) return;
         var s = AppSettings.Current;
         var snapshot = (s.AfterCopy, s.AfterShow, s.AfterSave);
+        var language = UILanguageUtil.Parse(s.UiLanguage);
         var (shot, rect) = OverlayForm.SelectArea();
         shot?.Dispose(); // only the rect is needed; frames come from the timer
         if (rect.Width < 40 || rect.Height < 60)
         {
-            onFinish(new ScrollShotFinish { AfterCopy = snapshot.AfterCopy, AfterShow = snapshot.AfterShow, AfterSave = snapshot.AfterSave });
+            onFinish(new ScrollShotFinish
+            {
+                AfterCopy = snapshot.AfterCopy,
+                AfterShow = snapshot.AfterShow,
+                AfterSave = snapshot.AfterSave,
+                UiLanguage = language,
+            });
             return;
         }
-        _active = new ScrollShotSession(rect, onFinish, snapshot);
+        _active = new ScrollShotSession(rect, onFinish, snapshot, language);
     }
 
     /// Skip the area picker. Used by `--test-shot` on the Windows runner.
@@ -65,7 +73,8 @@ sealed class ScrollShotSession
     {
         if (_active != null)
             throw new InvalidOperationException("a scroll session is already active");
-        _active = new ScrollShotSession(rect, onFinish, snapshot);
+        var language = UILanguageUtil.Parse(AppSettings.Current.UiLanguage);
+        _active = new ScrollShotSession(rect, onFinish, snapshot, language);
     }
 
     internal static ScrollShotSession? ActiveForTesting => _active;
@@ -82,15 +91,17 @@ sealed class ScrollShotSession
     ScrollShotSession(
         Rectangle rect,
         Action<ScrollShotFinish> onFinish,
-        (bool AfterCopy, bool AfterShow, bool AfterSave) snapshot)
+        (bool AfterCopy, bool AfterShow, bool AfterSave) snapshot,
+        UILanguage language)
     {
         _rect = rect;
         _onFinish = onFinish;
         _stop = new ScrollStopMachine(snapshot.AfterCopy, snapshot.AfterShow, snapshot.AfterSave);
+        _language = language;
         _sync = SynchronizationContext.Current;
         BuildChrome();
         InstallStop();
-        _label.Text = $"  Cuộn từ từ — ảnh ghép hiện bên dưới · {StopHint}";
+        _label.Text = $"  {CaptureCopy.ScrollSlowly(_language)} · {StopHint}";
 
         _timer.Interval = 180;
         _timer.Tick += (_, _) => CaptureTick();
@@ -158,19 +169,19 @@ sealed class ScrollShotSession
         {
             _stitcher = new WinStitcher(bmp);
             AddPreviewSlice(bmp);
-            _label.Text = $"  Cuộn từ từ — ảnh ghép hiện bên dưới · {StopHint}";
+            _label.Text = $"  {CaptureCopy.ScrollSlowly(_language)} · {StopHint}";
         }
         else if (_stitcher.Append(bmp))
         {
             AddPreviewSlice(_stitcher.LastSlice);
             _label.Text = "  " + ScrollSessionStop.StitchingProgressText(
-                _stitcher.TotalHeight, _hotkeysRegistered);
+                _stitcher.TotalHeight, _hotkeysRegistered, _language);
             if (_stitcher.TotalHeight >= MaxHeightPx)
                 ApplyStop(ScrollStopAction.Finish, ScrollStopInvoke.UiMarshals);
         }
         else
         {
-            _label.Text = "  Chưa khớp được — cuộn chậm lại một chút";
+            _label.Text = "  " + CaptureCopy.NoMatch(_language);
             bmp.Dispose();
         }
     }
@@ -252,6 +263,7 @@ sealed class ScrollShotSession
             AfterCopy = _stop.AfterCopy,
             AfterShow = _stop.AfterShow,
             AfterSave = _stop.AfterSave,
+            UiLanguage = _language,
         });
     }
 
@@ -299,7 +311,7 @@ sealed class ScrollShotSession
         _label.Bounds = new Rectangle(6, 6, panelW - 12, 40);
         var done = new Button
         {
-            Text = "✓ Xong",
+            Text = CaptureCopy.DoneButton(_language),
             ForeColor = Color.White,
             BackColor = Color.FromArgb(0, 120, 212),
             FlatStyle = FlatStyle.Flat,
@@ -382,6 +394,7 @@ sealed class ScrollShotFinish
     public bool AfterCopy;
     public bool AfterShow;
     public bool AfterSave;
+    public UILanguage UiLanguage;
 }
 
 /// Low-level keyboard hook that CONSUMES matching session keys (returns 1)
