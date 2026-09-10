@@ -12,15 +12,22 @@ enum CaptureCopySourceScan {
         "SelectionOverlay.swift",
     ]
 
-    /// Out-of-slice or non-result toasts. Reason is part of the gate so a
-    /// silent allowlist cannot grow without a sentence.
+    /// Out-of-slice or non-result toasts. Exact match — a prefix must not
+    /// hide a future literal. Reason is part of the gate so the list cannot
+    /// grow silently.
     static let allowlist: [(needle: String, reason: String)] = [
-        ("Snippr is running —", "launch splash, not a capture-result toast"),
-        ("URL scheme is disabled", "Advanced settings, not capture"),
-        ("No image in clipboard", "Load From Clipboard, not a capture path"),
-        ("No text found", "OCR — out of i18n slice"),
-        ("Text copied", "OCR overlay — out of i18n slice"),
-        ("No pixel", "eyedropper / Slice A measure, not capture-result"),
+        ("Snippr is running — ⇧⌘1 screen · ⇧⌘2 area",
+         "launch splash, not a capture-result toast — Win PR decides with OCR group"),
+        ("URL scheme is disabled in Advanced settings",
+         "Advanced settings, not capture"),
+        ("No image in clipboard",
+         "Load From Clipboard, not a capture path"),
+        ("No text found",
+         "OCR — out of i18n slice, Win PR decides with splash"),
+        ("Text copied",
+         "OCR overlay — out of i18n slice, Win PR decides with splash"),
+        ("No pixel",
+         "eyedropper / Slice A measure, not capture-result"),
     ]
 
     static func sourceDirectory(fromFile file: String = #file) -> URL {
@@ -43,7 +50,14 @@ enum CaptureCopySourceScan {
     static func scan(file: String, source: String) -> [String] {
         let stripped = stripComments(source)
         var hits: [String] = []
-        let markers = ["ToastHUD.show(", "updateProgress(", ".stringValue ="]
+        let markers = [
+            "ToastHUD.show(",
+            "updateProgress(",
+            ".stringValue =",
+            "NSTextField(wrappingLabelWithString:",
+            "NSButton(title:",
+            "NSAttributedString(string:",
+        ]
         var searchFrom = stripped.startIndex
         while searchFrom < stripped.endIndex {
             var best: (idx: String.Index, marker: String)? = nil
@@ -57,17 +71,20 @@ enum CaptureCopySourceScan {
             guard let hit = best else { break }
             let afterMarker = stripped.index(hit.idx, offsetBy: hit.marker.count)
             let snippet: String
-            if hit.marker.hasSuffix("(") {
+            if hit.marker.hasSuffix("(") || hit.marker.hasSuffix(":") {
                 snippet = argumentSnippet(stripped, from: afterMarker)
             } else {
                 snippet = rhsSnippet(stripped, from: afterMarker)
             }
-            searchFrom = stripped.index(afterMarker, offsetBy: min(1, stripped.distance(from: afterMarker, to: stripped.endIndex)))
-            if callGoesThroughCaptureCopy(snippet) { continue }
+            let next = stripped.index(afterMarker, offsetBy:
+                min(1, stripped.distance(from: afterMarker, to: stripped.endIndex)))
+            searchFrom = next
+            let symbols = symbolArgumentLiterals(in: snippet)
             for lit in stringLiterals(in: snippet) {
                 if isPunctuationOnly(lit) { continue }
-                if isSymbolName(lit) { continue }
-                if allowlist.contains(where: { lit.contains($0.needle) }) { continue }
+                if symbols.contains(lit) { continue }
+                if isCaptureCopyInterpolation(lit) { continue }
+                if allowlist.contains(where: { $0.needle == lit }) { continue }
                 let line = lineNumber(of: hit.idx, in: stripped)
                 hits.append("\(file):\(line):\(lit)")
             }
@@ -150,15 +167,51 @@ enum CaptureCopySourceScan {
         return String(text[start...])
     }
 
-    private static func callGoesThroughCaptureCopy(_ snippet: String) -> Bool {
-        let trimmed = snippet.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed.hasPrefix("CaptureCopy.") { return true }
-        if trimmed.hasPrefix("$") { return true }
-        // Interpolation whose pieces are CaptureCopy / session fields.
-        if trimmed.hasPrefix("\"\\(") && trimmed.contains("CaptureCopy.") { return true }
-        if trimmed.contains("CaptureCopy.") && !trimmed.contains("\"") { return true }
-        if trimmed.contains("Self.bidirectionalScrollHint") { return true }
-        return false
+    /// Literals that are the argument of `symbol:` in this call snippet.
+    private static func symbolArgumentLiterals(in snippet: String) -> Set<String> {
+        var found: Set<String> = []
+        var i = snippet.startIndex
+        while i < snippet.endIndex {
+            if snippet[i...].hasPrefix("symbol:") {
+                let after = snippet.index(i, offsetBy: "symbol:".count)
+                let rest = snippet[after...].trimmingCharacters(in: .whitespacesAndNewlines)
+                if rest.hasPrefix("\"") {
+                    found.formUnion(stringLiterals(in: String(rest.prefix(while: { $0 != "," && $0 != ")" }))))
+                }
+                i = after
+                continue
+            }
+            i = snippet.index(after: i)
+        }
+        return found
+    }
+
+    /// `"\(CaptureCopy.foo()) · \(stopHint)"` is production wiring, not a
+    /// hardcoded sentence. `"Copied"` or `" extra"` is not.
+    private static func isCaptureCopyInterpolation(_ lit: String) -> Bool {
+        guard lit.contains("\\(") else { return false }
+        return isPunctuationOnly(stripInterpolations(lit))
+    }
+
+    private static func stripInterpolations(_ s: String) -> String {
+        var out = ""
+        var i = s.startIndex
+        while i < s.endIndex {
+            if s[i...].hasPrefix("\\(") {
+                var j = s.index(i, offsetBy: 2)
+                var depth = 1
+                while j < s.endIndex && depth > 0 {
+                    if s[j] == "(" { depth += 1 }
+                    else if s[j] == ")" { depth -= 1 }
+                    j = s.index(after: j)
+                }
+                i = j
+                continue
+            }
+            out.append(s[i])
+            i = s.index(after: i)
+        }
+        return out
     }
 
     private static func stringLiterals(in snippet: String) -> [String] {
@@ -172,7 +225,15 @@ enum CaptureCopySourceScan {
                 while j < snippet.endIndex {
                     let c = snippet[j]
                     if escaped { buf.append(c); escaped = false }
-                    else if c == "\\" { escaped = true }
+                    else if c == "\\" {
+                        let n = snippet.index(after: j)
+                        if n < snippet.endIndex && snippet[n] == "(" {
+                            buf.append("\\(")
+                            j = snippet.index(after: n)
+                            continue
+                        }
+                        escaped = true
+                    }
                     else if c == "\"" { break }
                     else { buf.append(c) }
                     j = snippet.index(after: j)
@@ -184,17 +245,6 @@ enum CaptureCopySourceScan {
             i = snippet.index(after: i)
         }
         return lits
-    }
-
-    /// SF Symbol token in `symbol:` — not user-facing copy.
-    private static func isSymbolName(_ s: String) -> Bool {
-        let t = s.trimmingCharacters(in: .whitespaces)
-        guard !t.isEmpty, !t.contains(where: { $0.isWhitespace }) else { return false }
-        return t.unicodeScalars.allSatisfy {
-            CharacterSet.letters.contains($0)
-                || CharacterSet.decimalDigits.contains($0)
-                || $0 == "."
-        }
     }
 
     private static func isPunctuationOnly(_ s: String) -> Bool {
