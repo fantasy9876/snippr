@@ -111,24 +111,27 @@ enum CaptureCopySourceScan {
         let scanned = Set(scannedFiles)
         let excluded = Set(excludedFiles.map(\.file))
 
-        let files = (try? FileManager.default.contentsOfDirectory(
+        // N9: recurse like Windows AllDirectories. A nested file used to be
+        // invisible to discovery — the hole N7 closed, one directory up.
+        let enumerator = FileManager.default.enumerator(
             at: sourceDir,
             includingPropertiesForKeys: [.isRegularFileKey],
-            options: [.skipsHiddenFiles])) ?? []
-        for url in files {
+            options: [.skipsHiddenFiles])
+        while let url = enumerator?.nextObject() as? URL {
             guard url.pathExtension == "swift" else { continue }
-            let name = url.lastPathComponent
+            let rel = relativePath(url, from: sourceDir)
+            if rel.contains("/.") { continue }
             guard let text = try? String(contentsOf: url, encoding: .utf8) else {
-                found.append("\(name):unreadable")
+                found.append("\(rel):unreadable")
                 continue
             }
             guard discoveryMarkers.contains(where: { text.contains($0) }) else { continue }
-            if excluded.contains(name) { continue }
-            if scanned.contains(name) {
-                found.append(contentsOf: scan(file: name, source: text))
+            if excluded.contains(rel) { continue }
+            if scanned.contains(rel) {
+                found.append(contentsOf: scan(file: rel, source: text))
                 continue
             }
-            found.append("\(name):has-marker-not-listed")
+            found.append("\(rel):has-marker-not-listed")
         }
 
         for name in scannedFiles {
@@ -140,21 +143,23 @@ enum CaptureCopySourceScan {
         return found
     }
 
+    static func relativePath(_ url: URL, from dir: URL) -> String {
+        let base = dir.standardizedFileURL.path
+        let path = url.standardizedFileURL.path
+        if path.hasPrefix(base) {
+            let rest = path.dropFirst(base.count)
+            return rest.hasPrefix("/") ? String(rest.dropFirst()) : String(rest)
+        }
+        return url.lastPathComponent
+    }
+
     static func scan(file: String, source: String) -> [String] {
         let stripped = stripComments(source)
         var hits: [String] = []
-        let markers = [
-            "ToastHUD.show(",
-            "updateProgress(",
-            ".stringValue =",
-            "NSTextField(wrappingLabelWithString:",
-            "NSButton(title:",
-            "NSAttributedString(string:",
-        ]
         var searchFrom = stripped.startIndex
         while searchFrom < stripped.endIndex {
             var best: (idx: String.Index, marker: String)? = nil
-            for marker in markers {
+            for marker in discoveryMarkers {
                 if let r = stripped.range(of: marker, range: searchFrom..<stripped.endIndex) {
                     if best == nil || r.lowerBound < best!.idx {
                         best = (r.lowerBound, marker)
