@@ -932,7 +932,7 @@ sealed class AreaReviewForm : Form
         }
         catch (Exception)
         {
-            ToastForm.Show(CaptureCopy.ExportAnnotatedFailed());
+            ToastForm.Show(CaptureCopy.ExportAnnotatedFailed(CaptureCopy.Current));
             return;
         }
         ChosenAction = action;

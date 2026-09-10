@@ -1513,8 +1513,6 @@ static class Program
         if (hintEn != enStopHotkey) f.Add($"en hint '{hintEn}'");
         var hintVi = ScrollSessionStop.SessionStopHint(true, UILanguage.Vietnamese);
         if (hintVi != viStopHotkey) f.Add($"vi hint '{hintVi}'");
-        if (ScrollSessionStop.SessionStopHint(true) != enStopHotkey)
-            f.Add($"default hint '{ScrollSessionStop.SessionStopHint(true)}'");
         if (hintEn.Contains("Esc để xong", StringComparison.Ordinal)
             || hintVi.Contains("Esc để xong", StringComparison.Ordinal))
             f.Add("hint still says Esc finishes");
@@ -1552,8 +1550,6 @@ static class Program
             || progressVi.Contains(", xong ", StringComparison.Ordinal)
             || progressVi.Contains("xong Enter", StringComparison.Ordinal))
             f.Add($"vi progress still has xong next to Esc '{progressVi}'");
-        if (ScrollSessionStop.StitchingProgressText(1234, true) != progressEn)
-            f.Add("default progress not English");
         return f;
     }
 

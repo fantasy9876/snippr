@@ -27,6 +27,10 @@ static class CaptureCopySourceScan
          "OCR — out of i18n slice; splash/OCR joint decision with macOS"),
         ("MiscForms.cs",
          "pin/about/settings chrome; Language radios stay English/Tiếng Việt by design"),
+        ("TestEntry.cs",
+         "Windows runner smoke, not production copy"),
+        ("Ui/OcrResultPanel.cs",
+         "OCR panel — out of i18n slice, same group as OcrTranslate"),
     ];
 
     static readonly (string Prefix, string Reason)[] ExcludedPrefixes =
@@ -69,18 +73,21 @@ static class CaptureCopySourceScan
          "Open File, not a capture path"),
         ("Text copied",
          "OCR overlay — out of i18n slice, Win PR decides with splash"),
+        ("Snippr {Application.ProductVersion.Split('+')[0]}",
+         "tray tooltip version string, not capture-result copy"),
     ];
 
     static readonly string[] DiscoveryMarkers =
     [
         "ToastForm.Show(",
-        "_label.Text =",
+        ".Text =",
+        "new Button",
     ];
 
     static readonly string[] ScanMarkers =
     [
         "ToastForm.Show(",
-        "_label.Text =",
+        ".Text =",
         "new Button",
     ];
 

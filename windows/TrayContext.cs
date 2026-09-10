@@ -159,17 +159,18 @@ sealed class TrayContext : ApplicationContext
     /// explicit, so they say exactly where the picture goes.
     void RouteReviewed(OverlayAction? action, Bitmap image)
     {
+        var lang = CaptureCopy.Current;
         switch (action)
         {
             case OverlayAction.Copy:
-                if (TryCopyImage(image)) ToastForm.Show(CaptureCopy.ScreenshotCopied());
-                else ToastForm.Show(CaptureCopy.ClipboardBusy());
+                if (TryCopyImage(image)) ToastForm.Show(CaptureCopy.ScreenshotCopied(lang));
+                else ToastForm.Show(CaptureCopy.ClipboardBusy(lang));
                 image.Dispose();
                 break;
             case OverlayAction.Save:
                 if (CaptureUtil.SaveToFolder(image) is string path)
-                    ToastForm.Show(CaptureCopy.SavedFile(Path.GetFileName(path)));
-                else ToastForm.Show(CaptureCopy.SaveFailed());
+                    ToastForm.Show(CaptureCopy.SavedFile(Path.GetFileName(path), lang));
+                else ToastForm.Show(CaptureCopy.SaveFailed(lang));
                 image.Dispose();
                 break;
             case OverlayAction.Pin:
@@ -194,7 +195,7 @@ sealed class TrayContext : ApplicationContext
     {
         if (CaptureBusy) return;
         var shot = CaptureUtil.ActiveWindow();
-        if (shot == null) { ToastForm.Show(CaptureCopy.NoWindowFound()); return; }
+        if (shot == null) { ToastForm.Show(CaptureCopy.NoWindowFound(CaptureCopy.Current)); return; }
         HandleResult(shot);
     }
 
@@ -271,7 +272,7 @@ sealed class TrayContext : ApplicationContext
         // no longer on any monitor — used to crash inside Bitmap.Clone
         if (CaptureUtil.Rect(rect) is not Bitmap shot)
         {
-            ToastForm.Show(CaptureCopy.SavedRegionGone());
+            ToastForm.Show(CaptureCopy.SavedRegionGone(CaptureCopy.Current));
             CaptureArea();
             return;
         }

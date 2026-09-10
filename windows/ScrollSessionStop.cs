@@ -105,13 +105,13 @@ public static class ScrollSessionStop
     }
 
     public static string SessionStopHint(
-        bool hotkeysRegistered, UILanguage language = UILanguage.English) =>
+        bool hotkeysRegistered, UILanguage language) =>
         CaptureCopy.StopHint(hotkeysRegistered, language);
 
     /// Do not prefix with "xong " / "done " — that sat next to "Esc hủy"
     /// and read as if Esc still finished the capture (macOS H3).
     public static string StitchingProgressText(
-        int pixels, bool hotkeysRegistered, UILanguage language = UILanguage.English) =>
+        int pixels, bool hotkeysRegistered, UILanguage language) =>
         CaptureCopy.StitchingProgress(pixels, hotkeysRegistered, language);
 
     public const int VkShift = 0x10;
