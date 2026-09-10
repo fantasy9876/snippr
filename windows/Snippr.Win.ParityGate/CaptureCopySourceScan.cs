@@ -77,6 +77,23 @@ static class CaptureCopySourceScan
          "tray tooltip version string, not capture-result copy"),
     ];
 
+    /// Production assignments in files ParityGate cannot compile. Same net as
+    /// capture-copy-source-scan: the gate reads the source text. Mutating the
+    /// wiring (Sol S1/S2) removes a required needle and goes red. Add a row
+    /// when a new seam lives outside the gate's compile set (Honey family).
+    static readonly (string File, string Needle, string Reason)[] RequiredSeams =
+    [
+        ("Program.cs",
+         "CaptureCopy.Resolve = static () => UILanguageUtil.Parse(AppSettings.Current.UiLanguage);",
+         "S1: Current follows Settings; a constant English Resolve skips Vietnamese"),
+        ("AppSettings.cs",
+         "public string UiLanguage { get; set; } = UILanguageUtil.EnglishCode;",
+         "S2: missing/fresh key is English; a string literal default can silently become vi"),
+        ("CaptureCopy.cs",
+         "public const string EnglishCode = \"en\";",
+         "the identifier AppSettings uses must mean English"),
+    ];
+
     static readonly string[] DiscoveryMarkers =
     [
         "ToastForm.Show(",
@@ -152,6 +169,48 @@ static class CaptureCopySourceScan
         }
 
         return found;
+    }
+
+    public static List<string> SeamHits(string windowsDir)
+    {
+        var found = new List<string>();
+        foreach (var (file, needle, reason) in RequiredSeams)
+        {
+            if (string.IsNullOrWhiteSpace(needle)) found.Add($"seam-empty-needle:{file}");
+            if (string.IsNullOrWhiteSpace(reason)) found.Add($"seam-empty-reason:{file}");
+            var full = Path.Combine(windowsDir, file);
+            if (!File.Exists(full))
+            {
+                found.Add($"{file}:missing");
+                continue;
+            }
+            string text;
+            try { text = File.ReadAllText(full); }
+            catch
+            {
+                found.Add($"{file}:unreadable");
+                continue;
+            }
+            var got = CollapseWs(StripComments(text));
+            var want = CollapseWs(needle);
+            if (!got.Contains(want, StringComparison.Ordinal))
+                found.Add($"{file}:seam-missing");
+        }
+        return found;
+    }
+
+    static string CollapseWs(string s)
+    {
+        var buf = new StringBuilder(s.Length);
+        var gap = false;
+        foreach (var c in s)
+        {
+            if (char.IsWhiteSpace(c)) { gap = true; continue; }
+            if (gap && buf.Length > 0) buf.Append(' ');
+            gap = false;
+            buf.Append(c);
+        }
+        return buf.ToString();
     }
 
     static bool PrefixExcluded(string rel) =>

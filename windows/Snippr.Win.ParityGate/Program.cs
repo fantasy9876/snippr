@@ -46,6 +46,7 @@ static class Program
         failed += Check("win-scroll-tray-route", ScrollTrayRouteGate());
         failed += Check("win-capture-copy-literals", CaptureCopyLiterals());
         failed += Check("win-capture-copy-source-scan", CaptureCopySourceScanGate());
+        failed += Check("win-ui-language-seams", UiLanguageSeams());
         if (pending > 0)
             Console.WriteLine($"{pending} PARITY GATE(S) PENDING — not a pass");
         Console.WriteLine(failed == 0
@@ -1871,4 +1872,7 @@ static class Program
 
     static List<string> CaptureCopySourceScanGate() =>
         CaptureCopySourceScan.Hits(CaptureCopySourceScan.WindowsDirectory());
+
+    static List<string> UiLanguageSeams() =>
+        CaptureCopySourceScan.SeamHits(CaptureCopySourceScan.WindowsDirectory());
 }

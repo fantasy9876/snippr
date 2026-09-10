@@ -45,7 +45,8 @@ class AppSettings
     public bool EscCopy { get; set; } = true;
     public string TranslateTarget { get; set; } = "vi";
     /// Capture-flow UI language. `en` / `vi`; missing or garbage → English.
-    public string UiLanguage { get; set; } = "en";
+    /// Must stay `UILanguageUtil.EnglishCode` — ParityGate pins this seam (S2).
+    public string UiLanguage { get; set; } = UILanguageUtil.EnglishCode;
     public int LastAreaX { get; set; } = -1;
     public int LastAreaY { get; set; }
     public int LastAreaW { get; set; }
