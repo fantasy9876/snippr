@@ -20,12 +20,12 @@ enum AppServices {
 
     static func handleCaptureError(_ error: Error) {
         if case CaptureError.permission = error {
-            ToastHUD.show("Screen Recording permission needed — enable Snippr in System Settings", symbol: "exclamationmark.shield.fill", duration: 5)
+            ToastHUD.show(CaptureCopy.screenRecordingNeeded(), symbol: "exclamationmark.shield.fill", duration: 5)
             openScreenRecordingSettings()
         } else if case CaptureError.cancelled = error {
             // silent
         } else {
-            ToastHUD.show("Capture failed", symbol: "exclamationmark.triangle.fill")
+            ToastHUD.show(CaptureCopy.captureFailed(), symbol: "exclamationmark.triangle.fill")
         }
     }
 }
@@ -411,7 +411,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func repeatAreaCapture() {
         guard let global = Settings.shared.lastAreaRect else {
-            ToastHUD.show("No previous area — use Capture Area first", symbol: "rectangle.dashed")
+            ToastHUD.show(CaptureCopy.noPreviousArea(), symbol: "rectangle.dashed")
             captureArea()
             return
         }
@@ -423,7 +423,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         })
         let visible = screen.map { $0.frame.intersection(global) } ?? .null
         guard let screen, visible.width >= 4, visible.height >= 4 else {
-            ToastHUD.show("Vùng đã lưu không còn trên màn hình — chọn lại nhé", symbol: "rectangle.dashed")
+            ToastHUD.show(CaptureCopy.savedRegionGone(), symbol: "rectangle.dashed")
             captureArea()
             return
         }
@@ -447,7 +447,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func captureActiveWindow() {
         guard let info = CaptureEngine.frontmostWindow() else {
-            ToastHUD.show("No window found", symbol: "macwindow")
+            ToastHUD.show(CaptureCopy.noWindowFound(), symbol: "macwindow")
             return
         }
         captureWindow(info)
@@ -552,15 +552,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let announce = !plan.opensEditor
             SaveService.shared.save(framed) { url in
                 guard announce else { return }
-                var toasts: [String] = copied ? ["copied"] : []
+                var toasts: [String] = copied ? [CaptureCopy.toastCopiedWord()] : []
                 if let url {
-                    toasts.append("saved \(url.lastPathComponent)")
+                    toasts.append(CaptureCopy.toastSavedWord(url.lastPathComponent))
                 } else {
                     // the only configured action failed — rescue the shot
                     if !copied { SaveService.shared.copyToClipboard(framed) }
-                    toasts.append(copied ? "save failed" : "save failed — copied instead")
+                    toasts.append(copied
+                        ? CaptureCopy.toastSaveFailed()
+                        : CaptureCopy.toastSaveFailedCopied())
                 }
-                ToastHUD.show("Screenshot \(toasts.joined(separator: " · "))")
+                ToastHUD.show(CaptureCopy.screenshotSummary(toasts))
             }
         }
 
@@ -577,11 +579,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if s.afterSave {
                 // toast arrives from the save completion above
             } else if copied {
-                ToastHUD.show("Screenshot copied")
+                ToastHUD.show(CaptureCopy.screenshotCopied())
             } else {
                 // nothing configured — at least copy so the shot isn't lost
                 SaveService.shared.copyToClipboard(framed)
-                ToastHUD.show("Screenshot copied to clipboard")
+                ToastHUD.show(CaptureCopy.screenshotCopiedToClipboard())
             }
         }
     }

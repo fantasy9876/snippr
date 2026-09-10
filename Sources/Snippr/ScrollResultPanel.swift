@@ -44,7 +44,7 @@ enum ScrollResultPresenter {
             var deps = dependencies ?? .live
             if !inputs.afterSave {
                 let baseToast = deps.toast
-                deps.toast = { _ in baseToast("Đã copy") }
+                deps.toast = { _ in baseToast(CaptureCopy.copied()) }
             }
             CaptureActionRouter.commit(
                 image, source: .scrollResult, intent: .scrollFinished,
@@ -594,9 +594,9 @@ final class ScrollResultPanel: NSPanel {
         guard let image = exportSnapshot else {
             // fail-closed: keep the panel (and the drawings) alive
             if let toast = dependencies?.toast {
-                toast("Không xuất được ảnh có nét vẽ — thử lại")
+                toast(CaptureCopy.exportAnnotatedFailed())
             } else {
-                ToastHUD.show("Không xuất được ảnh có nét vẽ — thử lại")
+                ToastHUD.show(CaptureCopy.exportAnnotatedFailed())
             }
             return
         }

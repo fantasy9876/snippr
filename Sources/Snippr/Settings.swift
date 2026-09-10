@@ -247,6 +247,8 @@ final class Settings {
         static let uploadProvider = "uploadProvider"
         static let lastAnnotationColor = "lastAnnotationColor"
         static let translateTarget = "translateTarget"
+        /// Capture-flow language. New key — do not migrate or rewrite older keys.
+        static let uiLanguage = "uiLanguage"
         // One-time behavior migrations. These are deliberately not shown in UI.
         static let didMigrateEditorFit = "didMigrateEditorFit_v1"
     }
@@ -269,6 +271,11 @@ final class Settings {
     var translateTarget: String {
         get { d.string(forKey: Keys.translateTarget) ?? "vi" }
         set { d.set(newValue, forKey: Keys.translateTarget) }
+    }
+
+    var uiLanguage: UILanguage {
+        get { UILanguage.resolved }
+        set { d.set(newValue.rawValue, forKey: Keys.uiLanguage) }
     }
 
     static func registerDefaults(applyMigrations: Bool = true) {
@@ -299,6 +306,7 @@ final class Settings {
             Keys.diagnostics: true,
             Keys.uploadProvider: "disabled",
             Keys.multipleSpotlight: true,
+            Keys.uiLanguage: UILanguage.english.rawValue,
         ])
         // Older releases defaulted to 100%, leaving larger/near-edge images
         // behind macOS scrollbars. Move every existing install to Fit once;

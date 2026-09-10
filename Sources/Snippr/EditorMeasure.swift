@@ -10,8 +10,7 @@ enum MeasureAxis: Equatable {
 
 enum SliceAHotkeys {
     /// Chrome copy only — stitcher already prepends on up-scroll.
-    static let bidirectionalScrollHint =
-        "Cuộn lên hoặc xuống — stitcher nối cả hai chiều"
+    static var bidirectionalScrollHint: String { CaptureCopy.bidirectional() }
 
     /// Honey slice B: Backdrop (D), Spotlight (S), Magnifier (M), Pixelate text (⇧B).
     static let reservedForSliceB: Set<String> = ["d", "s", "m"]

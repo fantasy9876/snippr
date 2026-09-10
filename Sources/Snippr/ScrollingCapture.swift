@@ -33,6 +33,9 @@ final class ScrollingCapture {
     /// Snapshotted at begin(): a Settings change while the user scrolls must
     /// not change the finish-time auto actions or the panel's display.
     private let sessionInputs: OverlaySessionInputs
+    /// Same snapshot-at-begin rule as `sessionInputs`: chrome and progress
+    /// stay in the language the session started with.
+    private let uiLanguage: UILanguage
     private var originScreen: NSScreen?
     private var finalized = false
     nonisolated(unsafe) private var finished = false
@@ -80,22 +83,25 @@ final class ScrollingCapture {
     }
 
     /// Live hint when the session hotkeys registered; otherwise only ✓.
-    private var stopHint: String { Self.sessionStopHint(hotkeysRegistered: hotkeysRegistered) }
+    private var stopHint: String {
+        Self.sessionStopHint(hotkeysRegistered: hotkeysRegistered, language: uiLanguage)
+    }
 
-    nonisolated static func sessionStopHint(hotkeysRegistered: Bool) -> String {
-        hotkeysRegistered
-            ? "Enter/✓ xong · ⌘C copy · Esc hủy"
-            : "bấm ✓ để xong"
+    nonisolated static func sessionStopHint(
+        hotkeysRegistered: Bool, language: UILanguage = .resolved
+    ) -> String {
+        CaptureCopy.stopHint(hotkeysRegistered: hotkeysRegistered, language: language)
     }
 
     /// Live stitching line. Do not prefix with "xong " — that sat next to
     /// "Esc hủy" and read as if Esc still finished the capture.
     nonisolated static func stitchingProgressText(
-        points: Int, connectingUp: Bool, hotkeysRegistered: Bool
+        points: Int, connectingUp: Bool, hotkeysRegistered: Bool,
+        language: UILanguage = .resolved
     ) -> String {
-        let suffix = connectingUp ? " (nối lên trên)" : ""
-        return "Đã ghép \(points) pt\(suffix) — cuộn tiếp · "
-            + sessionStopHint(hotkeysRegistered: hotkeysRegistered)
+        CaptureCopy.stitchingProgress(
+            points: points, connectingUp: connectingUp,
+            hotkeysRegistered: hotkeysRegistered, language: language)
     }
 
     /// Identifier for the live-preview "✓ Xong" control. Gates look this up
@@ -106,14 +112,16 @@ final class ScrollingCapture {
     /// Chrome copy: stitcher already prepends on up-scroll; this only tells
     /// the user both directions work. Do not change capture/hotkey behavior.
     nonisolated static var bidirectionalScrollHint: String {
-        SliceAHotkeys.bidirectionalScrollHint
+        CaptureCopy.bidirectional()
     }
 
     init(
         inputs: OverlaySessionInputs? = nil,
+        language: UILanguage? = nil,
         onFinish: @escaping @MainActor (ScrollFinish) -> Void
     ) {
         self.sessionInputs = inputs ?? .snapshot()
+        self.uiLanguage = language ?? UILanguage.resolved
         self.onFinish = onFinish
     }
 
@@ -122,6 +130,7 @@ final class ScrollingCapture {
         // Snapshot BEFORE the picker: the whole session (picker, scrolling,
         // finish routing) behaves per the settings at invocation time.
         let inputs = OverlaySessionInputs.snapshot()
+        let language = UILanguage.resolved
         SelectionOverlay.begin(purpose: .scrollRegion) { result in
             guard case let .area(screen, _, rect) = result else {
                 onFinish(ScrollFinish(
@@ -132,12 +141,13 @@ final class ScrollingCapture {
             // Too-short selections can never stitch (the matcher needs enough
             // rows for a template) — refuse up front, mirroring Windows.
             guard rect.width >= 40, rect.height >= 60 else {
-                ToastHUD.show("Vùng quá nhỏ cho chụp cuộn — chọn vùng cao hơn 60 pt",
+                ToastHUD.show(CaptureCopy.regionTooSmall(language),
                               symbol: "rectangle.dashed")
                 onFinish(ScrollFinish(image: nil, inputs: inputs, screen: screen))
                 return
             }
-            let session = ScrollingCapture(inputs: inputs, onFinish: onFinish)
+            let session = ScrollingCapture(
+                inputs: inputs, language: language, onFinish: onFinish)
             active = session
             Task { @MainActor in
                 await session.run(screen: screen, rect: rect)
@@ -159,7 +169,7 @@ final class ScrollingCapture {
         let screen = originScreen ?? NSScreen.main ?? NSScreen.screens.first
         if cancelled {
             EventLog.append("scroll cancelled")
-            ToastHUD.show("Đã hủy chụp cuộn", symbol: "xmark.circle.fill")
+            ToastHUD.show(CaptureCopy.scrollCancelled(uiLanguage), symbol: "xmark.circle.fill")
             onFinish(ScrollFinish(
                 image: nil, inputs: sessionInputs, screen: screen,
                 cancelled: true))
@@ -249,7 +259,7 @@ final class ScrollingCapture {
                     captureFailures = 0
                     backendNeedsHandshake = stitcher != nil
                     stitcher?.prepareForBackendTransition()
-                    updateProgress("Đang dùng chế độ tương thích — cuộn tiếp · \(stopHint)")
+                    updateProgress(CaptureCopy.compatibilityMode(uiLanguage) + stopHint)
                     NSLog("Snippr: sourceRect capture failed repeatedly — switching to full-display crop")
                 } else if captureFailures > 10 {
                     break
@@ -275,12 +285,10 @@ final class ScrollingCapture {
                         // bounded window keeps preview geometry global.
                         rebuildPreview(from: segmented, pinToTop: false)
                         updateProgress(
-                            "Đã đổi chế độ chụp và bắt đầu đoạn "
-                            + "\(segmented.segmentCount); vạch sáng đánh dấu chỗ thiếu")
+                            CaptureCopy.backendNewSegment(segmented.segmentCount, uiLanguage))
                         backendNeedsHandshake = false
                     case .appended, .prepended, .moved, .rejected:
-                        updateProgress(
-                            "Đang đồng bộ chế độ tương thích — cuộn chậm để nối tiếp")
+                        updateProgress(CaptureCopy.backendSync(uiLanguage))
                     }
                     if backendNeedsHandshake {
                         try? await Task.sleep(nanoseconds: 80_000_000)
@@ -302,7 +310,7 @@ final class ScrollingCapture {
                         first: frame.cgImage, scale: scale)
                     startPreview(with: frame.cgImage)
                     updateProgress(
-                        "\(Self.bidirectionalScrollHint) · \(stopHint)")
+                        "\(CaptureCopy.bidirectional(uiLanguage)) · \(stopHint)")
                 }
             }
 
@@ -444,7 +452,8 @@ final class ScrollingCapture {
                 Self.stitchingProgressText(
                     points: Int(CGFloat(s.totalHeight) / s.scale),
                     connectingUp: false,
-                    hotkeysRegistered: hotkeysRegistered))
+                    hotkeysRegistered: hotkeysRegistered,
+                    language: uiLanguage))
         case .prepended:
             // Always rebuild: the incremental paste-on-top path cannot
             // represent separators or completed segments above the current
@@ -454,7 +463,8 @@ final class ScrollingCapture {
                 Self.stitchingProgressText(
                     points: Int(CGFloat(s.totalHeight) / s.scale),
                     connectingUp: true,
-                    hotkeysRegistered: hotkeysRegistered))
+                    hotkeysRegistered: hotkeysRegistered,
+                    language: uiLanguage))
         case .moved:
             // A retrace adds no rows, but an accepted frame can still revoke
             // a header omit and raise totalHeight — resync the preview at the
@@ -464,8 +474,7 @@ final class ScrollingCapture {
                 rebuildPreview(from: s, pinToTop: previewPinnedTop)
             }
             updateProgress(
-                "Đang cuộn qua vùng đã chụp — "
-                + "\(Int(CGFloat(s.totalHeight) / s.scale)) pt")
+                CaptureCopy.retrace(Int(CGFloat(s.totalHeight) / s.scale), uiLanguage))
         case .startedSegment:
             // Rebuild the bounded bottom window instead of seeding an
             // incremental preview from separator + segment image: that local
@@ -474,11 +483,9 @@ final class ScrollingCapture {
             // scales the preview jumped a pixel after every re-anchor. The
             // window naturally shows the marker and the new segment.
             rebuildPreview(from: s, pinToTop: false)
-            updateProgress(
-                "Mất một đoạn do cuộn quá nhanh — đang ghi đoạn "
-                + "\(s.segmentCount); vạch sáng đánh dấu chỗ thiếu")
+            updateProgress(CaptureCopy.lostSegment(s.segmentCount, uiLanguage))
         case .rejected:
-            updateProgress("Chưa khớp được — cuộn chậm lại một chút")
+            updateProgress(CaptureCopy.noMatch(uiLanguage))
         }
     }
 
@@ -792,15 +799,16 @@ final class ScrollingCapture {
         container.layer?.cornerRadius = 12
 
         let label = NSTextField(wrappingLabelWithString:
-            "\(Self.bidirectionalScrollHint) · \(stopHint)")
+            "\(CaptureCopy.bidirectional(uiLanguage)) · \(stopHint)")
         label.font = .systemFont(ofSize: 11.5, weight: .semibold)
         label.textColor = .white
         label.identifier = NSUserInterfaceItemIdentifier(Self.hintLabelIdentifier)
         label.setAccessibilityIdentifier(Self.hintLabelIdentifier)
         progressLabel = label
 
+        let doneTitle = CaptureCopy.doneButton(uiLanguage)
         let doneFont = NSFont.systemFont(ofSize: 12, weight: .semibold)
-        let done = NSButton(title: "✓ Xong", target: self, action: #selector(finishTapped))
+        let done = NSButton(title: doneTitle, target: self, action: #selector(finishTapped))
         // Overlay-toolbar shape: no system bezel, so inactive-window dimming
         // has nothing to dim. Title color is attributed (not semantic) so it
         // stays white even if a future caller drops the appearance pin.
@@ -810,7 +818,7 @@ final class ScrollingCapture {
         done.font = doneFont
         done.contentTintColor = .white
         done.attributedTitle = NSAttributedString(
-            string: "✓ Xong",
+            string: doneTitle,
             attributes: [
                 .foregroundColor: NSColor.white,
                 .font: doneFont,
@@ -819,7 +827,7 @@ final class ScrollingCapture {
         done.focusRingType = .none
         done.identifier = NSUserInterfaceItemIdentifier(Self.doneButtonIdentifier)
         done.setAccessibilityIdentifier(Self.doneButtonIdentifier)
-        done.setAccessibilityLabel("✓ Xong")
+        done.setAccessibilityLabel(doneTitle)
         done.wantsLayer = true
         done.layer?.backgroundColor = NSColor(white: 0.22, alpha: 1).cgColor
         done.layer?.cornerRadius = 6
@@ -834,6 +842,7 @@ final class ScrollingCapture {
         header.edgeInsets = NSEdgeInsets(top: 10, left: 12, bottom: 4, right: 12)
 
         let preview = ScrollPreviewView()
+        preview.uiLanguage = uiLanguage
         previewView = preview
 
         let column = NSStackView(views: [header, preview])
@@ -1386,6 +1395,7 @@ final class ScrollPreviewView: NSView {
     /// When capturing upward the newest content is at the top; pin there so
     /// the user always sees the strip growing.
     var pinToTop = false
+    var uiLanguage: UILanguage = .english
 
     override func draw(_ dirtyRect: NSRect) {
         guard let ctx = NSGraphicsContext.current?.cgContext else { return }
@@ -1398,7 +1408,7 @@ final class ScrollPreviewView: NSView {
                 .font: NSFont.systemFont(ofSize: 11),
                 .foregroundColor: NSColor(calibratedWhite: 0.65, alpha: 1),
             ]
-            ("Chờ khung hình đầu tiên…" as NSString).draw(
+            (CaptureCopy.waitingFirstFrame(uiLanguage) as NSString).draw(
                 at: NSPoint(x: inset, y: bounds.midY), withAttributes: attrs)
             return
         }

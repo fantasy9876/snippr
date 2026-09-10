@@ -1192,7 +1192,7 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
         let next = style.clamped()
         guard next.kind == .none || backdropPeakFits(next) else {
             ToastHUD.show(
-                "Vùng chọn quá lớn cho Backdrop",
+                CaptureCopy.selectionTooLargeForBackdrop(),
                 symbol: "exclamationmark.triangle.fill",
                 on: window?.screen ?? screen, above: window?.level)
             return false
@@ -1251,8 +1251,8 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
         let canonical = syncSessionPixelRect() ?? selection
         func payloadFailed() {
             let message = lastPayloadFailure == .backdrop
-                ? "Không dựng được nền Backdrop — thử preset khác"
-                : "Không xuất được ảnh có nét vẽ — thử lại"
+                ? CaptureCopy.backdropBuildFailed()
+                : CaptureCopy.exportAnnotatedFailed()
             if let toast = owner.routerDependenciesOverride?.toast {
                 toast(message)
             } else {
@@ -1432,8 +1432,8 @@ final class SelectionOverlayView: NSView, RedactionSurfaceDelegate {
             // fail-closed like the panel: keep review + drawings, tell the
             // user, run NO action. Nothing above this line mutated anything.
             let message = lastPayloadFailure == .backdrop
-                ? "Không dựng được nền Backdrop — thử preset khác"
-                : "Không xuất được ảnh có nét vẽ — thử lại"
+                ? CaptureCopy.backdropBuildFailed()
+                : CaptureCopy.exportAnnotatedFailed()
             if let toast = owner.routerDependenciesOverride?.toast {
                 toast(message)
             } else {
