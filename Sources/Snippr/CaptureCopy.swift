@@ -249,7 +249,7 @@ enum CaptureCopy {
     static func noPreviousArea(_ lang: UILanguage = .resolved) -> String {
         switch lang {
         case .english: return "No previous area — use Capture Area first"
-        case .vietnamese: return "Chưa có vùng trước — hãy chọn vùng trước đã"
+        case .vietnamese: return "Chưa có vùng đã lưu — chụp một vùng trước đã"
         }
     }
 
@@ -258,7 +258,7 @@ enum CaptureCopy {
         case .english:
             return "Screen Recording permission needed — enable Snippr in System Settings"
         case .vietnamese:
-            return "Cần quyền Screen Recording — bật Snippr trong Cài đặt Hệ thống"
+            return "Cần quyền Screen Recording — bật Snippr trong Cài đặt hệ thống"
         }
     }
 

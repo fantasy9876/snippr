@@ -6145,11 +6145,11 @@ enum SelfTest {
                     pin("en-no-prev-area", CaptureCopy.noPreviousArea(.english),
                         "No previous area — use Capture Area first")
                     pin("vi-no-prev-area", CaptureCopy.noPreviousArea(.vietnamese),
-                        "Chưa có vùng trước — hãy chọn vùng trước đã")
+                        "Chưa có vùng đã lưu — chụp một vùng trước đã")
                     pin("en-screen-rec", CaptureCopy.screenRecordingNeeded(.english),
                         "Screen Recording permission needed — enable Snippr in System Settings")
                     pin("vi-screen-rec", CaptureCopy.screenRecordingNeeded(.vietnamese),
-                        "Cần quyền Screen Recording — bật Snippr trong Cài đặt Hệ thống")
+                        "Cần quyền Screen Recording — bật Snippr trong Cài đặt hệ thống")
                     pin("en-capture-failed", CaptureCopy.captureFailed(.english),
                         "Capture failed")
                     pin("vi-capture-failed", CaptureCopy.captureFailed(.vietnamese),
