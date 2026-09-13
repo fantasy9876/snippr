@@ -105,9 +105,17 @@ static class CaptureCopySourceScan
         "new Button",
     ];
 
-    public static string WindowsDirectory([CallerFilePath] string file = "")
+    /// Captured in this file, not at the call site — a default
+    /// `[CallerFilePath]` argument would follow ParityGate Program.cs
+    /// (one folder down today) or a throwaway driver (not). Same idea as
+    /// macOS `scanFilePath = #filePath`.
+    static readonly string ScanFilePath = CaptureScanFilePath();
+
+    static string CaptureScanFilePath([CallerFilePath] string file = "") => file;
+
+    public static string WindowsDirectory()
     {
-        var dir = Path.GetDirectoryName(file)
+        var dir = Path.GetDirectoryName(ScanFilePath)
             ?? throw new InvalidOperationException("CaptureCopySourceScan has no file path");
         return Path.GetFullPath(Path.Combine(dir, ".."));
     }
@@ -161,6 +169,7 @@ static class CaptureCopySourceScan
             if (scanned.Contains(rel))
             {
                 found.AddRange(Scan(rel, text));
+                found.AddRange(LanguageLiteralArgs(rel, text));
                 continue;
             }
             found.Add($"{rel}:has-marker-not-listed");
@@ -268,6 +277,37 @@ static class CaptureCopySourceScan
             }
 
             searchFrom = after + (after < stripped.Length ? 1 : 0);
+        }
+        return hits;
+    }
+
+    /// Honey F1: a CaptureCopy call in capture-flow files must not take a
+    /// hardcoded UILanguage.English / Vietnamese — that bypasses Current /
+    /// the session snapshot. Compiler only requires *some* language.
+    static List<string> LanguageLiteralArgs(string file, string source)
+    {
+        var hits = new List<string>();
+        var stripped = StripComments(source);
+        const string prefix = "CaptureCopy.";
+        int searchFrom = 0;
+        while (searchFrom < stripped.Length)
+        {
+            var idx = stripped.IndexOf(prefix, searchFrom, StringComparison.Ordinal);
+            if (idx < 0) break;
+            var i = idx + prefix.Length;
+            while (i < stripped.Length && (char.IsLetterOrDigit(stripped[i]) || stripped[i] == '_'))
+                i++;
+            while (i < stripped.Length && char.IsWhiteSpace(stripped[i])) i++;
+            if (i >= stripped.Length || stripped[i] != '(')
+            {
+                searchFrom = idx + prefix.Length;
+                continue;
+            }
+            var snippet = ArgumentSnippet(stripped, i + 1);
+            if (snippet.Contains("UILanguage.English", StringComparison.Ordinal)
+                || snippet.Contains("UILanguage.Vietnamese", StringComparison.Ordinal))
+                hits.Add($"{file}:{LineNumber(stripped, idx)}:UILanguage-literal-arg");
+            searchFrom = i + 1;
         }
         return hits;
     }

@@ -202,15 +202,16 @@ sealed class TrayContext : ApplicationContext
     void StartScrollShot()
     {
         if (CaptureBusy) return;
-        ScrollShotSession.Begin(OnScrollFinished);
+        ScrollShotSession.Begin(finish => { OnScrollFinished(finish); });
     }
 
     /// Production finish callback. `--test-shot` calls this with the finish
     /// the live session just produced — same method the tray registers.
-    internal static void OnScrollFinished(ScrollShotFinish finish)
+    /// Returns the route so smoke can observe it; the tray ignores the value
+    /// (Honey D2). No static test fields in production.
+    internal static ScrollFinishActions? OnScrollFinished(ScrollShotFinish finish)
     {
-        ScrollFinishCalledForTesting = true;
-        LastScrollRouteForTesting = ScrollStopMachine.RouteFinish(new ScrollFinishInputs
+        var route = ScrollStopMachine.RouteFinish(new ScrollFinishInputs
         {
             Cancelled = finish.Cancelled,
             QuickCopy = finish.QuickCopy,
@@ -218,21 +219,16 @@ sealed class TrayContext : ApplicationContext
             AfterShow = finish.AfterShow,
             AfterSave = finish.AfterSave,
         });
-        if (LastScrollRouteForTesting is not { } route)
+        if (route is not { } actions)
         {
             finish.Image?.Dispose();
             if (finish.Cancelled) ToastForm.Show(CaptureCopy.ScrollCancelled(finish.UiLanguage));
-            return;
+            return null;
         }
-        if (finish.Image == null) return;
-        HandleResult(finish.Image, route.Copy, route.Show, route.Save);
+        if (finish.Image == null) return actions;
+        HandleResult(finish.Image, actions.Copy, actions.Show, actions.Save);
+        return actions;
     }
-
-    /// Observation of `OnScrollFinished`. Reset by smoke before each session
-    /// so a skipped callback cannot reuse the last route — Esc's success is
-    /// a null route, which would otherwise look the same as "never called".
-    internal static bool ScrollFinishCalledForTesting { get; set; }
-    internal static ScrollFinishActions? LastScrollRouteForTesting { get; set; }
 
     void RecognizeTextArea()
     {

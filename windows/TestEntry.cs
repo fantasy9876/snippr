@@ -1154,14 +1154,13 @@ static class TestEntry
         // WM_HOTKEY from HotkeyWindow.WndProc or the WH_KEYBOARD_LL fallback.
         // Shift+Esc is the local parity table (win-scroll-session-stop-semantics),
         // not a smoke step — ForKey is not session behavior.
-        ScrollShotFinish DriveScroll(
+        (ScrollShotFinish Finish, ScrollFinishActions? Route) DriveScroll(
             int hotkeyId,
             (bool AfterCopy, bool AfterShow, bool AfterSave) after)
         {
             SweepScrollUi();
-            TrayContext.ScrollFinishCalledForTesting = false;
-            TrayContext.LastScrollRouteForTesting = null;
             ScrollShotFinish? got = null;
+            ScrollFinishActions? route = null;
             var rect = new Rectangle(40, 40, 120, 90);
             var savePrev = AppSettings.Current.SaveFolder;
             AppSettings.Current.SaveFolder = Path.Combine(dir, "scroll-smoke-saves");
@@ -1172,7 +1171,7 @@ static class TestEntry
                     f =>
                     {
                         got = f;
-                        TrayContext.OnScrollFinished(f);
+                        route = TrayContext.OnScrollFinished(f);
                     });
                 Application.DoEvents();
                 var session = ScrollShotSession.ActiveForTesting
@@ -1191,9 +1190,8 @@ static class TestEntry
                 }
                 if (ScrollShotSession.IsActive)
                     throw new InvalidOperationException("scroll session still active");
-                if (!TrayContext.ScrollFinishCalledForTesting)
-                    throw new InvalidOperationException("OnScrollFinished was not called");
-                return got ?? throw new InvalidOperationException("scroll session produced no finish");
+                return (got ?? throw new InvalidOperationException("scroll session produced no finish"),
+                    route);
             }
             finally
             {
@@ -1203,43 +1201,43 @@ static class TestEntry
 
         Step("scroll-esc-cancels", () =>
         {
-            var finish = DriveScroll(
+            var (finish, route) = DriveScroll(
                 ScrollSessionStop.EscId,
                 (AfterCopy: false, AfterShow: true, AfterSave: false));
             if (!finish.Cancelled)
                 throw new InvalidOperationException("Esc did not cancel");
-            if (TrayContext.LastScrollRouteForTesting != null)
+            if (route != null)
                 throw new InvalidOperationException("Esc still routed a result");
             SweepScrollUi();
         });
         Step("scroll-enter-finishes-to-show", () =>
         {
-            var finish = DriveScroll(
+            var (finish, route) = DriveScroll(
                 ScrollSessionStop.ReturnId,
                 (AfterCopy: false, AfterShow: true, AfterSave: false));
             if (finish.Cancelled || finish.QuickCopy)
                 throw new InvalidOperationException(
                     $"Enter cancelled={finish.Cancelled} quickCopy={finish.QuickCopy}");
-            if (TrayContext.LastScrollRouteForTesting is not { } route)
+            if (route is not { } enter)
                 throw new InvalidOperationException("Enter produced no route");
-            if (route.Copy || !route.Show || route.Save)
+            if (enter.Copy || !enter.Show || enter.Save)
                 throw new InvalidOperationException(
-                    $"Enter route copy={route.Copy} show={route.Show} save={route.Save}");
+                    $"Enter route copy={enter.Copy} show={enter.Show} save={enter.Save}");
             SweepScrollUi();
         });
         Step("scroll-ctrlc-quickcopies", () =>
         {
-            var finish = DriveScroll(
+            var (finish, route) = DriveScroll(
                 ScrollSessionStop.CopyId,
                 (AfterCopy: false, AfterShow: true, AfterSave: true));
             if (!finish.QuickCopy || finish.Cancelled)
                 throw new InvalidOperationException(
                     $"Ctrl+C cancelled={finish.Cancelled} quickCopy={finish.QuickCopy}");
-            if (TrayContext.LastScrollRouteForTesting is not { } route)
+            if (route is not { } copy)
                 throw new InvalidOperationException("Ctrl+C produced no route");
-            if (!route.Copy || route.Show || !route.Save)
+            if (!copy.Copy || copy.Show || !copy.Save)
                 throw new InvalidOperationException(
-                    $"Ctrl+C opened editor copy={route.Copy} show={route.Show} save={route.Save}");
+                    $"Ctrl+C opened editor copy={copy.Copy} show={copy.Show} save={copy.Save}");
             SweepScrollUi();
         });
 

@@ -131,10 +131,10 @@ jobs:
               $lines.Add('        CaptureCopy.Resolve = static () => UILanguage.English;')
             }
           }
-          [System.IO.File]::WriteAllLines($prog, $lines)
           Write-Host '== mutated Program.cs (covering line)'
-          Select-String -Path $prog -Pattern 'CaptureCopy.Resolve' | ForEach-Object { Write-Host $_.Line }
           try {
+            [System.IO.File]::WriteAllLines($prog, $lines)
+            Select-String -Path $prog -Pattern 'CaptureCopy.Resolve' | ForEach-Object { Write-Host $_.Line }
             Write-Host '== ParityGate must stay green (needle still present)'
             & dotnet run --project windows/Snippr.Win.ParityGate/Snippr.Win.ParityGate.csproj `
               -c Release -f net8.0 --no-launch-profile
